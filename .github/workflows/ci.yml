@@ -1,0 +1,379 @@
+name: CI
+
+# CI runs on pull requests and manual dispatch. Main pushes are covered
+# by deploy-dev.yml's quality_gate job, which runs the same checks before
+# building/deploying — running both on every main push is duplicate work
+# on a single-capacity self-hosted runner.
+# NO `pull_request` trigger, DELIBERATELY (removed 2026-08-25).
+#
+# This repository is PUBLIC and its Actions execute on a SELF-HOSTED runner —
+# one Mac that also holds the dev Postgres, the Docker socket (mounted into
+# every job container), GCP credentials and a persistent pnpm store. A
+# `pull_request` trigger on that combination means an outside fork can open a
+# PR and run arbitrary code on that machine. There is no sandbox between a job
+# and the host here; `container.options` in the runner config bind-mounts
+# /var/run/docker.sock, so a job can start privileged containers on the host.
+#
+# Nothing is lost by dropping it: this repo pushes straight to main, so the
+# pull_request trigger fired approximately never, and deploy-dev.yml's
+# `quality_gate` is the gate that actually runs (see its own notes).
+#
+# If PR CI is wanted again, it must be `pull_request_target`-free and gated on
+# a trusted-author check, or moved to a runner that is not this workstation.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # Optional: configure these secrets in the repository settings so CI builds
+      # and Playwright/e2e runs can render maps during tests.
+      NEXT_PUBLIC_TILESERVER_URL: "https://tiles-dev.ithasfire.com"
+      NEXT_PUBLIC_GEOAPIFY_API_KEY: ${{ vars.NEXT_PUBLIC_GEOAPIFY_API_KEY }}
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dev
+        ports:
+          - 5432
+        options: >-
+          --health-cmd="pg_isready -U postgres" --health-interval=5s --health-timeout=2s --health-retries=10
+      # Required by apps/api's auth-atomic-rate-limit-concurrency suite, which
+      # proves the auth pre-limiter is atomic under concurrency — the one
+      # property a mocked RateLimitPort cannot show (it is atomic by
+      # construction). @th/test-utils' startRedisContainer picks this up via
+      # TESTCONTAINERS_REUSE_REDIS_URL on that step; without the service it
+      # would fall back to Docker-in-Docker Testcontainers, which is not
+      # reachable from a job container (same constraint as the Postgres
+      # service above).
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379
+        options: >-
+          --health-cmd="redis-cli ping" --health-interval=5s --health-timeout=2s --health-retries=10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable corepack and pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.16.1 --activate
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Wait for Postgres
+        run: |
+          echo "Waiting for Postgres to be ready..."
+          for i in {1..20}; do
+            pg_isready -h postgres -p 5432 -U postgres && break || sleep 3
+          done
+
+      - name: Validate Prisma schema
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+        run: pnpm -F @th/db exec prisma validate
+
+      - name: Generate Prisma client
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+        run: pnpm exec prisma generate
+
+      - name: Apply Prisma migrations
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+        run: pnpm -F @th/db exec prisma migrate deploy --config ../../prisma.config.ts
+
+      - name: Build repository
+        run: pnpm build
+
+      # Typecheck is covered by the Build step above (Turbo runs tsc per-package).
+      # A monorepo-wide `tsc -p tsconfig.base.json` is not feasible until every
+      # app/package has compatible compiler options and excludes binary fixtures.
+
+      - name: Lint
+        run: pnpm lint
+
+      # Runs BEFORE the suites below, because it is the gate on those suites
+      # existing at all. Every "ran in NO workflow" note further down this file
+      # was written after the fact, by hand, months apart — this is the step
+      # that makes the next one a red build instead of an archaeology exercise.
+      # It also catches a typo'd `pnpm -F` (exits 0, permanently green) and a
+      # vitest step aimed at a package with no tests (exits non-zero on arrival).
+      - name: Check CI test coverage is real
+        run: node scripts/ci/check-ci-test-coverage.mjs
+
+      # @th/types — 161 tests / 18 files that ran in NO workflow until now: money,
+      # safe-external-url, the ~12 SEO builders (JSON-LD / metadata) and passkey-name.
+      # It is the leaf every other package imports, and passkey-name is consumed at
+      # runtime by BOTH apps/web and apps/scanner, so breakage here is wide. The
+      # package declared no `test` script and no vitest devDependency — the suite only
+      # ran locally because nodeLinker: hoisted made the root vitest resolvable by
+      # accident. DB-free and fast (~0.9s), and runs first because @th/core depends on it.
+      - name: Run shared types unit tests
+        run: pnpm -F @th/types exec vitest --run
+
+      # Same "ran in NO workflow" gap as @th/types above, found by the same sweep.
+      # All four are DB-free, secret-free and finish in ~2s each.
+      #   @th/errors     — the error contract every transport/adapter normalizes
+      #                    through (AppError, codes, normalizeError): 64 tests.
+      #   @th/schema     — prosemirror doc schema, the validator for every stored
+      #                    rich-text block: 7 tests. It declared NO vitest at all
+      #                    and only ran locally because nodeLinker: hoisted made
+      #                    the root 3.2.4 resolvable; now pinned to ^3.2.4 so the
+      #                    major can't shift under it.
+      #   @th/ports      — search port zod schemas: 5 tests.
+      #   @th/test-utils — the shared fakes (fake repo prototypes + notifications
+      #                    repo): 32 tests. A broken fake silently invalidates the
+      #                    core/adapters suites that build on it, so it gates first.
+      # Deliberately `exec vitest --run` rather than `run test` to match every
+      # other step here and to be immune to a package's script drifting to watch
+      # mode. Each package keeps its OWN vitest major (1.6.1 / 2.1.9 / 3.2.4) —
+      # pnpm's nested install resolves per-package, nothing is up/downgraded.
+      - name: Run shared errors unit tests
+        run: pnpm -F @th/errors exec vitest --run
+
+      - name: Run shared schema unit tests
+        run: pnpm -F @th/schema exec vitest --run
+
+      - name: Run shared ports unit tests
+        run: pnpm -F @th/ports exec vitest --run
+
+      - name: Run shared test-utils unit tests
+        run: pnpm -F @th/test-utils exec vitest --run
+
+      # @th/locale — ICU translator + format-event-date, plus the WHOLE-CATALOG
+      # parity gate over messages/{en,es}.json (key-set drift in both directions
+      # + per-key ICU argument parity) and the `icuArgumentNames` scanner that
+      # backs it. 36 tests across 4 src/ suites. Also ungated until recently.
+      # Note the package ships a BUILT dist/__tests__ copy of the same suites;
+      # vitest's default exclude covers **/dist/** so only the src/ files are
+      # collected — do not add a custom `test.exclude` here without re-adding
+      # the defaults.
+      - name: Run shared locale unit tests
+        run: pnpm -F @th/locale exec vitest --run
+
+      # The catalogs' sort order is NOT covered by the suites above: the parity
+      # gate compares key SETS, `sort-messages.mjs --check` compares byte order.
+      # It sat red at HEAD with nothing running it, which is the same "green by
+      # construction" failure the coverage guard exists for — a lint script in a
+      # package.json that no workflow invokes is not a gate.
+      #
+      # `run lint:messages` (the package's own script) rather than `exec node
+      # ./scripts/...` so the entry point stays owned by the manifest. No flags:
+      # `pnpm run <script> -- <flags>` puts a literal `--` in the tool's argv and
+      # everything after it is silently dropped, so a flag here would be a no-op.
+      # Fix a failure with `pnpm -F @th/locale format:messages`.
+      - name: Check locale catalogs are sorted
+        run: pnpm -F @th/locale run lint:messages
+
+      - name: Run core unit tests
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+        run: pnpm -F @th/core exec vitest --run
+
+      - name: Run adapter unit tests
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+        run: pnpm -F @th/adapters exec vitest --run
+
+      # @th/trpc (packages/transport/trpc) — 464 tests that ran in NO workflow
+      # until now, the largest ungated suite in the repo. It covers the router
+      # contract, RBAC/second-factor guards, rate limiting, and the wire error
+      # shape, so breakage here reaches every client. Found red on main
+      # (booking-requests' listMySenders fake was missing entityPages.getByOwners,
+      # which the port declares and the Prisma adapter implements) — fixed rather
+      # than excluded, so this starts green with no quarantine.
+      - name: Run transport/trpc unit tests
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+        run: pnpm -F @th/trpc exec vitest --run
+
+      # Gates the Design System v2 token invariants (docs/design/design-system-v2.md):
+      # every theme carries the same key set, the v2 semantic keys exist in all themes,
+      # radius stays 0, and the documented Stub/Ember values match colors.ts. Without this
+      # step the design-system tests never ran in CI and could rot unnoticed.
+      - name: Run shared UI / design-system tests
+        run: pnpm -F @th/ui exec vitest --run
+
+      # @th/ui-email — renders every transactional template (26 assertions across
+      # the whole template registry) and was ungated. MUST run after "Build
+      # repository" above: the spec imports the package root, whose `main` is
+      # dist/index.js, so on an unbuilt tree it fails to resolve rather than
+      # testing src. That indirection is also why a new template silently 404s as
+      # template_not_found without a rebuild — this step now catches that.
+      - name: Run shared email template tests
+        run: pnpm -F @th/ui-email exec vitest --run
+
+      # apps/web's ~2.6k unit tests. Until 2026-07-17 they ran in NO CI job, so real breakage
+      # (a broken tamagui mock, a non-collecting suite) landed on main unnoticed. `test:ci` runs
+      # the full suite minus a small, shrinking quarantine of pre-existing reds — see
+      # apps/web/vitest.ci.config.ts.
+      - name: Run web unit tests
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+          NODE_OPTIONS: "--max-old-space-size=4096"
+        run: pnpm -F web run test:ci
+
+      # apps/api/test/** ran in NO workflow until now: apps/api defines `test`
+      # ("vitest --run") but neither this job nor deploy-dev.yml's quality_gate
+      # ever invoked it, so suites like test/migration-drift.test.ts (31 tests —
+      # the guard that makes schema drift fail fast at startup instead of 500ing
+      # the homepage) were dead weight in CI. DB-free and fast.
+      #
+      # The quarantine that used to live here is GONE — all 20 files / 169 tests
+      # run. The three excluded files were fixed rather than deleted:
+      #   - stripe-webhook + (jobs) release-expired-carts: workspace imports fell
+      #     through to each package's `"./*": "./src/*"` exports map, which
+      #     resolves a DIRECTORY subpath and stops. Fixed by aliasing @th/* to
+      #     source in apps/{api,jobs}/vitest.config.ts, matching what
+      #     packages/core and packages/adapters already did. Not an exports-map
+      #     bug: 60+ such imports resolve fine under tsx/Next at runtime.
+      #   - env-validation: fixture never got ORIGIN_SHARED_SECRET after it
+      #     became prod-required, so Zod failed on that key first.
+      #   - trpc-plugin: 9 tests asserted an errorFormatter on the Fastify
+      #     adapter, but it moved to initTRPC.create(...) — deleted as testing a
+      #     dead location; real-wiring coverage now in
+      #     packages/transport/trpc/src/__tests__/trpc-error-formatter.test.ts.
+      #
+      # --testTimeout/--hookTimeout: kept as headroom for a saturated runner.
+      # Run #580 timed out instrument-before-send, account-email-change and
+      # ical-route at vitest's 5s default for assertions that are instant
+      # locally. Local runs keep the strict default, where a slow test is a real
+      # signal rather than contention. Keep in sync with deploy-dev.yml.
+      - name: Run API unit tests
+        env:
+          # See the `redis` service above. Without this the concurrency suite
+          # falls back to Docker-in-Docker Testcontainers and fails on arrival.
+          TESTCONTAINERS_REUSE_REDIS_URL: redis://redis:6379
+        run: pnpm -F api exec vitest --run --testTimeout=30000 --hookTimeout=30000
+
+      # apps/jobs — same gap as apps/api above: `test` defined, never invoked.
+      # Carries the highest-value drift tests (src/__tests__/migration-drift.test.ts:
+      # the short-circuit runs BEFORE the run tracker / DLQ / Discord lifecycle
+      # alerts, and ?force=true cannot bypass it); jobs was ~208 of ~220 drift
+      # Sentry events.
+      #
+      # TESTCONTAINERS_REUSE_DATABASE_URL is REQUIRED here, not optional:
+      # postgres-job-run-tracker.test.ts calls @th/test-utils' startPostgresContainer,
+      # which without it falls back to Docker-in-Docker Testcontainers (unreachable
+      # from this job container). With it, the helper CREATEs a throwaway database on
+      # the service container per run — so no collision with the migrated `dev` DB.
+      # Set explicitly rather than relying on CI=true, which Forgejo does not
+      # reliably provide (see deploy-dev.yml's quality_gate for the same note).
+      #
+      # release-expired-carts.test.ts is no longer excluded — it failed at COLLECT
+      # on "Cannot find package '@th/core/use-cases/resale'", fixed by the @th/*
+      # aliases in apps/jobs/vitest.config.ts (see the API step above).
+      - name: Run jobs unit tests
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+          TESTCONTAINERS_REUSE_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+        run: pnpm -F jobs exec vitest --run --testTimeout=30000 --hookTimeout=30000
+
+      # apps/audio-transcoder — `test:ci`, NOT `test`. The package's full suite
+      # includes two files that cannot run on a CI runner by design:
+      # test/e2e-pubsub.test.ts boots the real Fastify server on a fixed port and
+      # needs the gcloud Pub/Sub emulator + Java + real R2 credentials, and
+      # test/e2e-transcode.test.ts asserts a locally-installed ffmpeg. `test:ci`
+      # excludes **/test/e2e-*.test.ts and leaves app.test.ts +
+      # ffmpeg-transcoder.test.ts (9 tests) — both pure and ffmpeg-agnostic
+      # (ffmpeg-transcoder only asserts typeof on isAvailable and try/catches
+      # getVersion). Kept as a package script rather than an inline --exclude so
+      # this workflow and deploy-dev.yml cannot drift apart.
+      - name: Run audio-transcoder unit tests
+        run: pnpm -F audio-transcoder run test:ci
+
+      # apps/scanner + apps/mobile — ~180 tests that ran in NO workflow. Neither is
+      # deployed by a Cloud Run pipeline (scanner-release.yml / mobile-release.yml
+      # ship them via EAS), which is why they were missed, but both consume
+      # @th/types, @th/errors, @th/trpc and @th/ui from this same tree, so a shared
+      # change can break them and nothing noticed.
+      #
+      # scanner: 8 files / ~79 tests (qr parsing, passkey-name, offline network
+      # state, people-search tokenizer, POS terms ack, palette). Its `test` script
+      # used to be un-runnable — vitest's default include matches **/*.spec.js and
+      # collected e2e-appium/tests/*.spec.js, which are Appium/Mocha specs and die
+      # at import with "describe is not defined". Fixed properly in
+      # apps/scanner/vitest.config.ts (exclude e2e-appium/**) instead of
+      # hand-scoping the path here, so the local script is trustworthy too.
+      #
+      # NOT added: a scanner typecheck step. `tsc --noEmit` there is structurally
+      # red (~1087 TS2307 "Cannot find module '@th/core/...'" because the scanner
+      # tsconfig has no @th/core / @th/ports path mappings, plus pre-existing
+      # errors in app.config.ts, scanner-app.tsx and ui/event-selector.tsx).
+      # Wiring it would be red on arrival; fix the tsconfig first.
+      - name: Run scanner unit tests
+        run: pnpm -F scanner exec vitest --run
+
+      # @th/ui-native — the RN design-system token layer (palette, tone families).
+      # Same "ran in NO workflow" gap as @th/types and @th/errors above: its
+      # palette tests (identical key sets across Ember/Stub, contrast pairings)
+      # were a phantom gate — green locally, executed by nothing. Both apps/scanner
+      # and apps/mobile render from these tokens, so a bad pairing here ships to
+      # two apps. The scan-flow contrast guard deliberately lives in apps/scanner
+      # (which this workflow already runs) rather than here, but that is a reason
+      # to wire this package up, not to leave it unwatched.
+      #
+      # Filter name verified against the package's own `name` field — a typo'd
+      # `pnpm -F` prints "No projects matched the filters" and exits 0, which is a
+      # permanently-green step that looks like coverage.
+      - name: Run ui-native unit tests
+        run: pnpm -F @th/ui-native exec vitest --run
+
+      # mobile: 4 files / 103 tests — checkout eligibility + selection (money
+      # math), push registration, ticket formatting.
+      - name: Run mobile unit tests
+        run: pnpm -F mobile exec vitest --run
+
+      - name: Run API smoke test
+        run: pnpm -F api run smoke
+
+  # Blocks a PR that INTRODUCES a secret. Scans only the commits the PR adds
+  # (base..head), not full history — pre-existing history debt is tracked
+  # separately (rotate + purge) and must not fail every unrelated PR.
+  secret-scan:
+    # Only meaningful on a PR: the base..head range below is empty on
+    # workflow_dispatch (both shas blank), which would falsely report green.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          VERSION=8.30.1
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      # Was scoped to a PR range. This workflow is dispatch-only now, so those
+      # expressions resolve to empty and the range became a bare `..`, which
+      # scans nothing while still exiting 0 — a green step that checks nothing.
+      # Scan the full history instead: slower, but honest.
+      - name: Scan history for secrets
+        run: |
+          gitleaks git --redact --no-banner -c .gitleaks.toml --log-opts="--no-merges" .

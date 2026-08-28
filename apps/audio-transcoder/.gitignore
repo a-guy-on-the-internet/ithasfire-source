@@ -1,0 +1,5 @@
+# Test outputs
+test/fixtures/output/
+
+# Note: test-audio.mp3 is tracked for reproducible E2E tests
+# If the file is too large for git, use Git LFS or download on CI

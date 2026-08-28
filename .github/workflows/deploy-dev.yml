@@ -1,0 +1,1763 @@
+name: Deploy dev
+
+# Deploys on every push to main. Quality is gated server-side here before
+# build/deploy work starts, in addition to local hooks and CI on main.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+      - ".githooks/**"
+  workflow_dispatch:
+    inputs:
+      services:
+        description: "Comma-separated services to build+roll (web,api,jobs,tileserver,audio). Use 'all' for the full pipeline incl. terraform/migrate/seed."
+        required: false
+        default: "web"
+
+permissions:
+  contents: read
+
+concurrency:
+  # Shared group with terraform-apply so a deploy-dev and a manual
+  # terraform-apply against dev can't race on the GCS state lock.
+  group: hf-dev
+  cancel-in-progress: true
+
+jobs:
+  # ── Change detection ──────────────────────────────────────────────────
+  changes:
+    name: Detect changed services
+    runs-on: ubuntu-latest
+    outputs:
+      api: ${{ steps.filter.outputs.api }}
+      web: ${{ steps.filter.outputs.web }}
+      jobs: ${{ steps.filter.outputs.jobs }}
+      tileserver: ${{ steps.filter.outputs.tileserver }}
+      audio_transcoder: ${{ steps.filter.outputs.audio_transcoder }}
+      any_app: ${{ steps.filter.outputs.api == 'true' || steps.filter.outputs.web == 'true' || steps.filter.outputs.jobs == 'true' || steps.filter.outputs.audio_transcoder == 'true' }}
+      infra: ${{ steps.filter.outputs.infra }}
+      migrations: ${{ steps.filter.outputs.migrations }}
+      # ── Scoped-deploy decision (see the `scope` step below) ──
+      # On push these mirror the path-filter outputs. On workflow_dispatch
+      # they reflect the maintainer-supplied `services` input so a deploy can
+      # be narrowed to a single service without touching terraform/migrate/seed.
+      do_api: ${{ steps.scope.outputs.do_api }}
+      do_web: ${{ steps.scope.outputs.do_web }}
+      do_jobs: ${{ steps.scope.outputs.do_jobs }}
+      do_tileserver: ${{ steps.scope.outputs.do_tileserver }}
+      do_audio: ${{ steps.scope.outputs.do_audio }}
+      do_terraform: ${{ steps.scope.outputs.do_terraform }}
+      do_migrate: ${{ steps.scope.outputs.do_migrate }}
+      do_seed: ${{ steps.scope.outputs.do_seed }}
+      # Break-glass opt-out (workflow_dispatch only) — see the `skip-migrate`
+      # token in the `scope` step. Never 'true' on a push.
+      skip_migrate: ${{ steps.scope.outputs.skip_migrate }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            shared: &shared
+              - 'packages/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - 'turbo.json'
+              - 'tsconfig.base.json'
+              - 'prisma.config.ts'
+            api:
+              - *shared
+              - 'apps/api/**'
+            web:
+              - *shared
+              - 'apps/web/**'
+            jobs:
+              - *shared
+              - 'apps/jobs/**'
+            tileserver:
+              - 'infra/docker/tileserver/**'
+              - 'infra/docker/Dockerfile.tileserver'
+            audio_transcoder:
+              - *shared
+              - 'apps/audio-transcoder/**'
+            infra:
+              - 'infra/terraform/**'
+              - 'apps/jobs/jobs.manifest.json'
+            migrations:
+              - 'packages/db/prisma/migrations/**'
+              - 'packages/db/prisma/**.prisma'
+
+      # ── Resolve the scoped-deploy decision ──────────────────────────────
+      # Centralizes the build/roll/terraform/migrate/seed gating so every
+      # downstream job reads a single boolean instead of re-deriving the
+      # push-vs-dispatch + path-filter logic. Emits strings 'true'/'false'.
+      - name: Resolve deploy scope
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SERVICES_INPUT: ${{ inputs.services }}
+          FILTER_API: ${{ steps.filter.outputs.api }}
+          FILTER_WEB: ${{ steps.filter.outputs.web }}
+          FILTER_JOBS: ${{ steps.filter.outputs.jobs }}
+          FILTER_TILESERVER: ${{ steps.filter.outputs.tileserver }}
+          FILTER_AUDIO: ${{ steps.filter.outputs.audio_transcoder }}
+          FILTER_INFRA: ${{ steps.filter.outputs.infra }}
+          FILTER_MIGRATIONS: ${{ steps.filter.outputs.migrations }}
+        run: |
+          set -euo pipefail
+
+          # Normalize a raw value to the string 'true' or 'false'.
+          norm() { [[ "${1:-}" == "true" ]] && echo "true" || echo "false"; }
+
+          do_api=false
+          do_web=false
+          do_jobs=false
+          do_tileserver=false
+          do_audio=false
+          do_terraform=false
+          do_migrate=false
+          do_seed=false
+          # Break-glass only, and only reachable via workflow_dispatch. A push
+          # can never set this — the DB must always be allowed to catch up.
+          skip_migrate=false
+
+          if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
+            # ── push: mirror the path-filter outputs ──
+            do_api="$(norm "$FILTER_API")"
+            do_web="$(norm "$FILTER_WEB")"
+            do_jobs="$(norm "$FILTER_JOBS")"
+            do_tileserver="$(norm "$FILTER_TILESERVER")"
+            do_audio="$(norm "$FILTER_AUDIO")"
+            do_terraform="$(norm "$FILTER_INFRA")"
+            do_migrate="$(norm "$FILTER_MIGRATIONS")"
+            # any_app || tileserver || infra
+            if [[ "$do_api" == "true" || "$do_web" == "true" || "$do_jobs" == "true" || "$do_audio" == "true" || "$do_tileserver" == "true" || "$do_terraform" == "true" ]]; then
+              do_seed=true
+            fi
+          else
+            # ── workflow_dispatch: honour the maintainer-supplied list ──
+            # Lowercase, split on comma, trim each token.
+            raw="$(printf '%s' "${SERVICES_INPUT:-web}" | tr '[:upper:]' '[:lower:]')"
+            tokens=()
+            IFS=',' read -ra parts <<< "$raw"
+            for p in "${parts[@]}"; do
+              t="$(printf '%s' "$p" | tr -d '[:space:]')"
+              [[ -n "$t" ]] && tokens+=("$t")
+            done
+
+            has() {
+              local needle="$1" tok
+              for tok in "${tokens[@]}"; do
+                [[ "$tok" == "$needle" ]] && return 0
+              done
+              return 1
+            }
+
+            # ── Break-glass: `skip-migrate` ─────────────────────────────────
+            # INCIDENT ACTION, NOT ROUTINE. Migrations are otherwise mandatory
+            # on every run (see migrate_db) precisely because a diff-gated
+            # migration let the dev DB fall permanently behind. But a dev DB can
+            # get wedged so that `prisma migrate deploy` fails every time — e.g.
+            # P3009 after a run was cancelled mid-migration, which this workflow
+            # can cause via `concurrency.cancel-in-progress: true` above. Without
+            # an escape hatch that state would also block every urgent hotfix
+            # roll, since deploy_dev hard-requires migrate_db success.
+            #
+            # `skip-migrate` skips migrate_db and relaxes the terraform +
+            # deploy_dev gates to accept 'skipped'. It knowingly ships code onto
+            # a schema we could not bring up to date — use it to restore service,
+            # then fix the migration and re-run a normal deploy. Mirrors the
+            # `skip_migrate` input on terraform-apply.yml.
+            #
+            # It is also the documented way out of a fresh-env bootstrap
+            # deadlock: on a brand-new dev env the hf-dev-database-url secret
+            # doesn't exist yet, so migrate_db cannot succeed until terraform has
+            # created it — dispatch `terraform,skip-migrate` once to break the
+            # circle, then deploy normally.
+            #
+            # ⚠ SKIP-MIGRATE ALONE IS NOT ENOUGH — READ THIS DURING AN INCIDENT.
+            # api and jobs both run a migration-drift guard that returns 503 from
+            # /health when the running image needs migrations the DB doesn't have,
+            # and both Cloud Run services have a startup probe on /health. So on a
+            # wedged DB the rolled revision never becomes Ready: `skip-migrate`
+            # skips the migration but the hotfix still does not ship. To actually
+            # ship, ALSO disable enforcement, in ONE of these two ways:
+            #
+            #  1. Preferred, whole-environment:
+            #     set `migration_drift_enforce = "false"` in
+            #     infra/terraform/envs/<env>/<env>.tfvars and apply. That sets
+            #     MIGRATION_DRIFT_ENFORCE on the api + jobs revisions.
+            #     Accepted values: false|0|off (disable) / true|1|on (force on).
+            #     It disables ENFORCEMENT ONLY — detection, logging and Sentry
+            #     reporting all continue, and the guard additionally logs
+            #     `migration_drift_enforcement_disabled` at error level and
+            #     reports to Sentry on EVERY boot while it is set.
+            #     REVERT IT AFTERWARDS: delete the line (null is the correct
+            #     resting state, not "true") and apply again.
+            #
+            #  2. Cheaper, jobs only: set `startup_probe_path = null` on the jobs
+            #     module. Drops that service's probe without weakening drift
+            #     enforcement anywhere. Use when only the jobs roll is blocked.
+            #
+            # Rationale and full procedure: see the `migration_drift_enforce`
+            # variable in infra/terraform/variables.tf.
+            if has skip-migrate; then
+              skip_migrate=true
+            fi
+
+            if has all; then
+              # Full pipeline — reproduces today's dispatch behavior.
+              do_api=true
+              do_web=true
+              do_jobs=true
+              do_tileserver=true
+              do_audio=true
+              do_terraform=true
+              do_migrate=true
+              do_seed=true
+            else
+              has api        && do_api=true
+              has web        && do_web=true
+              has jobs       && do_jobs=true
+              has tileserver && do_tileserver=true
+              has audio      && do_audio=true
+              { has terraform || has infra; }      && do_terraform=true
+              { has migrate   || has migrations; } && do_migrate=true
+              has seed       && do_seed=true
+
+              # Fail loudly on a typo'd input instead of a green do-nothing run.
+              # NOTE: skip_migrate is deliberately NOT part of this check —
+              # it's a modifier, not a target, so `services=skip-migrate` alone
+              # must still fail as "nothing to deploy".
+              if [[ "$do_api$do_web$do_jobs$do_tileserver$do_audio$do_terraform$do_migrate$do_seed" != *true* ]]; then
+                echo "::error::Unrecognized services input '${SERVICES_INPUT}'. Use a comma list of: web, api, jobs, tileserver, audio, terraform, migrate, seed — or 'all'. ('skip-migrate' is a break-glass modifier and must accompany a service.)"
+                exit 1
+              fi
+            fi
+
+            # Contradictory scope: 'all' and 'migrate' both request migrations.
+            # Silently picking a winner here is how a break-glass roll turns
+            # into an accidental un-migrated deploy (or vice versa) — fail.
+            if [[ "$skip_migrate" == "true" && "$do_migrate" == "true" ]]; then
+              echo "::error::Contradictory services input '${SERVICES_INPUT}': 'skip-migrate' cannot be combined with 'migrate'/'migrations'/'all'."
+              exit 1
+            fi
+          fi
+
+          {
+            echo "do_api=${do_api}"
+            echo "do_web=${do_web}"
+            echo "do_jobs=${do_jobs}"
+            echo "do_tileserver=${do_tileserver}"
+            echo "do_audio=${do_audio}"
+            echo "do_terraform=${do_terraform}"
+            echo "do_migrate=${do_migrate}"
+            echo "do_seed=${do_seed}"
+            echo "skip_migrate=${skip_migrate}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Resolved scope (event=${EVENT_NAME}, services='${SERVICES_INPUT:-}'):"
+          echo "  api=${do_api} web=${do_web} jobs=${do_jobs} tileserver=${do_tileserver} audio=${do_audio}"
+          echo "  terraform=${do_terraform} migrate=${do_migrate} seed=${do_seed}"
+          if [[ "$skip_migrate" == "true" ]]; then
+            echo "::warning::BREAK-GLASS: skip-migrate requested — migrate_db will be SKIPPED and the roll will proceed against the current (possibly stale) schema. Fix the migration and re-run a normal deploy."
+          fi
+
+  # ── CI coverage guard ─────────────────────────────────────────────────
+  # Its own job, with NO `needs` and NO path gating, deliberately.
+  #
+  # It was first written as a step inside `quality_gate` — which is gated on
+  # an app/service having changed, so a push touching only .github/workflows
+  # or scripts/ skips it entirely. That is precisely the push most likely to
+  # break CI wiring: run #667 (this guard's own commit) skipped every job in
+  # this workflow. A check on CI configuration that does not run when CI
+  # configuration changes is the thing it exists to detect.
+  #
+  # Cheap enough to be unconditional: the script imports only node builtins,
+  # so this is a checkout and a node run — no pnpm install, no Postgres, a
+  # few seconds on a single-capacity runner.
+  ci_coverage_guard:
+    name: CI coverage guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check CI test coverage is real
+        run: node scripts/ci/check-ci-test-coverage.mjs
+
+  quality_gate:
+    name: Server-side quality gate
+    needs: [changes]
+    # Superset of every build/migrate gate so a build always has its gate.
+    if: >-
+      needs.changes.outputs.do_api == 'true' ||
+      needs.changes.outputs.do_web == 'true' ||
+      needs.changes.outputs.do_jobs == 'true' ||
+      needs.changes.outputs.do_tileserver == 'true' ||
+      needs.changes.outputs.do_audio == 'true' ||
+      needs.changes.outputs.do_migrate == 'true'
+    runs-on: ubuntu-latest
+    env:
+      NEXT_PUBLIC_TILESERVER_URL: "https://tiles-dev.ithasfire.com"
+      NEXT_PUBLIC_GEOAPIFY_API_KEY: ${{ vars.NEXT_PUBLIC_GEOAPIFY_API_KEY }}
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dev
+        ports:
+          - 5432
+        options: >-
+          --health-cmd="pg_isready -U postgres" --health-interval=5s --health-timeout=2s --health-retries=10
+      # Required by apps/api's auth-atomic-rate-limit-concurrency suite, which
+      # proves the auth pre-limiter is atomic under concurrency — the one
+      # property a mocked RateLimitPort cannot show (it is atomic by
+      # construction). @th/test-utils' startRedisContainer picks this up via
+      # TESTCONTAINERS_REUSE_REDIS_URL on the test step; without the service it
+      # would fall back to Docker-in-Docker Testcontainers, which is not
+      # reachable from a job container (same constraint as the Postgres service
+      # above).
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379
+        options: >-
+          --health-cmd="redis-cli ping" --health-interval=5s --health-timeout=2s --health-retries=10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable corepack and pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.16.1 --activate
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Wait for Postgres
+        run: |
+          for i in {1..20}; do
+            pg_isready -h postgres -p 5432 -U postgres && break || sleep 3
+          done
+
+      - name: Prisma validate + generate + migrate
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+        run: |
+          pnpm -F @th/db exec prisma validate
+          pnpm exec prisma generate
+          pnpm -F @th/db exec prisma migrate deploy --config ../../prisma.config.ts
+
+      - name: Lint + Test (parallel)
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+          # Explicitly point @th/test-utils' Postgres helper at the service
+          # container instead of letting it try to spawn its own with
+          # Testcontainers. Forgejo Actions doesn't reliably set CI=true, and
+          # nested-docker testcontainers don't work from job containers anyway.
+          TESTCONTAINERS_REUSE_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+          # Same deal for Redis: apps/api's auth-atomic-rate-limit-concurrency
+          # suite needs a REAL Redis to prove the auth pre-limiter is atomic
+          # under concurrency (a mocked RateLimitPort is atomic by construction
+          # and proves nothing). Points @th/test-utils' startRedisContainer at
+          # the `redis` service container declared on this job.
+          TESTCONTAINERS_REUSE_REDIS_URL: redis://redis:6379
+          CI: "true"
+          NODE_OPTIONS: "--max-old-space-size=4096"
+        run: |
+          # @th/ui-email resolves via its BUILT dist by design (apps/api's vitest
+          # config deliberately does not alias it to src — .eta templates). The
+          # api suite imports it through the mailer adapters, so build it BEFORE
+          # the fan-out or all of test/stripe-webhook.test.ts fails on
+          # "Failed to resolve entry for package @th/ui-email" (runs 590/594).
+          pnpm -F @th/ui-email build
+          # SEQUENTIAL since 2026-07-28: the parallel fan-out made every gate
+          # run a dice roll — seven concurrent vitest suites on this single Mac
+          # produced a DIFFERENT contention flake per run (ui 590/600/616,
+          # types 598, trpc 602/610-collect, web 608/612, jobs-app 615, plus a
+          # full 1h37m hang in 614) while every suite passes alone. Lint stays
+          # backgrounded (I/O-light); each suite now gets the whole box.
+          # Retries/timeouts kept as belt-and-braces. Costs ~10 extra minutes;
+          # buys a deterministic gate.
+          pnpm lint &
+          LINT_PID=$!
+          FAIL=0
+          # EVERY suite below MUST keep its `|| FAIL=1`. Without it a red suite is
+          # swallowed by the next command's exit status and the gate goes green,
+          # which in this pipeline re-rolls the PREVIOUS image and looks like a
+          # successful deploy.
+          # @th/types — money, safe-external-url, SEO builders, passkey-name.
+          pnpm -F @th/types exec vitest --run --retry=1 --testTimeout=30000 --hookTimeout=30000 || FAIL=1
+          # Shared leaves that ran in NO workflow until now. All DB-free, ~2s each,
+          # and each keeps its own vitest major (errors/test-utils 1.6.1, ports
+          # 2.1.9, schema/locale 3.2.4/2.1.9) — pnpm resolves per package.
+          # @th/errors — AppError / codes / normalizeError, the contract every
+          # transport and adapter normalizes through.
+          pnpm -F @th/errors exec vitest --run --retry=1 --testTimeout=30000 --hookTimeout=30000 || FAIL=1
+          # @th/schema — prosemirror doc schema; validates every stored rich-text
+          # block. Declared no vitest at all and only ran locally by hoist accident.
+          pnpm -F @th/schema exec vitest --run --retry=1 --testTimeout=30000 --hookTimeout=30000 || FAIL=1
+          # @th/ports — search port zod schemas.
+          pnpm -F @th/ports exec vitest --run --retry=1 --testTimeout=30000 --hookTimeout=30000 || FAIL=1
+          # @th/test-utils — the shared fakes. A broken fake silently invalidates
+          # the core/adapters suites below, so it runs before them.
+          pnpm -F @th/test-utils exec vitest --run --retry=1 --testTimeout=30000 --hookTimeout=30000 || FAIL=1
+          # @th/locale — ICU translator + event-date formatting.
+          pnpm -F @th/locale exec vitest --run --retry=1 --testTimeout=30000 --hookTimeout=30000 || FAIL=1
+          # Catalog sort order (`sort-messages.mjs --check`). NOT the parity
+          # suite above — that compares key sets, this compares byte order, and
+          # it is what keeps en.json/es.json line-comparable. Wired here as well
+          # as in ci.yml for the reason stated further down: ci.yml triggers on
+          # pull_request only, so quality_gate is in practice the only gate that
+          # runs. Fix with `pnpm -F @th/locale format:messages`.
+          # No --retry/--timeout flags: `pnpm run <script> -- <flags>` drops
+          # everything after `--` (see the audio-transcoder note below).
+          pnpm -F @th/locale run lint:messages || FAIL=1
+          pnpm -F @th/core exec vitest --run --retry=1 --testTimeout=30000 --hookTimeout=30000 || FAIL=1
+          pnpm -F @th/adapters exec vitest --run --retry=1 --testTimeout=30000 --hookTimeout=30000 || FAIL=1
+          # @th/ui — Design System v2 token invariants + interaction tests.
+          pnpm -F @th/ui exec vitest --run --retry=1 --testTimeout=30000 --hookTimeout=30000 || FAIL=1
+          # @th/ui-email — renders the whole transactional template registry.
+          # Relies on the `pnpm -F @th/ui-email build` above: its spec imports the
+          # package root, whose `main` is dist/index.js.
+          pnpm -F @th/ui-email exec vitest --run --retry=1 --testTimeout=30000 --hookTimeout=30000 || FAIL=1
+          # @th/ui-native — the RN palette and the four door-mode tone families,
+          # rendered by BOTH apps/scanner and apps/mobile, so a bad contrast
+          # pairing ships to two apps. Added to ci.yml first and ONLY there,
+          # which left it still running approximately never (see the note above
+          # about pull_request); that miss is why the coverage guard now demands
+          # a workflow that triggers on a push to main, not merely any workflow.
+          pnpm -F @th/ui-native exec vitest --run --retry=1 --testTimeout=30000 --hookTimeout=30000 || FAIL=1
+          # @th/trpc — router contract, RBAC guards, rate limiting, wire shape.
+          pnpm -F @th/trpc exec vitest --run --retry=1 --testTimeout=30000 --hookTimeout=30000 || FAIL=1
+          # apps/api — stripe-webhook stays CI-quarantined (hangs in CI with
+          # fully mocked deps; runs 590/598 — still green on dev machines).
+          pnpm -F api exec vitest --run --retry=1 --testTimeout=30000 --hookTimeout=30000 --exclude '**/stripe-webhook.test.ts' || FAIL=1
+          # apps/jobs — migration-drift short-circuit guard and friends.
+          pnpm -F jobs exec vitest --run --retry=1 --testTimeout=30000 --hookTimeout=30000 || FAIL=1
+          # apps/audio-transcoder — `test:ci`, not `test`: the two e2e-*.test.ts
+          # files need the gcloud Pub/Sub emulator + Java + real R2 creds + a local
+          # ffmpeg and a free fixed port. This service IS rolled by this workflow
+          # (build_audio_transcoder), so the remaining 9 unit tests gate it.
+          #
+          # No --retry/--testTimeout here, DELIBERATELY. `pnpm run <script> -- <flags>`
+          # puts a literal `--` in vitest's argv and vitest (cac) DROPS everything
+          # after it — verified: `run test:ci -- --definitelyNotAVitestFlag` runs
+          # green instead of erroring on the unknown flag. So those flags would be a
+          # silent no-op, not protection. The suite is 9 pure unit tests in ~2s and
+          # apps/audio-transcoder/vitest.config.ts already sets testTimeout: 30000.
+          # (Same caveat applies to the `run test:ci --` web step further down.)
+          pnpm -F audio-transcoder run test:ci || FAIL=1
+          # apps/scanner + apps/mobile — ~180 tests that ran in NO workflow. Not
+          # deployed here (EAS ships them via scanner-release.yml /
+          # mobile-release.yml), but both consume @th/types, @th/errors, @th/trpc
+          # and @th/ui from this tree, so a shared change can break them silently.
+          # They are gated HERE and not only in ci.yml because ci.yml triggers on
+          # pull_request and this repo pushes straight to main — quality_gate is in
+          # practice the only gate that runs.
+          # scanner's e2e-appium/*.spec.js are excluded via apps/scanner/vitest.config.ts
+          # (Appium/Mocha specs; they die at import under vitest).
+          pnpm -F scanner exec vitest --run --retry=1 --testTimeout=30000 --hookTimeout=30000 || FAIL=1
+          pnpm -F mobile exec vitest --run --retry=1 --testTimeout=30000 --hookTimeout=30000 || FAIL=1
+          wait $LINT_PID || FAIL=1
+          exit $FAIL
+
+      # apps/web's ~2.6k unit tests (minus a small shrinking quarantine — see
+      # apps/web/vitest.ci.config.ts). Run sequentially, not in the parallel block above: the suite
+      # is large and the self-hosted runner is single-capacity, so a 4th concurrent vitest risks OOM.
+      # Until 2026-07-17 these ran in no gate, so breakage reached main unseen.
+      - name: Web unit tests
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+          TESTCONTAINERS_REUSE_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+          CI: "true"
+          NODE_OPTIONS: "--max-old-space-size=4096"
+        # NO flags here, DELIBERATELY — same `--` trap as the audio-transcoder
+        # step above. `pnpm run <script> -- <flags>` puts a literal `--` in
+        # vitest's argv and vitest (cac) drops everything after it, so
+        # `--retry=1 --testTimeout=30000 --hookTimeout=30000` were a silent
+        # no-op here for as long as they were written.
+        #
+        # This suite ran at vitest's DEFAULT 5s timeout with no retry as a
+        # result, while the comment claimed the retry was absorbing
+        # moderate-layout's jsdom navigation flake. Run 659 failed on exactly
+        # that test — "Test timed out in 5000ms" — and 608/612 were probably
+        # the same thing read as ordinary contention.
+        #
+        # testTimeout / hookTimeout / retry now live in
+        # apps/web/vitest.ci.config.ts, where an argv separator cannot swallow
+        # them. Do not re-add them here.
+        run: pnpm -F web run test:ci
+
+  # ── Build jobs ────────────────────────────────────────────────────────
+  build_api:
+    name: Build + push api:dev
+    needs: [changes, quality_gate]
+    if: needs.changes.outputs.do_api == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      # ── Setup gcloud, retried once ──────────────────────────────────────
+      # THE CANONICAL COPY OF THIS NOTE. The same three steps appear at every
+      # `setup-gcloud` call site across the deploy, hotfix and terraform
+      # workflows; they all point back here.
+      #
+      # The action downloads and untars the Cloud SDK, and that is the one
+      # genuinely flaky thing these jobs do. Run #661 died inside
+      # `tar xz --warning=no-unknown-keyword ...` with no further output, which
+      # failed `Post-deploy verification` before it ran a single probe — a
+      # healthy dev deploy (build, migrate, roll and seed all green, both public
+      # endpoints serving the new revision) reported red by a download.
+      #
+      # A `uses:` step cannot be wrapped in a retry action, since those only
+      # re-run shell. So the retry IS a second invocation, gated on the first
+      # one's outcome. Re-running is safe: the action re-resolves the SDK and
+      # re-adds it to PATH, and holds no state between attempts.
+      #
+      # `outcome`, not `conclusion`: `continue-on-error` rewrites conclusion to
+      # 'success', so gating on that would mean the retry never fires.
+      #
+      # The `gcloud version` check is what keeps this honest. `continue-on-error`
+      # makes a first-attempt failure quiet, so without it a run where BOTH
+      # attempts failed would carry on and die at some later step with a
+      # confusing error instead of "gcloud is missing". It also means this
+      # construction degrades safely if the runner's expression support ever
+      # disagrees with us about `outcome` — the worst case is a loud, accurate
+      # failure here rather than a silent one further down.
+      - name: Setup gcloud
+        id: setup_gcloud
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure docker auth for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push (api)
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          TAG: dev
+          SERVICE: api
+          SKIP_BUILD: ${{ vars.SKIP_BUILD }}
+        run: |
+          repo_host="${REGION}-docker.pkg.dev"
+          image_ref="${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:${TAG}"
+
+          build_args=()
+          if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
+            build_args+=(--build-arg SKIP_BUILD=1)
+          fi
+
+          # mode=max, NOT min: multi-stage build — the expensive `install`
+          # stage (pnpm install, prisma generate, app build) is discarded into
+          # the slim runtime stage, so mode=min would cache almost nothing and
+          # every build re-ran a cold install.
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --push \
+            --cache-from=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2 \
+            --cache-to=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2,mode=max \
+            "${build_args[@]}" \
+            -f apps/api/Dockerfile \
+            -t "${image_ref}" \
+            -t "${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:dev-${GITHUB_SHA::7}" \
+            .
+
+  build_web:
+    name: Build + push web:dev
+    needs: [changes, quality_gate]
+    if: needs.changes.outputs.do_web == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure docker auth for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push (web)
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          TAG: dev
+          SERVICE: web
+          SKIP_BUILD: ${{ vars.SKIP_BUILD }}
+          # Hardcoded (not vars.*) so the dev bundle can't drift from the
+          # rebrand domain — mirrors deploy-prod.yml. Next inlines these at
+          # build time; updating Cloud Run env can't fix an already-baked value.
+          NEXT_PUBLIC_TILESERVER_URL: "https://tiles-dev.ithasfire.com"
+          NEXT_PUBLIC_SITE_URL: "https://web-dev.ithasfire.com"
+          NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY_DEV }}
+          NEXT_PUBLIC_TURNSTILE_SITE_KEY: ${{ secrets.NEXT_PUBLIC_TURNSTILE_SITE_KEY_DEV }}
+          NEXT_PUBLIC_GEOAPIFY_API_KEY: ${{ secrets.NEXT_PUBLIC_GEOAPIFY_API_KEY }}
+          NEXT_PUBLIC_API_BASE_URL: "https://api-dev.ithasfire.com"
+          NEXT_PUBLIC_SENTRY_DSN: ${{ secrets.NEXT_PUBLIC_SENTRY_DSN }}
+          NEXT_PUBLIC_SENTRY_ENVIRONMENT: "development"
+          # Repo variables, not secrets — a site domain isn't sensitive. Unset
+          # by default so dev traffic never pollutes the stats; set
+          # NEXT_PUBLIC_PLAUSIBLE_DOMAIN_DEV only if you register a dev site.
+          NEXT_PUBLIC_PLAUSIBLE_DOMAIN: ${{ vars.NEXT_PUBLIC_PLAUSIBLE_DOMAIN_DEV }}
+          NEXT_PUBLIC_PLAUSIBLE_SRC: ${{ vars.NEXT_PUBLIC_PLAUSIBLE_SRC }}
+          # Cloudflare Web Analytics site token — public by design (it ships in
+          # the HTML), so a variable rather than a secret. Separate dev token so
+          # dev traffic lands in its own site.
+          NEXT_PUBLIC_CF_BEACON_TOKEN: ${{ vars.NEXT_PUBLIC_CF_BEACON_TOKEN_DEV }}
+          NEXT_PUBLIC_BUILD_SHA: ${{ github.sha }}
+          NEXT_PUBLIC_APP_VERSION: ${{ vars.NEXT_PUBLIC_APP_VERSION }}
+          # Sentry source-map upload (build-time). See deploy-prod.yml for rationale;
+          # dev uploads to the same project, distinguished by release SHA. Token is
+          # scoped to org:read + project:read + project:releases only.
+          SENTRY_ORG: "hearth-fire"
+          SENTRY_PROJECT: "hearth-fire-web"
+          SENTRY_AUTH_TOKEN: ${{ secrets.TF_VAR_SENTRY_AUTH_TOKEN }}
+        run: |
+          repo_host="${REGION}-docker.pkg.dev"
+          image_ref="${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:${TAG}"
+
+          build_args=()
+          if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
+            build_args+=(--build-arg SKIP_BUILD=1)
+          fi
+
+          # Next.js inlines NEXT_PUBLIC_* at build time, so pass them as build args.
+          [[ -n "$NEXT_PUBLIC_TILESERVER_URL" ]]        && build_args+=(--build-arg "NEXT_PUBLIC_TILESERVER_URL=${NEXT_PUBLIC_TILESERVER_URL}")
+          [[ -n "$NEXT_PUBLIC_SITE_URL" ]]               && build_args+=(--build-arg "NEXT_PUBLIC_SITE_URL=${NEXT_PUBLIC_SITE_URL}")
+          [[ -n "$NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY" ]] && build_args+=(--build-arg "NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=${NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY}")
+          [[ -n "$NEXT_PUBLIC_TURNSTILE_SITE_KEY" ]]     && build_args+=(--build-arg "NEXT_PUBLIC_TURNSTILE_SITE_KEY=${NEXT_PUBLIC_TURNSTILE_SITE_KEY}")
+          [[ -n "$NEXT_PUBLIC_GEOAPIFY_API_KEY" ]]       && build_args+=(--build-arg "NEXT_PUBLIC_GEOAPIFY_API_KEY=${NEXT_PUBLIC_GEOAPIFY_API_KEY}")
+          [[ -n "$NEXT_PUBLIC_API_BASE_URL" ]]           && build_args+=(--build-arg "NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL}")
+          [[ -n "$NEXT_PUBLIC_SENTRY_DSN" ]]             && build_args+=(--build-arg "NEXT_PUBLIC_SENTRY_DSN=${NEXT_PUBLIC_SENTRY_DSN}")
+          [[ -n "$NEXT_PUBLIC_SENTRY_ENVIRONMENT" ]]     && build_args+=(--build-arg "NEXT_PUBLIC_SENTRY_ENVIRONMENT=${NEXT_PUBLIC_SENTRY_ENVIRONMENT}")
+          [[ -n "$NEXT_PUBLIC_PLAUSIBLE_DOMAIN" ]]       && build_args+=(--build-arg "NEXT_PUBLIC_PLAUSIBLE_DOMAIN=${NEXT_PUBLIC_PLAUSIBLE_DOMAIN}")
+          [[ -n "$NEXT_PUBLIC_PLAUSIBLE_SRC" ]]          && build_args+=(--build-arg "NEXT_PUBLIC_PLAUSIBLE_SRC=${NEXT_PUBLIC_PLAUSIBLE_SRC}")
+          [[ -n "$NEXT_PUBLIC_CF_BEACON_TOKEN" ]]        && build_args+=(--build-arg "NEXT_PUBLIC_CF_BEACON_TOKEN=${NEXT_PUBLIC_CF_BEACON_TOKEN}")
+
+          # Sentry source-map upload — guarded so builds without the token still succeed.
+          [[ -n "$SENTRY_AUTH_TOKEN" ]]                  && build_args+=(--build-arg "SENTRY_AUTH_TOKEN=${SENTRY_AUTH_TOKEN}")
+          [[ -n "$SENTRY_ORG" ]]                         && build_args+=(--build-arg "SENTRY_ORG=${SENTRY_ORG}")
+          [[ -n "$SENTRY_PROJECT" ]]                     && build_args+=(--build-arg "SENTRY_PROJECT=${SENTRY_PROJECT}")
+
+          # Build metadata — always pass (SHA is always available; version defaults to "dev")
+          build_args+=(--build-arg "NEXT_PUBLIC_BUILD_SHA=${NEXT_PUBLIC_BUILD_SHA:0:7}")
+          build_args+=(--build-arg "NEXT_PUBLIC_APP_VERSION=${NEXT_PUBLIC_APP_VERSION:-dev}")
+
+          # mode=max, NOT min: multi-stage build — the expensive `install`
+          # stage (pnpm install, prisma generate, app build) is discarded into
+          # the slim runtime stage, so mode=min would cache almost nothing and
+          # every build re-ran a cold install.
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --push \
+            --cache-from=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2 \
+            --cache-to=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2,mode=max \
+            "${build_args[@]}" \
+            -f apps/web/Dockerfile \
+            -t "${image_ref}" \
+            -t "${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:dev-${GITHUB_SHA::7}" \
+            .
+
+  build_jobs:
+    name: Build + push jobs:dev
+    needs: [changes, quality_gate]
+    if: needs.changes.outputs.do_jobs == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure docker auth for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push (jobs)
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          TAG: dev
+          SERVICE: jobs
+          SKIP_BUILD: ${{ vars.SKIP_BUILD }}
+        run: |
+          repo_host="${REGION}-docker.pkg.dev"
+          image_ref="${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:${TAG}"
+
+          build_args=()
+          if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
+            build_args+=(--build-arg SKIP_BUILD=1)
+          fi
+
+          # mode=max, NOT min: multi-stage build — the expensive `install`
+          # stage (pnpm install, prisma generate, app build) is discarded into
+          # the slim runtime stage, so mode=min would cache almost nothing and
+          # every build re-ran a cold install.
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --push \
+            --cache-from=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2 \
+            --cache-to=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2,mode=max \
+            "${build_args[@]}" \
+            -f apps/jobs/Dockerfile \
+            -t "${image_ref}" \
+            -t "${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:dev-${GITHUB_SHA::7}" \
+            .
+
+  build_tileserver:
+    name: Build + push tileserver:dev
+    needs: [changes, quality_gate]
+    if: needs.changes.outputs.do_tileserver == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure docker auth for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push (tileserver)
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          TAG: dev
+          SERVICE: tileserver
+        run: |
+          repo_host="${REGION}-docker.pkg.dev"
+          image_ref="${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:${TAG}"
+
+          # mode=max, NOT min: multi-stage build — the expensive `install`
+          # stage (pnpm install, prisma generate, app build) is discarded into
+          # the slim runtime stage, so mode=min would cache almost nothing and
+          # every build re-ran a cold install.
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --push \
+            --cache-from=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2 \
+            --cache-to=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2,mode=max \
+            -f infra/docker/Dockerfile.tileserver \
+            -t "${image_ref}" \
+            -t "${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:dev-${GITHUB_SHA::7}" \
+            infra/docker
+
+  build_audio_transcoder:
+    name: Build + push audio-transcoder:dev
+    needs: [changes, quality_gate]
+    if: needs.changes.outputs.do_audio == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure docker auth for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push (audio-transcoder)
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          TAG: dev
+          SERVICE: audio-transcoder
+        run: |
+          repo_host="${REGION}-docker.pkg.dev"
+          image_ref="${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:${TAG}"
+
+          # mode=max, NOT min: multi-stage build — the expensive `install`
+          # stage (pnpm install, prisma generate, app build) is discarded into
+          # the slim runtime stage, so mode=min would cache almost nothing and
+          # every build re-ran a cold install.
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --push \
+            --cache-from=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2 \
+            --cache-to=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2,mode=max \
+            -f apps/audio-transcoder/Dockerfile \
+            -t "${image_ref}" \
+            -t "${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:dev-${GITHUB_SHA::7}" \
+            .
+
+  # ── Terraform (dev auto-apply) ─────────────────────────────────────────
+  terraform:
+    name: Terraform apply (dev)
+    # migrate_db is in `needs` so the SCHEMA ALWAYS PRECEDES REVISION CREATION.
+    # terraform can create a new Cloud Run revision (any change to a service
+    # template re-pulls the mutable :dev tag's current digest), so an infra-only
+    # push could otherwise start serving an image carrying an unapplied
+    # migration — and with the startup-probe drift guard on /health that
+    # revision fails its probe (30 x 5s) and aborts `terraform apply` partway
+    # through, leaving infra half-applied. terraform previously needed only
+    # [changes, quality_gate] while migrate_db additionally needs all five
+    # builds, so terraform always started strictly earlier and raced it.
+    #
+    # No cycle: migrate_db needs [changes, quality_gate, build_*] and does not
+    # depend on terraform.
+    #
+    # Consequences accepted: (1) terraform now also waits on the builds
+    # transitively, and a failed in-scope build blocks the infra apply — correct,
+    # since that apply would roll a revision for a deploy that isn't happening;
+    # use the standalone terraform-apply.yml workflow if infra must land anyway.
+    # (2) On a FRESH-ENV BOOTSTRAP migrate_db can't succeed until terraform has
+    # created hf-dev-database-url, which would deadlock — dispatch
+    # `services=terraform,skip-migrate` once to break the circle (same one-time
+    # bootstrap caveat deploy-prod.yml documents on its migrate_db).
+    needs: [changes, quality_gate, migrate_db]
+    if: >-
+      always() && !cancelled() &&
+      (needs.quality_gate.result == 'success' || needs.quality_gate.result == 'skipped') &&
+      (
+        needs.migrate_db.result == 'success' ||
+        (needs.changes.outputs.skip_migrate == 'true' && needs.migrate_db.result == 'skipped')
+      ) &&
+      needs.changes.outputs.do_terraform == 'true'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.6
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Terraform init (cached + retry)
+        run: bash infra/terraform/scripts/tf-init-cached.sh infra/terraform -input=false
+
+      - name: Select dev workspace
+        run: terraform -chdir=infra/terraform workspace select dev || terraform -chdir=infra/terraform workspace new dev
+
+      - name: Terraform apply (dev)
+        env:
+          TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_cloudflare_api_key: ${{ secrets.TF_VAR_CLOUDFLARE_API_KEY }}
+          TF_VAR_cloudflare_email: ${{ secrets.TF_VAR_CLOUDFLARE_EMAIL }}
+          TF_VAR_stripe_secret_key: ${{ secrets.STRIPE_SECRET_KEY_DEV }}
+          TF_VAR_stripe_webhook_secret: ${{ secrets.STRIPE_WEBHOOK_SECRET_DEV }}
+          TF_VAR_stripe_connect_webhook_secret: ${{ secrets.STRIPE_CONNECT_WEBHOOK_SECRET_DEV }}
+          TF_VAR_stripe_publishable_key: ${{ secrets.STRIPE_PUBLISHABLE_KEY_DEV }}
+          TF_VAR_turnstile_secret_key: ${{ secrets.TURNSTILE_SECRET_KEY_DEV }}
+          TF_VAR_better_auth_secret: ${{ secrets.BETTER_AUTH_SECRET_DEV }}
+          TF_VAR_origin_shared_secret: ${{ secrets.ORIGIN_SHARED_SECRET_DEV }}
+          TF_VAR_consent_ip_hash_salt: ${{ secrets.CONSENT_IP_HASH_SALT_DEV }}
+          TF_VAR_resend_api_key: ${{ secrets.RESEND_API_KEY_DEV }}
+          TF_VAR_resend_webhook_secret: ${{ secrets.RESEND_WEBHOOK_SECRET_DEV }}
+          # ── AWS (Terraform provider for SES module — only used when enable_aws=true) ──
+          TF_VAR_aws_access_key_id: ${{ secrets.TF_VAR_AWS_ACCESS_KEY_ID }}
+          TF_VAR_aws_secret_access_key: ${{ secrets.TF_VAR_AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_aws_assume_role_arn: ${{ secrets.TF_VAR_AWS_ASSUME_ROLE_ARN }}
+          TF_VAR_google_client_id: ${{ secrets.TF_VAR_GOOGLE_CLIENT_ID }}
+          TF_VAR_google_client_secret: ${{ secrets.TF_VAR_GOOGLE_CLIENT_SECRET }}
+          TF_VAR_google_web_client_id: ${{ secrets.TF_VAR_GOOGLE_WEB_CLIENT_ID }}
+          TF_VAR_google_ios_client_id: ${{ secrets.TF_VAR_GOOGLE_IOS_CLIENT_ID }}
+          TF_VAR_google_android_client_id: ${{ secrets.TF_VAR_GOOGLE_ANDROID_CLIENT_ID }}
+          TF_VAR_apple_client_id: ${{ secrets.TF_VAR_APPLE_CLIENT_ID }}
+          TF_VAR_apple_client_secret: ${{ secrets.TF_VAR_APPLE_CLIENT_SECRET }}
+          TF_VAR_apple_app_bundle_identifier: ${{ secrets.TF_VAR_APPLE_APP_BUNDLE_IDENTIFIER }}
+          # Apple Wallet pass signing. Both default to null in variables.tf, so
+          # omitting them here does not fail the apply — it silently leaves the
+          # API on the stub wallet adapter. apple_team_id and
+          # apple_pass_type_identifier are public and live in the tfvars.
+          TF_VAR_apple_pass_certificate_p12_base64: ${{ secrets.APPLE_PASS_CERTIFICATE_P12_BASE64_DEV }}
+          TF_VAR_apple_pass_certificate_password: ${{ secrets.APPLE_PASS_CERTIFICATE_PASSWORD_DEV }}
+          TF_VAR_neon_api_key: ${{ secrets.TF_VAR_NEON_API_KEY }}
+          TF_VAR_upstash_api_key: ${{ secrets.TF_VAR_UPSTASH_API_KEY }}
+          TF_VAR_upstash_email: ${{ secrets.TF_VAR_UPSTASH_EMAIL }}
+          TF_VAR_redis_url: ${{ secrets.REDIS_URL_DEV }}
+          TF_VAR_meilisearch_master_key: ${{ secrets.MEILISEARCH_MASTER_KEY_DEV }}
+          TF_VAR_ziptax_api_key: ${{ secrets.TF_VAR_ZIPTAX_API_KEY }}
+          TF_VAR_geoapify_api_key: ${{ secrets.TF_VAR_GEOAPIFY_API_KEY }}
+          TF_VAR_azure_content_safety_endpoint: ${{ secrets.TF_VAR_AZURE_CONTENT_SAFETY_ENDPOINT }}
+          TF_VAR_azure_content_safety_key: ${{ secrets.TF_VAR_AZURE_CONTENT_SAFETY_KEY }}
+          TF_VAR_jobs_api_key: ${{ secrets.JOBS_API_KEY_DEV }}
+          TF_VAR_unsubscribe_secret: ${{ secrets.UNSUBSCRIBE_SECRET_DEV }}
+          TF_VAR_volunteer_scan_token_secret: ${{ secrets.VOLUNTEER_SCAN_TOKEN_SECRET_DEV }}
+          TF_VAR_discord_alerts_webhook: ${{ secrets.DISCORD_ALERTS_WEBHOOK_DEV }}
+          TF_VAR_discord_support_webhook: ${{ secrets.DISCORD_SUPPORT_WEBHOOK_DEV }}
+          TF_VAR_sentry_dsn: ${{ secrets.TF_VAR_SENTRY_DSN }}
+          TF_VAR_sentry_auth_token: ${{ secrets.TF_VAR_SENTRY_AUTH_TOKEN }}
+          TF_VAR_storage_s3_access_key_id: ${{ secrets.STORAGE_S3_ACCESS_KEY_ID_DEV }}
+          TF_VAR_storage_s3_secret_access_key: ${{ secrets.STORAGE_S3_SECRET_ACCESS_KEY_DEV }}
+          TF_VAR_storage_s3_public_base_url: ${{ secrets.STORAGE_S3_PUBLIC_BASE_URL_DEV }}
+        run: terraform -chdir=infra/terraform apply -auto-approve -no-color -input=false -var-file=envs/dev/dev.tfvars
+
+  # ── Post-build ────────────────────────────────────────────────────────
+  migrate_db:
+    name: Run Prisma migrations (dev)
+    needs:
+      [
+        changes,
+        quality_gate,
+        build_api,
+        build_web,
+        build_jobs,
+        build_tileserver,
+        build_audio_transcoder,
+      ]
+    # STATE-DRIVEN, NOT DIFF-DRIVEN. Mirrors deploy-prod.yml's migrate_db, which
+    # carries no scope gate at all.
+    #
+    # This was gated on needs.changes.outputs.do_migrate — a paths-filter diff of
+    # the CURRENT push — to avoid hitting Neon (and burning compute quota) on a
+    # scoped service-only roll. That tradeoff caused seven "column … does not
+    # exist" (P2022) incidents in 90 days. The images are always built from the
+    # whole tree, so they can carry migrations committed in EARLIER pushes that
+    # were never applied (that run failed, was cancelled, or was a scoped
+    # dispatch that omitted `migrate`). Once the DB falls behind it can NEVER
+    # catch up on its own: every later apps-only push has do_migrate=false, skips
+    # this job, and ships still more schema-dependent code onto the stale schema.
+    # Correctness wins over the saved connection — `prisma migrate deploy` is
+    # idempotent and a no-op when nothing is pending, so the steady-state cost is
+    # one short DB connection.
+    #
+    # workflow_dispatch: the `services` input still scopes WHICH services get
+    # built and rolled, but it can no longer scope migrations away — a scoped
+    # service roll must not be able to ship code onto a stale schema, so
+    # migrating is the default for every dispatch too. The ONLY opt-out is the
+    # explicit `skip-migrate` break-glass token (see the `scope` step), which is
+    # an incident action for a wedged DB, not a routine flag. do_migrate no
+    # longer decides whether this job runs (it still gates quality_gate, where
+    # `prisma validate` is worth running on a schema change).
+    #
+    # Two guards are kept, both written in the same explicit
+    # `always() && (result == 'success' || result == 'skipped')` form every other
+    # gate in this file uses. A bare `!failure()` would be equivalent under
+    # GitHub's evaluator (a status-check function suppresses the implicit
+    # needs-skip rule) but real CI here is FORGEJO Actions, and this file has no
+    # precedent for that form; if Forgejo applied skip-propagation anyway,
+    # migrate_db would be 'skipped' on nearly every push, deploy_dev's
+    # `migrate_db.result == 'success'` would be false, and every dev deploy would
+    # stop silently (the `notify` job is muted). Enumerate instead of relying on
+    # evaluator subtleties.
+    #
+    #  1. Upstream health — if the quality gate or an in-scope build already
+    #     broke, don't migrate for a roll that won't happen.
+    #  2. Scope — skip only when this run builds and rolls NOTHING. paths-ignore
+    #     covers just docs/**, **.md and .githooks/**, so a push touching only
+    #     .github/workflows/**, apps/scanner/**, apps/mobile/**, .claude/** or
+    #     scripts/** sets every do_* false: all builds skip, deploy_dev skips,
+    #     and waking Neon plus a full pnpm install on the single-capacity runner
+    #     buys nothing. This clause CANNOT reintroduce the original bug the way
+    #     the old do_migrate-only gate did: if no image is built and no service
+    #     is rolled, no new code can reach a stale schema, and the very next run
+    #     that does build something migrates first. do_migrate stays in the OR
+    #     only so a schema-only change still migrates on its own.
+    if: >-
+      always() && !cancelled() &&
+      (needs.quality_gate.result == 'success' || needs.quality_gate.result == 'skipped') &&
+      (needs.build_api.result == 'success' || needs.build_api.result == 'skipped') &&
+      (needs.build_web.result == 'success' || needs.build_web.result == 'skipped') &&
+      (needs.build_jobs.result == 'success' || needs.build_jobs.result == 'skipped') &&
+      (needs.build_tileserver.result == 'success' || needs.build_tileserver.result == 'skipped') &&
+      (needs.build_audio_transcoder.result == 'success' || needs.build_audio_transcoder.result == 'skipped') &&
+      needs.changes.outputs.skip_migrate != 'true' &&
+      (
+        needs.changes.outputs.do_api == 'true' ||
+        needs.changes.outputs.do_web == 'true' ||
+        needs.changes.outputs.do_jobs == 'true' ||
+        needs.changes.outputs.do_tileserver == 'true' ||
+        needs.changes.outputs.do_audio == 'true' ||
+        needs.changes.outputs.do_terraform == 'true' ||
+        needs.changes.outputs.do_migrate == 'true'
+      )
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Fetch DATABASE_URL from Secret Manager
+        # Source of truth for the dev DB is the Terraform-managed Secret
+        # Manager secret hf-dev-database-url (created by secrets.tf from
+        # the Neon project's pooler URI). Avoids drift between a separate
+        # DEV_DATABASE_URL Forgejo secret and what Cloud Run actually uses.
+        run: |
+          url="$(gcloud secrets versions access latest --secret=hf-dev-database-url --project=hearthfire-491918)"
+          echo "::add-mask::${url}"
+          echo "DATABASE_URL=${url}" >> "$GITHUB_ENV"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm prisma:gen
+
+      - name: Run prisma migrate deploy
+        run: pnpm db:migrate:deploy
+
+      # Make drift loud and correctly attributed. This job is now the ONLY thing
+      # standing between a stale dev schema and the roll, and the `notify` job
+      # below is muted (`false &&`), so a red migration would otherwise be silent
+      # until someone noticed P2022s on the dev homepage. Same shape as
+      # terraform-apply.yml's migration-failure alert; best-effort, never fails
+      # the job further (the migrate step itself already failed the run).
+      - name: Report migration failure to Discord
+        if: failure()
+        env:
+          # Passed via env, not interpolated into the script body: a webhook with
+          # a shell metacharacter can't break (or be injected into) the script.
+          WEBHOOK: ${{ secrets.DISCORD_ALERTS_WEBHOOK_DEV }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          [[ -z "${WEBHOOK:-}" ]] && exit 0
+          MSG="🟥 prisma migrate deploy (dev) FAILED — dev deploy + seed are BLOCKED and the dev DB is behind the built images. Commit \`${COMMIT_SHA}\`. Fix the migration and re-run: ${RUN_URL}"
+          # `|| exit 0`: a python hiccup must not stack a second red step onto an
+          # already-failed job and confuse which step actually broke.
+          PAYLOAD=$(MSG="$MSG" python3 -c 'import json,os; print(json.dumps({"content": os.environ["MSG"]}))') || exit 0
+          curl -fsSL -m 10 -X POST "$WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD" || true
+
+      # GLOBAL fee policy. The platform fee is defined in CODE
+      # (packages/core/src/lib/pricing/platform-fee-policy.ts) and this step
+      # materializes it into the `FeePolicy` row that checkout snapshots and
+      # `PayoutTerms.feePolicyId` pins. Idempotent in the strong sense: it
+      # compares field-by-field and does nothing when the row already matches,
+      # so the steady state is one SELECT, not a new policy version per deploy.
+      #
+      # WHY IT SITS IN migrate_db AND NOT NEXT TO THE CATEGORY/TAG SEEDS: on
+      # dev those two live in `seed_admin`, which is gated on
+      # `do_seed == 'true'` AND `deploy_dev == 'success'`, so a scoped dispatch
+      # can skip them entirely. Categories and tags can wait for the next
+      # deploy; an absent or stale GLOBAL fee policy cannot — `publishEvent`
+      # throws FEE_POLICY_NOT_FOUND and checkout cannot price a ticket. This
+      # job is state-driven and runs on every push that builds anything, so the
+      # policy tracks the constant on the same cadence as the schema. It also
+      # matches deploy-prod.yml, where the seeds do live in `migrate_db`.
+      #
+      # WHY IT IS *AFTER* the failure reporter above rather than before it:
+      # that step is `if: failure()`, evaluated against job status SO FAR. Put
+      # this step first and a fee-policy failure would fire an alert claiming
+      # "prisma migrate deploy FAILED", sending whoever is on the hook chasing
+      # a migration that was fine.
+      #
+      # DELIBERATELY NOT `continue-on-error` (unlike the catalogue seeds in
+      # `seed_admin`): catalogue CONTENT must never hold a deploy hostage, but
+      # this is the money path. Prod's first-ever publish failed with
+      # FEE_POLICY_NOT_FOUND precisely because nothing ever installed this row.
+      # Fail loudly.
+      - name: Seed platform fee policy
+        id: seed_fee_policy
+        run: pnpm -F api exec tsx src/scripts/seed-platform-fee-policy.ts
+
+      # WITHOUT THIS BLOCK A RED FEE-POLICY SEED IS A SILENT RED RUN. The only
+      # other reporter in this job is the migration alert above, which is
+      # `if: failure()` and therefore already evaluated (and skipped) by the
+      # time this step runs — that is precisely why the seed sits after it. The
+      # `notify` job at the bottom of this file is muted (`false &&`), so
+      # nothing else would say a word. Keyed on the step's OUTCOME, matching the
+      # outcome-keyed reporters in deploy-prod.yml.
+      #
+      # Note the step is NOT `continue-on-error`, so the job is already red by
+      # the time this runs; `always()` is what lets it run at all. This is an
+      # alert, not a rescue.
+      - name: Report fee-policy seed failure to Discord
+        if: always() && steps.seed_fee_policy.outcome == 'failure'
+        env:
+          # Passed via env, not interpolated into the script body: a webhook
+          # with a shell metacharacter can't break (or be injected into) it.
+          WEBHOOK: ${{ secrets.DISCORD_ALERTS_WEBHOOK_DEV }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          [[ -z "${WEBHOOK:-}" ]] && exit 0
+          MSG="🟥 GLOBAL fee policy seed (dev) FAILED — the dev deploy is BLOCKED. If no ACTIVE GLOBAL FeePolicy row exists, \`publishEvent\` throws FEE_POLICY_NOT_FOUND and checkout cannot price a ticket. NOTE: if the write succeeded and only the search REINDEX failed, the fee is live but every published event serves a stale fee-inclusive price — re-running the deploy will NOT retry it; run \`pnpm -F api reindex:search\` by hand. Commit \`${COMMIT_SHA}\`: ${RUN_URL}"
+          # `|| exit 0`: a python hiccup must not stack a second red step onto
+          # an already-failed job and confuse which step actually broke.
+          PAYLOAD=$(MSG="$MSG" python3 -c 'import json,os; print(json.dumps({"content": os.environ["MSG"]}))') || exit 0
+          curl -fsSL -m 10 -X POST "$WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD" || true
+
+  deploy_dev:
+    name: Deploy dev (roll Cloud Run)
+    needs:
+      [
+        changes,
+        quality_gate,
+        build_api,
+        build_web,
+        build_jobs,
+        build_tileserver,
+        build_audio_transcoder,
+        migrate_db,
+        terraform,
+      ]
+    # A build that's out of scope is 'skipped' (its do_* flag is false); a build
+    # that ran and broke is 'failure'. Requiring every build to be success-OR-
+    # skipped means ANY in-scope build failure blocks the entire roll — so we
+    # never re-roll a stale tag against a migrated DB, and never ship a
+    # half-built combo (e.g. new api + stale web). See the build-doesn't-gate-
+    # roll footgun this closes.
+    #
+    # migrate_db is required to have SUCCEEDED. It is no longer diff-gated (see
+    # its comment): whenever this run builds or rolls anything, migrate_db runs,
+    # so in a healthy run its result is always 'success'. The old asymmetric rule
+    # — accept 'skipped' when do_migrate != 'true' — was the other half of the
+    # drift bug: it let an apps-only push roll code onto a DB still missing
+    # migrations from an earlier failed run ("column … does not exist" 500s).
+    #
+    # 'skipped' is accepted in exactly ONE case: an operator dispatched the
+    # `skip-migrate` break-glass token (see the `scope` step). Every other route
+    # to 'skipped' — a failed quality gate, a failed build, an out-of-scope run —
+    # must block the roll, and does: the build clauses above already reject the
+    # failure cases, and an out-of-scope run is rejected by the do_* clause
+    # below. A red migration therefore blocks the roll outright instead of
+    # surfacing later as a confusing seed failure.
+    if: >-
+      always() && !cancelled() &&
+      (needs.quality_gate.result == 'success' || needs.quality_gate.result == 'skipped') &&
+      (needs.build_api.result == 'success' || needs.build_api.result == 'skipped') &&
+      (needs.build_web.result == 'success' || needs.build_web.result == 'skipped') &&
+      (needs.build_jobs.result == 'success' || needs.build_jobs.result == 'skipped') &&
+      (needs.build_tileserver.result == 'success' || needs.build_tileserver.result == 'skipped') &&
+      (needs.build_audio_transcoder.result == 'success' || needs.build_audio_transcoder.result == 'skipped') &&
+      (
+        needs.migrate_db.result == 'success' ||
+        (needs.changes.outputs.skip_migrate == 'true' && needs.migrate_db.result == 'skipped')
+      ) &&
+      (needs.terraform.result == 'success' || needs.terraform.result == 'skipped') &&
+      (
+        needs.changes.outputs.do_api == 'true' ||
+        needs.changes.outputs.do_web == 'true' ||
+        needs.changes.outputs.do_jobs == 'true' ||
+        needs.changes.outputs.do_tileserver == 'true' ||
+        needs.changes.outputs.do_audio == 'true' ||
+        needs.changes.outputs.do_terraform == 'true'
+      )
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Deploy Cloud Run services (dev)
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          TAG: dev
+          SERVICE_API_NAME: ${{ vars.CLOUD_RUN_DEV_API_SERVICE }}
+          SERVICE_WEB_NAME: ${{ vars.CLOUD_RUN_DEV_WEB_SERVICE }}
+          SERVICE_JOBS_NAME: ${{ vars.CLOUD_RUN_DEV_JOBS_SERVICE }}
+          SERVICE_TILESERVER_NAME: ${{ vars.CLOUD_RUN_DEV_TILESERVER_SERVICE }}
+          SERVICE_AUDIO_TRANSCODER_NAME: ${{ vars.CLOUD_RUN_DEV_AUDIO_TRANSCODER_SERVICE }}
+          # Scope flags — only roll the services in the resolved deploy scope.
+          # A web-only dispatch rolls ONLY web; a terraform-only dispatch rolls
+          # nothing (no do_* service flag is set).
+          DO_API: ${{ needs.changes.outputs.do_api }}
+          DO_WEB: ${{ needs.changes.outputs.do_web }}
+          DO_JOBS: ${{ needs.changes.outputs.do_jobs }}
+          DO_TILESERVER: ${{ needs.changes.outputs.do_tileserver }}
+          DO_AUDIO: ${{ needs.changes.outputs.do_audio }}
+        run: |
+          repo_host="${REGION}-docker.pkg.dev"
+
+          deploy_service() {
+            local svc="$1" img="$2"
+            gcloud run deploy "$svc" \
+              --region "$REGION" --image "$img" --quiet
+            # Belt-and-suspenders: force 100% of traffic onto the revision we
+            # just deployed. `gcloud run deploy` already promotes to latest by
+            # default, but if a service has drifted to a PINNED named revision
+            # (latestRevision:false) a plain deploy can leave the new revision
+            # at 0% traffic — exactly the hf-dev-tileserver failure mode (green
+            # pipeline, stale runtime). --to-latest repairs that pin in place.
+            gcloud run services update-traffic "$svc" \
+              --region "$REGION" --to-latest --quiet
+          }
+
+          [[ "$DO_API" == "true" ]]        && deploy_service "${SERVICE_API_NAME}"        "${repo_host}/${PROJECT_ID}/${AR_REPO}/api:${TAG}"
+          [[ "$DO_WEB" == "true" ]]        && deploy_service "${SERVICE_WEB_NAME}"        "${repo_host}/${PROJECT_ID}/${AR_REPO}/web:${TAG}"
+          [[ "$DO_JOBS" == "true" ]]       && deploy_service "${SERVICE_JOBS_NAME}"       "${repo_host}/${PROJECT_ID}/${AR_REPO}/jobs:${TAG}"
+          [[ "$DO_TILESERVER" == "true" ]] && deploy_service "${SERVICE_TILESERVER_NAME}" "${repo_host}/${PROJECT_ID}/${AR_REPO}/tileserver:${TAG}"
+
+          if [[ "$DO_AUDIO" == "true" && -n "${SERVICE_AUDIO_TRANSCODER_NAME:-}" ]]; then
+            deploy_service "${SERVICE_AUDIO_TRANSCODER_NAME}" "${repo_host}/${PROJECT_ID}/${AR_REPO}/audio-transcoder:${TAG}"
+          fi
+
+  post_deploy_verify:
+    name: Post-deploy verification
+    needs: [changes, deploy_dev]
+    if: >-
+      always() && !cancelled() &&
+      needs.deploy_dev.result == 'success' &&
+      (
+        needs.changes.outputs.do_api == 'true' ||
+        needs.changes.outputs.do_web == 'true' ||
+        needs.changes.outputs.do_jobs == 'true' ||
+        needs.changes.outputs.do_tileserver == 'true' ||
+        needs.changes.outputs.do_audio == 'true' ||
+        needs.changes.outputs.do_terraform == 'true'
+      )
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Verify Cloud Run readiness and live endpoints
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          SERVICE_API_NAME: ${{ vars.CLOUD_RUN_DEV_API_SERVICE }}
+          SERVICE_WEB_NAME: ${{ vars.CLOUD_RUN_DEV_WEB_SERVICE }}
+          SERVICE_JOBS_NAME: ${{ vars.CLOUD_RUN_DEV_JOBS_SERVICE }}
+          SERVICE_TILESERVER_NAME: ${{ vars.CLOUD_RUN_DEV_TILESERVER_SERVICE }}
+          SERVICE_AUDIO_TRANSCODER_NAME: ${{ vars.CLOUD_RUN_DEV_AUDIO_TRANSCODER_SERVICE }}
+          # Scope flags — only describe/probe a service that was actually
+          # rolled by deploy_dev. Services outside the scope are skipped, not
+          # probed, so we never imply a deploy that didn't happen.
+          DO_API: ${{ needs.changes.outputs.do_api }}
+          DO_WEB: ${{ needs.changes.outputs.do_web }}
+          DO_JOBS: ${{ needs.changes.outputs.do_jobs }}
+          DO_TILESERVER: ${{ needs.changes.outputs.do_tileserver }}
+          DO_AUDIO: ${{ needs.changes.outputs.do_audio }}
+        run: |
+          set -euo pipefail
+
+          describe_service() {
+            local service_name="$1"
+            local label="$2"
+            echo "Checking Cloud Run service: ${label} (${service_name})"
+            gcloud run services describe "$service_name" \
+              --region "$REGION" \
+              --project "$PROJECT_ID" \
+              --format='yaml(metadata.name,status.url,status.latestReadyRevisionName,status.conditions)'
+          }
+
+          get_service_url() {
+            local service_name="$1"
+            gcloud run services describe "$service_name" \
+              --region "$REGION" \
+              --project "$PROJECT_ID" \
+              --format='value(status.url)'
+          }
+
+          probe_url() {
+            local label="$1"
+            local url="$2"
+            local auth="${3:-public}"  # "public" or "authed"
+            echo "Probing ${label}: ${url}"
+            # Dev services scale to zero: the first request after a roll boots
+            # the container AND (for web SSR) warms the api + Neon chain, which
+            # legitimately exceeds 30s. Retry the probe so a cold start doesn't
+            # mark a healthy deploy red (2026-07-14: run #564 false-failed
+            # exactly this way while every service was fine).
+            #
+            # --fail-with-body, NOT --fail: plain --fail DISCARDS the response
+            # body on an HTTP error, so a drift 503 from /health surfaced only as
+            # "curl: (22) ... returned error: 503" with the pending migration
+            # names — the single most useful line in the whole run — thrown away.
+            # --fail-with-body keeps the non-zero exit AND the body (curl >= 7.76;
+            # ubuntu-latest ships 8.x).
+            local curl_args=(--fail-with-body --silent --show-error --location
+              --max-time 60 --retry 3 --retry-delay 10 --retry-all-errors)
+            local body rc=0
+            body="$(mktemp)"
+            if [[ "$auth" == "authed" ]]; then
+              local token
+              token="$(gcloud auth print-identity-token --audiences="$url")"
+              curl "${curl_args[@]}" -o "$body" -H "Authorization: Bearer ${token}" "$url" || rc=$?
+            else
+              curl "${curl_args[@]}" -o "$body" "$url" || rc=$?
+            fi
+            if (( rc != 0 )); then
+              echo "::error::${label} probe FAILED (curl exit ${rc}). Response body:"
+              head -c 4000 "$body" || true
+              echo
+            fi
+            rm -f "$body"
+            return "$rc"
+          }
+
+          # Only describe + probe services in the resolved deploy scope.
+          # api/web/tileserver are public; jobs and audio-transcoder are
+          # private Cloud Run services, so probe them with an OIDC token.
+          if [[ "$DO_API" == "true" ]]; then
+            describe_service "$SERVICE_API_NAME" api
+            api_url="$(get_service_url "$SERVICE_API_NAME")"
+            [[ -n "$api_url" ]]
+            probe_url "api /health" "${api_url%/}/health"
+          fi
+
+          if [[ "$DO_JOBS" == "true" ]]; then
+            describe_service "$SERVICE_JOBS_NAME" jobs
+            jobs_url="$(get_service_url "$SERVICE_JOBS_NAME")"
+            [[ -n "$jobs_url" ]]
+            probe_url "jobs /health" "${jobs_url%/}/health" authed
+          fi
+
+          if [[ "$DO_WEB" == "true" ]]; then
+            describe_service "$SERVICE_WEB_NAME" web
+            web_url="$(get_service_url "$SERVICE_WEB_NAME")"
+            [[ -n "$web_url" ]]
+            probe_url "web /" "${web_url%/}/"
+          fi
+
+          if [[ "$DO_TILESERVER" == "true" ]]; then
+            describe_service "$SERVICE_TILESERVER_NAME" tileserver
+            tileserver_url="$(get_service_url "$SERVICE_TILESERVER_NAME")"
+            [[ -n "$tileserver_url" ]]
+            probe_url "tileserver /health" "${tileserver_url%/}/health"
+          fi
+
+          if [[ "$DO_AUDIO" == "true" && -n "${SERVICE_AUDIO_TRANSCODER_NAME:-}" ]]; then
+            # ingress=internal, so it's unreachable from the public CI runner.
+            # Trust the describe_service Ready=True signal instead of an HTTP probe.
+            describe_service "$SERVICE_AUDIO_TRANSCODER_NAME" audio-transcoder
+            transcoder_url="$(get_service_url "$SERVICE_AUDIO_TRANSCODER_NAME")"
+            [[ -n "$transcoder_url" ]]
+          fi
+
+  # ── Seed admin ────────────────────────────────────────────────────────
+  # Dev is a known-fixture environment: the admin account is intentionally
+  # the same as local seed (apps/api/src/scripts/seed/ids.ts) so scanners,
+  # web, and local devs all use one set of test creds. Runs after every
+  # successful deploy — `seed-platform-admin.ts` is an upsert, so re-running
+  # only refreshes the password / verified flag and is cheap.
+  #
+  # These creds are NOT secret — they're test fixtures. Anything sensitive
+  # belongs in prod (which uses separate secrets, see deploy-prod.yml).
+  seed_admin:
+    name: Seed platform admin (dev)
+    needs: [changes, deploy_dev, migrate_db]
+    # migrate_db must have SUCCEEDED. This previously used a bare `always()` and
+    # never inspected needs.migrate_db.result, so it ran even when migrations
+    # were skipped or failed — and seeding a stale schema dies with a misleading
+    # `P2022 ColumnNotFound` inside seed-platform-admin.ts, which masks the real
+    # problem (an un-applied migration) as a seed bug. `always()` is still needed
+    # so the job is evaluated when in-scope builds were skipped, but every needed
+    # result is now checked explicitly.
+    #
+    # STRICTER than the deploy_dev gate on purpose: `skip-migrate` does NOT
+    # relax this. Break-glass exists to get a code roll out against a knowingly
+    # stale schema; re-seeding fixtures into that schema is not urgent and is
+    # the exact scenario that produces the misleading P2022 above. Once the
+    # migration is fixed, dispatch a normal deploy (e.g. `services=all`) — note
+    # `services=seed` alone can never seed, since it rolls nothing and this job
+    # requires deploy_dev == 'success'.
+    if: >-
+      always() && !cancelled() &&
+      needs.deploy_dev.result == 'success' &&
+      needs.migrate_db.result == 'success' &&
+      needs.changes.outputs.do_seed == 'true'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm prisma:gen
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Fetch DATABASE_URL from Secret Manager
+        run: |
+          url="$(gcloud secrets versions access latest --secret=hf-dev-database-url --project=hearthfire-491918)"
+          echo "::add-mask::${url}"
+          echo "DATABASE_URL=${url}" >> "$GITHUB_ENV"
+
+      - name: Seed platform admin
+        run: |
+          pnpm -F api exec tsx src/scripts/seed-platform-admin.ts \
+            --email 'admin@ithasfire.com' \
+            --password 'Dev-Login-2026!' \
+            --name 'Platform Admin' \
+            --email-verified
+
+      - name: Seed platform categories
+        run: pnpm -F api exec tsx src/scripts/seed-platform-categories.ts
+
+      - name: Seed platform tags
+        run: pnpm -F api exec tsx src/scripts/seed-platform-tags.ts
+
+      # Volunteer role packs (FR-018). Runs AFTER categories: pack targeting is
+      # resolved by category slug.
+      #
+      # INSTALL-ONLY, matching prod. No `--refresh`, no `--prune`: the
+      # catalogue is DB-managed from the first install on (staff author it at
+      # /platform/volunteer-packs), and this job runs on every dev push. The
+      # step creates rows that are missing and never overwrites or deletes
+      # staff-authored content. To force the git baseline over a dev DB, run
+      # `pnpm seed:volunteer-packs:refresh` by hand — or `pnpm seed:dev`, which
+      # wipes and reseeds with refresh + prune on. See the header of
+      # apps/api/src/scripts/seed/volunteer-packs.ts.
+      #
+      # `continue-on-error`: the step throws on CONTENT problems (anchored
+      # shift bounds, duplicate names, a zod parse) and talks to Neon. This
+      # job (`seed_admin`) already runs AFTER `deploy_dev`, so a red step here
+      # cannot roll anything back — but it would still red the run and bury
+      # the signal for whatever actually broke. Catalogue content never fails
+      # a deploy; it alerts.
+      - name: Seed volunteer role packs
+        id: seed_volunteer_packs
+        continue-on-error: true
+        run: pnpm -F api exec tsx src/scripts/seed-volunteer-packs.ts
+
+      # Same shape as the migration-failure alert above. `failure()` would not
+      # fire — `continue-on-error` keeps the job green — so this keys off the
+      # step's own outcome. Best-effort; never fails the job.
+      - name: Report volunteer-pack seed failure to Discord
+        if: steps.seed_volunteer_packs.outcome == 'failure'
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_ALERTS_WEBHOOK_DEV }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          [[ -z "${WEBHOOK:-}" ]] && exit 0
+          MSG="🟧 Volunteer role-pack seed (dev) FAILED — the deploy itself is UNAFFECTED (install-only, non-blocking), but the launch catalogue may be missing or partially installed. Commit \`${COMMIT_SHA}\`. Check /platform/volunteer-packs: ${RUN_URL}"
+          PAYLOAD=$(MSG="$MSG" python3 -c 'import json,os; print(json.dumps({"content": os.environ["MSG"]}))') || exit 0
+          curl -fsSL -m 10 -X POST "$WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD" || true
+
+      # Ticket-type packs (ticket-type-packs spec FR-013). Same contract as
+      # the volunteer step above: INSTALL-ONLY, non-blocking, alerts instead
+      # of failing the deploy. To force the git baseline over a dev DB, run
+      # `pnpm seed:ticket-packs:refresh` by hand — or `pnpm seed:dev`.
+      - name: Seed ticket-type packs
+        id: seed_ticket_packs
+        continue-on-error: true
+        run: pnpm -F api exec tsx src/scripts/seed-ticket-packs.ts
+
+      # Application-form starter catalogue (application-driven-events spec
+      # Phase 4). INSTALL-ONLY, non-blocking. To force the git baseline over a
+      # dev DB, run `pnpm seed:application-form-templates:refresh` by hand —
+      # or `pnpm seed:dev`.
+      - name: Seed application-form templates
+        id: seed_application_form_templates
+        continue-on-error: true
+        run: pnpm -F api exec tsx src/scripts/seed-application-form-templates.ts
+
+      - name: Report ticket-pack seed failure to Discord
+        if: steps.seed_ticket_packs.outcome == 'failure'
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_ALERTS_WEBHOOK_DEV }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          [[ -z "${WEBHOOK:-}" ]] && exit 0
+          MSG="🟧 Ticket-type pack seed (dev) FAILED — the deploy itself is UNAFFECTED (install-only, non-blocking), but the launch catalogue may be missing or partially installed. Commit \`${COMMIT_SHA}\`. Check /platform/ticket-packs: ${RUN_URL}"
+          PAYLOAD=$(MSG="$MSG" python3 -c 'import json,os; print(json.dumps({"content": os.environ["MSG"]}))') || exit 0
+          curl -fsSL -m 10 -X POST "$WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD" || true
+
+      # WITHOUT THIS BLOCK THE SEED STEP IS A GATE THAT LOOKS REAL: it is
+      # `continue-on-error`, so a zod parse error or a Neon connection failure
+      # leaves the job GREEN and `failure()` never fires. Keyed on the step's
+      # OUTCOME, exactly like the two reporters above.
+      - name: Report application-form-template seed failure to Discord
+        if: steps.seed_application_form_templates.outcome == 'failure'
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_ALERTS_WEBHOOK_DEV }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          [[ -z "${WEBHOOK:-}" ]] && exit 0
+          MSG="🟧 Application-form template seed (dev) FAILED — the deploy itself is UNAFFECTED (install-only, non-blocking), but the starter catalogue may be missing or partially installed, so the template picker will look empty. Commit \`${COMMIT_SHA}\`. Re-run by hand with \`pnpm seed:application-form-templates:refresh\`: ${RUN_URL}"
+          PAYLOAD=$(MSG="$MSG" python3 -c 'import json,os; print(json.dumps({"content": os.environ["MSG"]}))') || exit 0
+          curl -fsSL -m 10 -X POST "$WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD" || true
+
+  # ── Discord notification ──────────────────────────────────────────────
+  notify:
+    name: Notify deploy result
+    needs:
+      [
+        changes,
+        quality_gate,
+        build_api,
+        build_web,
+        build_jobs,
+        build_tileserver,
+        terraform,
+        migrate_db,
+        deploy_dev,
+        post_deploy_verify,
+      ]
+    # Disabled — every push was firing a Discord notification and that's
+    # noise. Re-enable by removing the `false &&` once we want the dev-deploy
+    # status pings back. Manual `workflow_dispatch` runs still post nothing,
+    # which is the intended muted state.
+    if: >-
+      false && always() && !cancelled() &&
+      (
+        needs.changes.outputs.any_app == 'true' ||
+        needs.changes.outputs.tileserver == 'true' ||
+        needs.changes.outputs.infra == 'true' ||
+        github.event_name == 'workflow_dispatch'
+      ) &&
+      (contains(needs.*.result, 'success') || contains(needs.*.result, 'failure'))
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Post to Discord
+        env:
+          # success = deploy landed and post-deploy verification passed
+          RESULT: >-
+            ${{
+              needs.post_deploy_verify.result == 'success' && 'success' ||
+              contains(needs.*.result, 'failure') && 'failure' ||
+              'failure'
+            }}
+        run: |
+          STATUS_ICON=$( [ "$RESULT" = "success" ] && echo "✅" || echo "❌" )
+          COLOUR=$( [ "$RESULT" = "success" ] && echo "3066993" || echo "15158332" )
+
+          # Build prod deploy link (only shown on success)
+          PROD_URL="${{ github.server_url }}/${{ github.repository }}/actions/workflows/deploy-prod.yml"
+          PROD_FIELD=""
+          if [ "$RESULT" = "success" ]; then
+            PROD_FIELD=",{\"name\": \"🚀 Push to Prod?\", \"value\": \"[Deploy to production](${PROD_URL})\", \"inline\": false}"
+          fi
+
+          curl -fsSL -X POST "${{ secrets.DISCORD_DEPLOY_DEV_WEBHOOK }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"embeds\": [{
+                \"title\": \"${STATUS_ICON} Deploy DEV — ${RESULT}\",
+                \"color\": ${COLOUR},
+                \"fields\": [
+                  {\"name\": \"Commit\",  \"value\": \"\`${{ github.sha }}\`\",           \"inline\": true},
+                  {\"name\": \"Branch\",  \"value\": \"\`${{ github.ref_name }}\`\",       \"inline\": true},
+                  {\"name\": \"Actor\",   \"value\": \"\`${{ github.actor }}\`\",          \"inline\": true},
+                  {\"name\": \"Run\",     \"value\": \"[View run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }})\", \"inline\": false}
+                  ${PROD_FIELD}
+                ]
+              }]
+            }"

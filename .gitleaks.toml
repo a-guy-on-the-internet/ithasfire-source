@@ -1,0 +1,50 @@
+# gitleaks configuration for Ithas Fire — TicketHunter
+#
+# Scans for committed secrets (API keys, tokens, private keys). Runs three ways:
+#   • locally in .githooks/pre-commit on staged changes (blocks the commit)
+#   • in CI (.github/workflows/ci.yml → secret-scan job) on pull requests
+#   • on demand:  gitleaks git .            (full history)
+#                 gitleaks dir .            (working tree)
+#
+# The allowlist below suppresses KNOWN-SAFE matches only — test fixtures,
+# publishable (pk_) keys, sample/story data, and dev-only seed credentials.
+# Do NOT add real-secret-bearing paths (.vscode, infra tfvars/scripts) here.
+
+title = "Ithas Fire gitleaks config"
+
+[extend]
+# Start from gitleaks' maintained default ruleset, then narrow with the
+# allowlist. Keeps us current as new provider key formats are added upstream.
+useDefault = true
+
+[allowlist]
+description = "Known-safe fixtures, publishable keys, and placeholder values"
+
+# Path-scoped: files that legitimately contain fake or public values.
+paths = [
+  '''.*\.test\.ts$''',                                    # unit-test fixtures
+  '''.*/__tests__/.*''',                                  # test directories
+  '''.*\.spec\.ts$''',
+  '''packages/ui/src/stories/.*''',                       # Storybook sample data
+  '''packages/ui-email/src/templates/registry\.ts$''',   # rendered email samples
+  '''apps/api/src/scripts/seed/.*''',                     # dev-only seed credentials
+  # AAGUIDs are PUBLIC authenticator-model identifiers from the FIDO Metadata
+  # Service (via the MIT passkeydeveloper roster) — the opposite of a secret:
+  # a passkey transmits one so a relying party can name the device. The file is
+  # ~385 bare UUIDs, every one of which trips generic-api-key.
+  '''packages/types/src/passkey-aaguid-data\.ts$''',
+  '''.*\.env\.example$''',                                # placeholder env templates
+  '''.*\.env\.sample$''',
+  '''.*/e2e-appium/node_modules/.*''',                    # vendored test deps
+]
+
+# Value-scoped: patterns that are safe by construction wherever they appear.
+regexes = [
+  '''pk_(test|live)_[A-Za-z0-9]+''',   # Stripe PUBLISHABLE keys are meant to be public
+  '''sk_test_1234567890''',            # canonical fake test secret key
+  '''sk_test_[0-9]{6,}''',             # numeric-only test keys = fixtures
+  '''AKIAIOSFODNN7EXAMPLE''',          # AWS docs example key
+  # Anchored: the SECRET VALUE itself must be a placeholder word, so a real
+  # key merely sitting on a line that mentions "example" is NOT suppressed.
+  '''(?i)^(example|placeholder|changeme|your[-_]?(api[-_]?)?key)''',
+]

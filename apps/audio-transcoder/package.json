@@ -1,0 +1,33 @@
+{
+  "name": "audio-transcoder",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "test": "vitest --run",
+    "test:ci": "vitest --run --exclude '**/test/e2e-*.test.ts'",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@google-cloud/pubsub": "^5.2.2",
+    "@prisma/adapter-pg": "^7.2.0",
+    "@th/adapters": "workspace:^",
+    "@th/core": "workspace:^",
+    "@th/db": "workspace:^",
+    "@th/ports": "workspace:^",
+    "dotenv": "^17.2.2",
+    "fastify": "^5.6.0",
+    "ioredis": "^5.6.1",
+    "pg": "^8.11.3",
+    "tsx": "4.23.1",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@th/tsconfig": "workspace:^",
+    "@types/pg": "^8.11.6",
+    "vitest": "^3.2.4"
+  }
+}

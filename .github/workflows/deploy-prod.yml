@@ -1,0 +1,806 @@
+name: Deploy prod
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Shared group with terraform-apply so a deploy-prod and a manual
+  # terraform-apply against prod can't race on the GCS state lock.
+  group: hf-prod
+  cancel-in-progress: false
+
+jobs:
+  # ── Promote api + jobs (re-tag dev → prod, no rebuild) ────────────────
+  promote_api:
+    name: Promote api:dev → api:prod
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Re-tag api:dev as api:prod
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+        run: |
+          base="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}"
+          gcloud artifacts docker tags add "${base}/api:dev" "${base}/api:prod" --quiet
+
+  promote_jobs:
+    name: Promote jobs:dev → jobs:prod
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Re-tag jobs:dev as jobs:prod
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+        run: |
+          base="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}"
+          gcloud artifacts docker tags add "${base}/jobs:dev" "${base}/jobs:prod" --quiet
+
+  promote_tileserver:
+    name: Promote tileserver:dev → tileserver:prod
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      # The tileserver image has no NEXT_PUBLIC_* / per-env build args, so the
+      # dev-built digest is byte-identical to what prod should run. Promote by
+      # re-tagging dev → prod (same pattern as api/jobs) rather than rebuilding.
+      - name: Re-tag tileserver:dev as tileserver:prod
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+        run: |
+          base="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}"
+          gcloud artifacts docker tags add "${base}/tileserver:dev" "${base}/tileserver:prod" --quiet
+
+  promote_audio_transcoder:
+    name: Promote audio-transcoder:dev → audio-transcoder:prod
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      # The audio-transcoder image has no NEXT_PUBLIC_* / per-env build args, so
+      # the dev-built digest is byte-identical to what prod should run. Promote
+      # by re-tagging dev → prod (same pattern as api/jobs/tileserver) rather
+      # than rebuilding.
+      - name: Re-tag audio-transcoder:dev as audio-transcoder:prod
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+        run: |
+          base="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}"
+          gcloud artifacts docker tags add "${base}/audio-transcoder:dev" "${base}/audio-transcoder:prod" --quiet
+
+  # ── Build web (needs different NEXT_PUBLIC_* for prod) ────────────────
+  build_web:
+    name: Build + push web:prod
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure docker auth for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push (web)
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          TAG: prod
+          SERVICE: web
+          # ── Prod NEXT_PUBLIC_* build args (inlined at build time) ──
+          NEXT_PUBLIC_TILESERVER_URL: "https://tiles-prod.ithasfire.com"
+          NEXT_PUBLIC_SITE_URL: "https://ithasfire.com"
+          NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY_PROD }}
+          NEXT_PUBLIC_TURNSTILE_SITE_KEY: ${{ secrets.NEXT_PUBLIC_TURNSTILE_SITE_KEY_PROD }}
+          NEXT_PUBLIC_GEOAPIFY_API_KEY: ${{ secrets.NEXT_PUBLIC_GEOAPIFY_API_KEY }}
+          NEXT_PUBLIC_API_BASE_URL: "https://api.ithasfire.com"
+          NEXT_PUBLIC_SENTRY_DSN: ${{ secrets.NEXT_PUBLIC_SENTRY_DSN }}
+          NEXT_PUBLIC_SENTRY_ENVIRONMENT: "production"
+          # Repo variables, not secrets — a site domain isn't sensitive.
+          # Analytics stays off until NEXT_PUBLIC_PLAUSIBLE_DOMAIN is set.
+          NEXT_PUBLIC_PLAUSIBLE_DOMAIN: ${{ vars.NEXT_PUBLIC_PLAUSIBLE_DOMAIN }}
+          NEXT_PUBLIC_PLAUSIBLE_SRC: ${{ vars.NEXT_PUBLIC_PLAUSIBLE_SRC }}
+          # Cloudflare Web Analytics site token — public by design (it ships in
+          # the HTML), so a variable rather than a secret.
+          NEXT_PUBLIC_CF_BEACON_TOKEN: ${{ vars.NEXT_PUBLIC_CF_BEACON_TOKEN }}
+          NEXT_PUBLIC_BUILD_SHA: ${{ github.sha }}
+          NEXT_PUBLIC_APP_VERSION: ${{ vars.NEXT_PUBLIC_APP_VERSION }}
+          # Sentry source-map upload (build-time, builder stage only). ORG/PROJECT
+          # are non-secret slugs; the token is scoped to org:read + project:read +
+          # project:releases. next.config.ts's Sentry plugin uploads source maps so
+          # prod stack traces are readable. Passed as build args because the
+          # Dockerfile exposes them to the `next build` RUN (same as NEXT_PUBLIC_*).
+          SENTRY_ORG: "hearth-fire"
+          SENTRY_PROJECT: "hearth-fire-web"
+          SENTRY_AUTH_TOKEN: ${{ secrets.TF_VAR_SENTRY_AUTH_TOKEN }}
+        run: |
+          repo_host="${REGION}-docker.pkg.dev"
+          image_ref="${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:${TAG}"
+
+          build_args=()
+
+          # Next.js inlines NEXT_PUBLIC_* at build time, so pass them as build args.
+          [[ -n "$NEXT_PUBLIC_TILESERVER_URL" ]]        && build_args+=(--build-arg "NEXT_PUBLIC_TILESERVER_URL=${NEXT_PUBLIC_TILESERVER_URL}")
+          [[ -n "$NEXT_PUBLIC_SITE_URL" ]]               && build_args+=(--build-arg "NEXT_PUBLIC_SITE_URL=${NEXT_PUBLIC_SITE_URL}")
+          [[ -n "$NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY" ]] && build_args+=(--build-arg "NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=${NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY}")
+          [[ -n "$NEXT_PUBLIC_TURNSTILE_SITE_KEY" ]]     && build_args+=(--build-arg "NEXT_PUBLIC_TURNSTILE_SITE_KEY=${NEXT_PUBLIC_TURNSTILE_SITE_KEY}")
+          [[ -n "$NEXT_PUBLIC_GEOAPIFY_API_KEY" ]]       && build_args+=(--build-arg "NEXT_PUBLIC_GEOAPIFY_API_KEY=${NEXT_PUBLIC_GEOAPIFY_API_KEY}")
+          [[ -n "$NEXT_PUBLIC_API_BASE_URL" ]]           && build_args+=(--build-arg "NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL}")
+          [[ -n "$NEXT_PUBLIC_SENTRY_DSN" ]]             && build_args+=(--build-arg "NEXT_PUBLIC_SENTRY_DSN=${NEXT_PUBLIC_SENTRY_DSN}")
+          [[ -n "$NEXT_PUBLIC_SENTRY_ENVIRONMENT" ]]     && build_args+=(--build-arg "NEXT_PUBLIC_SENTRY_ENVIRONMENT=${NEXT_PUBLIC_SENTRY_ENVIRONMENT}")
+          [[ -n "$NEXT_PUBLIC_PLAUSIBLE_DOMAIN" ]]       && build_args+=(--build-arg "NEXT_PUBLIC_PLAUSIBLE_DOMAIN=${NEXT_PUBLIC_PLAUSIBLE_DOMAIN}")
+          [[ -n "$NEXT_PUBLIC_PLAUSIBLE_SRC" ]]          && build_args+=(--build-arg "NEXT_PUBLIC_PLAUSIBLE_SRC=${NEXT_PUBLIC_PLAUSIBLE_SRC}")
+          [[ -n "$NEXT_PUBLIC_CF_BEACON_TOKEN" ]]        && build_args+=(--build-arg "NEXT_PUBLIC_CF_BEACON_TOKEN=${NEXT_PUBLIC_CF_BEACON_TOKEN}")
+
+          # Sentry source-map upload — guarded so PRs/forks without the token still build (plugin no-ops on empty).
+          [[ -n "$SENTRY_AUTH_TOKEN" ]]                  && build_args+=(--build-arg "SENTRY_AUTH_TOKEN=${SENTRY_AUTH_TOKEN}")
+          [[ -n "$SENTRY_ORG" ]]                         && build_args+=(--build-arg "SENTRY_ORG=${SENTRY_ORG}")
+          [[ -n "$SENTRY_PROJECT" ]]                     && build_args+=(--build-arg "SENTRY_PROJECT=${SENTRY_PROJECT}")
+
+          # Build metadata
+          build_args+=(--build-arg "NEXT_PUBLIC_BUILD_SHA=${NEXT_PUBLIC_BUILD_SHA:0:7}")
+          build_args+=(--build-arg "NEXT_PUBLIC_APP_VERSION=${NEXT_PUBLIC_APP_VERSION:-0.1.0}")
+
+          # Reads dev's buildcache too (second --cache-from). apps/web/Dockerfile
+          # declares the NEXT_PUBLIC_* ARGs AFTER the install stage on purpose, so
+          # pnpm install + prisma generate are byte-identical between dev and prod
+          # and prod can reuse dev's layers. The `next build` layer is NOT shared:
+          # different arg values give it a different cache key, so prod always
+          # rebuilds the bundle with prod values. Writes only to buildcache-prod.
+          #
+          # The prod-<sha> tag exists so a prod web image is traceable back to
+          # a commit. api/jobs/tileserver/audio don't need one: they're PROMOTED
+          # (re-tagged) from dev, so the same digest already carries the
+          # dev-<sha> tag deploy-dev.yml pushed. web is built fresh here — it
+          # shares no digest with dev — so without this tag the only prod web
+          # provenance was the moving :prod tag.
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --push \
+            --cache-from=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-prod \
+            --cache-from=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2 \
+            --cache-to=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-prod,mode=max \
+            "${build_args[@]}" \
+            -f apps/web/Dockerfile \
+            -t "${image_ref}" \
+            -t "${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:prod-${GITHUB_SHA::7}" \
+            .
+
+  migrate_db:
+    name: Run Prisma migrations (prod)
+    # Gate on the IMAGE jobs, NOT terraform_apply. Migrations must run whenever
+    # the new images land, so a promoted image never serves against an
+    # un-migrated schema. Previously this needed [terraform_apply]; when a
+    # terraform failure (e.g. an unrelated infra teardown) aborted that job,
+    # migrate_db was skipped while promote_* had already moved the :prod tag —
+    # leaving new code live on the old schema. migrate_db fetches DATABASE_URL
+    # from the (already-provisioned) hf-prod-database-url secret directly, so it
+    # does not depend on terraform running first in steady state.
+    # NOTE: on a brand-new env bootstrap (secret not yet created) this job will
+    # fail until the first terraform_apply provisions hf-prod-database-url; that
+    # is a one-time bootstrap concern, not a steady-state deploy.
+    needs: [promote_api, promote_jobs, promote_tileserver, promote_audio_transcoder, build_web]
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Fetch DATABASE_URL from Secret Manager
+        # Source of truth for the prod DB is the Terraform-managed Secret
+        # Manager secret hf-prod-database-url. Avoids drift between a
+        # separate PROD_DATABASE_URL Forgejo secret and what Cloud Run
+        # actually uses.
+        run: |
+          url="$(gcloud secrets versions access latest --secret=hf-prod-database-url --project=hearthfire-491918)"
+          echo "::add-mask::${url}"
+          echo "DATABASE_URL=${url}" >> "$GITHUB_ENV"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm prisma:gen
+
+      - name: Run prisma migrate deploy
+        run: pnpm db:migrate:deploy
+
+      # All three seed scripts are idempotent (upsert on a stable key) and seed
+      # only platform-default content; support-recovery is withheld. They
+      # inherit DATABASE_URL exported to $GITHUB_ENV above.
+      - name: Seed platform categories
+        run: pnpm -F api exec tsx src/scripts/seed-platform-categories.ts
+
+      - name: Seed platform tags
+        run: pnpm -F api exec tsx src/scripts/seed-platform-tags.ts
+
+      # GLOBAL fee policy. The platform fee is defined in CODE
+      # (packages/core/src/lib/pricing/platform-fee-policy.ts) and this step
+      # materializes it into the `FeePolicy` row that checkout snapshots and
+      # `PayoutTerms.feePolicyId` pins. Idempotent in the strong sense: it
+      # compares field-by-field and does nothing when the row already matches,
+      # so the steady state is one SELECT, not a new policy version per deploy.
+      #
+      # DELIBERATELY NOT `continue-on-error`, unlike the three catalogue seeds
+      # below it. Those install CONTENT, and content must never hold a code
+      # deploy hostage. This one is load-bearing for the money path: with no
+      # effective GLOBAL policy, `publishEvent` throws FEE_POLICY_NOT_FOUND and
+      # checkout cannot price a ticket — which is exactly how prod's first-ever
+      # publish failed, because prod was never seeded. A silent green step here
+      # would reproduce that. Fail loudly.
+      - name: Seed platform fee policy
+        id: seed_fee_policy
+        run: pnpm -F api exec tsx src/scripts/seed-platform-fee-policy.ts
+
+      # The generic `notify` job at the bottom of this file already fires on a
+      # red migrate_db, but it says only "Deploy PROD — failure". This names the
+      # actual consequence so nobody has to open the run to learn whether
+      # checkout can price a ticket. Keyed on the step's OUTCOME like the three
+      # catalogue reporters below; `always()` because the step is NOT
+      # `continue-on-error`, so the job is already failing by the time it runs.
+      - name: Report fee-policy seed failure to Discord
+        if: always() && steps.seed_fee_policy.outcome == 'failure'
+        env:
+          # Passed via env, not interpolated into the script body: a webhook
+          # with a shell metacharacter can't break (or be injected into) it.
+          WEBHOOK: ${{ secrets.DISCORD_ALERTS_WEBHOOK_PROD }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          [[ -z "${WEBHOOK:-}" ]] && exit 0
+          MSG="🟥 GLOBAL fee policy seed (prod) FAILED — deploy_prod is BLOCKED and the \`:prod\` image tags have ALREADY moved. If no ACTIVE GLOBAL FeePolicy row exists, \`publishEvent\` throws FEE_POLICY_NOT_FOUND and checkout cannot price a ticket. NOTE: if the write succeeded and only the search REINDEX failed, the fee is live but every published event serves a stale fee-inclusive price — re-running the deploy will NOT retry it; run \`pnpm -F api reindex:search\` by hand. Commit \`${COMMIT_SHA}\`: ${RUN_URL}"
+          PAYLOAD=$(MSG="$MSG" python3 -c 'import json,os; print(json.dumps({"content": os.environ["MSG"]}))') || exit 0
+          curl -fsSL -m 10 -X POST "$WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD" || true
+
+      # Volunteer role packs (FR-018). Runs AFTER categories: pack targeting is
+      # resolved by category slug.
+      #
+      # INSTALL-ONLY. No `--refresh`, no `--prune`, deliberately: the catalogue
+      # is DB-managed from the first install on (staff author it at
+      # /platform/volunteer-packs), and this job runs on EVERY prod dispatch,
+      # including one for an unrelated web fix. The step therefore creates rows
+      # that are missing and never overwrites or deletes staff-authored
+      # content. See the header of apps/api/src/scripts/seed/volunteer-packs.ts.
+      #
+      # FIRST PROD INSTALL: do it by hand, not by relying on this step —
+      #   DATABASE_URL=<prod> pnpm seed:volunteer-packs:remote
+      # — then verify the five packs render at /platform/volunteer-packs before
+      # trusting the deploy path with the catalogue.
+      #
+      # `continue-on-error`: this step throws on CONTENT problems (anchored
+      # shift bounds, duplicate names, a zod parse) and makes a few dozen
+      # round-trips to Neon, and it sits in `migrate_db` — which `deploy_prod`
+      # gates on, while the `:prod` image tags have ALREADY moved. Catalogue
+      # content must never hold a code deploy hostage, or roll back to the old
+      # image. Failures alert instead.
+      - name: Seed volunteer role packs
+        id: seed_volunteer_packs
+        continue-on-error: true
+        run: pnpm -F api exec tsx src/scripts/seed-volunteer-packs.ts
+
+      # Mirrors deploy-dev.yml's migration-failure alert. `failure()` would not
+      # fire here — `continue-on-error` keeps the job green — so this keys off
+      # the step's own outcome. Best-effort; never fails the job.
+      - name: Report volunteer-pack seed failure to Discord
+        if: steps.seed_volunteer_packs.outcome == 'failure'
+        env:
+          # Passed via env, not interpolated into the script body: a webhook
+          # with a shell metacharacter can't break (or be injected into) it.
+          WEBHOOK: ${{ secrets.DISCORD_ALERTS_WEBHOOK_PROD }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          [[ -z "${WEBHOOK:-}" ]] && exit 0
+          MSG="🟧 Volunteer role-pack seed (prod) FAILED — the deploy itself is UNAFFECTED (install-only, non-blocking), but the launch catalogue may be missing or partially installed. Commit \`${COMMIT_SHA}\`. Check /platform/volunteer-packs: ${RUN_URL}"
+          PAYLOAD=$(MSG="$MSG" python3 -c 'import json,os; print(json.dumps({"content": os.environ["MSG"]}))') || exit 0
+          curl -fsSL -m 10 -X POST "$WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD" || true
+
+      # Ticket-type packs (ticket-type-packs spec FR-013). Same contract as
+      # the volunteer step above: INSTALL-ONLY (no --refresh / --prune — the
+      # catalogue is DB-managed after first install, authored at
+      # /platform/ticket-packs), non-blocking (`continue-on-error`), alerts
+      # instead of failing the deploy. FIRST PROD INSTALL by hand:
+      #   DATABASE_URL=<prod> pnpm seed:ticket-packs:remote
+      - name: Seed ticket-type packs
+        id: seed_ticket_packs
+        continue-on-error: true
+        run: pnpm -F api exec tsx src/scripts/seed-ticket-packs.ts
+
+      # Application-form starter catalogue (application-driven-events spec
+      # Phase 4). Same contract as the two steps above: INSTALL-ONLY (no
+      # --refresh / --prune), non-blocking, alerts instead of failing the
+      # deploy. FIRST PROD INSTALL by hand:
+      #   DATABASE_URL=<prod> pnpm seed:application-form-templates:remote
+      - name: Seed application-form templates
+        id: seed_application_form_templates
+        continue-on-error: true
+        run: pnpm -F api exec tsx src/scripts/seed-application-form-templates.ts
+
+      - name: Report ticket-pack seed failure to Discord
+        if: steps.seed_ticket_packs.outcome == 'failure'
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_ALERTS_WEBHOOK_PROD }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          [[ -z "${WEBHOOK:-}" ]] && exit 0
+          MSG="🟧 Ticket-type pack seed (prod) FAILED — the deploy itself is UNAFFECTED (install-only, non-blocking), but the launch catalogue may be missing or partially installed. Commit \`${COMMIT_SHA}\`. Check /platform/ticket-packs: ${RUN_URL}"
+          PAYLOAD=$(MSG="$MSG" python3 -c 'import json,os; print(json.dumps({"content": os.environ["MSG"]}))') || exit 0
+          curl -fsSL -m 10 -X POST "$WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD" || true
+
+      # WITHOUT THIS BLOCK THE STEP ABOVE IS A GATE THAT LOOKS REAL: it is
+      # `continue-on-error`, so a zod parse error or a Neon connection failure
+      # leaves the job GREEN and `failure()` never fires — prod would ship an
+      # empty starter catalogue and nobody would be told. Keyed on the step's
+      # OUTCOME, exactly like the two reporters above.
+      - name: Report application-form-template seed failure to Discord
+        if: steps.seed_application_form_templates.outcome == 'failure'
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_ALERTS_WEBHOOK_PROD }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          [[ -z "${WEBHOOK:-}" ]] && exit 0
+          MSG="🟧 Application-form template seed (prod) FAILED — the deploy itself is UNAFFECTED (install-only, non-blocking), but the starter catalogue may be missing or partially installed, so organizers turning on an application gate will see an empty template picker. Commit \`${COMMIT_SHA}\`. Re-run by hand with \`pnpm seed:application-form-templates:remote\`: ${RUN_URL}"
+          PAYLOAD=$(MSG="$MSG" python3 -c 'import json,os; print(json.dumps({"content": os.environ["MSG"]}))') || exit 0
+          curl -fsSL -m 10 -X POST "$WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD" || true
+
+      # FOLLOW-UP (not this diff): `migrate_db` runs AFTER promote_api /
+      # promote_jobs / promote_tileserver / promote_audio_transcoder have
+      # already re-tagged `:prod`, and `terraform_apply` is gated only on the
+      # image jobs, not on `migrate_db`. A red migrate_db therefore leaves the
+      # DB migrated, the `:prod` tags moved and terraform possibly half-rolled
+      # while `deploy_prod` goes red. The categories/tags seeds share that
+      # coupling. Worth restructuring on its own.
+
+  # ── Terraform apply (sync env vars + infra before rolling services) ───
+  # Ensures Cloud Run env vars, IAM bindings, Scheduler jobs, and DNS
+  # records are in sync with the checked-in Terraform config BEFORE the
+  # new container images start serving.
+  #
+  # Required GitHub Secrets (prod environment):
+  #   TF_VAR_CLOUDFLARE_API_TOKEN, TF_VAR_CLOUDFLARE_API_KEY,
+  #   TF_VAR_CLOUDFLARE_EMAIL, TF_VAR_NEON_API_KEY
+  #
+  # If the secrets are not configured the step is skipped (services still
+  # deploy with existing env vars, matching pre-Terraform behaviour).
+  terraform_apply:
+    name: Terraform apply (prod)
+    needs: [promote_api, build_web, promote_jobs, promote_tileserver, promote_audio_transcoder]
+    runs-on: ubuntu-latest
+    environment: prod
+    # Runs BEFORE migrate_db so the Secret Manager entries it creates
+    # (notably hf-prod-database-url) exist before the migration job tries
+    # to read them. On a fresh-bootstrap deploy that secret doesn't exist
+    # yet, and the old order — migrate_db before terraform_apply — failed
+    # every first apply.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.6
+
+      - name: Terraform init + apply (prod)
+        working-directory: infra/terraform
+        env:
+          TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_cloudflare_api_key: ${{ secrets.TF_VAR_CLOUDFLARE_API_KEY }}
+          TF_VAR_cloudflare_email: ${{ secrets.TF_VAR_CLOUDFLARE_EMAIL }}
+          TF_VAR_stripe_secret_key: ${{ secrets.STRIPE_SECRET_KEY_PROD }}
+          TF_VAR_stripe_webhook_secret: ${{ secrets.STRIPE_WEBHOOK_SECRET_PROD }}
+          TF_VAR_stripe_connect_webhook_secret: ${{ secrets.STRIPE_CONNECT_WEBHOOK_SECRET_PROD }}
+          TF_VAR_stripe_publishable_key: ${{ secrets.STRIPE_PUBLISHABLE_KEY_PROD }}
+          TF_VAR_turnstile_secret_key: ${{ secrets.TURNSTILE_SECRET_KEY_PROD }}
+          TF_VAR_better_auth_secret: ${{ secrets.BETTER_AUTH_SECRET_PROD }}
+          TF_VAR_origin_shared_secret: ${{ secrets.ORIGIN_SHARED_SECRET_PROD }}
+          TF_VAR_consent_ip_hash_salt: ${{ secrets.CONSENT_IP_HASH_SALT_PROD }}
+          TF_VAR_resend_api_key: ${{ secrets.RESEND_API_KEY_PROD }}
+          TF_VAR_resend_webhook_secret: ${{ secrets.RESEND_WEBHOOK_SECRET_PROD }}
+          TF_VAR_aws_access_key_id: ${{ secrets.TF_VAR_AWS_ACCESS_KEY_ID }}
+          TF_VAR_aws_secret_access_key: ${{ secrets.TF_VAR_AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_aws_assume_role_arn: ${{ secrets.TF_VAR_AWS_ASSUME_ROLE_ARN }}
+          TF_VAR_google_client_id: ${{ secrets.TF_VAR_GOOGLE_CLIENT_ID }}
+          TF_VAR_google_client_secret: ${{ secrets.TF_VAR_GOOGLE_CLIENT_SECRET }}
+          TF_VAR_google_web_client_id: ${{ secrets.TF_VAR_GOOGLE_WEB_CLIENT_ID }}
+          TF_VAR_google_ios_client_id: ${{ secrets.TF_VAR_GOOGLE_IOS_CLIENT_ID }}
+          TF_VAR_google_android_client_id: ${{ secrets.TF_VAR_GOOGLE_ANDROID_CLIENT_ID }}
+          TF_VAR_apple_client_id: ${{ secrets.TF_VAR_APPLE_CLIENT_ID }}
+          TF_VAR_apple_client_secret: ${{ secrets.TF_VAR_APPLE_CLIENT_SECRET }}
+          TF_VAR_apple_app_bundle_identifier: ${{ secrets.TF_VAR_APPLE_APP_BUNDLE_IDENTIFIER }}
+          # Apple Wallet pass signing. Both default to null in variables.tf, so
+          # omitting them here does not fail the apply — it silently leaves the
+          # API on the stub wallet adapter. apple_team_id and
+          # apple_pass_type_identifier are public and live in the tfvars.
+          TF_VAR_apple_pass_certificate_p12_base64: ${{ secrets.APPLE_PASS_CERTIFICATE_P12_BASE64_PROD }}
+          TF_VAR_apple_pass_certificate_password: ${{ secrets.APPLE_PASS_CERTIFICATE_PASSWORD_PROD }}
+          TF_VAR_neon_api_key: ${{ secrets.TF_VAR_NEON_API_KEY }}
+          TF_VAR_storage_s3_access_key_id: ${{ secrets.STORAGE_S3_ACCESS_KEY_ID_PROD }}
+          TF_VAR_storage_s3_secret_access_key: ${{ secrets.STORAGE_S3_SECRET_ACCESS_KEY_PROD }}
+          TF_VAR_storage_s3_public_base_url: ${{ secrets.STORAGE_S3_PUBLIC_BASE_URL_PROD }}
+          TF_VAR_upstash_api_key: ${{ secrets.TF_VAR_UPSTASH_API_KEY }}
+          TF_VAR_upstash_email: ${{ secrets.TF_VAR_UPSTASH_EMAIL }}
+          TF_VAR_redis_url: ${{ secrets.REDIS_URL_PROD }}
+          TF_VAR_meilisearch_master_key: ${{ secrets.MEILISEARCH_MASTER_KEY_PROD }}
+          TF_VAR_ziptax_api_key: ${{ secrets.TF_VAR_ZIPTAX_API_KEY }}
+          TF_VAR_geoapify_api_key: ${{ secrets.TF_VAR_GEOAPIFY_API_KEY }}
+          TF_VAR_azure_content_safety_endpoint: ${{ secrets.TF_VAR_AZURE_CONTENT_SAFETY_ENDPOINT }}
+          TF_VAR_azure_content_safety_key: ${{ secrets.TF_VAR_AZURE_CONTENT_SAFETY_KEY }}
+          TF_VAR_jobs_api_key: ${{ secrets.JOBS_API_KEY_PROD }}
+          TF_VAR_unsubscribe_secret: ${{ secrets.UNSUBSCRIBE_SECRET_PROD }}
+          TF_VAR_volunteer_scan_token_secret: ${{ secrets.VOLUNTEER_SCAN_TOKEN_SECRET_PROD }}
+          TF_VAR_discord_alerts_webhook: ${{ secrets.DISCORD_ALERTS_WEBHOOK_PROD }}
+          TF_VAR_discord_support_webhook: ${{ secrets.DISCORD_SUPPORT_WEBHOOK_PROD }}
+          TF_VAR_sentry_dsn: ${{ secrets.TF_VAR_SENTRY_DSN }}
+          TF_VAR_sentry_auth_token: ${{ secrets.TF_VAR_SENTRY_AUTH_TOKEN }}
+        run: |
+          bash scripts/tf-init-cached.sh . -upgrade
+          terraform workspace select prod 2>/dev/null || terraform workspace new prod
+          terraform apply -auto-approve -var-file=envs/prod/prod.tfvars
+
+  deploy_prod:
+    name: Deploy prod (roll Cloud Run)
+    # The image jobs (promote_api/jobs/tileserver, build_web) are listed
+    # explicitly even though terraform_apply already needs them. The roll must
+    # NEVER ship a stale/half-built set of images: if any promote or the web
+    # build fails, block the roll outright. Keeping these in the gate (rather
+    # than relying on the transitive terraform_apply chain) means a future
+    # change to terraform_apply's own gating can't silently re-open the
+    # build-doesn't-gate-roll footgun.
+    needs:
+      [
+        promote_api,
+        promote_jobs,
+        promote_tileserver,
+        promote_audio_transcoder,
+        build_web,
+        terraform_apply,
+        migrate_db,
+      ]
+    if: >-
+      ${{ !cancelled() &&
+      needs.promote_api.result == 'success' &&
+      needs.promote_jobs.result == 'success' &&
+      needs.promote_tileserver.result == 'success' &&
+      needs.promote_audio_transcoder.result == 'success' &&
+      needs.build_web.result == 'success' &&
+      needs.terraform_apply.result == 'success' &&
+      needs.migrate_db.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Deploy Cloud Run services (prod)
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          TAG: prod
+          SERVICE_API_NAME: ${{ vars.CLOUD_RUN_PROD_API_SERVICE }}
+          SERVICE_WEB_NAME: ${{ vars.CLOUD_RUN_PROD_WEB_SERVICE }}
+          SERVICE_JOBS_NAME: ${{ vars.CLOUD_RUN_PROD_JOBS_SERVICE }}
+          # Prod tileserver Cloud Run service name. Mirrors the dev
+          # CLOUD_RUN_DEV_TILESERVER_SERVICE "set-it-to-enable" pattern: when
+          # this var is empty the tileserver roll is skipped (the image is still
+          # promoted + applied by Terraform, just not rolled here). Set it to
+          # hf-prod-tileserver to roll the prod tileserver on every dispatch.
+          SERVICE_TILESERVER_NAME: ${{ vars.CLOUD_RUN_PROD_TILESERVER_SERVICE }}
+        run: |
+          repo_host="${REGION}-docker.pkg.dev"
+
+          deploy_service() {
+            local svc="$1" img="$2"
+            gcloud run deploy "$svc" \
+              --region "$REGION" --image "$img" --quiet
+            # Belt-and-suspenders: force 100% of traffic onto the revision we
+            # just deployed. `gcloud run deploy` already promotes to latest by
+            # default, but if a service has drifted to a PINNED named revision
+            # (latestRevision:false) a plain deploy can leave the new revision
+            # at 0% traffic — a green pipeline serving a stale runtime.
+            # --to-latest repairs that pin in place.
+            gcloud run services update-traffic "$svc" \
+              --region "$REGION" --to-latest --quiet
+          }
+
+          deploy_service "${SERVICE_API_NAME}"  "${repo_host}/${PROJECT_ID}/${AR_REPO}/api:${TAG}"
+          deploy_service "${SERVICE_WEB_NAME}"  "${repo_host}/${PROJECT_ID}/${AR_REPO}/web:${TAG}"
+          deploy_service "${SERVICE_JOBS_NAME}" "${repo_host}/${PROJECT_ID}/${AR_REPO}/jobs:${TAG}"
+
+          if [[ -n "${SERVICE_TILESERVER_NAME:-}" ]]; then
+            deploy_service "${SERVICE_TILESERVER_NAME}" "${repo_host}/${PROJECT_ID}/${AR_REPO}/tileserver:${TAG}"
+          fi
+
+  post_deploy_verify:
+    name: Post-deploy verification
+    needs: [deploy_prod]
+    if: ${{ !cancelled() && needs.deploy_prod.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Verify Cloud Run readiness and live endpoints
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          SERVICE_API_NAME: ${{ vars.CLOUD_RUN_PROD_API_SERVICE }}
+          SERVICE_WEB_NAME: ${{ vars.CLOUD_RUN_PROD_WEB_SERVICE }}
+          SERVICE_JOBS_NAME: ${{ vars.CLOUD_RUN_PROD_JOBS_SERVICE }}
+        run: |
+          set -euo pipefail
+
+          describe_service() {
+            local service_name="$1"
+            local label="$2"
+            echo "Checking Cloud Run service: ${label} (${service_name})"
+            gcloud run services describe "$service_name" \
+              --region "$REGION" \
+              --project "$PROJECT_ID" \
+              --format='yaml(metadata.name,status.url,status.latestReadyRevisionName,status.conditions)'
+          }
+
+          get_service_url() {
+            local service_name="$1"
+            gcloud run services describe "$service_name" \
+              --region "$REGION" \
+              --project "$PROJECT_ID" \
+              --format='value(status.url)'
+          }
+
+          probe_url() {
+            local label="$1"
+            local url="$2"
+            local auth="${3:-public}"  # "public" or "authed"
+            echo "Probing ${label}: ${url}"
+            if [[ "$auth" == "authed" ]]; then
+              local token
+              token="$(gcloud auth print-identity-token --audiences="$url")"
+              curl --fail --silent --show-error --location --max-time 30 \
+                -H "Authorization: Bearer ${token}" "$url" > /dev/null
+            else
+              curl --fail --silent --show-error --location --max-time 30 "$url" > /dev/null
+            fi
+          }
+
+          describe_service "$SERVICE_API_NAME" api
+          describe_service "$SERVICE_JOBS_NAME" jobs
+          describe_service "$SERVICE_WEB_NAME" web
+
+          api_url="$(get_service_url "$SERVICE_API_NAME")"
+          jobs_url="$(get_service_url "$SERVICE_JOBS_NAME")"
+          web_url="$(get_service_url "$SERVICE_WEB_NAME")"
+
+          [[ -n "$api_url" ]]
+          [[ -n "$jobs_url" ]]
+          [[ -n "$web_url" ]]
+
+          # api + web are public; jobs is private (Pub/Sub + Cloud Scheduler
+          # triggers, no allUsers invoker binding) so it needs an OIDC token.
+          probe_url "api /health" "${api_url%/}/health"
+          probe_url "jobs /health" "${jobs_url%/}/health" authed
+          probe_url "web /" "${web_url%/}/"
+
+  # ── Seed admin REMOVED — bootstrap is manual now ──────────────────────
+  # Previously a `seed_admin` job upserted the prod platform admin from
+  # PROD_SEED_ADMIN_EMAIL / PROD_SEED_ADMIN_PASSWORD on every
+  # workflow_dispatch. Two problems:
+  #
+  #   1. A real prod credential lived plain-text-readable to anyone with
+  #      Forgejo repo settings access. Compromise that secret → full
+  #      platform admin.
+  #   2. The upsert RESET the password on every prod deploy. If the
+  #      human admin rotated their password via the UI, the next
+  #      dispatch silently clobbered it back to the Forgejo value.
+  #
+  # Admin auth is no longer deploy-driven. Bootstrap a fresh
+  # environment with `./scripts/seed-prod-admin.sh` (interactive,
+  # password never written to disk / shell history / any secret store).
+  # Run it once; future admins are added through the UI by the seeded
+  # admin (SSO / invitation flow). The PROD_SEED_ADMIN_* Forgejo
+  # secrets have been deleted — re-adding them would not re-enable
+  # this job, since the workflow step itself is gone.
+
+  notify:
+    name: Notify deploy result
+    needs: [promote_api, promote_jobs, promote_audio_transcoder, build_web, migrate_db, terraform_apply, deploy_prod, post_deploy_verify]
+    if: >-
+      always() && !cancelled() &&
+      (
+        needs.post_deploy_verify.result == 'success' ||
+        contains(needs.*.result, 'failure')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post to Discord
+        env:
+          RESULT: ${{ needs.post_deploy_verify.result == 'success' && 'success' || 'failure' }}
+        run: |
+          STATUS_ICON=$( [ "$RESULT" = "success" ] && echo "✅" || echo "❌" )
+          COLOUR=$( [ "$RESULT" = "success" ] && echo "3066993" || echo "15158332" )
+          curl -fsSL -X POST "${{ secrets.DISCORD_DEPLOY_PROD_WEBHOOK }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"embeds\": [{
+                \"title\": \"${STATUS_ICON} Deploy PROD — ${RESULT}\",
+                \"color\": ${COLOUR},
+                \"fields\": [
+                  {\"name\": \"Commit\",  \"value\": \"\`${{ github.sha }}\`\",           \"inline\": true},
+                  {\"name\": \"Branch\",  \"value\": \"\`${{ github.ref_name }}\`\",       \"inline\": true},
+                  {\"name\": \"Actor\",   \"value\": \"\`${{ github.actor }}\`\",          \"inline\": true},
+                  {\"name\": \"Run\",     \"value\": \"[View run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }})\", \"inline\": false}
+                ]
+              }]
+            }"

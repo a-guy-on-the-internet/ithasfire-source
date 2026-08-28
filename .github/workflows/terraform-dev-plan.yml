@@ -1,0 +1,125 @@
+name: Terraform dev plan
+
+# `pull_request` removed 2026-08-25 — see the long note in ci.yml. Public repo
+# + self-hosted runner on the dev workstation means a fork PR would execute on
+# that machine, and this workflow in particular holds cloud credentials and
+# runs `terraform plan` against real dev state.
+#
+# It was pull_request-ONLY, so dispatch replaces it rather than sitting
+# alongside a push trigger: run it by hand against a ref before applying.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Keyed on the dispatched ref. Was `github.event.pull_request.number`, which
+  # is empty on workflow_dispatch — every run collapsed into one group.
+  group: terraform-dev-plan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: Plan (dev workspace)
+    runs-on: ubuntu-latest
+    environment: dev
+    # No fork-PR guard needed any more: this workflow is dispatch-only, and
+    # dispatching requires write access. The old
+    # `github.event.pull_request.head.repo.full_name == github.repository`
+    # check evaluated FALSE on every dispatch (no pull_request in the event
+    # payload), so the job silently never ran.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.6
+
+      # OIDC auth is only needed because our backend is GCS and we want a real plan,
+      # not a backend=false validate.
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Terraform init (cached + retry, GCS backend)
+        run: bash infra/terraform/scripts/tf-init-cached.sh infra/terraform -input=false
+
+      - name: Select workspace (dev)
+        run: terraform -chdir=infra/terraform workspace select dev || terraform -chdir=infra/terraform workspace new dev
+
+      - name: Terraform plan (dev)
+        env:
+          # ── Cloudflare ──
+          TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_cloudflare_api_key: ${{ secrets.TF_VAR_CLOUDFLARE_API_KEY }}
+          TF_VAR_cloudflare_email: ${{ secrets.TF_VAR_CLOUDFLARE_EMAIL }}
+          # ── Stripe ──
+          TF_VAR_stripe_secret_key: ${{ secrets.STRIPE_SECRET_KEY_DEV }}
+          TF_VAR_stripe_webhook_secret: ${{ secrets.STRIPE_WEBHOOK_SECRET_DEV }}
+          TF_VAR_stripe_connect_webhook_secret: ${{ secrets.STRIPE_CONNECT_WEBHOOK_SECRET_DEV }}
+          TF_VAR_stripe_publishable_key: ${{ secrets.STRIPE_PUBLISHABLE_KEY_DEV }}
+          TF_VAR_turnstile_secret_key: ${{ secrets.TURNSTILE_SECRET_KEY_DEV }}
+          # ── Auth ──
+          TF_VAR_better_auth_secret: ${{ secrets.BETTER_AUTH_SECRET_DEV }}
+          # ── SES (email sending) ──
+          # ── SMTP (fallback for non-Terraform-managed SES credentials) ──
+          # ── Resend ──
+          TF_VAR_resend_api_key: ${{ secrets.RESEND_API_KEY_DEV }}
+          TF_VAR_resend_webhook_secret: ${{ secrets.RESEND_WEBHOOK_SECRET_DEV }}
+          # ── AWS (Terraform provider for SES module — only used when enable_aws=true) ──
+          TF_VAR_aws_access_key_id: ${{ secrets.TF_VAR_AWS_ACCESS_KEY_ID }}
+          TF_VAR_aws_secret_access_key: ${{ secrets.TF_VAR_AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_aws_assume_role_arn: ${{ secrets.TF_VAR_AWS_ASSUME_ROLE_ARN }}
+          # ── Google OAuth ──
+          TF_VAR_google_client_id: ${{ secrets.TF_VAR_GOOGLE_CLIENT_ID }}
+          TF_VAR_google_client_secret: ${{ secrets.TF_VAR_GOOGLE_CLIENT_SECRET }}
+          TF_VAR_google_web_client_id: ${{ secrets.TF_VAR_GOOGLE_WEB_CLIENT_ID }}
+          TF_VAR_google_ios_client_id: ${{ secrets.TF_VAR_GOOGLE_IOS_CLIENT_ID }}
+          TF_VAR_google_android_client_id: ${{ secrets.TF_VAR_GOOGLE_ANDROID_CLIENT_ID }}
+          # ── Apple OAuth ──
+          TF_VAR_apple_client_id: ${{ secrets.TF_VAR_APPLE_CLIENT_ID }}
+          TF_VAR_apple_client_secret: ${{ secrets.TF_VAR_APPLE_CLIENT_SECRET }}
+          TF_VAR_apple_app_bundle_identifier: ${{ secrets.TF_VAR_APPLE_APP_BUNDLE_IDENTIFIER }}
+          # ── Apple Wallet passes ──
+          # Both default to null in variables.tf, so omitting them does not fail
+          # the plan — it silently leaves the API on the stub wallet adapter.
+          # apple_team_id / apple_pass_type_identifier are public: see tfvars.
+          TF_VAR_apple_pass_certificate_p12_base64: ${{ secrets.APPLE_PASS_CERTIFICATE_P12_BASE64_DEV }}
+          TF_VAR_apple_pass_certificate_password: ${{ secrets.APPLE_PASS_CERTIFICATE_PASSWORD_DEV }}
+          # ── Neon / Upstash ──
+          TF_VAR_neon_api_key: ${{ secrets.TF_VAR_NEON_API_KEY }}
+          TF_VAR_upstash_api_key: ${{ secrets.TF_VAR_UPSTASH_API_KEY }}
+          TF_VAR_upstash_email: ${{ secrets.TF_VAR_UPSTASH_EMAIL }}
+          TF_VAR_meilisearch_master_key: ${{ secrets.MEILISEARCH_MASTER_KEY_DEV }}
+          # ── API keys ──
+          TF_VAR_ziptax_api_key: ${{ secrets.TF_VAR_ZIPTAX_API_KEY }}
+          TF_VAR_geoapify_api_key: ${{ secrets.TF_VAR_GEOAPIFY_API_KEY }}
+          TF_VAR_azure_content_safety_endpoint: ${{ secrets.TF_VAR_AZURE_CONTENT_SAFETY_ENDPOINT }}
+          TF_VAR_azure_content_safety_key: ${{ secrets.TF_VAR_AZURE_CONTENT_SAFETY_KEY }}
+          # ── Jobs service ──
+          TF_VAR_jobs_api_key: ${{ secrets.JOBS_API_KEY_DEV }}
+          # ── Announcement unsubscribe ──
+          TF_VAR_unsubscribe_secret: ${{ secrets.UNSUBSCRIBE_SECRET_DEV }}
+          TF_VAR_volunteer_scan_token_secret: ${{ secrets.VOLUNTEER_SCAN_TOKEN_SECRET_DEV }}
+          TF_VAR_discord_alerts_webhook: ${{ secrets.DISCORD_ALERTS_WEBHOOK_DEV }}
+          TF_VAR_discord_support_webhook: ${{ secrets.DISCORD_SUPPORT_WEBHOOK_DEV }}
+        run: terraform -chdir=infra/terraform plan -no-color -input=false -var-file=envs/dev/dev.tfvars

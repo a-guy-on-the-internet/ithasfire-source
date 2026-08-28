@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "appium": {
+      "type": "stdio",
+      "command": "/Users/somehuman/.nvm/versions/node/v24.8.0/bin/appium-mcp"
+    }
+  }
+}

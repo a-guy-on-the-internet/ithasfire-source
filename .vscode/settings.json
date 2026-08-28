@@ -1,0 +1,17 @@
+{
+    "[prisma]": {
+        "editor.defaultFormatter": "Prisma.prisma"
+    },
+    "typescript.tsdk": "node_modules/typescript/lib",
+    "cSpell.enabled": false,
+    "chat.agent.enabled": true,
+    "chat.agentFilesLocations": [".github/agents"],
+    "mcp": {
+        "servers": {
+            "better-auth": {
+                "type": "http",
+                "url": "https://mcp.better-auth.com/mcp"
+            }
+        }
+    }
+}

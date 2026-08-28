@@ -1,0 +1,41 @@
+{
+  "servers": {
+    "chrome-devtools": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "chrome-devtools-mcp@latest", "--isolated"]
+    },
+    "sentry": {
+      "type": "http",
+      "url": "https://mcp.sentry.dev/mcp"
+    },
+    "appium": {
+      "type": "stdio",
+      "command": "appium-mcp"
+    },
+    "ithasfire": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["tsx", "${workspaceFolder}/apps/mcp/src/index.ts"],
+      "env": {
+        "ITHASFIRE_API_URL": "http://localhost:3001",
+        "ITHASFIRE_API_KEY": "${input:ithasfire_api_key}",
+        "ITHASFIRE_SESSION_TOKEN": "${input:ithasfire_session_token}"
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "ithasfire_api_key",
+      "type": "promptString",
+      "description": "Ithas Fire API key (thk_...) — generate via apiKeys.create tRPC call. Leave blank to fall back to session token.",
+      "password": true
+    },
+    {
+      "id": "ithasfire_session_token",
+      "type": "promptString",
+      "description": "Ithas Fire session token — copy from DevTools → Application → Cookies → better-auth.session_token after logging in as ADMIN. Only used if API key is blank.",
+      "password": true
+    }
+  ]
+}

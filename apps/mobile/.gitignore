@@ -1,0 +1,11 @@
+# typescript
+*.tsbuildinfo
+
+# generated native folders
+#
+# `expo prebuild` / `expo run:ios` regenerate these from app.config.ts, so they
+# are build output rather than source. Mirrors apps/scanner/.gitignore — without
+# this, running the app locally drops a few hundred untracked files into the
+# working tree.
+/ios
+/android

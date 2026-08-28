@@ -1,0 +1,29 @@
+name: Infra validation
+
+# `pull_request` removed 2026-08-25 — see the long note in ci.yml. Public repo
+# + self-hosted runner on the dev workstation: a fork PR would run on that box.
+# The push trigger keeps the real coverage (this repo pushes straight to main),
+# and dispatch allows a manual run against any ref while main is unwritable.
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "infra/**"
+      - ".github/workflows/infra-validation.yml"
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Terraform checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.6
+
+      - name: Run infra validation script
+        run: bash infra/terraform/scripts/validate.sh

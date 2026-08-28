@@ -1,0 +1,21 @@
+{
+  "extends": "../../packages/config/tsconfig/base.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "baseUrl": ".",
+    "paths": {
+      "@th/core/*": ["../../packages/core/src/*"],
+      "@th/adapters": ["../../packages/adapters/src/index.ts"],
+      "@th/adapters/*": ["../../packages/adapters/src/*"],
+      "@th/schema": ["../../packages/schema/src/index.ts"],
+      "@th/schema/*": ["../../packages/schema/src/*"],
+      "@th/types": ["../../packages/types/src/index.ts"],
+      "@th/types/*": ["../../packages/types/src/*"],
+      "@th/ports": ["../../packages/ports/src/index.ts"],
+      "@th/ports/*": ["../../packages/ports/src/*"]
+    }
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
+}

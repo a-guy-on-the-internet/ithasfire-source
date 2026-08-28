@@ -1,0 +1,30 @@
+{
+  "extends": "../../packages/config/tsconfig/base.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "baseUrl": ".",
+    "skipLibCheck": true,
+    "paths": {
+      "@th/core/*": ["../../packages/core/src/*"],
+      "@th/adapters": ["../../packages/adapters/src/index.ts"],
+      "@th/adapters/*": ["../../packages/adapters/src/*"],
+      "@th/ports": ["../../packages/ports/src/index.ts"],
+      "@th/ports/*": ["../../packages/ports/src/*"],
+      "@th/test-utils": ["../../packages/test-utils/src/index.ts"],
+      "@th/test-utils/*": ["../../packages/test-utils/src/*"],
+      "@th/types": ["../../packages/types/src/index.ts"],
+      "@th/types/*": ["../../packages/types/src/*"],
+      "@th/schema": ["../../packages/schema/src/index.ts"],
+      "@th/schema/*": ["../../packages/schema/src/*"]
+    }
+  },
+  "include": ["src"],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "../../packages/adapters/src/db/prisma/payouts.ts",
+    "../../packages/adapters/src/db/prisma/settlement-lines.ts",
+    "../../packages/adapters/src/db/prisma/order-item-settlement-lines.ts"
+  ]
+}

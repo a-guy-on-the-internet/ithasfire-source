@@ -1,0 +1,635 @@
+name: Hotfix (express deploy)
+
+# ── What this is ──────────────────────────────────────────────────────────
+# An EMERGENCY lane for rolling a single service to dev and/or prod fast —
+# the "something is broken while a live event is scanning tickets" path.
+# Target wall-clock is 5-8 min vs the 20-30 min of deploy-dev.yml +
+# deploy-prod.yml.
+#
+# It gets there by skipping, deliberately:
+#   • the full quality gate (lint + ~2.6k web unit tests + core/adapters/ui)
+#   • terraform apply
+#   • prisma migrate deploy
+#   • the seed jobs
+#
+# What it does NOT skip: the Docker build itself. For both web (`next build`)
+# and api (`tsc -p tsconfig.json`) the build IS a typecheck, so a type error
+# still fails the run. What you lose is the TEST suites — you are trusting
+# your local verification. That is the trade; `confirm: HOTFIX` is the ack.
+#
+# ── Safety rails ──────────────────────────────────────────────────────────
+#   • `confirm` must be the literal string HOTFIX.
+#   • Refuses to run if the ref carries migrations not yet applied to the
+#     target DB — a hotfix must never ship code ahead of the schema. Use the
+#     full pipeline for anything with a schema change.
+#   • Refuses to run if the ref changes infra/terraform (or the jobs manifest)
+#     relative to the commit currently deployed — this lane skips
+#     `terraform apply`, and code that reads a not-yet-created env var or
+#     secret usually breaks one route while /health stays green, so the probe
+#     would not catch it. Override with ignore_infra_drift.
+#     See scripts/ci/check-infra-drift.sh.
+#   • Captures the currently-serving revision BEFORE rolling, probes after,
+#     and AUTO-ROLLS-BACK if the probe fails — in a way that SURVIVES the next
+#     `terraform apply`. See scripts/ci/roll-cloud-run.sh: terraform is
+#     authoritative on both traffic (latest=100%) and the image tag, so a
+#     plain traffic pin would be silently reverted back onto the broken
+#     revision. The rollback moves the :$ENV tag and redeploys instead.
+#   • Shares the hf-prod / hf-dev concurrency groups so it cannot race a
+#     normal deploy or a terraform apply.
+#
+# ── Cost note for `service: web` ──────────────────────────────────────────
+# web is the one service whose image is NOT environment-agnostic: Next
+# inlines NEXT_PUBLIC_* at build time, which is why deploy-prod.yml rebuilds
+# web while it merely re-tags api/jobs/tileserver. So `service: web` +
+# `target: both` costs TWO builds and roughly doubles the wall-clock. Under
+# real time pressure pick `target: prod`. (Making NEXT_PUBLIC_* runtime-
+# injected would collapse this to a re-tag — see the deploy-speed notes.)
+
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: "Which single service to hotfix"
+        required: true
+        type: choice
+        options: [web, api, jobs, tileserver, audio]
+        default: web
+      target:
+        description: "Where to roll it"
+        required: true
+        type: choice
+        options: [both, prod, dev]
+        default: both
+      confirm:
+        description: "Type HOTFIX to confirm you are skipping the test gate"
+        required: true
+        default: ""
+      run_checks:
+        description: "Also run the touched package's unit tests (slower, safer)"
+        required: false
+        type: boolean
+        default: false
+      ignore_infra_drift:
+        description: "Proceed even if the ref carries un-applied infra/terraform changes (you accept the risk)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # Serialize against the normal pipelines on the GCS state lock / Cloud Run
+  # rolls. A dev-only hotfix queues on hf-dev; anything touching prod (incl.
+  # `both`) queues on hf-prod. cancel-in-progress is false everywhere — a
+  # half-applied hotfix is worse than a slow one.
+  group: ${{ inputs.target == 'dev' && 'hf-dev' || 'hf-prod' }}
+  cancel-in-progress: false
+
+jobs:
+  # ── Preflight: confirm string, scope resolution, migration safety ───────
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    outputs:
+      do_dev: ${{ steps.scope.outputs.do_dev }}
+      do_prod: ${{ steps.scope.outputs.do_prod }}
+      image: ${{ steps.scope.outputs.image }}
+      dockerfile: ${{ steps.scope.outputs.dockerfile }}
+      probe_path: ${{ steps.scope.outputs.probe_path }}
+      probe_auth: ${{ steps.scope.outputs.probe_auth }}
+      test_filter: ${{ steps.scope.outputs.test_filter }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history: the infra-drift check below diffs this ref against
+          # the commit currently deployed, which is arbitrarily far back.
+          fetch-depth: 0
+
+      - name: Validate confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          if [[ "$CONFIRM" != "HOTFIX" ]]; then
+            echo "::error::confirm must be the literal string HOTFIX. This lane skips the test gate; the confirmation is deliberate."
+            exit 1
+          fi
+
+      - name: Resolve service scope
+        id: scope
+        env:
+          SERVICE: ${{ inputs.service }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+
+          case "$SERVICE" in
+            web)
+              image=web;              dockerfile=apps/web/Dockerfile
+              probe_path="/";         probe_auth=public;  test_filter=web ;;
+            api)
+              image=api;              dockerfile=apps/api/Dockerfile
+              probe_path="/health";   probe_auth=public;  test_filter=api ;;
+            jobs)
+              image=jobs;             dockerfile=apps/jobs/Dockerfile
+              # jobs is a private Cloud Run service — probe with an OIDC token.
+              probe_path="/health";   probe_auth=authed;  test_filter=jobs ;;
+            tileserver)
+              image=tileserver;       dockerfile=infra/docker/Dockerfile.tileserver
+              probe_path="/health";   probe_auth=public;  test_filter="" ;;
+            audio)
+              image=audio-transcoder; dockerfile=apps/audio-transcoder/Dockerfile
+              # ingress=internal — unreachable from the runner, so no HTTP probe.
+              probe_path="";          probe_auth=none;    test_filter=audio-transcoder ;;
+            *)
+              echo "::error::Unknown service '${SERVICE}'."; exit 1 ;;
+          esac
+
+          do_dev=false
+          do_prod=false
+          case "$TARGET" in
+            dev)  do_dev=true ;;
+            prod) do_prod=true ;;
+            both) do_dev=true; do_prod=true ;;
+            *)    echo "::error::Unknown target '${TARGET}'."; exit 1 ;;
+          esac
+
+          {
+            echo "do_dev=${do_dev}"
+            echo "do_prod=${do_prod}"
+            echo "image=${image}"
+            echo "dockerfile=${dockerfile}"
+            echo "probe_path=${probe_path}"
+            echo "probe_auth=${probe_auth}"
+            echo "test_filter=${test_filter}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Hotfix scope: service=${SERVICE} image=${image} dev=${do_dev} prod=${do_prod}"
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Refuse if the ref carries unapplied migrations
+        # A hotfix skips `prisma migrate deploy`, so shipping a ref that
+        # contains an unapplied migration would put new code in front of an
+        # old schema — the "column ... does not exist" 500s that deploy-dev.yml
+        # goes to some length to prevent.
+        #
+        # Checked by comparing migration DIRECTORIES in the ref against the
+        # successfully-applied rows in _prisma_migrations, straight over psql.
+        # Deliberately does NOT `pnpm install` + `prisma migrate status`: that
+        # costs minutes and this whole workflow exists to save them.
+        env:
+          DO_DEV: ${{ steps.scope.outputs.do_dev }}
+          DO_PROD: ${{ steps.scope.outputs.do_prod }}
+        run: |
+          set -uo pipefail
+
+          check_env() {
+            local env_name="$1" secret_name="$2"
+            local url applied missing="" name dir
+
+            url="$(gcloud secrets versions access latest \
+              --secret="${secret_name}" --project=hearthfire-491918)" || return 1
+            echo "::add-mask::${url}"
+
+            # psql via a throwaway container — no client install on the runner.
+            # Retried once: Neon cold-starts, and a single connect timeout
+            # should not block an emergency deploy. Still FAILS CLOSED if both
+            # attempts fail — an unreadable schema means we cannot prove the
+            # ref is safe to ship without migrations.
+            local attempt
+            for attempt in 1 2; do
+              applied="$(docker run --rm -i postgres:15-alpine \
+                psql "${url}" -tAc \
+                "select migration_name from _prisma_migrations where finished_at is not null and rolled_back_at is null")" && break
+              if [[ "$attempt" == 2 ]]; then
+                echo "::error::${env_name}: could not read _prisma_migrations after 2 attempts. Failing closed."
+                return 1
+              fi
+              echo "${env_name}: DB read failed (attempt ${attempt}), retrying in 5s…"
+              sleep 5
+            done
+
+            for dir in packages/db/prisma/migrations/*/; do
+              [[ -d "$dir" ]] || continue
+              name="$(basename "$dir")"
+              if ! grep -qxF "$name" <<< "$applied"; then
+                missing+="    ${name}"$'\n'
+              fi
+            done
+
+            if [[ -n "$missing" ]]; then
+              echo "::error::${env_name}: this ref contains migrations not applied to the ${env_name} database:"
+              printf '%s' "$missing"
+              echo "::error::A hotfix does not run migrations. Use deploy-dev.yml / deploy-prod.yml for schema changes."
+              return 1
+            fi
+            echo "${env_name}: schema is up to date with this ref."
+          }
+
+          rc=0
+          if [[ "$DO_DEV" == "true" ]]; then
+            check_env dev hf-dev-database-url || rc=1
+          fi
+          if [[ "$DO_PROD" == "true" ]]; then
+            check_env prod hf-prod-database-url || rc=1
+          fi
+          exit $rc
+
+      - name: Refuse if the ref carries unapplied infra changes
+        # A hotfix skips `terraform apply`, so a ref that changes Cloud Run env
+        # vars, secrets, IAM, or the jobs manifest would ship code that reads
+        # infrastructure it hasn't got. That failure usually breaks ONE route
+        # rather than /health, so the post-deploy probe would go green on a
+        # broken deploy — which is exactly why this is checked up front.
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          IMAGE: ${{ steps.scope.outputs.image }}
+          REF_SHA: ${{ github.sha }}
+          IGNORE_DRIFT: ${{ inputs.ignore_infra_drift }}
+          DO_DEV: ${{ steps.scope.outputs.do_dev }}
+          DO_PROD: ${{ steps.scope.outputs.do_prod }}
+        run: |
+          set -euo pipefail
+          # Explicit `if` blocks, not `[[ … ]] && envs=…`: under `set -e` an
+          # AND-list whose test is false returns non-zero and kills the step.
+          envs=""
+          if [[ "$DO_DEV" == "true" ]]; then
+            envs="${envs} dev"
+          fi
+          if [[ "$DO_PROD" == "true" ]]; then
+            envs="${envs} prod"
+          fi
+          ENVS="${envs# }" bash scripts/ci/check-infra-drift.sh
+
+  # ── Optional scoped tests ──────────────────────────────────────────────
+  # Off by default: the Docker build already typechecks (next build / tsc),
+  # so this buys you the unit suites specifically. Turn it on when the fix is
+  # non-trivial and you can afford the minutes.
+  checks:
+    name: Scoped unit tests
+    needs: [preflight]
+    if: ${{ inputs.run_checks && needs.preflight.outputs.test_filter != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable corepack and pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.16.1 --activate
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm prisma:gen
+
+      - name: Run unit tests for the touched app
+        env:
+          CI: "true"
+          NODE_OPTIONS: "--max-old-space-size=4096"
+          FILTER: ${{ needs.preflight.outputs.test_filter }}
+        run: |
+          set -euo pipefail
+          # web has a dedicated CI config (quarantine list); everything else
+          # runs plain vitest.
+          if [[ "$FILTER" == "web" ]]; then
+            pnpm -F web run test:ci
+          else
+            pnpm -F "$FILTER" exec vitest --run
+          fi
+
+  # ── Build the image(s) ─────────────────────────────────────────────────
+  build:
+    name: Build ${{ inputs.service }}
+    needs: [preflight, checks]
+    # `checks` is skipped when run_checks is false — accept skipped, never
+    # accept failure.
+    if: >-
+      always() && !cancelled() &&
+      needs.preflight.result == 'success' &&
+      (needs.checks.result == 'success' || needs.checks.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure docker auth for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          SERVICE: ${{ inputs.service }}
+          IMAGE: ${{ needs.preflight.outputs.image }}
+          DOCKERFILE: ${{ needs.preflight.outputs.dockerfile }}
+          DO_DEV: ${{ needs.preflight.outputs.do_dev }}
+          DO_PROD: ${{ needs.preflight.outputs.do_prod }}
+          # web-only build args (Next inlines these; see the header note).
+          NEXT_PUBLIC_GEOAPIFY_API_KEY: ${{ secrets.NEXT_PUBLIC_GEOAPIFY_API_KEY }}
+          NEXT_PUBLIC_SENTRY_DSN: ${{ secrets.NEXT_PUBLIC_SENTRY_DSN }}
+          PLAUSIBLE_DOMAIN_PROD: ${{ vars.NEXT_PUBLIC_PLAUSIBLE_DOMAIN }}
+          PLAUSIBLE_DOMAIN_DEV: ${{ vars.NEXT_PUBLIC_PLAUSIBLE_DOMAIN_DEV }}
+          NEXT_PUBLIC_PLAUSIBLE_SRC: ${{ vars.NEXT_PUBLIC_PLAUSIBLE_SRC }}
+          CF_BEACON_TOKEN_PROD: ${{ vars.NEXT_PUBLIC_CF_BEACON_TOKEN }}
+          CF_BEACON_TOKEN_DEV: ${{ vars.NEXT_PUBLIC_CF_BEACON_TOKEN_DEV }}
+          STRIPE_PK_DEV: ${{ secrets.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY_DEV }}
+          STRIPE_PK_PROD: ${{ secrets.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY_PROD }}
+          TURNSTILE_KEY_DEV: ${{ secrets.NEXT_PUBLIC_TURNSTILE_SITE_KEY_DEV }}
+          TURNSTILE_KEY_PROD: ${{ secrets.NEXT_PUBLIC_TURNSTILE_SITE_KEY_PROD }}
+          NEXT_PUBLIC_APP_VERSION: ${{ vars.NEXT_PUBLIC_APP_VERSION }}
+        run: |
+          set -euo pipefail
+
+          repo_host="${REGION}-docker.pkg.dev"
+          base="${repo_host}/${PROJECT_ID}/${AR_REPO}/${IMAGE}"
+          sha="${GITHUB_SHA::7}"
+
+          # Build once per environment ONLY for web, whose bundle has the
+          # environment baked in. Every other image is environment-agnostic
+          # (config arrives as Cloud Run env vars), which is exactly why
+          # deploy-prod.yml can re-tag them instead of rebuilding.
+          # $1 = environment whose build args to bake in (web only; ignored
+          #      otherwise). $2.. = the full set of tags to push.
+          build_for() {
+            local env_name="$1"; shift
+            local cache_ref extra=() tags=()
+
+            local t
+            for t in "$@"; do tags+=(-t "$t"); done
+
+            if [[ "$env_name" == "prod" ]]; then
+              cache_ref="${base}:buildcache-prod"
+            else
+              cache_ref="${base}:buildcache-v2"
+            fi
+
+            if [[ "$SERVICE" == "web" ]]; then
+              if [[ "$env_name" == "prod" ]]; then
+                extra+=(--build-arg "NEXT_PUBLIC_TILESERVER_URL=https://tiles-prod.ithasfire.com")
+                extra+=(--build-arg "NEXT_PUBLIC_SITE_URL=https://ithasfire.com")
+                extra+=(--build-arg "NEXT_PUBLIC_API_BASE_URL=https://api.ithasfire.com")
+                extra+=(--build-arg "NEXT_PUBLIC_SENTRY_ENVIRONMENT=production")
+                extra+=(--build-arg "NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=${STRIPE_PK_PROD}")
+                extra+=(--build-arg "NEXT_PUBLIC_TURNSTILE_SITE_KEY=${TURNSTILE_KEY_PROD}")
+                extra+=(--build-arg "NEXT_PUBLIC_APP_VERSION=${NEXT_PUBLIC_APP_VERSION:-0.1.0}")
+                extra+=(--build-arg "NEXT_PUBLIC_PLAUSIBLE_DOMAIN=${PLAUSIBLE_DOMAIN_PROD}")
+                extra+=(--build-arg "NEXT_PUBLIC_CF_BEACON_TOKEN=${CF_BEACON_TOKEN_PROD}")
+              else
+                extra+=(--build-arg "NEXT_PUBLIC_TILESERVER_URL=https://tiles-dev.ithasfire.com")
+                extra+=(--build-arg "NEXT_PUBLIC_SITE_URL=https://web-dev.ithasfire.com")
+                extra+=(--build-arg "NEXT_PUBLIC_API_BASE_URL=https://api-dev.ithasfire.com")
+                extra+=(--build-arg "NEXT_PUBLIC_SENTRY_ENVIRONMENT=development")
+                extra+=(--build-arg "NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=${STRIPE_PK_DEV}")
+                extra+=(--build-arg "NEXT_PUBLIC_TURNSTILE_SITE_KEY=${TURNSTILE_KEY_DEV}")
+                extra+=(--build-arg "NEXT_PUBLIC_APP_VERSION=${NEXT_PUBLIC_APP_VERSION:-dev}")
+                extra+=(--build-arg "NEXT_PUBLIC_PLAUSIBLE_DOMAIN=${PLAUSIBLE_DOMAIN_DEV}")
+                extra+=(--build-arg "NEXT_PUBLIC_CF_BEACON_TOKEN=${CF_BEACON_TOKEN_DEV}")
+              fi
+              extra+=(--build-arg "NEXT_PUBLIC_GEOAPIFY_API_KEY=${NEXT_PUBLIC_GEOAPIFY_API_KEY}")
+              extra+=(--build-arg "NEXT_PUBLIC_SENTRY_DSN=${NEXT_PUBLIC_SENTRY_DSN}")
+              extra+=(--build-arg "NEXT_PUBLIC_PLAUSIBLE_SRC=${NEXT_PUBLIC_PLAUSIBLE_SRC}")
+              extra+=(--build-arg "NEXT_PUBLIC_BUILD_SHA=${sha}")
+            fi
+
+            # Log the tags, not env_name — env_name only selects build args
+            # (web) and the cache ref, so "for dev" would read as a lie on a
+            # prod-only hotfix of an environment-agnostic image.
+            echo "── Building ${IMAGE} → ${*} ──"
+            # mode=max for the same reason as deploy-dev.yml: the expensive
+            # install stage is discarded into the slim runtime stage, so
+            # mode=min would cache almost nothing.
+            docker buildx build \
+              --platform linux/amd64 \
+              --provenance=false \
+              --push \
+              --cache-from=type=registry,ref="${cache_ref}" \
+              --cache-to=type=registry,ref="${cache_ref}",mode=max \
+              "${extra[@]}" \
+              -f "${DOCKERFILE}" \
+              "${tags[@]}" \
+              .
+          }
+
+          if [[ "$SERVICE" == "web" ]]; then
+            # Two builds when target=both — the bundle has the environment
+            # baked in, so a dev image can never be promoted to prod.
+            if [[ "$DO_DEV" == "true" ]]; then
+              build_for dev "${base}:dev" "${base}:dev-${sha}"
+            fi
+            if [[ "$DO_PROD" == "true" ]]; then
+              build_for prod "${base}:prod" "${base}:prod-${sha}"
+            fi
+          else
+            # Environment-agnostic image: ONE build, pushed under exactly the
+            # tags in scope. Deliberately does not touch the :dev tag on a
+            # prod-only hotfix — that would move dev's tag backwards to a ref
+            # that may be behind main without ever rolling dev.
+            tag_list=()
+            if [[ "$DO_DEV" == "true" ]]; then
+              tag_list+=("${base}:dev" "${base}:dev-${sha}")
+            fi
+            if [[ "$DO_PROD" == "true" ]]; then
+              tag_list+=("${base}:prod" "${base}:prod-${sha}")
+            fi
+            build_for dev "${tag_list[@]}"
+          fi
+
+          echo "Pushed ${base} (sha ${sha})"
+
+  # ── Roll dev ───────────────────────────────────────────────────────────
+  roll_dev:
+    name: Roll dev
+    needs: [preflight, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.preflight.outputs.do_dev == 'true' }}
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Resolve Cloud Run service name
+        id: svc
+        env:
+          SERVICE: ${{ inputs.service }}
+          # Passed individually and selected in bash rather than chained in a
+          # GitHub expression: an `a && vars.X || b && vars.Y` chain silently
+          # falls through to the NEXT branch when vars.X is empty, which would
+          # roll the wrong Cloud Run service.
+          SVC_WEB: ${{ vars.CLOUD_RUN_DEV_WEB_SERVICE }}
+          SVC_API: ${{ vars.CLOUD_RUN_DEV_API_SERVICE }}
+          SVC_JOBS: ${{ vars.CLOUD_RUN_DEV_JOBS_SERVICE }}
+          SVC_TILESERVER: ${{ vars.CLOUD_RUN_DEV_TILESERVER_SERVICE }}
+          SVC_AUDIO: ${{ vars.CLOUD_RUN_DEV_AUDIO_TRANSCODER_SERVICE }}
+        run: |
+          set -euo pipefail
+          case "$SERVICE" in
+            web)        svc="${SVC_WEB:-}" ;;
+            api)        svc="${SVC_API:-}" ;;
+            jobs)       svc="${SVC_JOBS:-}" ;;
+            tileserver) svc="${SVC_TILESERVER:-}" ;;
+            audio)      svc="${SVC_AUDIO:-}" ;;
+          esac
+          if [[ -z "$svc" ]]; then
+            echo "::error::No Cloud Run service name configured for dev/${SERVICE}. Set the matching CLOUD_RUN_DEV_*_SERVICE variable."
+            exit 1
+          fi
+          echo "svc=${svc}" >> "$GITHUB_OUTPUT"
+
+      - name: Roll, probe, terraform-durable rollback on failure
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          IMAGE: ${{ needs.preflight.outputs.image }}
+          ENV_NAME: dev
+          SVC: ${{ steps.svc.outputs.svc }}
+          PROBE_PATH: ${{ needs.preflight.outputs.probe_path }}
+          PROBE_AUTH: ${{ needs.preflight.outputs.probe_auth }}
+        run: bash scripts/ci/roll-cloud-run.sh
+
+  # ── Roll prod ──────────────────────────────────────────────────────────
+  roll_prod:
+    name: Roll prod
+    needs: [preflight, build, roll_dev]
+    # When target=both, prod rolls only after dev came back healthy. When
+    # target=prod, roll_dev is legitimately skipped.
+    if: >-
+      always() && !cancelled() &&
+      needs.build.result == 'success' &&
+      needs.preflight.outputs.do_prod == 'true' &&
+      (needs.roll_dev.result == 'success' || needs.roll_dev.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Resolve Cloud Run service name
+        id: svc
+        env:
+          SERVICE: ${{ inputs.service }}
+          # Passed individually and selected in bash rather than chained in a
+          # GitHub expression: an `a && vars.X || b && vars.Y` chain silently
+          # falls through to the NEXT branch when vars.X is empty, which would
+          # roll the wrong Cloud Run service.
+          SVC_WEB: ${{ vars.CLOUD_RUN_PROD_WEB_SERVICE }}
+          SVC_API: ${{ vars.CLOUD_RUN_PROD_API_SERVICE }}
+          SVC_JOBS: ${{ vars.CLOUD_RUN_PROD_JOBS_SERVICE }}
+          SVC_TILESERVER: ${{ vars.CLOUD_RUN_PROD_TILESERVER_SERVICE }}
+          SVC_AUDIO: ${{ vars.CLOUD_RUN_PROD_AUDIO_TRANSCODER_SERVICE }}
+        run: |
+          set -euo pipefail
+          case "$SERVICE" in
+            web)        svc="${SVC_WEB:-}" ;;
+            api)        svc="${SVC_API:-}" ;;
+            jobs)       svc="${SVC_JOBS:-}" ;;
+            tileserver) svc="${SVC_TILESERVER:-}" ;;
+            audio)      svc="${SVC_AUDIO:-}" ;;
+          esac
+          if [[ -z "$svc" ]]; then
+            echo "::error::No Cloud Run service name configured for prod/${SERVICE}. Set the matching CLOUD_RUN_PROD_*_SERVICE variable."
+            exit 1
+          fi
+          echo "svc=${svc}" >> "$GITHUB_OUTPUT"
+
+      - name: Roll, probe, terraform-durable rollback on failure
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          IMAGE: ${{ needs.preflight.outputs.image }}
+          ENV_NAME: prod
+          SVC: ${{ steps.svc.outputs.svc }}
+          PROBE_PATH: ${{ needs.preflight.outputs.probe_path }}
+          PROBE_AUTH: ${{ needs.preflight.outputs.probe_auth }}
+        run: bash scripts/ci/roll-cloud-run.sh

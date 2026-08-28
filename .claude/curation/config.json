@@ -1,0 +1,48 @@
+{
+  "$comment": "Config for the weekly curation agents (/open-mic-scout and /stale-event-sweep). Edit freely — add regions, add/remove categories. Both commands read this file at run time.",
+
+  "regions": [
+    {
+      "id": "nashville-tn",
+      "enabled": true,
+      "label": "Nashville, TN",
+      "city": "Nashville",
+      "state": "TN",
+      "country": "US",
+      "radiusKm": 40,
+      "centerLat": 36.1627,
+      "centerLng": -86.7816
+    }
+  ],
+
+  "openMicScout": {
+    "$comment": "Categories the scout web-searches for in each enabled region. Expand this list to widen coverage.",
+    "categories": [
+      "open mic (general)",
+      "comedy open mic",
+      "poetry / spoken word open mic",
+      "music open mic / acoustic night",
+      "jam session",
+      "songwriter / singer-songwriter night",
+      "karaoke night",
+      "storytelling / lit open mic"
+    ],
+    "dedupeWindowDays": 120,
+    "maxNewPerRun": 25,
+    "listingMode": "community"
+  },
+
+  "staleEventSweep": {
+    "$comment": "What the freshness sweep flags. gracePeriodDays: how long after end/start a PUBLISHED event may linger before it's flagged as needing COMPLETED/ARCHIVED.",
+    "gracePeriodDays": 1,
+    "flagPastPublished": true,
+    "flagCancelledStillVisible": true,
+    "flagCommunityListingsPastDated": true,
+    "checkDeadLinks": true,
+    "maxItemsPerRun": 200
+  },
+
+  "output": {
+    "dir": "docs/curation"
+  }
+}

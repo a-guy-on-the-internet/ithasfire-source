@@ -1,0 +1,20 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"],
+      "@th/errors": ["../../packages/errors/src/index.ts"],
+      "@th/errors/*": ["../../packages/errors/src/*"],
+      "@th/trpc": ["../../packages/transport/trpc/src/index.ts"],
+      "@th/trpc/*": ["../../packages/transport/trpc/src/*"],
+      "@th/ui": ["../../packages/ui/src/index.ts"],
+      "@th/ui/*": ["../../packages/ui/src/*"],
+      "@th/ui-native": ["../../packages/ui-native/src/index.ts"],
+      "@th/ui-native/*": ["../../packages/ui-native/src/*"]
+    }
+  },
+  "include": ["**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules"]
+}

@@ -1,0 +1,47 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"],
+      "@th/errors": ["../../packages/errors/src/index.ts"],
+      "@th/errors/*": ["../../packages/errors/src/*"],
+      "@th/trpc": ["../../packages/transport/trpc/src/index.ts"],
+      "@th/trpc/*": ["../../packages/transport/trpc/src/*"],
+      "@th/types": ["../../packages/types/src/index.ts"],
+      "@th/types/*": ["../../packages/types/src/*"],
+      "@th/ui": ["../../packages/ui/src/index.ts"],
+      "@th/ui/*": ["../../packages/ui/src/*"],
+      "@th/ui-native": ["../../packages/ui-native/src/index.ts"],
+      "@th/ui-native/*": ["../../packages/ui-native/src/*"],
+      // The scanner imports only `AppRouter` from @th/trpc, but a TYPE import
+      // is still a source import: TS follows the router graph into
+      // packages/core, which reaches for @th/core, @th/ports and friends. With
+      // no mapping for those, every one of those files failed to resolve
+      // (1181 × TS2307) and then cascaded into ~640 implicit-any errors in
+      // code this app never runs. Mirrors apps/web's mappings, which is why
+      // that app has always typechecked clean against the same graph.
+      "@th/core": ["../../packages/core/src/index.ts"],
+      "@th/core/*": ["../../packages/core/src/*"],
+      "@th/adapters": ["../../packages/adapters/src/index.ts"],
+      "@th/adapters/*": ["../../packages/adapters/src/*"],
+      "@th/ports": ["../../packages/ports/src/index.ts"],
+      "@th/ports/*": ["../../packages/ports/src/*"],
+      "@th/schema": ["../../packages/schema/src/index.ts"],
+      "@th/schema/*": ["../../packages/schema/src/*"],
+      "@th/locale": ["../../packages/locale/src/index.ts"],
+      "@th/locale/*": ["../../packages/locale/*"],
+      "@th/test-utils": ["../../packages/test-utils/src/index.ts"],
+      "@th/test-utils/*": ["../../packages/test-utils/src/*"],
+      "@th/services-rich-text-html": [
+        "../../packages/service/rich-text-html/src/index.ts"
+      ],
+      "@th/services-rich-text-html/*": [
+        "../../packages/service/rich-text-html/src/*"
+      ]
+    }
+  },
+  "include": ["**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules"]
+}

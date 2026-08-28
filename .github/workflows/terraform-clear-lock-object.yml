@@ -1,0 +1,91 @@
+# When `terraform-force-unlock.yml` requires a Lock ID, this one is the
+# nuclear-option fallback: deletes the GCS lock object outright. The
+# Terraform GCS backend stores its lock as a sibling object next to the
+# state file; removing it has the same effect as `force-unlock`, but
+# doesn't require copy-pasting the Lock ID out of a failed run's logs.
+#
+# Use only when:
+# 1. A previous CD run died holding the lock, AND
+# 2. You're certain no Terraform run is currently in flight (the bucket
+#    won't be racing two writers — it'll just lose its bookkeeping).
+name: Terraform clear lock object (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      workspace:
+        description: "Terraform workspace whose lock to clear"
+        type: choice
+        required: true
+        options:
+          - dev
+          - prod
+
+permissions:
+  contents: read
+
+jobs:
+  clear-lock:
+    name: Clear lock object (${{ inputs.workspace }})
+    runs-on: ubuntu-latest
+    # No environment: scoping — GCP_SA_KEY lives at repo level (matches
+    # the deploy-dev.yml pattern). Forgejo's env-scoped secret lookup
+    # returns empty for unset env-level secrets, which causes the auth
+    # action to fall through to OIDC (which Forgejo doesn't support).
+
+    steps:
+      # Forgejo Actions doesn't inject the OIDC tokens GitHub does, so
+      # WIF auth (workload_identity_provider/service_account) errors with
+      # "did not inject $ACTIONS_ID_TOKEN_REQUEST_TOKEN". Match the working
+      # `terraform-apply.yml` pattern and use the SA key secret directly.
+      - name: Auth to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Show current lock object (if any)
+        run: |
+          set +e
+          # The GCS backend's workspace state lives at
+          # gs://<bucket>/<prefix>/<workspace>.tfstate and the lock object
+          # at gs://<bucket>/<prefix>/<workspace>.tflock. Both paths are
+          # hard-coded below to match `infra/terraform/main.tf`.
+          BUCKET="hf-terraform-hearthfire-491918"
+          PREFIX="hearthfire/infra"
+          WS="${{ inputs.workspace }}"
+          echo "Inspecting gs://${BUCKET}/${PREFIX}/${WS}.tflock"
+          gcloud storage ls -l "gs://${BUCKET}/${PREFIX}/${WS}.tflock" || echo "(no lock object found)"
+
+      - name: Delete lock object
+        run: |
+          set -e
+          BUCKET="hf-terraform-hearthfire-491918"
+          PREFIX="hearthfire/infra"
+          WS="${{ inputs.workspace }}"
+          gcloud storage rm "gs://${BUCKET}/${PREFIX}/${WS}.tflock" --quiet || {
+            echo "::warning::No lock object to delete — state was not locked."
+          }
+
+      - name: Confirm cleared
+        run: |
+          BUCKET="hf-terraform-hearthfire-491918"
+          PREFIX="hearthfire/infra"
+          WS="${{ inputs.workspace }}"
+          if gcloud storage ls "gs://${BUCKET}/${PREFIX}/${WS}.tflock" 2>/dev/null; then
+            echo "::error::Lock object still present after delete — investigate manually."
+            exit 1
+          fi
+          echo "Lock object cleared for workspace '${WS}'."

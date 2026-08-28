@@ -1,0 +1,82 @@
+{
+  "cli": {
+    "version": ">= 12.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "channel": "development",
+      "env": {
+        "EXPO_PUBLIC_API_BASE_URL": "http://localhost:3001",
+        "EXPO_PUBLIC_WEB_BASE_URL": "http://localhost:3000",
+        "EXPO_PUBLIC_APP_ENV": "development",
+        "EXPO_PUBLIC_STRIPE_PUBLISHABLE_KEY": "pk_test_51TFMBTAY7Crkzix4zBv9OsdpO330nm0v9yhV3Np1p8wVehfYA7lHxIK8vUZdetwaWYcN1Nsoy4dpHfKWeWEA0QUU00fkuJKRY2",
+        "EXPO_PUBLIC_WALLET_PAYMENTS_ENABLED": "false"
+      },
+      "ios": {
+        "simulator": false,
+        "resourceClass": "m-medium"
+      },
+      "android": {
+        "buildType": "apk",
+        "resourceClass": "medium"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "channel": "preview",
+      "env": {
+        "EXPO_PUBLIC_API_BASE_URL": "https://api-dev.ithasfire.com",
+        "EXPO_PUBLIC_WEB_BASE_URL": "https://web-dev.ithasfire.com",
+        "EXPO_PUBLIC_APP_ENV": "preview",
+        "EXPO_PUBLIC_STRIPE_PUBLISHABLE_KEY": "pk_test_51TFMBTAY7Crkzix4zBv9OsdpO330nm0v9yhV3Np1p8wVehfYA7lHxIK8vUZdetwaWYcN1Nsoy4dpHfKWeWEA0QUU00fkuJKRY2",
+        "EXPO_PUBLIC_WALLET_PAYMENTS_ENABLED": "false"
+      },
+      "ios": {
+        "simulator": false,
+        "resourceClass": "m-medium"
+      },
+      "android": {
+        "buildType": "apk",
+        "resourceClass": "medium"
+      }
+    },
+    "production": {
+      "distribution": "store",
+      "channel": "production",
+      "autoIncrement": true,
+      "env": {
+        "EXPO_PUBLIC_API_BASE_URL": "https://api.ithasfire.com",
+        "EXPO_PUBLIC_WEB_BASE_URL": "https://ithasfire.com",
+        "EXPO_PUBLIC_APP_ENV": "production",
+        "EXPO_PUBLIC_SENTRY_DSN": "https://3ac5479451cb9cfcdac0018d01cad6c7@o4511120392454144.ingest.us.sentry.io/4511289359335424",
+        "EXPO_PUBLIC_STRIPE_PUBLISHABLE_KEY": "",
+        "EXPO_PUBLIC_WALLET_PAYMENTS_ENABLED": "false"
+      },
+      "ios": {
+        "credentialsSource": "remote",
+        "resourceClass": "m-medium"
+      },
+      "android": {
+        "buildType": "app-bundle",
+        "credentialsSource": "remote",
+        "resourceClass": "medium"
+      }
+    }
+  },
+  "submit": {
+    "production": {
+      "ios": {
+        "ascAppId": "6784035633",
+        "appleTeamId": "FJG7F43395"
+      },
+      "android": {
+        "serviceAccountKeyPath": "../../.secrets/play-service-account.json",
+        "track": "internal",
+        "releaseStatus": "draft"
+      }
+    }
+  }
+}

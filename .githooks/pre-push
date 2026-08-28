@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────────────────────
+# pre-push hook — mirrors CI checks locally so we don't burn GH Actions minutes.
+#
+# Runs: lockfile sync → prisma validate → build → lint → core tests → adapter tests
+#
+# Skip with: git push --no-verify
+#
+# ── The summary tells the truth ───────────────────────────────────────────────
+# This hook used to print "All pre-push checks passed" unconditionally — even
+# when lint had errors and core tests failed. It let 7 commits out over three
+# real failures, because the green banner directly contradicted the warnings
+# printed two lines above it. A summary that cannot say "no" is not a gate.
+#
+# Steps now report into one of three buckets, and the closing banner reflects
+# whichever is worst:
+#
+#   FAILED  — the step ran to completion and something was wrong. Blocks.
+#   WARNED  — the step could not reach a verdict (hit the wall-clock cap, or
+#             was skipped for missing config). Never blocks: an inconclusive
+#             run is not evidence of a problem.
+#   passed  — ran clean.
+#
+# Escape hatches, in order of preference:
+#   PREPUSH_SOFT=1 git push   — downgrade FAILED to WARNED. Use when the tree is
+#                               dirty with someone else's in-flight work and the
+#                               failure is not in what you are pushing (this repo
+#                               routinely carries concurrent uncommitted work).
+#   git push --no-verify      — skip the hook entirely.
+#
+# NOTE: every step here tests the WORKING TREE, not the commits being pushed. A
+# dirty tree can therefore fail you for code you are not pushing — which is
+# exactly what PREPUSH_SOFT is for.
+# ──────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+# ── Colour helpers ──────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No colour
+
+step() { printf "\n${YELLOW}▸ %s${NC}\n" "$1"; }
+pass() { printf "${GREEN}  ✓ %s${NC}\n" "$1"; }
+fail() { printf "${RED}  ✗ %s${NC}\n" "$1"; exit 1; }
+
+# Outcome accumulators. Deliberately newline-delimited STRINGS rather than
+# arrays: this script runs under `set -u`, and expanding an empty array
+# (`${ARR[@]}`) is an unbound-variable error on bash 3.2 — which is still what
+# /bin/bash is on macOS. `env bash` may find a 5.x on PATH, but the hook must
+# not depend on that.
+FAILED_STEPS=""
+WARNED_STEPS=""
+record_fail() { FAILED_STEPS="${FAILED_STEPS}  • $1\n"; }
+record_warn() { WARNED_STEPS="${WARNED_STEPS}  • $1\n"; }
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# ── Skip on non-code pushes (tags, etc.) ────────────────────────────────────
+# The hook receives lines on stdin: <local ref> <local sha> <remote ref> <remote sha>
+# If no refs are provided (e.g. deleting a remote branch), skip.
+if ! read -r _ _ _ _; then
+  exit 0
+fi
+
+# ── Check if only docs/infra changed (mirror CI paths-ignore) ──────────────
+# Compare what's being pushed vs what remote already has.
+REMOTE_REF=$(git rev-parse --abbrev-ref @{upstream} 2>/dev/null || echo "origin/main")
+CHANGED_FILES=$(git diff --name-only "$REMOTE_REF"...HEAD 2>/dev/null || echo "")
+
+if [ -n "$CHANGED_FILES" ]; then
+  # Filter out docs, markdown, and terraform-only changes
+  CODE_CHANGES=$(echo "$CHANGED_FILES" | grep -vE '^(docs/|infra/terraform/|\.github/workflows/(infra-validation|terraform-))|\.md$' || true)
+  if [ -z "$CODE_CHANGES" ]; then
+    printf "${GREEN}▸ Only docs/infra changes — skipping pre-push checks${NC}\n"
+    exit 0
+  fi
+fi
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  pre-push checks (mirrors CI — skip with --no-verify)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# ── 1. Lockfile sync ────────────────────────────────────────────────────────
+# Catches the case where a `pnpm add` / hand-edit updated package.json (or
+# pnpm-lock.yaml) without the matching counterpart making it into the
+# commit. CI runs `pnpm install --frozen-lockfile` and bombs the gate
+# 14+ minutes in; doing the same check here fails locally in ~3 seconds.
+# Auto-recovery hint included so the next person doesn't have to think.
+step "Lockfile sync"
+LOCK_OUT=$(mktemp)
+if pnpm install --frozen-lockfile --prefer-offline > "$LOCK_OUT" 2>&1; then
+  pass "package.json + pnpm-lock.yaml in sync"
+else
+  printf "${RED}  ✗ Lockfile is out of sync with package.json${NC}\n"
+  grep -E 'ERR_PNPM|specifiers in the lockfile|dependencies were|dependencies are mismatched|dependencies were removed|^\* ' "$LOCK_OUT" | head -20
+  printf "${YELLOW}  Recover: ${NC}pnpm install --no-frozen-lockfile && git add package.json pnpm-lock.yaml apps/*/package.json packages/*/package.json\n"
+  rm -f "$LOCK_OUT"
+  exit 1
+fi
+rm -f "$LOCK_OUT"
+
+# ── 2. Prisma validate ──────────────────────────────────────────────────────
+step "Prisma validate"
+pnpm db:validate > /dev/null 2>&1 && pass "Schema valid" || fail "Prisma schema validation failed"
+
+# ── 2. Build ────────────────────────────────────────────────────────────────
+step "Build (turbo)"
+BUILD_OUT=$(mktemp)
+if pnpm build > "$BUILD_OUT" 2>&1; then
+  pass "Build succeeded"
+else
+  printf "${RED}  ✗ Build failed${NC}\n"
+  # Show only error lines — strip noise, keep TS errors + build failures
+  grep -E 'error TS|Type error|SyntaxError|Cannot find|⨯|ELIFECYCLE|ERR_|\bfailed\b' "$BUILD_OUT" | head -40 || tail -30 "$BUILD_OUT"
+  rm -f "$BUILD_OUT"
+  exit 1
+fi
+rm -f "$BUILD_OUT"
+
+# ── 2b. Prune turbo cache ───────────────────────────────────────────────────
+# The build above writes a new artifact to .turbo/cache per task-hash; turbo
+# never prunes it, so the dir grows unbounded. Cap it (default 5 GB, oldest-first).
+step "Prune turbo cache"
+"$REPO_ROOT/scripts/prune-turbo-cache.sh" && pass "Cache within size cap"
+
+# ── 3. Lint ─────────────────────────────────────────────────────────────────
+# `pnpm lint` exits non-zero only on ERRORS; warnings alone leave it at 0. So a
+# non-zero here is a real, blocking problem, not style noise.
+step "Lint"
+if pnpm lint > /dev/null 2>&1; then
+  pass "Lint passed"
+else
+  printf "${RED}  ✗ Lint failed — run 'pnpm lint' to review${NC}\n"
+  record_fail "Lint (pnpm lint)"
+fi
+
+# ── 4. Core + adapter unit tests ───────────────────────────────────────────
+# These steps are BOUNDED by wall clock, which is why the outcome is graded
+# rather than boolean. Hitting the cap tells you nothing about the code, so it
+# warns; a suite that RAN and failed is real evidence, so it blocks.
+#
+# (They used to be soft in BOTH cases. That is what let a push through over
+# three genuinely failing core tests.)
+#
+# Why a WALL-CLOCK bound and not just vitest's flags: --testTimeout /
+# --hookTimeout bound test bodies and hooks, but an inline third argument to
+# beforeAll OVERRIDES them. Several adapter tests do exactly that, e.g.
+# idempotency/__tests__/prisma-adapter.test.ts:
+#
+#     beforeAll(async () => { await startPostgresContainer(); ... }, 300_000)
+#
+# @th/test-utils' startPostgresContainer spins up a real postgis Testcontainer
+# (.withStartupTimeout(300_000)). Seven adapter test files do this, serially
+# (vitest.config.ts pins maxForks: 1), so the suite can legitimately sit for
+# tens of minutes on a cold Docker. It measured 40+ minutes here and the push
+# never completed.
+#
+# CI dodges this entirely by setting TESTCONTAINERS_REUSE_DATABASE_URL (see
+# ci.yml + deploy-dev.yml), which makes the helper create a throwaway database
+# on an existing Postgres instead of starting containers. The hook deliberately
+# does NOT set that for you: the helper runs CREATE DATABASE / DROP DATABASE
+# WITH (FORCE), and local dev points at a CLOUD database, so guessing a URL
+# here could drop databases on a real environment. Export it yourself if you
+# want these steps fast locally, pointed at a throwaway LOCAL Postgres:
+#
+#     export TESTCONTAINERS_REUSE_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/postgres
+#
+# macOS ships no `timeout`/`gtimeout`, so bound it by hand. Kill the process
+# GROUP: vitest forks workers that outlive the parent otherwise (orphaned
+# workers with PPID 1 held fixture locks and wedged the next run).
+VITEST_BOUNDS="--testTimeout=30000 --hookTimeout=30000"
+# Measured: @th/core is 535 files / ~5,957 tests / ~233s on an idle M-series
+# Mac. The cap must clear that comfortably or it truncates a suite that
+# genuinely passes — an earlier 180s default did exactly that, turning a real
+# green step into a meaningless warning. 420s leaves ~80% headroom for a loaded
+# machine while still bounding a pathological hang.
+STEP_CAP_SECONDS="${PREPUSH_TEST_CAP:-420}"
+
+run_bounded() {
+  # run_bounded <label> <review-cmd> -- <cmd...>
+  local label="$1" review="$2"; shift 3
+  set -m
+  "$@" > /dev/null 2>&1 &
+  local pid=$!
+  set +m
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$STEP_CAP_SECONDS" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 -"$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null
+    # `|| true` is load-bearing: this script runs under `set -e`, and reaping a
+    # SIGKILLed job makes `wait` exit 137, which would abort the whole hook —
+    # turning a soft warning into a failed push. (It did exactly that.)
+    wait "$pid" 2>/dev/null || true
+    # INCONCLUSIVE, not failed: the suite was stopped mid-flight, so it is not
+    # evidence of anything. Warn, never block.
+    printf "${YELLOW}  ⚠ %s exceeded %ss and was stopped — run '%s' to review${NC}\n" \
+      "$label" "$STEP_CAP_SECONDS" "$review"
+    record_warn "$label (inconclusive — hit the ${STEP_CAP_SECONDS}s cap)"
+    return 0
+  fi
+  if wait "$pid" 2>/dev/null; then
+    pass "$label passed"
+  else
+    # Ran to completion and failed. This is the case that used to be swallowed.
+    printf "${RED}  ✗ Some %s failed — run '%s' to review${NC}\n" "$label" "$review"
+    record_fail "$label (run '$review')"
+  fi
+  return 0
+}
+
+step "Core unit tests"
+run_bounded "Core tests" "pnpm -F @th/core exec vitest --run" -- \
+  pnpm -F @th/core exec vitest --run $VITEST_BOUNDS
+
+# ── 5. Adapter unit tests ──────────────────────────────────────────────────
+# Skipped unless TESTCONTAINERS_REUSE_DATABASE_URL is set, and that is a
+# deliberate call rather than laziness. Seven files in this package call
+# startPostgresContainer, vitest.config.ts pins maxForks: 1, and vitest runs
+# files serially — so the FIRST container test blocks every file behind it.
+# Without the env var the step cannot get past that file, so it would burn the
+# entire cap to produce a warning while testing almost nothing. Skipping states
+# that honestly and instantly instead of pretending to check.
+#
+# CI always sets the var (ci.yml, deploy-dev.yml), so adapter coverage is never
+# actually lost — it runs there on every push.
+step "Adapter unit tests"
+if [ -n "${TESTCONTAINERS_REUSE_DATABASE_URL:-}" ]; then
+  run_bounded "Adapter tests" "pnpm -F @th/adapters exec vitest --run" -- \
+    pnpm -F @th/adapters exec vitest --run $VITEST_BOUNDS
+else
+  printf "${YELLOW}  ⚠ Skipped — needs TESTCONTAINERS_REUSE_DATABASE_URL (7 tests start postgis containers, serially, and would stall).${NC}\n"
+  printf "${YELLOW}    Point it at a THROWAWAY LOCAL Postgres — the helper runs CREATE/DROP DATABASE, and local dev points at a cloud DB.${NC}\n"
+  printf "${YELLOW}    CI runs this suite regardless.${NC}\n"
+  record_warn "Adapter tests (skipped — no TESTCONTAINERS_REUSE_DATABASE_URL)"
+fi
+
+# ── 6. Web i18n copy guard ──────────────────────────────────────────────────
+# Fast, deterministic guard: error-code↔catalog parity + no catch-all-phrase
+# regression in user-facing error copy. Hard-fails (unlike the soft test steps
+# above) — it runs in ~1s and the whole point is to BLOCK copy rot from shipping.
+step "Web i18n copy guard"
+I18N_OUT=$(mktemp)
+if pnpm -F web exec vitest --run src/i18n > "$I18N_OUT" 2>&1; then
+  pass "i18n parity + catch-all guard passed"
+else
+  printf "${RED}  ✗ i18n copy guard failed${NC}\n"
+  grep -E 'FAIL|✗|expected|offenders|AssertionError|Error:' "$I18N_OUT" | head -30 || tail -30 "$I18N_OUT"
+  rm -f "$I18N_OUT"
+  exit 1
+fi
+rm -f "$I18N_OUT"
+
+# ── Summary ─────────────────────────────────────────────────────────────────
+# The banner reports the WORST outcome recorded, never a fixed string.
+echo ""
+if [ -n "$FAILED_STEPS" ]; then
+  if [ -n "${PREPUSH_SOFT:-}" ]; then
+    printf "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+    printf "${YELLOW}  pre-push: FAILURES DOWNGRADED by PREPUSH_SOFT=1${NC}\n"
+    printf "%b" "$FAILED_STEPS"
+    [ -n "$WARNED_STEPS" ] && printf "%b" "$WARNED_STEPS"
+    printf "${YELLOW}  Pushing anyway because you asked. CI still runs these.${NC}\n"
+    printf "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+    echo ""
+    exit 0
+  fi
+  printf "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+  printf "${RED}  pre-push FAILED — push aborted${NC}\n"
+  printf "%b" "$FAILED_STEPS"
+  if [ -n "$WARNED_STEPS" ]; then
+    printf "${YELLOW}  also inconclusive:${NC}\n"
+    printf "%b" "$WARNED_STEPS"
+  fi
+  printf "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+  printf "  Fix the above, or:\n"
+  printf "    ${YELLOW}PREPUSH_SOFT=1 git push${NC}   if the failure is in someone else's\n"
+  printf "                              uncommitted work and not in your commits\n"
+  printf "    ${YELLOW}git push --no-verify${NC}      to skip these checks entirely\n"
+  echo ""
+  exit 1
+fi
+
+if [ -n "$WARNED_STEPS" ]; then
+  printf "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+  printf "${YELLOW}  pre-push passed, with inconclusive steps:${NC}\n"
+  printf "%b" "$WARNED_STEPS"
+  printf "${YELLOW}  Nothing failed — these simply did not reach a verdict.${NC}\n"
+  printf "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+  echo ""
+  exit 0
+fi
+
+printf "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+printf "${GREEN}  All pre-push checks passed${NC}\n"
+printf "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+echo ""

@@ -1,0 +1,124 @@
+name: Upload tile data to GCS
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: "Region to download (planet, north-america, us, europe)"
+        required: true
+        default: "planet"
+        type: choice
+        options:
+          - planet
+          - north-america
+          - us
+          - europe
+      maxzoom:
+        description: "Maximum zoom level"
+        required: true
+        default: "14"
+        type: string
+      bucket:
+        description: "GCS bucket name for tile upload"
+        required: true
+        default: "hf-dev-tiles"
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  download_and_upload:
+    name: Download tiles (${{ inputs.region }}) + upload to GCS
+    runs-on: ubuntu-latest
+    timeout-minutes: 480
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Install pmtiles CLI
+        env:
+          PMTILES_VERSION: "1.27.1"
+          PMTILES_SHA256: "ffeb68af165b19e06d56904c83b20e73d2f78fbb07c15fa23a9c1e56ee9c44a5"
+        run: |
+          curl -fsSL "https://github.com/protomaps/go-pmtiles/releases/download/v${PMTILES_VERSION}/go-pmtiles_${PMTILES_VERSION}_Linux_x86_64.tar.gz" \
+            -o /tmp/pmtiles.tar.gz
+          echo "${PMTILES_SHA256}  /tmp/pmtiles.tar.gz" | sha256sum -c -
+          tar -xz -C /usr/local/bin pmtiles < /tmp/pmtiles.tar.gz
+          pmtiles --version
+
+      - name: Download tile extract
+        env:
+          REGION: ${{ inputs.region }}
+          MAX_ZOOM: ${{ inputs.maxzoom }}
+          PMTILES_SOURCE: "https://build.protomaps.com/20260301.pmtiles"
+        run: |
+          set -euo pipefail
+          OUTPUT_FILE="openmaptiles.pmtiles"
+
+          declare -A REGION_BOUNDS=(
+            ["north-america"]="-170,15,-50,72"
+            ["us"]="-125,24,-66,50"
+            ["europe"]="-32,34,45,72"
+            ["planet"]=""
+          )
+
+          BOUNDS="${REGION_BOUNDS[$REGION]:-}"
+
+          if [[ "$REGION" == "planet" ]]; then
+            echo "Downloading full planet PMTiles..."
+            curl -L --progress-bar -o "$OUTPUT_FILE" "$PMTILES_SOURCE"
+          elif [[ -n "$BOUNDS" ]]; then
+            echo "Extracting $REGION tiles (bounds: $BOUNDS, maxzoom: $MAX_ZOOM)..."
+            pmtiles extract "$PMTILES_SOURCE" "$OUTPUT_FILE" \
+              --bbox="$BOUNDS" \
+              --maxzoom="$MAX_ZOOM"
+          else
+            echo "Unknown region: $REGION"
+            exit 1
+          fi
+
+          ls -lh "$OUTPUT_FILE"
+          echo "TILES_FILE=$OUTPUT_FILE" >> "$GITHUB_ENV"
+
+      - name: Upload to GCS
+        env:
+          BUCKET: ${{ inputs.bucket }}
+        run: |
+          DEST="gs://${BUCKET}/openmaptiles.pmtiles"
+          echo "Uploading ${TILES_FILE} to ${DEST}..."
+          gcloud storage cp "${TILES_FILE}" "${DEST}"
+          echo "Upload complete."
+          gcloud storage ls -l "${DEST}"
+
+      - name: Summary
+        run: |
+          SIZE=$(ls -lh "${TILES_FILE}" | awk '{print $5}')
+          echo "### Tile upload complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Setting | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Region | ${{ inputs.region }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Max zoom | ${{ inputs.maxzoom }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| File size | ${SIZE} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| GCS bucket | gs://${{ inputs.bucket }}/openmaptiles.pmtiles |" >> "$GITHUB_STEP_SUMMARY"

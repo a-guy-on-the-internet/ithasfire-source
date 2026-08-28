@@ -1,0 +1,56 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Git LFS — track binary / large-media file types
+# ─────────────────────────────────────────────────────────────────────────────
+# Run `git lfs install` once after cloning to enable.
+# Existing files already committed as regular blobs will stay that way until
+# migrated (`git lfs migrate import`). New/modified files matching these
+# patterns will be stored via LFS automatically.
+# ─────────────────────────────────────────────────────────────────────────────
+# ── Images ────────────────────────────────────────────────────────────────────
+*.png filter=lfs diff=lfs merge=lfs -text
+*.jpg filter=lfs diff=lfs merge=lfs -text
+*.jpeg filter=lfs diff=lfs merge=lfs -text
+*.webp filter=lfs diff=lfs merge=lfs -text
+*.gif filter=lfs diff=lfs merge=lfs -text
+*.ico filter=lfs diff=lfs merge=lfs -text
+*.bmp filter=lfs diff=lfs merge=lfs -text
+*.tiff filter=lfs diff=lfs merge=lfs -text
+# ── Video / audio ─────────────────────────────────────────────────────────────
+*.webm filter=lfs diff=lfs merge=lfs -text
+*.mp4 filter=lfs diff=lfs merge=lfs -text
+*.mp3 filter=lfs diff=lfs merge=lfs -text
+*.wav filter=lfs diff=lfs merge=lfs -text
+*.ogg filter=lfs diff=lfs merge=lfs -text
+# ── Keystores / certificates ─────────────────────────────────────────────────
+*.p12 filter=lfs diff=lfs merge=lfs -text
+*.keystore filter=lfs diff=lfs merge=lfs -text
+*.jks filter=lfs diff=lfs merge=lfs -text
+*.pfx filter=lfs diff=lfs merge=lfs -text
+# ── Fonts ─────────────────────────────────────────────────────────────────────
+*.woff filter=lfs diff=lfs merge=lfs -text
+*.woff2 filter=lfs diff=lfs merge=lfs -text
+*.ttf filter=lfs diff=lfs merge=lfs -text
+*.otf filter=lfs diff=lfs merge=lfs -text
+*.eot filter=lfs diff=lfs merge=lfs -text
+# ── Misc binary blobs ────────────────────────────────────────────────────────
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.tar.gz filter=lfs diff=lfs merge=lfs -text
+*.sqlite filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+# ── Exceptions: keep small SVGs inline (they're text/XML) ────────────────────
+# SVGs are NOT tracked by LFS — they diff nicely and are usually small.
+# ── Exceptions: tiny Next.js app icons (< 4 KB) ─────────────────────────────
+# These must be real files in the Docker build context (no LFS pointers).
+apps/web/src/app/favicon.ico !filter !diff !merge -text
+apps/web/src/app/icon.png !filter !diff !merge -text
+apps/web/src/app/apple-icon.png !filter !diff !merge -text
+# ── Exceptions: web public/ runtime assets ──────────────────────────────────
+# Forgejo Actions' actions/checkout doesn't carry the runner token through
+# to LFS GETs (manual curl with the batch's auth header works, but the
+# runner's clone gets 401-equivalents). Web Docker builds saw pointer files
+# instead of binaries, so brand PNGs rendered as broken images on web-dev.
+# These ~1.2 MB of assets stay as regular git blobs — small enough that
+# fighting LFS auth isn't worth it.
+apps/web/public/**/*.png !filter !diff !merge
+apps/web/public/**/*.woff2 !filter !diff !merge
+*.pkpass filter=lfs diff=lfs merge=lfs -text

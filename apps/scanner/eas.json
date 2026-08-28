@@ -1,0 +1,75 @@
+{
+  "cli": {
+    "version": ">= 12.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "channel": "development",
+      "env": {
+        "EXPO_TAP_TO_PAY_TIER": "development",
+        "EXPO_PUBLIC_APP_ENV": "development"
+      },
+      "ios": {
+        "simulator": false,
+        "resourceClass": "m-medium"
+      },
+      "android": {
+        "buildType": "apk",
+        "resourceClass": "medium"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "channel": "preview",
+      "env": {
+        "EXPO_TAP_TO_PAY_TIER": "development",
+        "EXPO_PUBLIC_APP_ENV": "preview",
+        "EXPO_PUBLIC_API_BASE_URL": "http://localhost:3001",
+        "EXPO_PUBLIC_AUTH_ORIGIN": "http://localhost:3000",
+        "EXPO_PUBLIC_WEB_BASE_URL": "http://localhost:3000"
+      },
+      "ios": {
+        "resourceClass": "m-medium"
+      },
+      "android": {
+        "buildType": "apk",
+        "resourceClass": "medium"
+      }
+    },
+    "production": {
+      "distribution": "store",
+      "channel": "production",
+      "autoIncrement": true,
+      "env": {
+        "EXPO_TAP_TO_PAY_TIER": "none",
+        "EXPO_PUBLIC_APP_ENV": "production",
+        "EXPO_PUBLIC_API_BASE_URL": "https://api.ithasfire.com",
+        "EXPO_PUBLIC_AUTH_ORIGIN": "https://ithasfire.com",
+        "EXPO_PUBLIC_WEB_BASE_URL": "https://ithasfire.com"
+      },
+      "ios": {
+        "resourceClass": "m-medium"
+      },
+      "android": {
+        "buildType": "app-bundle",
+        "resourceClass": "medium"
+      }
+    }
+  },
+  "submit": {
+    "production": {
+      "ios": {
+        "ascAppId": "6784035261",
+        "appleTeamId": "FJG7F43395"
+      },
+      "android": {
+        "serviceAccountKeyPath": "../../.secrets/play-service-account.json",
+        "track": "internal",
+        "releaseStatus": "draft"
+      }
+    }
+  }
+}

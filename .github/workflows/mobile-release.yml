@@ -1,0 +1,136 @@
+name: Mobile Release (EAS)
+
+on:
+  push:
+    tags:
+      - 'mobile-v*'
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Platform to build'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - ios
+          - android
+          - all
+      profile:
+        description: 'Build profile'
+        required: true
+        default: 'preview'
+        type: choice
+        options:
+          - development
+          - preview
+          - production
+      submit:
+        description: 'Submit to stores after build'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  build:
+    name: EAS Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Enable corepack and pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.16.1 --activate
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build tRPC package
+        run: pnpm -F @th/trpc run build
+
+      - name: Setup EAS
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Determine build parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "platform=${{ github.event.inputs.platform }}" >> $GITHUB_OUTPUT
+            echo "profile=${{ github.event.inputs.profile }}" >> $GITHUB_OUTPUT
+            echo "submit=${{ github.event.inputs.submit }}" >> $GITHUB_OUTPUT
+          else
+            # Tag push - build production for all platforms
+            echo "platform=all" >> $GITHUB_OUTPUT
+            echo "profile=production" >> $GITHUB_OUTPUT
+            echo "submit=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run EAS Build
+        working-directory: apps/mobile
+        run: |
+          ARGS="--platform ${{ steps.params.outputs.platform }} --profile ${{ steps.params.outputs.profile }} --non-interactive"
+          
+          if [ "${{ steps.params.outputs.submit }}" = "true" ]; then
+            ARGS="$ARGS --auto-submit"
+          fi
+          
+          eas build $ARGS
+
+  # Optional: separate submit job for more control
+  submit:
+    name: Submit to Stores
+    runs-on: ubuntu-latest
+    needs: build
+    if: |
+      github.event.inputs.submit == 'true' ||
+      (startsWith(github.ref, 'refs/tags/mobile-v') && contains(github.ref, '-release'))
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup EAS
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Submit to stores
+        working-directory: apps/mobile
+        run: |
+          PLATFORM="${{ github.event.inputs.platform || 'all' }}"
+          eas submit --platform $PLATFORM --profile production --latest --non-interactive

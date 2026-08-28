@@ -1,0 +1,74 @@
+name: pg-dump image
+
+# Builds the database-backup job image (infra/docker/pg-dump) and pushes it
+# to Artifact Registry as services/pg-dump:<tag> + :<git-sha>.
+#
+# The image is referenced by Terraform via var.db_backup_image
+# (infra/terraform/envs/prod/prod.tfvars) with a PINNED tag — never :latest.
+# After pushing a new tag, bump db_backup_image and run terraform apply so
+# the Cloud Run Jobs pick up the new digest.
+#
+# Spec: docs/specs/2026-05-22/completed/pg-dump-to-gcs.spec.md
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to push (e.g. v1). Pin this tag in db_backup_image."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build_push:
+    name: Build + push pg-dump:${{ inputs.tag }}
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth to Google Cloud (SA key — repo convention, see terraform-clear-lock-object.yml)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure docker auth for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push (pg-dump)
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          repo_host="${REGION}-docker.pkg.dev"
+          image_base="${repo_host}/${PROJECT_ID}/${AR_REPO}/pg-dump"
+
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --push \
+            -f infra/docker/pg-dump/Dockerfile \
+            -t "${image_base}:${TAG}" \
+            -t "${image_base}:${GITHUB_SHA::7}" \
+            infra/docker/pg-dump

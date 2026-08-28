@@ -1,0 +1,252 @@
+name: Terraform apply (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Terraform workspace/environment to apply"
+        type: choice
+        required: true
+        options:
+          - dev
+          - prod
+      skip_migrate:
+        description: "Skip the post-apply Prisma migration. Leave FALSE unless the DB schema is already in sync (e.g. an infra-only apply). Skipping can leave a recreated / apply-rolled Cloud Run revision serving code ahead of an un-migrated DB."
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # Shared group with deploy-{env} so a manual terraform-apply and a
+  # deploy-{env} can't race on the GCS state lock.
+  group: hf-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    name: Apply (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    # Use GitHub Environments to require approval before execution.
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.6
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Terraform init (cached + retry, GCS backend)
+        run: bash infra/terraform/scripts/tf-init-cached.sh infra/terraform -input=false
+
+      - name: Select workspace
+        run: terraform -chdir=infra/terraform workspace select "${{ inputs.environment }}" || terraform -chdir=infra/terraform workspace new "${{ inputs.environment }}"
+
+      - name: Terraform apply
+        env:
+          # ── Cloudflare ──
+          TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_cloudflare_api_key: ${{ secrets.TF_VAR_CLOUDFLARE_API_KEY }}
+          TF_VAR_cloudflare_email: ${{ secrets.TF_VAR_CLOUDFLARE_EMAIL }}
+          # ── Stripe ──
+          TF_VAR_stripe_secret_key: ${{ inputs.environment == 'prod' && secrets.STRIPE_SECRET_KEY_PROD || secrets.STRIPE_SECRET_KEY_DEV }}
+          TF_VAR_stripe_webhook_secret: ${{ inputs.environment == 'prod' && secrets.STRIPE_WEBHOOK_SECRET_PROD || secrets.STRIPE_WEBHOOK_SECRET_DEV }}
+          TF_VAR_stripe_connect_webhook_secret: ${{ inputs.environment == 'prod' && secrets.STRIPE_CONNECT_WEBHOOK_SECRET_PROD || secrets.STRIPE_CONNECT_WEBHOOK_SECRET_DEV }}
+          TF_VAR_stripe_publishable_key: ${{ inputs.environment == 'prod' && secrets.STRIPE_PUBLISHABLE_KEY_PROD || secrets.STRIPE_PUBLISHABLE_KEY_DEV }}
+          TF_VAR_turnstile_secret_key: ${{ inputs.environment == 'prod' && secrets.TURNSTILE_SECRET_KEY_PROD || secrets.TURNSTILE_SECRET_KEY_DEV }}
+          # ── Auth ──
+          TF_VAR_better_auth_secret: ${{ inputs.environment == 'prod' && secrets.BETTER_AUTH_SECRET_PROD || secrets.BETTER_AUTH_SECRET_DEV }}
+          TF_VAR_origin_shared_secret: ${{ inputs.environment == 'prod' && secrets.ORIGIN_SHARED_SECRET_PROD || secrets.ORIGIN_SHARED_SECRET_DEV }}
+          # ── SES (email sending) ──
+          # ── SMTP (fallback for non-Terraform-managed SES credentials) ──
+          # ── Resend ──
+          TF_VAR_resend_api_key: ${{ inputs.environment == 'prod' && secrets.RESEND_API_KEY_PROD || secrets.RESEND_API_KEY_DEV }}
+          TF_VAR_resend_webhook_secret: ${{ inputs.environment == 'prod' && secrets.RESEND_WEBHOOK_SECRET_PROD || secrets.RESEND_WEBHOOK_SECRET_DEV }}
+          # ── AWS (Terraform provider for SES module — only used when enable_aws=true) ──
+          TF_VAR_aws_access_key_id: ${{ secrets.TF_VAR_AWS_ACCESS_KEY_ID }}
+          TF_VAR_aws_secret_access_key: ${{ secrets.TF_VAR_AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_aws_assume_role_arn: ${{ secrets.TF_VAR_AWS_ASSUME_ROLE_ARN }}
+          # ── Google OAuth ──
+          TF_VAR_google_client_id: ${{ secrets.TF_VAR_GOOGLE_CLIENT_ID }}
+          TF_VAR_google_client_secret: ${{ secrets.TF_VAR_GOOGLE_CLIENT_SECRET }}
+          TF_VAR_google_web_client_id: ${{ secrets.TF_VAR_GOOGLE_WEB_CLIENT_ID }}
+          TF_VAR_google_ios_client_id: ${{ secrets.TF_VAR_GOOGLE_IOS_CLIENT_ID }}
+          TF_VAR_google_android_client_id: ${{ secrets.TF_VAR_GOOGLE_ANDROID_CLIENT_ID }}
+          # ── Apple OAuth ──
+          TF_VAR_apple_client_id: ${{ secrets.TF_VAR_APPLE_CLIENT_ID }}
+          TF_VAR_apple_client_secret: ${{ secrets.TF_VAR_APPLE_CLIENT_SECRET }}
+          TF_VAR_apple_app_bundle_identifier: ${{ secrets.TF_VAR_APPLE_APP_BUNDLE_IDENTIFIER }}
+          # ── Apple Wallet passes ──
+          # Both default to null in variables.tf, so omitting them does not fail
+          # the apply — it silently leaves the API on the stub wallet adapter.
+          # apple_team_id / apple_pass_type_identifier are public: see tfvars.
+          TF_VAR_apple_pass_certificate_p12_base64: ${{ inputs.environment == 'prod' && secrets.APPLE_PASS_CERTIFICATE_P12_BASE64_PROD || secrets.APPLE_PASS_CERTIFICATE_P12_BASE64_DEV }}
+          TF_VAR_apple_pass_certificate_password: ${{ inputs.environment == 'prod' && secrets.APPLE_PASS_CERTIFICATE_PASSWORD_PROD || secrets.APPLE_PASS_CERTIFICATE_PASSWORD_DEV }}
+          # ── Neon / Upstash ──
+          # Single org-wide key — both envs share the SomeHuman org now.
+          TF_VAR_neon_api_key: ${{ secrets.TF_VAR_NEON_API_KEY }}
+          TF_VAR_upstash_api_key: ${{ secrets.TF_VAR_UPSTASH_API_KEY }}
+          TF_VAR_upstash_email: ${{ secrets.TF_VAR_UPSTASH_EMAIL }}
+          # Pre-provisioned Redis URL (prod runs enable_upstash=false; dev gets module output).
+          TF_VAR_redis_url: ${{ inputs.environment == 'prod' && secrets.REDIS_URL_PROD || secrets.REDIS_URL_DEV }}
+          TF_VAR_meilisearch_master_key: ${{ inputs.environment == 'prod' && secrets.MEILISEARCH_MASTER_KEY_PROD || secrets.MEILISEARCH_MASTER_KEY_DEV }}
+          # ── API keys ──
+          TF_VAR_ziptax_api_key: ${{ secrets.TF_VAR_ZIPTAX_API_KEY }}
+          TF_VAR_geoapify_api_key: ${{ secrets.TF_VAR_GEOAPIFY_API_KEY }}
+          TF_VAR_azure_content_safety_endpoint: ${{ secrets.TF_VAR_AZURE_CONTENT_SAFETY_ENDPOINT }}
+          TF_VAR_azure_content_safety_key: ${{ secrets.TF_VAR_AZURE_CONTENT_SAFETY_KEY }}
+          # ── Jobs service ──
+          TF_VAR_jobs_api_key: ${{ inputs.environment == 'prod' && secrets.JOBS_API_KEY_PROD || secrets.JOBS_API_KEY_DEV }}
+          # ── Announcement unsubscribe ──
+          TF_VAR_unsubscribe_secret: ${{ inputs.environment == 'prod' && secrets.UNSUBSCRIBE_SECRET_PROD || secrets.UNSUBSCRIBE_SECRET_DEV }}
+          TF_VAR_volunteer_scan_token_secret: ${{ inputs.environment == 'prod' && secrets.VOLUNTEER_SCAN_TOKEN_SECRET_PROD || secrets.VOLUNTEER_SCAN_TOKEN_SECRET_DEV }}
+          TF_VAR_discord_alerts_webhook: ${{ inputs.environment == 'prod' && secrets.DISCORD_ALERTS_WEBHOOK_PROD || secrets.DISCORD_ALERTS_WEBHOOK_DEV }}
+          TF_VAR_discord_support_webhook: ${{ inputs.environment == 'prod' && secrets.DISCORD_SUPPORT_WEBHOOK_PROD || secrets.DISCORD_SUPPORT_WEBHOOK_DEV }}
+          # ── Sentry ──
+          TF_VAR_sentry_dsn: ${{ secrets.TF_VAR_SENTRY_DSN }}
+          TF_VAR_sentry_auth_token: ${{ secrets.TF_VAR_SENTRY_AUTH_TOKEN }}
+          # ── Jobs S3 (R2) — required so audio_transcoder_s3_* coalesce() in
+          # main.tf has a non-null fallback. Same vars deploy-dev passes. ──
+          # Per-env R2 tokens — each scoped only to its own bucket so a leak
+          # in one env doesn't blow open the other. Unsuffixed = prod for
+          # historical reasons (worth renaming to _PROD later for symmetry).
+          TF_VAR_storage_s3_access_key_id: ${{ inputs.environment == 'prod' && secrets.STORAGE_S3_ACCESS_KEY_ID_PROD || secrets.STORAGE_S3_ACCESS_KEY_ID_DEV }}
+          TF_VAR_storage_s3_secret_access_key: ${{ inputs.environment == 'prod' && secrets.STORAGE_S3_SECRET_ACCESS_KEY_PROD || secrets.STORAGE_S3_SECRET_ACCESS_KEY_DEV }}
+          TF_VAR_storage_s3_public_base_url: ${{ inputs.environment == 'prod' && secrets.STORAGE_S3_PUBLIC_BASE_URL_PROD || secrets.STORAGE_S3_PUBLIC_BASE_URL_DEV }}
+          # ── GDPR consent IP hash salt (per-env) ──
+          TF_VAR_consent_ip_hash_salt: ${{ inputs.environment == 'prod' && secrets.CONSENT_IP_HASH_SALT_PROD || secrets.CONSENT_IP_HASH_SALT_DEV }}
+        run: |
+          set -o pipefail
+          if [[ "${{ inputs.environment }}" == "prod" ]]; then
+            terraform -chdir=infra/terraform apply -auto-approve -no-color -input=false -var-file=envs/prod/prod.tfvars 2>&1 | tee /tmp/tf-apply.log
+          else
+            terraform -chdir=infra/terraform apply -auto-approve -no-color -input=false -var-file=envs/dev/dev.tfvars 2>&1 | tee /tmp/tf-apply.log
+          fi
+
+      # Forgejo's API exposes no run logs, so on failure post the terraform
+      # error blocks to the ops Discord (same channel the apps alert to).
+      # Best-effort — never fails the job further.
+      - name: Report terraform errors to Discord
+        if: failure()
+        run: |
+          WEBHOOK="${{ inputs.environment == 'prod' && secrets.DISCORD_ALERTS_WEBHOOK_PROD || secrets.DISCORD_ALERTS_WEBHOOK_DEV }}"
+          [[ -z "$WEBHOOK" ]] && exit 0
+          TAIL=$(grep -B1 -A12 '^Error\|^│ Error' /tmp/tf-apply.log 2>/dev/null | head -c 1600)
+          [[ -z "$TAIL" ]] && TAIL=$(tail -c 1600 /tmp/tf-apply.log 2>/dev/null)
+          PAYLOAD=$(TF_TAIL="$TAIL" python3 -c 'import json,os; print(json.dumps({"content": "🟥 terraform apply (${{ inputs.environment }}) failed:\n```\n" + os.environ.get("TF_TAIL","(no log)") + "\n```"}))')
+          curl -fsSL -m 10 -X POST "$WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD" || true
+
+  migrate_db:
+    name: Run Prisma migrations (${{ inputs.environment }})
+    needs: [apply]
+    # Runs only when `apply` succeeded AND the operator did not opt out.
+    # Default (skip_migrate=false) always migrates, so an apply that rolls a
+    # new Cloud Run revision (a template change re-pulls the mutable :env tag's
+    # current digest — i.e. possibly newer code) can never silently leave the
+    # DB behind. Skipping is a conscious, logged choice — not a default.
+    if: ${{ !cancelled() && needs.apply.result == 'success' && inputs.skip_migrate != true }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    # Ordering note: migrations run AFTER `apply`, not before, on purpose.
+    # migrate_db reads DATABASE_URL from the Secret Manager entry
+    # (hf-${env}-database-url) that `apply` *creates* on a fresh-env bootstrap —
+    # migrating first would fail because the secret doesn't exist yet. `apply`
+    # with mutable-tag images (:dev/:prod) does not itself create a new revision
+    # unless the service template changes, so this path rarely rolls new code;
+    # when it does, the migration below keeps the schema in sync and, on
+    # failure, pages ops loudly (see the failure alert) instead of drifting.
+    #
+    # If `apply` created or replaced the Neon project, the DB is empty and
+    # the running Cloud Run revision will crash on next startup probe. Run
+    # migrations here so a fresh DB doesn't leave the env broken until
+    # somebody triggers redeploy-{env} separately.
+    #
+    # Idempotent — running migrate deploy when there's nothing pending
+    # against an already-migrated DB is a no-op, so this is safe to run
+    # on every apply.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Fetch DATABASE_URL from Secret Manager
+        # Source of truth is hf-${env}-database-url, written by secrets.tf
+        # from the Neon project's pooler URI. Same pattern as deploy-dev.
+        run: |
+          url="$(gcloud secrets versions access latest \
+            --secret=hf-${{ inputs.environment }}-database-url \
+            --project=hearthfire-491918)"
+          echo "::add-mask::${url}"
+          echo "DATABASE_URL=${url}" >> "$GITHUB_ENV"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm prisma:gen
+
+      - name: Run prisma migrate deploy
+        run: pnpm db:migrate:deploy
+
+      # A failed migration here is the schema-ahead condition: `apply` already
+      # ran (and may have rolled a new revision), so a broken migrate means the
+      # DB is behind the live code. Forgejo exposes no run-log API, so page ops
+      # on the same channel the apps alert to. Best-effort — never fails further.
+      - name: Report migration failure to Discord
+        if: failure()
+        run: |
+          WEBHOOK="${{ inputs.environment == 'prod' && secrets.DISCORD_ALERTS_WEBHOOK_PROD || secrets.DISCORD_ALERTS_WEBHOOK_DEV }}"
+          [[ -z "$WEBHOOK" ]] && exit 0
+          MSG="🟥 prisma migrate deploy (${{ inputs.environment }}) FAILED after terraform apply — DB may be behind live Cloud Run code. Investigate + re-run redeploy-${{ inputs.environment }} once the migration is fixed."
+          PAYLOAD=$(MSG="$MSG" python3 -c 'import json,os; print(json.dumps({"content": os.environ["MSG"]}))')
+          curl -fsSL -m 10 -X POST "$WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD" || true

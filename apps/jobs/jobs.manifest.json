@@ -1,0 +1,274 @@
+{
+  "$comment": "Single source of truth for job infrastructure. Read by Terraform (Cloud Scheduler, Pub/Sub) and TypeScript (schedule metadata). Run the pre-commit hook or `pnpm -C apps/jobs validate:manifest` to check for drift.",
+  "scheduled": {
+    "community.dispatch-rsvp-confirmations": {
+      "description": "Drain the RSVP-confirmation outbox and send each newly-RSVP'd attendee an in-app + email confirmation with event details and links to the event page and /my-rsvps, with retry and dead-lettering.",
+      "cron": "*/2 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "community.purge-dispatched-rsvp-notices": {
+      "description": "Delete dispatched RSVP-confirmation notices past the retention window so (eventId, humanId) linkage rows don't accumulate at rest indefinitely. Never deletes undispatched/in-flight notices.",
+      "cron": "30 4 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "community.refresh-recurring-dates": {
+      "description": "Rolling re-expansion of recurring community listings: tops up each listing's EventDate window and re-pins Event.startsAt to the next upcoming date so recurring listings stay 'upcoming' in discovery + geo×category SEO.",
+      "cron": "15 5 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "booking-requests.auto-expire": {
+      "description": "Daily expiry of open (PENDING/VIEWED) performer booking requests past their TTL.",
+      "cron": "30 2 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "events.expire-applications": {
+      "description": "Nightly expiry of PENDING event-application submissions whose form closed more than the grace window (7 days) ago — flips them to EXPIRED in one batch, no emails.",
+      "cron": "45 2 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "post-event-prompts.enqueue": {
+      "description": "Daily sweep that enqueues post-event prompts into the shared PostEventPrompt outbox: PERFORMER prompts for completed platform-booked gigs, then ATTENDEE prompts for scanned ticket holders of ended events (performer-prompted humans excluded). Idempotent via the (eventId, humanId, audience) unique index.",
+      "cron": "0 15 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "post-event-prompts.dispatch": {
+      "description": "Drain the post-event prompt outbox: one-time in-app + email post-gig review prompt per performer, deep-linking to /review-a-place, with retry and dead-lettering. ATTENDEE prompts stay pending (dispatch-gated) until the attendee review form ships.",
+      "cron": "30 15 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "attendee-reviews.recompute-aggregates": {
+      "description": "Weekly rebuild of the anonymized attendee-review aggregate snapshots (threshold-gated, bucketed) served on event, venue, organizer and series surfaces. Weekly on purpose: the delay defeats temporal correlation.",
+      "cron": "0 7 * * 1",
+      "timezone": "Etc/UTC"
+    },
+    "attendee-review-digests.send": {
+      "description": "Weekly attendee review-prompt email digest: one email per human listing their un-reviewed, still-in-window attended shows, with a one-click unsubscribe (List-Unsubscribe header) and 3-strike soft auto-suppression. In-app prompts are unaffected. Idempotent per (human, week) via NotificationDigestLog.",
+      "cron": "0 16 * * 4",
+      "timezone": "Etc/UTC"
+    },
+    "analytics.event-daily-stats": {
+      "description": "Nightly aggregation of per-event sell-through, revenue, and ticket stats.",
+      "cron": "30 3 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "analytics.resale-price-snapshots": {
+      "description": "Nightly refresh of resale price suggestions based on recent market data.",
+      "cron": "0 4 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "events.dispatch-change-notifications": {
+      "description": "Drain the event-change notification outbox (cancel / reschedule / venue-change) and fan each notice out to its watchers (savers + RSVPers) and refunded buyers over in-app + email, with retry and dead-lettering.",
+      "cron": "*/2 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "events.address-reveal-notify": {
+      "description": "Notify active ticket holders of OBSCURED events whose addressRevealAt just crossed that the exact address is now live (in-app forced on + email/push per preference). Idempotent via the per-event addressRevealNotifiedAt cursor.",
+      "cron": "*/15 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "events.purge-dispatched-change-notices": {
+      "description": "Delete dispatched event-change notices past the retention window so the buyer humanIds and refund amounts persisted in CANCELLED payloads don't live at rest indefinitely. Never deletes undispatched/in-flight notices.",
+      "cron": "0 4 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "places.cleanup-stale-verification-docs": {
+      "description": "Daily cleanup of orphaned verification documents from R2 storage.",
+      "cron": "0 3 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "places.recalculate-place-stats": {
+      "description": "Recalculates aggregate stats (payout, scores, draw, flags, genre cloud) for places with stale review data.",
+      "cron": "*/15 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "places.recompute-public-snapshots": {
+      "description": "Weekly rebuild of the anonymized public review snapshots (threshold-gated, bucketed aggregates) served on place pages. Weekly on purpose: the delay defeats temporal correlation.",
+      "cron": "0 6 * * 1",
+      "timezone": "Etc/UTC"
+    },
+    "humans.compute-human-stats": {
+      "description": "Recomputes materialized performer stats from attributions, events, and follows.",
+      "cron": "10 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "orgs.compute-org-stats": {
+      "description": "Recomputes materialized organization stats from events, orders, attributions, and follows.",
+      "cron": "20 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "search.full-reindex": {
+      "description": "Rebuild the selected search backend index (events, humans, places, organizations) from scratch.",
+      "cron": "0 3 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "search.reindex-scheduled-price-flips": {
+      "description": "Re-index events whose ticket-type scheduled price change (TicketType.scheduledPriceAt) crossed inside the scan window, so the search index's materialized minPaidPriceCents stops advertising the pre-flip price. Price stays read-time truth everywhere that takes money; this only refreshes a derived cache. Idempotent (the document is rewritten from source rows), and the 6h lookback absorbs cron drift. If it never runs, browse cards go stale until the nightly full reindex — never a mispriced sale.",
+      "cron": "*/15 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "stripe-connect.reconcile-capabilities": {
+      "description": "Pull-based backstop for connected-account capability state. `account.updated` is the only push writer of Payee.chargesEnabled/payoutsEnabled, so a webhook that is never delivered or fails our shape guard leaves an org silently unable to publish a paid event. Re-reads the stalest accounts through the same derivation the webhook uses, and reports how many had drifted. Runs before the payout batch so a healed payee is payable the same night.",
+      "cron": "20 22 * * *",
+      "timezone": "America/Chicago"
+    },
+    "settlements.run-batch": {
+      "description": "Consolidated per-payee payout batch.",
+      "cron": "0 0 * * *",
+      "timezone": "America/Chicago"
+    },
+    "settlements.verify-ledger": {
+      "_comment": "Terraform-visible: this entry mints a Cloud Scheduler job on the next apply. Deliberately 4h AFTER settlements.run-batch (midnight CT) so the sweep audits the night's PAYOUT/RESERVE writes at rest instead of racing them; the HTTP endpoint works (manual trigger from the platform jobs page) as soon as the handler deploys, before any apply.",
+      "description": "Read-only ledger reconciliation sweep (ledger-authoritative-settlement spec §9): recomputes PayeeLedgerBalance rollups from entries, checks per-(order,payee) refund conservation, and flags finalized orders missing SETTLEMENT_CREDITs. Reports via Sentry + Discord; never repairs.",
+      "cron": "0 4 * * *",
+      "timezone": "America/Chicago"
+    },
+    "sitemaps.generate": {
+      "description": "Generate sitemap XML files for SEO.",
+      "cron": "30 1 * * *",
+      "timezone": "Etc/UTC",
+      "payload": "{\"trigger\":{\"reason\":\"nightly\"},\"baseUrl\":\"https://ithasfire.com\"}"
+    },
+    "tickets.expire-resale-claims": {
+      "description": "Transition all open resale claims past their deadline to expired status.",
+      "cron": "0 2 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "tickets.expire-resale-listings": {
+      "description": "Expire ACTIVE resale listings past their expiry or event end.",
+      "cron": "0 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "tickets.release-expired-carts": {
+      "description": "Cancel stale PENDING orders and their Stripe PaymentIntents.",
+      "cron": "*/5 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "tickets.release-expired-holds": {
+      "description": "Release seat holds that have exceeded their TTL.",
+      "cron": "*/5 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "volunteers.reminders-24h": {
+      "description": "Email/SMS/in-app reminders to volunteers ~24h before their shift. Window is +23h45m to +24h15m, so the */15 tick catches every shift exactly once.",
+      "cron": "*/15 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "volunteers.reminders-1h": {
+      "description": "Email/SMS/in-app reminders to volunteers ~1h before their shift. Window is +55m to +65m, so the */5 tick catches every shift exactly once.",
+      "cron": "*/5 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "storage.sweep-orphaned-uploads": {
+      "description": "Clean up orphaned audio and image uploads — stalled transcodes, images no event still references, expired soft-deletes.",
+      "cron": "0 4 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "storage.drain-pending-deletions": {
+      "description": "Drain the object-storage deletion outbox: delete keys/prefixes enqueued in-transaction by event deletes, with exponential backoff and dead-lettering.",
+      "cron": "*/15 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "moderation.report-queue-health": {
+      "description": "Hourly health read over the image-moderation queue: images overdue for draining, images that failed to scan recently, images that exhausted the requeue cap, and flagged images awaiting human review too long. Raises a Discord alert ONLY when a count is non-zero, so an alert always means something.",
+      "cron": "5 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "moderation.requeue-degraded": {
+      "description": "Revive dead-lettered DEGRADED image-moderation rows (status FLAGGED + degraded, never reviewed, under the requeue cap) back to PENDING so the drain re-scores them once the provider recovers. Only rows the SCANNER failed on are eligible; a real content verdict is never revived. Hourly is deliberate: the drain's own retry window already covers outages up to ~3 days, so this is the slow backstop for anything longer.",
+      "cron": "0 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "moderation.drain-image-moderations": {
+      "description": "Drain the image-moderation outbox (PENDING ImageModerationRecord rows) through the moderation provider (Azure AI Content Safety, or the auto-approving stub when unconfigured), writing verdicts back onto each record. Retries transient provider failures with exponential backoff and dead-letters exhausted rows to FLAGGED+degraded so held images clear (or surface for review) quickly.",
+      "cron": "*/2 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "support.purge-resolved-threads": {
+      "description": "Delete resolved support threads (and their messages) past the retention window (SUPPORT_RETENTION_DAYS).",
+      "cron": "0 5 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "push.drain-receipts": {
+      "description": "Poll Expo push receipts for recently sent notifications and disable devices whose receipts report DeviceNotRegistered/InvalidCredentials (Expo only surfaces many dead installs in the receipt phase ~15min after the send ticket returns ok). Resolved and expired rows are deleted, so the PushReceipt outbox drains to empty.",
+      "cron": "*/15 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "idempotency.purge-expired": {
+      "description": "Delete idempotency records past their retention window (no-op on the Redis backend, which expires keys itself).",
+      "cron": "45 5 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "memberships.refresh-tax-jurisdictions": {
+      "description": "Re-confirm cached membership tax rates against the rate provider, archiving and replacing any that changed and repointing affected subscriptions. The ONLY trigger that can catch a jurisdiction changing its own rate — no member-side event ever signals one, so without this a member who never moves would be billed a stale rate indefinitely.",
+      "cron": "40 6 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "jobs.prune-run-history": {
+      "description": "Trim JobRun history to the retention cap across all jobs (no-op on the Redis backend, which trims on write).",
+      "cron": "50 5 * * *",
+      "timezone": "Etc/UTC"
+    }
+  },
+  "queue": {
+    "admin.csv-export": {
+      "description": "Background CSV export for admin tables.",
+      "topic": "hf-admin-csv-export"
+    },
+    "announcements.dispatch-notifications": {
+      "description": "Dispatches in-app / push notifications for an announcement.",
+      "topic": "hf-announcement-notifications"
+    },
+    "search.index-event": {
+      "description": "Index a single event into the selected search backend.",
+      "topic": "hf-index-event"
+    },
+    "search.index-human": {
+      "description": "Index a single human/profile into the selected search backend.",
+      "topic": "hf-index-human"
+    },
+    "search.index-place": {
+      "description": "Index a single place/venue into the selected search backend.",
+      "topic": "hf-index-place"
+    },
+    "search.index-organization": {
+      "description": "Index a single organization into the selected search backend.",
+      "topic": "hf-index-organization"
+    },
+    "settlements.execute-transfer": {
+      "_comment": "HANDLERLESS as of the 2026-08-10 ledger cutover — the per-settlement transfer job is deleted; money moves only through settlements.run-batch. Entry retained deliberately: the topic + push subscription are Terraform-managed (infra/terraform/infracost-usage*.yml reference them), so removing it here is an INFRA change, not a code one. Follow-up: retire the topic and drop this entry together.",
+      "description": "DELETED job. Topic retained pending Terraform cleanup.",
+      "topic": "hf-execute-settlement-transfer"
+    }
+  },
+  "legacy_queue": {
+    "_comment": "Pub/Sub topics from before the manifest existed. No code handlers — clean up or migrate as handlers are ported.",
+    "tickets.issue": {
+      "topic": "hf-issue-tickets",
+      "description": "Issue tickets for a completed order."
+    },
+    "tickets.hold": {
+      "topic": "hf-hold-tickets-for-checkout",
+      "description": "Hold tickets during checkout flow."
+    },
+    "tickets.generate-qr": {
+      "topic": "hf-generate-and-store-ticket-qr",
+      "description": "Generate and store QR code for a ticket."
+    },
+    "tickets.send-reminder": {
+      "topic": "hf-send-event-reminder",
+      "description": "Send event reminder notification to a user."
+    },
+    "emails.order-confirmation": {
+      "topic": "hf-send-order-confirmation-email",
+      "description": "Send order confirmation email."
+    },
+    "accounts.sync-stripe": {
+      "topic": "hf-stripe-account-capabilities-sync",
+      "description": "Sync Stripe Connect account capabilities."
+    },
+    "search.rebuild-event-index": {
+      "topic": "hf-rebuild-event-search-index",
+      "description": "Rebuild search index for an event."
+    }
+  }
+}

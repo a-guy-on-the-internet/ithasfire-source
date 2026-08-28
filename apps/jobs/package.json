@@ -1,0 +1,37 @@
+{
+  "name": "jobs",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/apps/jobs/src/index.js",
+    "test": "vitest --run",
+    "test:watch": "vitest",
+    "validate:manifest": "tsx src/scripts/validate-manifest.ts",
+    "test:payout-notification": "tsx src/scripts/test-payout-notification.ts"
+  },
+  "dependencies": {
+    "@prisma/adapter-pg": "^7.2.0",
+    "@sentry/node": "^10.46.0",
+    "@th/adapters": "workspace:^",
+    "@th/ui-email": "workspace:^",
+    "@th/core": "workspace:^",
+    "@th/db": "workspace:^",
+    "@th/errors": "workspace:^",
+    "@th/ports": "workspace:^",
+    "dotenv": "^17.2.2",
+    "fastify": "^5.6.0",
+    "ioredis": "^5.6.1",
+    "pg": "^8.11.3",
+    "tsx": "4.23.1",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@th/test-utils": "workspace:^",
+    "@th/tsconfig": "workspace:^",
+    "@types/pg": "^8.11.6",
+    "vitest": "^3.2.4"
+  }
+}

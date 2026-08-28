@@ -1,0 +1,63 @@
+name: Terraform force-unlock (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      workspace:
+        description: "Terraform workspace to unlock"
+        type: choice
+        required: true
+        options:
+          - dev
+          - prod
+      lock_id:
+        description: "Lock ID to force-unlock (from the error message)"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  force-unlock:
+    name: Force-unlock (${{ inputs.workspace }})
+    runs-on: ubuntu-latest
+    # See terraform-clear-lock-object.yml for why no environment: scoping.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.6
+
+      # Forgejo Actions doesn't inject GitHub OIDC tokens — match the
+      # working `terraform-apply.yml` pattern and use the SA key.
+      - name: Auth to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Terraform init (cached + retry, GCS backend)
+        run: bash infra/terraform/scripts/tf-init-cached.sh infra/terraform -input=false
+
+      - name: Select workspace
+        run: terraform -chdir=infra/terraform workspace select "${{ inputs.workspace }}"
+
+      - name: Force-unlock
+        run: terraform -chdir=infra/terraform force-unlock -force "${{ inputs.lock_id }}"

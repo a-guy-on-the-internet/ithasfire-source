@@ -1,0 +1,339 @@
+name: Redeploy prod (no rebuild)
+
+# Re-runs the post-build phases of deploy-prod.yml when the prod images
+# are already in Artifact Registry (e.g. a previous run failed at
+# migrations or Cloud Run roll). Skips promotions and web build entirely.
+#
+# Ordering note: terraform_apply runs BEFORE migrate_db. The DB URL the
+# migration job reads from Secret Manager (hf-prod-database-url) is
+# *created* by terraform_apply on first bootstrap — running migrations
+# first means the secret doesn't exist yet and the job fails. The main
+# deploy-prod.yml workflow has the reverse order, which is fine for
+# steady-state but fails the very first time. Keep this one in
+# terraform-first order so re-runs after a fresh bootstrap work cleanly.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hf-prod
+  cancel-in-progress: false
+
+jobs:
+  # ── Terraform apply first: creates / updates Secret Manager entries the
+  # migration job depends on, plus Cloud Run env-var bindings, IAM, DNS.
+  terraform_apply:
+    name: Terraform apply (prod)
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.6
+
+      - name: Terraform init + apply (prod)
+        working-directory: infra/terraform
+        env:
+          TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_cloudflare_api_key: ${{ secrets.TF_VAR_CLOUDFLARE_API_KEY }}
+          TF_VAR_cloudflare_email: ${{ secrets.TF_VAR_CLOUDFLARE_EMAIL }}
+          TF_VAR_stripe_secret_key: ${{ secrets.STRIPE_SECRET_KEY_PROD }}
+          TF_VAR_stripe_webhook_secret: ${{ secrets.STRIPE_WEBHOOK_SECRET_PROD }}
+          TF_VAR_stripe_connect_webhook_secret: ${{ secrets.STRIPE_CONNECT_WEBHOOK_SECRET_PROD }}
+          TF_VAR_stripe_publishable_key: ${{ secrets.STRIPE_PUBLISHABLE_KEY_PROD }}
+          TF_VAR_turnstile_secret_key: ${{ secrets.TURNSTILE_SECRET_KEY_PROD }}
+          TF_VAR_better_auth_secret: ${{ secrets.BETTER_AUTH_SECRET_PROD }}
+          TF_VAR_origin_shared_secret: ${{ secrets.ORIGIN_SHARED_SECRET_PROD }}
+          TF_VAR_consent_ip_hash_salt: ${{ secrets.CONSENT_IP_HASH_SALT_PROD }}
+          TF_VAR_resend_api_key: ${{ secrets.RESEND_API_KEY_PROD }}
+          TF_VAR_resend_webhook_secret: ${{ secrets.RESEND_WEBHOOK_SECRET_PROD }}
+          TF_VAR_aws_access_key_id: ${{ secrets.TF_VAR_AWS_ACCESS_KEY_ID }}
+          TF_VAR_aws_secret_access_key: ${{ secrets.TF_VAR_AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_aws_assume_role_arn: ${{ secrets.TF_VAR_AWS_ASSUME_ROLE_ARN }}
+          TF_VAR_google_client_id: ${{ secrets.TF_VAR_GOOGLE_CLIENT_ID }}
+          TF_VAR_google_client_secret: ${{ secrets.TF_VAR_GOOGLE_CLIENT_SECRET }}
+          TF_VAR_google_web_client_id: ${{ secrets.TF_VAR_GOOGLE_WEB_CLIENT_ID }}
+          TF_VAR_google_ios_client_id: ${{ secrets.TF_VAR_GOOGLE_IOS_CLIENT_ID }}
+          TF_VAR_google_android_client_id: ${{ secrets.TF_VAR_GOOGLE_ANDROID_CLIENT_ID }}
+          TF_VAR_apple_client_id: ${{ secrets.TF_VAR_APPLE_CLIENT_ID }}
+          TF_VAR_apple_client_secret: ${{ secrets.TF_VAR_APPLE_CLIENT_SECRET }}
+          TF_VAR_apple_app_bundle_identifier: ${{ secrets.TF_VAR_APPLE_APP_BUNDLE_IDENTIFIER }}
+          # Apple Wallet pass signing. Both default to null in variables.tf, so
+          # omitting them here does not fail the apply — it silently leaves the
+          # API on the stub wallet adapter. apple_team_id and
+          # apple_pass_type_identifier are public and live in the tfvars.
+          TF_VAR_apple_pass_certificate_p12_base64: ${{ secrets.APPLE_PASS_CERTIFICATE_P12_BASE64_PROD }}
+          TF_VAR_apple_pass_certificate_password: ${{ secrets.APPLE_PASS_CERTIFICATE_PASSWORD_PROD }}
+          TF_VAR_neon_api_key: ${{ secrets.TF_VAR_NEON_API_KEY }}
+          TF_VAR_storage_s3_access_key_id: ${{ secrets.STORAGE_S3_ACCESS_KEY_ID_PROD }}
+          TF_VAR_storage_s3_secret_access_key: ${{ secrets.STORAGE_S3_SECRET_ACCESS_KEY_PROD }}
+          TF_VAR_storage_s3_public_base_url: ${{ secrets.STORAGE_S3_PUBLIC_BASE_URL_PROD }}
+          TF_VAR_upstash_api_key: ${{ secrets.TF_VAR_UPSTASH_API_KEY }}
+          TF_VAR_upstash_email: ${{ secrets.TF_VAR_UPSTASH_EMAIL }}
+          TF_VAR_redis_url: ${{ secrets.REDIS_URL_PROD }}
+          TF_VAR_meilisearch_master_key: ${{ secrets.MEILISEARCH_MASTER_KEY_PROD }}
+          TF_VAR_ziptax_api_key: ${{ secrets.TF_VAR_ZIPTAX_API_KEY }}
+          TF_VAR_geoapify_api_key: ${{ secrets.TF_VAR_GEOAPIFY_API_KEY }}
+          TF_VAR_azure_content_safety_endpoint: ${{ secrets.TF_VAR_AZURE_CONTENT_SAFETY_ENDPOINT }}
+          TF_VAR_azure_content_safety_key: ${{ secrets.TF_VAR_AZURE_CONTENT_SAFETY_KEY }}
+          TF_VAR_jobs_api_key: ${{ secrets.JOBS_API_KEY_PROD }}
+          TF_VAR_unsubscribe_secret: ${{ secrets.UNSUBSCRIBE_SECRET_PROD }}
+          TF_VAR_volunteer_scan_token_secret: ${{ secrets.VOLUNTEER_SCAN_TOKEN_SECRET_PROD }}
+          TF_VAR_discord_alerts_webhook: ${{ secrets.DISCORD_ALERTS_WEBHOOK_PROD }}
+          TF_VAR_discord_support_webhook: ${{ secrets.DISCORD_SUPPORT_WEBHOOK_PROD }}
+          TF_VAR_sentry_dsn: ${{ secrets.TF_VAR_SENTRY_DSN }}
+          TF_VAR_sentry_auth_token: ${{ secrets.TF_VAR_SENTRY_AUTH_TOKEN }}
+        run: |
+          bash scripts/tf-init-cached.sh . -upgrade
+          terraform workspace select prod 2>/dev/null || terraform workspace new prod
+          terraform apply -auto-approve -var-file=envs/prod/prod.tfvars
+
+  migrate_db:
+    name: Run Prisma migrations (prod)
+    needs: [terraform_apply]
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Fetch DATABASE_URL from Secret Manager
+        run: |
+          url="$(gcloud secrets versions access latest --secret=hf-prod-database-url --project=hearthfire-491918)"
+          echo "::add-mask::${url}"
+          echo "DATABASE_URL=${url}" >> "$GITHUB_ENV"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm prisma:gen
+
+      - name: Run prisma migrate deploy
+        run: pnpm db:migrate:deploy
+
+  deploy_prod:
+    name: Deploy prod (roll Cloud Run)
+    needs: [migrate_db]
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Deploy Cloud Run services (prod)
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          TAG: prod
+          SERVICE_API_NAME: ${{ vars.CLOUD_RUN_PROD_API_SERVICE }}
+          SERVICE_WEB_NAME: ${{ vars.CLOUD_RUN_PROD_WEB_SERVICE }}
+          SERVICE_JOBS_NAME: ${{ vars.CLOUD_RUN_PROD_JOBS_SERVICE }}
+        run: |
+          repo_host="${REGION}-docker.pkg.dev"
+
+          deploy_service() {
+            local svc="$1" img="$2"
+            gcloud run deploy "$svc" \
+              --region "$REGION" --image "$img" --quiet
+          }
+
+          deploy_service "${SERVICE_API_NAME}"  "${repo_host}/${PROJECT_ID}/${AR_REPO}/api:${TAG}"
+          deploy_service "${SERVICE_WEB_NAME}"  "${repo_host}/${PROJECT_ID}/${AR_REPO}/web:${TAG}"
+          deploy_service "${SERVICE_JOBS_NAME}" "${repo_host}/${PROJECT_ID}/${AR_REPO}/jobs:${TAG}"
+
+  post_deploy_verify:
+    name: Post-deploy verification
+    needs: [deploy_prod]
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Verify Cloud Run readiness and live endpoints
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          SERVICE_API_NAME: ${{ vars.CLOUD_RUN_PROD_API_SERVICE }}
+          SERVICE_WEB_NAME: ${{ vars.CLOUD_RUN_PROD_WEB_SERVICE }}
+          SERVICE_JOBS_NAME: ${{ vars.CLOUD_RUN_PROD_JOBS_SERVICE }}
+        run: |
+          set -euo pipefail
+
+          describe_service() {
+            local service_name="$1"
+            local label="$2"
+            echo "Checking Cloud Run service: ${label} (${service_name})"
+            gcloud run services describe "$service_name" \
+              --region "$REGION" \
+              --project "$PROJECT_ID" \
+              --format='yaml(metadata.name,status.url,status.latestReadyRevisionName,status.conditions)'
+          }
+
+          get_service_url() {
+            local service_name="$1"
+            gcloud run services describe "$service_name" \
+              --region "$REGION" \
+              --project "$PROJECT_ID" \
+              --format='value(status.url)'
+          }
+
+          probe_url() {
+            local label="$1"
+            local url="$2"
+            echo "Probing ${label}: ${url}"
+            curl --fail --silent --show-error --location --max-time 30 "$url" > /dev/null
+          }
+
+          describe_service "$SERVICE_API_NAME" api
+          describe_service "$SERVICE_JOBS_NAME" jobs
+          describe_service "$SERVICE_WEB_NAME" web
+
+          api_url="$(get_service_url "$SERVICE_API_NAME")"
+          jobs_url="$(get_service_url "$SERVICE_JOBS_NAME")"
+          web_url="$(get_service_url "$SERVICE_WEB_NAME")"
+
+          [[ -n "$api_url" ]]
+          [[ -n "$jobs_url" ]]
+          [[ -n "$web_url" ]]
+
+          # Note: jobs is ingress-restricted (only Pub/Sub push / scheduler /
+          # API-proxy SAs can invoke), so we can't curl /health unauthenticated
+          # from the runner. The Ready condition check above is sufficient
+          # verification — the container booted and Cloud Run is routing.
+          probe_url "api /health" "${api_url%/}/health"
+          probe_url "web /" "${web_url%/}/"
+
+  seed_admin:
+    name: Seed platform admin (prod)
+    needs: [deploy_prod]
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm prisma:gen
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        id: setup_gcloud
+        # Retried below — see the note at the first occurrence in deploy-dev.yml.
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup gcloud (retry)
+        if: steps.setup_gcloud.outcome == 'failure'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Fetch DATABASE_URL from Secret Manager
+        run: |
+          url="$(gcloud secrets versions access latest --secret=hf-prod-database-url --project=hearthfire-491918)"
+          echo "::add-mask::${url}"
+          echo "DATABASE_URL=${url}" >> "$GITHUB_ENV"
+
+      - name: Seed platform admin
+        env:
+          PROD_SEED_ADMIN_EMAIL: ${{ secrets.PROD_SEED_ADMIN_EMAIL }}
+          PROD_SEED_ADMIN_PASSWORD: ${{ secrets.PROD_SEED_ADMIN_PASSWORD }}
+        run: |
+          if [[ -z "${PROD_SEED_ADMIN_EMAIL}" || -z "${PROD_SEED_ADMIN_PASSWORD}" ]]; then
+            echo "::error::PROD_SEED_ADMIN_EMAIL and PROD_SEED_ADMIN_PASSWORD must be set in the 'prod' environment secrets."
+            exit 1
+          fi
+          pnpm -F api exec tsx src/scripts/seed-platform-admin.ts \
+            --email "${PROD_SEED_ADMIN_EMAIL}" \
+            --password "${PROD_SEED_ADMIN_PASSWORD}" \
+            --name "Platform Admin" \
+            --email-verified

@@ -1,0 +1,36 @@
+# Version control
+.git
+.gitignore
+
+# Dependencies and build artifacts
+node_modules
+**/node_modules
+.pnpm-store
+.pnpmfile.cjs
+.turbo
+**/.turbo
+dist
+**/dist
+coverage
+**/coverage
+*.log
+*.tsbuildinfo
+
+# Editor and OS files
+.vscode
+.idea
+.DS_Store
+
+# Environment files
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
+# Local tooling and caches
+cypress
+.tmp
+.tmp*
+tmp

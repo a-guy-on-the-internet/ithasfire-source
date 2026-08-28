@@ -1,0 +1,161 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Prisma: generate (packages/db)",
+			"type": "shell",
+			"command": "pnpm prisma:gen",
+			"problemMatcher": [],
+			"group": "build",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			}
+		},
+		{
+			"label": "Prisma: validate schema",
+			"type": "shell",
+			"command": "pnpm db:validate"
+		},
+		{
+			"label": "Infra: docker compose up (db+redis)",
+			"type": "shell",
+			"command": "docker compose up -d",
+			"options": {
+				"cwd": "${workspaceFolder}/infra/docker"
+			},
+			"problemMatcher": [],
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			}
+		},
+		{
+			"label": "Infra: docker compose down",
+			"type": "shell",
+			"command": "docker compose down",
+			"options": {
+				"cwd": "${workspaceFolder}/infra/docker"
+			},
+			"problemMatcher": [],
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			}
+		},
+		{
+			"label": "DB: reset (local docker)",
+			"type": "shell",
+			"command": "pnpm db:reset",
+			"problemMatcher": [],
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			}
+		},
+		{
+			"label": "DB: wipe (local docker)",
+			"type": "shell",
+			"command": "pnpm db:wipe",
+			"problemMatcher": [],
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			}
+		},
+		{
+			"label": "API: start detached",
+			"type": "shell",
+			"command": "pnpm api:bg",
+			"problemMatcher": [],
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			}
+		},
+		{
+			"label": "API: stop detached",
+			"type": "shell",
+			"command": "pnpm api:bg:stop",
+			"problemMatcher": [],
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			}
+		},
+		{
+			"label": "API: check status",
+			"type": "shell",
+			"command": "pnpm api:bg:status 2>&1 || echo 'API not running'"
+		},
+		{
+			"label": "Web: dev local",
+			"type": "shell",
+			"command": "pnpm web:dev:local",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "Build: full monorepo",
+			"type": "shell",
+			"command": "pnpm build",
+			"problemMatcher": ["$tsc"]
+		},
+		{
+			"label": "Build: web only",
+			"type": "shell",
+			"command": "pnpm -F web build"
+		},
+		{
+			"label": "Typecheck: base tsconfig",
+			"type": "shell",
+			"command": "pnpm -w tsc -p tsconfig.base.json --noEmit"
+		},
+		{
+			"label": "Test: core use cases",
+			"type": "shell",
+			"command": "pnpm -C packages/core vitest --run --reporter=verbose"
+		},
+		{
+			"label": "Test: platform use cases",
+			"type": "shell",
+			"command": "pnpm -C packages/core exec vitest --run src/use-cases/platform/ --reporter=verbose"
+		},
+		{
+			"label": "E2E: web fullstack-auth-sync (1 worker)",
+			"type": "shell",
+			"command": "pnpm -F web test:e2e -- --workers=1 apps/web/e2e/fullstack-auth-sync.spec.ts",
+			"problemMatcher": [],
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			}
+		},
+		{
+			"label": "E2E: coming-soon-review-form",
+			"type": "shell",
+			"command": "cd apps/web && npx playwright test e2e/coming-soon-review-form.spec.ts --project=guest --reporter=list"
+		},
+		{
+			"label": "GH: recent workflow runs",
+			"type": "shell",
+			"command": "gh run list --repo a-guy-on-the-internet/Hearthfire --limit 10"
+		}
+	]
+}
