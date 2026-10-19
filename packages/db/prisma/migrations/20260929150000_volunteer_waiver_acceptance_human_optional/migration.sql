@@ -1,0 +1,13 @@
+-- Contact-only volunteer signups (an anonymous signup naming an email that
+-- already has an account) still record their waiver acceptance, but it is
+-- not attributed to that account: humanId is NULL. Relaxing NOT NULL is
+-- non-destructive; existing rows keep their humanId, and the FK, cascade
+-- and (humanId, waiverTemplateId) index are unchanged.
+--
+-- ROLLBACK NEEDS A DATA DECISION. Re-adding NOT NULL fails as soon as any
+-- contact-only acceptance row (humanId NULL) exists. Those rows are the only
+-- proof that the volunteer accepted the waiver for their signup, so do not
+-- just delete them: decide first whether to keep them elsewhere (e.g. copy to
+-- the signup's audit trail, which already holds the same evidence) or to
+-- drop the contact-only signups they belong to.
+ALTER TABLE "VolunteerWaiverAcceptance" ALTER COLUMN "humanId" DROP NOT NULL;

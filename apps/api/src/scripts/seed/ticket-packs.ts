@@ -1,6 +1,6 @@
 /**
  * ticket-packs.ts — the launch ticket-type catalogue (FR-013 of
- * docs/specs/2026-08-04/ticket-type-packs.spec.yaml).
+ * docs/specs/2026-08-04/completed/ticket-type-packs.spec.yaml).
  *
  * Four platform-curated packs, seeded through the normal seed path so dev,
  * staging and prod start from the same reviewed baseline. A catalogue row is
@@ -78,7 +78,16 @@ type SeedEntry = {
   minimumCents?: number | null;
   suggestedCents?: number | null;
   capacity: number;
-  doorPriceCents?: number | null;
+  /**
+   * RELATIVE price flip (the template schema's FR-011 encoding). There is no
+   * separate door price (door-sales-same-price-and-tax spec FR-012): "more at
+   * the door" is a price that rises when the event starts, and the door sells
+   * at whatever the event page shows at that moment.
+   */
+  scheduledPriceChange?: {
+    at: { anchor: "EVENT_START" | "EVENT_PUBLISH"; offsetMinutes: number };
+    priceCents: number;
+  } | null;
 };
 
 type SeedTemplate = {
@@ -115,18 +124,25 @@ export const LAUNCH_TICKET_PACKS: SeedPack[] = [
     key: "advance-plus-door",
     name: "Advance + door",
     blurb:
-      "One capacity pool, two prices: cheaper in advance, a little more at the door. Rewards buying ahead without splitting your room.",
+      "One ticket, one capacity pool: cheaper in advance, then the price goes up 24 hours before the show, online and at the door alike. Rewards buying ahead without splitting your room.",
     sortOrder: 1,
     templates: [
       {
         name: "Advance + door",
         entries: [
           {
-            // FR-004's showcase: one FIXED type, one capacity pool, an
-            // advance price and a door override.
+            // One FIXED type, one capacity pool: the advance price until 24
+            // hours before the show, then the day-of price. Same offset as the
+            // web editor's Advance/Door presets (DAY_OF_SHOW_OFFSET_MINUTES in
+            // ticket-type-presets.ts), so walk-ups during doors pay the day-of
+            // price. Online and the door both charge the resolved price
+            // (FR-012: no separate door price).
             name: "General admission",
             priceCents: 1500,
-            doorPriceCents: 2000,
+            scheduledPriceChange: {
+              at: { anchor: "EVENT_START", offsetMinutes: -1440 },
+              priceCents: 2000,
+            },
             capacity: 100,
           },
         ],
@@ -191,7 +207,7 @@ export type EncodedTemplate = {
     resaleAllowed: boolean;
     resaleCapCents: number | null;
     transferAllowed: boolean;
-    doorPriceCents: number | null;
+    scheduledPriceChange: SeedEntry["scheduledPriceChange"];
   }>;
 };
 
@@ -232,7 +248,7 @@ export function encodeTicketPackTemplates(pack: SeedPack): EncodedTemplate[] {
         resaleAllowed: false,
         resaleCapCents: null,
         transferAllowed: true,
-        doorPriceCents: entry.doorPriceCents ?? null,
+        scheduledPriceChange: entry.scheduledPriceChange ?? null,
       })),
     });
 

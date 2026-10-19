@@ -11,6 +11,10 @@ export type TicketFixture = {
   capacity: number;
   /** Link this ticket type to a PlaceLayout section by its stable layout ID (e.g. "ga-floor"). */
   layoutSectionId?: string;
+  /** Pay-what-you-want tiers: "ADJUSTABLE", with a floor and a default. */
+  pricingMode?: "FIXED" | "ADJUSTABLE";
+  minimumCents?: number;
+  suggestedCents?: number;
 };
 
 export type EventSeedFixture = {
@@ -105,6 +109,50 @@ export type PlaceFixture = {
    * VERIFIED, so unverified fixtures keep the CTA hidden regardless.
    */
   acceptsBookingRequests?: boolean;
+  /**
+   * Whether the ATTENDEE review aggregate is published on the public venue
+   * page (default true). `Place.attendeeReviewsPublic` ships
+   * `@default(false)` because in prod it is an owner opt-in — a real venue's
+   * customer feedback stays private until its owner says otherwise. The seed
+   * deliberately diverges: a dev database of venues whose review surfaces are
+   * all switched off cannot exercise the rating block, the aggregate, or the
+   * toggle's ON state. Governs only the attendee pipeline; performer reviews
+   * (`PlaceReview`) are always public and ungated.
+   */
+  attendeeReviewsPublic?: boolean;
+  /**
+   * Physical rooms for this venue, in sort order. OMITTED (the default) keeps
+   * the historical single "Main Space" every seeded place had — which is why
+   * the Space dimension was invisible in dev: with one room per venue, a
+   * space filter has nothing to filter. Supply this on venues that really do
+   * have separable rooms.
+   *
+   * Each entry pins its own id so reseeds are stable and holds can reference
+   * a specific room. The FIRST entry is the default space (sortOrder 0) and
+   * every calendar joins to all of them.
+   */
+  spaces?: { id: string; name: string }[];
+  /**
+   * Extra PROGRAMMING calendars beyond the default "Main Calendar" every
+   * venue gets. Calendars are the stream a booking request routes to
+   * (`BookingRequest.calendarId`) and the venue inbox's second filter
+   * dimension, so a venue with one calendar cannot demonstrate that filter.
+   *
+   * Keyed by slug (unique per place), which is also how booking fixtures
+   * name the calendar they route to.
+   */
+  calendars?: { slug: string; name: string; defaultStartTime?: string }[];
+  /**
+   * Weekly opening hours, applied PLACE-WIDE (`CalendarAvailability` with a
+   * null `calendarId`, which the venue-hierarchy model reads as "every
+   * calendar here").
+   *
+   * Without these a venue's public booking form shows every date as
+   * unavailable and an act cannot submit at all — so a seeded venue with no
+   * hours is a venue the booking loop cannot be exercised against. Set on the
+   * demo org's portfolio so that org is fully driveable out of a fresh seed.
+   */
+  openingHours?: { start: string; end: string };
 };
 
 // ── Regions ──────────────────────────────────────────────────────────────
@@ -129,6 +177,8 @@ export const REGIONS: Array<{ code: string; label: string }> = [
 export const SEED_CATEGORIES: ReadonlyArray<{
   slug: string;
   name: string;
+  /** Spanish name, written to `Category.nameTranslations.es`. */
+  es: string;
   sortOrder: number;
   platformDefault?: boolean;
   /**
@@ -139,22 +189,22 @@ export const SEED_CATEGORIES: ReadonlyArray<{
    */
   seoType?: EventSchemaType;
 }> = [
-  { slug: "music", name: "Music", sortOrder: 0, seoType: "MusicEvent" },
-  { slug: "nightlife", name: "Nightlife", sortOrder: 1, seoType: "MusicEvent" },
-  { slug: "food-drink", name: "Food & Drink", sortOrder: 2 },
-  { slug: "community", name: "Community", sortOrder: 3 },
-  { slug: "film", name: "Film & Media", sortOrder: 4 },
-  { slug: "arts", name: "Arts & Culture", sortOrder: 5 },
-  { slug: "sports", name: "Sports & Fitness", sortOrder: 6 },
-  { slug: "conference", name: "Conference & Workshop", sortOrder: 7 },
+  { slug: "music", name: "Music", es: "Música", sortOrder: 0, seoType: "MusicEvent" },
+  { slug: "nightlife", name: "Nightlife", es: "Vida nocturna", sortOrder: 1, seoType: "MusicEvent" },
+  { slug: "food-drink", name: "Food & Drink", es: "Comida y bebida", sortOrder: 2 },
+  { slug: "community", name: "Community", es: "Comunidad", sortOrder: 3 },
+  { slug: "film", name: "Film & Media", es: "Cine y medios", sortOrder: 4 },
+  { slug: "arts", name: "Arts & Culture", es: "Arte y cultura", sortOrder: 5 },
+  { slug: "sports", name: "Sports & Fitness", es: "Deporte y bienestar", sortOrder: 6 },
+  { slug: "conference", name: "Conference & Workshop", es: "Conferencias y talleres", sortOrder: 7 },
   {
     slug: "support-recovery",
-    name: "Support & Recovery",
+    name: "Support & Recovery", es: "Apoyo y recuperación",
     sortOrder: 8,
     platformDefault: false,
   },
-  { slug: "open-mics", name: "Open Mics", sortOrder: 9, seoType: "MusicEvent" },
-  { slug: "other", name: "Other", sortOrder: 10 },
+  { slug: "open-mics", name: "Open Mics", es: "Micrófono abierto", sortOrder: 9, seoType: "MusicEvent" },
+  { slug: "other", name: "Other", es: "Otros", sortOrder: 10 },
 ];
 
 // ── Tag genre seeds ──────────────────────────────────────────────────────
@@ -393,112 +443,118 @@ export const SEED_TAG_GENRES: TagGenreSeed[] = [
 /**
  * Demo event images from Unsplash (free to use, stable URLs).
  * These rotate through seed events to give visual variety.
+ *
+ * Cropped to 2:3 (`h=1200&fit=crop` on an 800px width) — the gig-flyer shape
+ * the event page is designed around (its poster rail prints a 2:3 file whole
+ * and only clamps taller ones). Landscape stock photos rendered fine but left
+ * the rail empty below a 250px image; a flyer-shaped cover is what a real
+ * organiser uploads.
  */
 export const DEMO_EVENT_IMAGES = [
   // Music/concerts
   {
-    url: "https://images.unsplash.com/photo-1470229722913-7c0e2dbbafd3?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1470229722913-7c0e2dbbafd3?w=800&h=1200&fit=crop&q=80",
     category: "music",
   },
   {
-    url: "https://images.unsplash.com/photo-1514525253161-7a46d19cd819?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1514525253161-7a46d19cd819?w=800&h=1200&fit=crop&q=80",
     category: "music",
   },
   {
-    url: "https://images.unsplash.com/photo-1506157786151-b8491531f063?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1506157786151-b8491531f063?w=800&h=1200&fit=crop&q=80",
     category: "music",
   },
   {
-    url: "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=800&h=1200&fit=crop&q=80",
     category: "music",
   },
   // Nightlife/parties
   {
-    url: "https://images.unsplash.com/photo-1492684223066-81342ee5ff30?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1492684223066-81342ee5ff30?w=800&h=1200&fit=crop&q=80",
     category: "nightlife",
   },
   {
-    url: "https://images.unsplash.com/photo-1489515217757-5fd1be406fef?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1489515217757-5fd1be406fef?w=800&h=1200&fit=crop&q=80",
     category: "nightlife",
   },
   {
-    url: "https://images.unsplash.com/photo-1545128485-c400e7702796?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1545128485-c400e7702796?w=800&h=1200&fit=crop&q=80",
     category: "nightlife",
   },
   // Food/drink
   {
-    url: "https://images.unsplash.com/photo-1551218808-94e220e084d2?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1551218808-94e220e084d2?w=800&h=1200&fit=crop&q=80",
     category: "food",
   },
   {
-    url: "https://images.unsplash.com/photo-1468078809804-4c7b3e60a478?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1468078809804-4c7b3e60a478?w=800&h=1200&fit=crop&q=80",
     category: "food",
   },
   {
-    url: "https://images.unsplash.com/photo-1414235077428-338989a2e8c0?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1414235077428-338989a2e8c0?w=800&h=1200&fit=crop&q=80",
     category: "food",
   },
   // Community/markets
   {
-    url: "https://images.unsplash.com/photo-1533174072545-7a4b6ad7a6c3?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1533174072545-7a4b6ad7a6c3?w=800&h=1200&fit=crop&q=80",
     category: "community",
   },
   {
-    url: "https://images.unsplash.com/photo-1531058020387-3be344556be6?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1531058020387-3be344556be6?w=800&h=1200&fit=crop&q=80",
     category: "community",
   },
   // Film/arts
   {
-    url: "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=800&h=1200&fit=crop&q=80",
     category: "film",
   },
   {
-    url: "https://images.unsplash.com/photo-1478720568477-152d9b164e26?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1478720568477-152d9b164e26?w=800&h=1200&fit=crop&q=80",
     category: "film",
   },
   // Conference/business
   {
-    url: "https://images.unsplash.com/photo-1521737604893-d14cc237f11d?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1521737604893-d14cc237f11d?w=800&h=1200&fit=crop&q=80",
     category: "conference",
   },
   {
-    url: "https://images.unsplash.com/photo-1540575467063-178a50c2df87?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1540575467063-178a50c2df87?w=800&h=1200&fit=crop&q=80",
     category: "conference",
   },
   // Sports/outdoor
   {
-    url: "https://images.unsplash.com/photo-1530549387789-4c1017266635?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1530549387789-4c1017266635?w=800&h=1200&fit=crop&q=80",
     category: "sports",
   },
   {
-    url: "https://images.unsplash.com/photo-1571902943202-507ec2618e8f?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1571902943202-507ec2618e8f?w=800&h=1200&fit=crop&q=80",
     category: "sports",
   },
   // Arts & Culture
   {
-    url: "https://images.unsplash.com/photo-1513364776144-60967b0f800f?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1513364776144-60967b0f800f?w=800&h=1200&fit=crop&q=80",
     category: "arts",
   },
   {
-    url: "https://images.unsplash.com/photo-1460661419201-fd4cecdf8a8b?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1460661419201-fd4cecdf8a8b?w=800&h=1200&fit=crop&q=80",
     category: "arts",
   },
   // Support & Recovery / Wellness
   {
-    url: "https://images.unsplash.com/photo-1529156069898-49953e39b3ac?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1529156069898-49953e39b3ac?w=800&h=1200&fit=crop&q=80",
     category: "support-recovery",
   },
   {
-    url: "https://images.unsplash.com/photo-1573497620053-ea5300f94f21?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1573497620053-ea5300f94f21?w=800&h=1200&fit=crop&q=80",
     category: "support-recovery",
   },
   // Open Mics / Comedy / Performance
   {
-    url: "https://images.unsplash.com/photo-1551818176-b35b6b47cce4?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1551818176-b35b6b47cce4?w=800&h=1200&fit=crop&q=80",
     category: "open-mics",
   },
   {
-    url: "https://images.unsplash.com/photo-1503095396549-807759245b35?w=800&q=80",
+    url: "https://images.unsplash.com/photo-1503095396549-807759245b35?w=800&h=1200&fit=crop&q=80",
     category: "open-mics",
   },
 ];
@@ -750,6 +806,21 @@ export const buildEventFixtures = (): EventSeedFixture[] => {
     { name: "VIP", priceCents: 9500, capacity: 50 },
   ];
 
+  // Tiers added AFTER the price bump, verbatim. The Manhattan walk carries the
+  // one pay-what-you-want tier the fee and pricing screens are checked against.
+  const TITLE_TO_EXTRA_TICKETS: Record<string, TicketFixture[]> = {
+    "Manhattan Gallery Walk": [
+      {
+        name: "Pay What You Want",
+        priceCents: 0,
+        capacity: 40,
+        pricingMode: "ADJUSTABLE",
+        minimumCents: 500,
+        suggestedCents: 1500,
+      },
+    ],
+  };
+
   // Events at venues with a PlaceLayout get section-aware ticket types.
   // The `layoutSectionId` links each ticket to the layout section's stable ID
   // so the seed can wire `seatSectionId` after materialization — no name matching.
@@ -846,7 +917,7 @@ export const buildEventFixtures = (): EventSeedFixture[] => {
         orgId: orgMapping.orgId,
         actorHumanId: orgMapping.actorHumanId,
         ...(placeId ? { placeId } : {}),
-        tickets,
+        tickets: [...tickets, ...(TITLE_TO_EXTRA_TICKETS[title] ?? [])],
       });
     }
   }
@@ -963,6 +1034,33 @@ export const buildEventFixtures = (): EventSeedFixture[] => {
     tickets: [{ name: "Workshop Seat", priceCents: 50000, capacity: 15 }],
   });
 
+  // Application-gated event that already happened. Exists to exercise the
+  // gate's form-unavailable swap: the page still renders the gate (a COMPLETED
+  // event is publicly readable), but the public form query answers
+  // EVENT_NOT_FOUND because the event is not PUBLISHED, so the gate goes from
+  // "Loading the application…" to its "unavailable" state. View it signed out
+  // (or as a non-member): org3's editors and staff get past the gate.
+  fixtures.push({
+    slug: "ca-sf-past-application-gated-supper",
+    title: "Founders Supper Series (Past)",
+    addressText: "3127 Fillmore St, San Francisco, CA 94123",
+    regionCode: "ca-sf",
+    daysFromNow: -10,
+    startHour: 18,
+    durationHours: 3,
+    status: "COMPLETED",
+    visibility: "PUBLIC",
+    gateType: "APPLICATION",
+    applicationQuestions: [
+      { prompt: "Tell us about yourself and your work.", type: "LONG_TEXT" },
+      { prompt: "How did you hear about this event?", type: "SHORT_TEXT" },
+    ],
+    categorySlug: "food-drink",
+    orgId: DEMO_IDS.org3,
+    actorHumanId: DEMO_IDS.human3,
+    tickets: [{ name: "Dinner Seat", priceCents: 0, capacity: 20 }],
+  });
+
   // ── Venue-linked events (assigned seating / seat painter) ──────────────
 
   // Paramount Theatre — owned by default org
@@ -1037,7 +1135,7 @@ export const buildEventFixtures = (): EventSeedFixture[] => {
 
   // ── Past events — explicitly for testing ────────────────────────────────
   // Every other fixture is in the *future* relative to when the seed runs
-  // (see `buildStartDate(daysFromNow, ...)` in seed/utils.ts). That's
+  // (see `buildStartDateInZone(daysFromNow, ...)` in seed/utils.ts). That's
   // intentional — the web event listings and the scanner event picker
   // both hide past events, so a fresh seed produces a list operators
   // can actually act on. These two fixtures are the deliberate
@@ -1246,6 +1344,7 @@ export const PLACES: PlaceFixture[] = [
     timezone: "America/Chicago",
     capacity: 1300,
     ownerOrgId: DEMO_IDS.org,
+    openingHours: { start: "18:00", end: "02:00" },
   },
   {
     id: DEMO_IDS.place2,
@@ -1397,5 +1496,94 @@ export const PLACES: PlaceFixture[] = [
     timezone: "America/Los_Angeles",
     capacity: 500,
     ownerOrgId: DEMO_IDS.org3,
+  },
+
+  // ── The demo org's venue portfolio ────────────────────────────────────────
+  // `demo` is the org the dev admin lands in, and it owned exactly ONE venue
+  // (The Paramount Theatre). That made its Bookings page read as a
+  // single-venue inbox — the venue filter hides the venue select for a
+  // one-venue org — so the cross-venue filter could never be exercised in dev.
+  // These three make it four, all in Austin so the portfolio reads as one
+  // operator's rooms rather than a scatter of unrelated venues.
+  {
+    id: DEMO_IDS.demoVenueMohawk,
+    name: "Mohawk",
+    address: "912 Red River St",
+    city: "Austin",
+    region: "TX",
+    country: "US",
+    postcode: "78701",
+    lat: 30.2686,
+    lng: -97.7365,
+    timezone: "America/Chicago",
+    capacity: 900,
+    ownerOrgId: DEMO_IDS.org,
+    openingHours: { start: "18:00", end: "02:00" },
+    // Two stages, indoor and outdoor — the real shape of the venue, and a
+    // second multi-room case so the space filter is not a single fixture.
+    spaces: [
+      { id: DEMO_IDS.demoSpaceMohawkOutdoor, name: "Outdoor Stage" },
+      { id: DEMO_IDS.demoSpaceMohawkIndoor, name: "Indoor Stage" },
+    ],
+    calendars: [
+      { slug: "outdoor-series", name: "Outdoor Series", defaultStartTime: "19:00" },
+    ],
+  },
+  {
+    id: DEMO_IDS.demoVenueCheerUp,
+    name: "Cheer Up Charlies",
+    address: "900 Red River St",
+    city: "Austin",
+    region: "TX",
+    country: "US",
+    postcode: "78701",
+    lat: 30.2679,
+    lng: -97.7362,
+    timezone: "America/Chicago",
+    capacity: 400,
+    ownerOrgId: DEMO_IDS.org,
+    openingHours: { start: "18:00", end: "02:00" },
+    spaces: [
+      { id: DEMO_IDS.demoSpaceCheerUpInside, name: "Inside" },
+      { id: DEMO_IDS.demoSpaceCheerUpOutside, name: "Outside" },
+    ],
+    calendars: [
+      { slug: "late-night", name: "Late Night", defaultStartTime: "22:00" },
+      { slug: "room-rental", name: "Room Rental" },
+    ],
+  },
+  {
+    id: DEMO_IDS.demoVenueHoleInWall,
+    name: "Hole in the Wall",
+    address: "2538 Guadalupe St",
+    city: "Austin",
+    region: "TX",
+    country: "US",
+    postcode: "78705",
+    lat: 30.2925,
+    lng: -97.7419,
+    timezone: "America/Chicago",
+    capacity: 150,
+    ownerOrgId: DEMO_IDS.org,
+    openingHours: { start: "18:00", end: "02:00" },
+    // Deliberately single-room: the inbox must stay correct for venues with
+    // no meaningful space dimension, which is most of them.
+  },
+  {
+    id: DEMO_IDS.unclaimedPlace,
+    name: "The Unclaimed Stage",
+    address: "123 Music St",
+    city: "Austin",
+    region: "TX",
+    country: "US",
+    postcode: "78701",
+    lat: 30.2680,
+    lng: -97.7360,
+    timezone: "America/Chicago",
+    capacity: 250,
+    // Deliberately unverified with no owner — the claim-venue flow can
+    // exercise parked requests against unclaimed venues. This fixture pairs
+    // with a parked PERFORM request in booking-requests.ts.
+    unverified: true,
   },
 ];

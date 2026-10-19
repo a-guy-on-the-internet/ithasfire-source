@@ -1,0 +1,357 @@
+status: draft
+task: >
+  Unify the "seat" and "ga" section kinds into a single "section" kind.
+  Capacity becomes a toggleable property on any section. The three-way
+  "seat | ga | helper" picker is replaced by a two-way "section | helper"
+  choice, with capacity as an optional toggle.
+
+goal: >
+  Eliminate the confusing GA-vs-Seat distinction that forces designers to
+  decide upfront how a section behaves. After unification, every non-helper
+  section can optionally hold individual seats AND/OR a capacity cap.
+  The buyer experience is derived from data rather than a pre-committed kind.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# New Model
+# ───────────────────────────────────────────────────────────────────────────────
+
+new_model:
+  SectionKind:
+    before: '"seat" | "ga" | "helper"'
+    after:  '"section" | "helper"'
+    notes: >
+      "section" replaces both "seat" and "ga". A section's behaviour is now
+      derived from two orthogonal properties: whether it contains seats, and
+      whether it has an explicit capacity.
+
+  DesignerSection:
+    kind:
+      type: '"section" | "helper"'
+      notes: >
+        Replaces the three-way union. All ticketable sections use "section";
+        decorative shapes use "helper".
+    capacity:
+      type: 'number | undefined'
+      notes: >
+        Available on ANY "section" kind (no longer GA-only). undefined means
+        "no explicit cap" — capacity is implicitly the seat count when seats
+        exist, or unlimited when no seats and no cap.
+    # seats, polygon, metadata, smoothing, edgeSmoothing — unchanged.
+
+  derived_behaviour:
+    - condition: 'seats.length > 0 && capacity === undefined'
+      label: 'Assigned seating (capacity = seat count)'
+      buyer_experience: 'Pick a specific seat on the map'
+      canvas_rendering: 'Standard section fill + individual seat circles'
+
+    - condition: 'seats.length > 0 && capacity !== undefined'
+      label: 'Assigned seating with explicit cap'
+      buyer_experience: 'Pick a specific seat; sales stop at capacity even if more seats exist'
+      canvas_rendering: 'Standard section fill + individual seat circles'
+      notes: 'Useful for blocking some seats without deleting them'
+
+    - condition: 'seats.length === 0 && capacity !== undefined'
+      label: 'General admission (area entry)'
+      buyer_experience: '"Admit 1 to [section name]" — no seat choice'
+      canvas_rendering: 'Section fill + hatch pattern (same as today''s GA rendering)'
+
+    - condition: 'seats.length === 0 && capacity === undefined'
+      label: 'Unconfigured section (warning state)'
+      buyer_experience: 'Not purchasable'
+      canvas_rendering: 'Section fill + subtle "needs seats or capacity" indicator'
+      notes: >
+        Designer shows a warning badge. Prevents save/publish if any section
+        is in this state (no seats, no capacity, not a helper).
+
+    - condition: 'kind === "helper"'
+      label: 'Decorative / non-ticketable'
+      buyer_experience: 'Not purchasable, visual only'
+      canvas_rendering: 'Dashed stroke, low-alpha fill (unchanged)'
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Touchpoints — every file that needs to change
+# ───────────────────────────────────────────────────────────────────────────────
+
+touchpoints:
+
+  # ── Designer types ───────────────────────────────────────────────────────
+  - file: apps/web/src/app/admin/[slug]/places/[placeId]/layout/_components/designer/types.ts
+    changes:
+      - what: 'Change SectionKind from "seat" | "ga" | "helper" to "section" | "helper"'
+      - what: 'Update SectionKind JSDoc to describe the new two-value union'
+      - what: 'Update DesignerSection.capacity JSDoc — no longer GA-only'
+      - what: 'Remove mentions of "seat" and "ga" from doc comments'
+
+  # ── Designer reducer ────────────────────────────────────────────────────
+  - file: apps/web/src/app/admin/[slug]/places/[placeId]/layout/_components/designer/reducer.ts
+    changes:
+      - what: 'Change initial drawingSectionKind from "seat" to "section"'
+      - what: 'CLOSE_POLYGON: remove kind-specific capacity default (capacity is now independent)'
+      - what: 'CLOSE_POLYGON: always set activeSectionId (was skipping for "helper")'
+      - what: 'CLOSE_POLYGON: remove kind-based activeTool auto-switch (was "place_seat" for seat, "select" for GA)'
+      - what: 'PLACE_SEAT: change guard from kind !== "seat" to kind === "helper" (block seats in helpers only)'
+      - what: 'SET_SECTION_CAPACITY: change guard from kind !== "ga" to kind === "helper" (capacity allowed on any section)'
+      - what: >
+          All batch-placement guards (COMMIT_LINE_PLACEMENT, COMMIT_ARC_PLACEMENT, etc.)
+          currently check kind !== "seat". Change to kind === "helper".
+      - what: 'Remove "ga"-specific branches — seat placement & capacity are now orthogonal'
+
+  # ── Designer toolbar ────────────────────────────────────────────────────
+  - file: apps/web/src/app/admin/[slug]/places/[placeId]/layout/_components/designer/DesignerToolbar.tsx
+    changes:
+      - what: >
+          Replace 3-button kind picker (seat/ga/helper) with 2-button picker
+          (section/helper). Optionally add descriptive subtitle text.
+      - what: >
+          Section card badge: replace kind.toUpperCase() with derived label —
+          show "ASSIGNED" when seats exist, "AREA" when capacity-only, "HELPER"
+          for helpers, or a warning icon when unconfigured.
+      - what: >
+          Capacity editor: show for ANY active section (not just GA). Add a
+          toggle switch "Set capacity limit" that shows/hides the numeric input.
+          Default off unless capacity is already set.
+      - what: >
+          Remove kind-based conditional for seat list vs capacity display.
+          Both can coexist on the same section.
+      - what: >
+          Section info line: replace the kind-dependent text with derived info:
+          "N seats" and/or "capacity: M" as applicable.
+      - what: >
+          Warning indicator: if a section has no seats AND no capacity AND is
+          not a helper, show a yellow warning badge "Needs seats or capacity".
+
+  # ── Canvas rendering ────────────────────────────────────────────────────
+  - file: apps/web/src/app/admin/[slug]/places/[placeId]/layout/_components/designer/draw.ts
+    changes:
+      - what: >
+          Replace isGa check (kind === "ga") with a derived check:
+          const isGa = section.kind === "section" && seatCount === 0 && section.capacity !== undefined;
+          This determines whether to render the hatch pattern.
+      - what: >
+          Replace isHelper check to use kind === "helper" (unchanged, but verify).
+      - what: >
+          Fill alpha: if section has no seats and has capacity (area admission),
+          use GA_SECTION_FILL_ALPHA. If it has seats, use 0.1. Helper stays 0.06.
+      - what: >
+          Add visual indicator for unconfigured sections (no seats, no capacity,
+          not helper): e.g. a subtle cross-hatch or question-mark pattern.
+
+  # ── CSV bridge (serialization / deserialization) ────────────────────────
+  - file: apps/web/src/app/admin/[slug]/places/[placeId]/layout/_components/designer/csv-bridge.ts
+    changes:
+      - what: >
+          VALID_SECTION_KINDS: add "section" to the set. Keep "seat" and "ga"
+          for backward compat during import (map them to "section" on load).
+      - what: >
+          Import: when rawKind is "seat" or "ga", map to "section". Preserve
+          capacity value from column 6 as-is.
+      - what: >
+          Export: always write "section" or "helper" in column 5. Capacity in
+          column 6 as before.
+      - what: >
+          Fallback section creation (lines 319, 384, 418): change kind from
+          "seat" to "section".
+
+  # ── Detect (image detection) ────────────────────────────────────────────
+  - file: apps/web/src/app/admin/[slug]/places/[placeId]/layout/_components/designer/detect.ts
+    changes:
+      - what: 'Change kind: "seat" to kind: "section" on detected sections'
+
+  # ── Index re-exports ────────────────────────────────────────────────────
+  - file: apps/web/src/app/admin/[slug]/places/[placeId]/layout/_components/designer/index.ts
+    changes:
+      - what: 'No structural changes; SectionKind re-export stays as-is'
+
+  # ── Shared types (@th/types) ────────────────────────────────────────────
+  - file: packages/types/src/repos/seats.ts
+    changes:
+      - what: >
+          LayoutSectionDef.kind: change type from "seat" | "ga" | "helper"
+          to "section" | "helper". Keep accepting "seat" | "ga" as legacy
+          aliases in the adapter (not in the type — handle at runtime).
+
+  # ── Prisma schema ──────────────────────────────────────────────────────
+  - file: packages/db/prisma/enums.prisma
+    changes:
+      - what: >
+          Keep SeatSectionType enum as { GA, RESERVED } for now. The enum maps
+          to the DERIVED behaviour, not the designer kind. A section with seats
+          materializes as RESERVED; a section with only capacity materializes as
+          GA. This is a runtime mapping, not a schema change.
+      - what: >
+          No migration needed. The adapter logic changes, not the enum values.
+    notes: >
+      Long-term, consider renaming GA → AREA and RESERVED → ASSIGNED for
+      clarity, but that's a separate migration with zero functional impact.
+
+  # ── Prisma seats adapter ───────────────────────────────────────────────
+  - file: packages/adapters/src/db/prisma/seats.ts
+    changes:
+      - what: >
+          materializeSections: replace the kind-based GA/RESERVED determination
+          with a derived check: if section has seats in seatIds[] → RESERVED,
+          else if section has capacity → GA, else skip (helper or unconfigured).
+      - what: >
+          Remove the legacy label-matching fallback (lines that check for
+          "general admission" in the label). The kind + seats + capacity data
+          is now authoritative.
+
+  # ── Buyer-side SeatMapPicker ───────────────────────────────────────────
+  - file: apps/web/src/app/events/checkout/[...slug]/_components/SeatMapPicker.tsx
+    changes:
+      - what: >
+          No changes needed. The SeatSection type already doesn't have a kind
+          field — it only uses capacity and geometry. The change is transparent
+          to the buyer side.
+    notes: >
+      The buyer experience is already derived from whether glyphs (seats) exist
+      for a section. Sections with glyphs show individual seats; sections
+      without glyphs show section-level quantity pickers. This is exactly the
+      unified model.
+
+  # ── SeatMapPicker stories ──────────────────────────────────────────────
+  - file: apps/web/src/app/events/checkout/[...slug]/_components/SeatMapPicker.stories.tsx
+    changes:
+      - what: 'Update any story data that references kind: "ga" or kind: "seat"'
+
+  # ── Seed / validation scripts ──────────────────────────────────────────
+  - file: apps/api/src/scripts/seed/seed-data.ts
+    changes:
+      - what: 'Update seed layout metadata to use kind: "section" instead of "seat" or "ga"'
+  - file: apps/api/src/scripts/seed/validate-layout-renderability.ts
+    changes:
+      - what: 'Update validation rules to accept "section" and "helper" only (warn on legacy values)'
+
+  # ── Tests ──────────────────────────────────────────────────────────────
+  - file: apps/web/src/app/admin/[slug]/places/[placeId]/layout/_components/designer/__tests__/reducer.test.ts
+    changes:
+      - what: 'Replace all kind: "seat" with kind: "section"'
+      - what: 'Replace all kind: "ga" with kind: "section" + capacity set'
+      - what: 'Update SET_DRAWING_SECTION_KIND tests for the new two-value union'
+      - what: 'Add tests for the unconfigured-section warning state'
+      - what: 'Add tests verifying seats AND capacity can coexist on one section'
+  - file: apps/web/src/app/admin/[slug]/places/[placeId]/layout/_components/designer/__tests__/csv-bridge.test.ts
+    changes:
+      - what: 'Update all kind: "seat" to kind: "section"'
+      - what: 'Add backward-compat test: import a CSV with kind "ga" → parsed as "section" + capacity'
+      - what: 'Add backward-compat test: import a CSV with kind "seat" → parsed as "section"'
+
+  # ── i18n ───────────────────────────────────────────────────────────────
+  - file: apps/web/src/i18n/messages/en.ts
+    changes:
+      - what: >
+          Update toolbar strings: remove "GA" / "Seat" kind labels, add
+          "Section" / "Helper" labels, add capacity toggle label, add
+          unconfigured-section warning text.
+      - what: 'Update toolbarGaCapacity → toolbarCapacity (no longer GA-specific)'
+      - what: 'Update toolbarGaInfo → toolbarAreaInfo or derive from context'
+  - file: apps/web/src/i18n/messages/es.ts
+    changes:
+      - what: 'Mirror all en.ts i18n changes'
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Migration strategy
+# ───────────────────────────────────────────────────────────────────────────────
+
+migration:
+  backward_compat:
+    csv_import: >
+      When the CSV bridge reads "seat" or "ga" in column 5, it maps both to
+      "section". "ga" sections keep their capacity value from column 6. "seat"
+      sections get capacity = undefined (auto from seat count). This is
+      lossless — all existing CSVs load correctly.
+    csv_export: >
+      New exports always write "section" or "helper". Old tools that read the
+      CSV and expect "seat"/"ga" will see "section" and should treat it as an
+      unknown-but-valid kind. The CSV format does not break because the kind
+      column was always a hint, not a structural key.
+    prisma: >
+      No schema migration needed. The SeatSectionType enum (GA/RESERVED)
+      stays. The adapter's materializeSections() switches from checking
+      sectionDef.kind to checking whether the section has seats in the seatIds
+      list (RESERVED) or only capacity (GA).
+    saved_layouts: >
+      Existing PlaceLayout.metadata stored in the database contains
+      sections[].kind = "seat" | "ga" | "helper". The adapter should accept
+      these legacy values at materialisation time and map them to the new
+      derived logic. No backfill needed — layouts are re-parsed on load
+      through the CSV bridge, which handles the mapping.
+
+  no_backfill: >
+    Since the CSV bridge normalises kind on import, and the Prisma adapter
+    derives SeatSectionType from data rather than kind, there is no stored
+    data that needs updating. The "ga"/"seat" values in old CSVs and layout
+    metadata are simply read as "section" at load time.
+
+  rollback: >
+    If we need to revert, change the type union back and restore the old
+    reducer/adapter branches. No data has been mutated, so rollback is clean.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Implementation order
+# ───────────────────────────────────────────────────────────────────────────────
+
+implementation_order:
+  - step: 1
+    description: >
+      types.ts — Change SectionKind union. This will surface every downstream
+      type error, giving a compile-time checklist.
+  - step: 2
+    description: >
+      reducer.ts — Update all kind checks. Fix compile errors from step 1.
+  - step: 3
+    description: >
+      csv-bridge.ts — Add backward-compat mapping on import, update export.
+  - step: 4
+    description: >
+      detect.ts — Trivial: "seat" → "section".
+  - step: 5
+    description: >
+      draw.ts — Switch from kind-based rendering to derived-behaviour checks.
+  - step: 6
+    description: >
+      DesignerToolbar.tsx — Replace kind picker, add capacity toggle, update
+      badges and info text.
+  - step: 7
+    description: >
+      packages/types seats.ts — Update LayoutSectionDef.kind type.
+  - step: 8
+    description: >
+      packages/adapters seats.ts — Update materialisation logic.
+  - step: 9
+    description: >
+      Tests — Update all test fixtures, add new edge-case tests.
+  - step: 10
+    description: >
+      i18n — Update en.ts and es.ts strings.
+  - step: 11
+    description: >
+      Seed scripts & stories — Update fixtures.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Open questions
+# ───────────────────────────────────────────────────────────────────────────────
+
+open_questions:
+  - question: >
+      Should unconfigured sections (no seats, no capacity, not helper) block
+      save, or just show a warning? Blocking is safer but might annoy
+      designers mid-draft.
+    suggestion: >
+      Warning badge in toolbar + toast on save attempt. Don't block save,
+      but block event publish if any section is unconfigured.
+
+  - question: >
+      Should we rename SeatSectionType.GA → AREA and RESERVED → ASSIGNED in
+      the Prisma enum for clarity?
+    suggestion: >
+      Defer to a separate spec. It's a Prisma migration with zero functional
+      impact but needs careful coordination with existing data.
+
+  - question: >
+      The hatch pattern is currently the only visual differentiator for
+      "area entry" sections. Should we add a label or icon on the canvas
+      (e.g. a small "GA" badge or person icon)?
+    suggestion: >
+      Add a small capacity badge at the section centroid showing the capacity
+      number, rendered at high enough zoom levels.

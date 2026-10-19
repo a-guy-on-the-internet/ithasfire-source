@@ -1,0 +1,78 @@
+# Spec: Sitemap Generator Job
+meta:
+  owner: platform-eng
+  status: complete
+  reviewers:
+    - seo
+    - platform-ops
+  linked_docs:
+    - ../platform/sitemaps-architecture.spec.yaml
+    - ../platform/sitemaps-observability.spec.yaml
+summary: |
+  Nightly and event-driven batch job that materializes sitemap shards for events, organizers,
+  humans, and collections into Cloudflare R2 and refreshes the sitemap index manifest used by
+  Fastify/Next.js transports.
+scope:
+  included:
+    - Pulling eligible records from Postgres via read replica.
+    - Generating XML + gzip shards under 50k URLs / 50 MB.
+    - Uploading active/archived shards to R2 and updating `index.xml`.
+    - Emitting metrics/logs defined in observability spec.
+  excluded:
+    - Dataset eligibility logic (handled by backfill jobs and guardrails).
+    - Transport-layer caching (handled by apps/api).
+execution:
+  orchestration: keda-scaledjob
+  image: ghcr.io/ithasfire/jobs:sitemaps-latest
+  command: ["node", "dist/sitemaps/generate.js"]
+  schedule:
+    full_rebuild: "30 1 * * *"  # UTC nightly
+    delta_sources:
+      - event.publish
+      - event.update
+      - organizer.update
+      - human.visibility_change
+  scaling:
+    min_pods: 0
+    max_pods: 4
+    concurrency: 1 per shard key (Redis mutex).
+inputs:
+  postgres:
+    database: analytics-read
+    role: readonly_sitemaps
+  config:
+    changefreq: seo.sitemaps.changefreq
+    feature_flag: feature.sitemaps
+  secrets:
+    - cloudflare.r2.access_key
+    - cloudflare.r2.secret_key
+    - cloudflare.r2.account_id
+outputs:
+  storage:
+    bucket: seo-sitemaps
+    layout:
+      active: sitemaps/{shard}.xml(.gz)
+      archive: sitemaps/archive/{YYYY}/{MM}/{shard}.xml.gz
+  telemetry:
+    metrics:
+      - sitemap.generator.duration_ms
+      - sitemap.generator.urls_emitted
+      - sitemap.generator.guardrail_ratio
+    logs: structured JSON per shard run
+failure_modes:
+  - name: dataset_empty
+    symptom: urls_emitted == 0 for active month
+    action: page seo-tech, run guardrail validator
+  - name: upload_failure
+    symptom: R2 upload error
+    retry: exponential backoff (3x) then alert platform-oncall
+  - name: mutex_contention
+    symptom: shard lock held > 5 minutes
+    resolution: check Redis lock table, release stale entry
+acceptance_criteria:
+  - Nightly run completes within 15 minutes on staging dataset.
+  - R2 index manifest reflects latest shard timestamps within 5 minutes of completion.
+  - Observability dashboard shows urls_emitted within ±2% of expected counts.
+rollout_notes:
+  - Keep dry-run namespace enabled until guardrail metrics stabilize for 7 days.
+  - Submit sitemap index to Google Search Console after first prod run.

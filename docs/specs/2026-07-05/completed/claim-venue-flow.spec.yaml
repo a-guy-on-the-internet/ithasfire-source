@@ -1,0 +1,355 @@
+# claim-venue-flow.spec.yaml
+#
+# Self-serve "claim this venue" flow: a signed-in human or org claims an
+# unclaimed/unverified Place from its public page. In one motion the claim
+# migrates ownership under the claimant AND puts the venue into a
+# provisional/verified-pending state, gated by automated proof and backstopped
+# by an admin review. Already-owned venues are blocked and routed to a dispute.
+
+version: "1.0"
+updated: "2026-07-05"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Anyone (including anonymous users via place-reviews.submit) can cause an
+    ACTIVE/UNVERIFIED stub Place to exist, and the public /places/id/{id} page
+    renders + is indexable — yet the real venue operator has NO way to take
+    ownership of that page. Today the only "verification" path
+    (submit-place-verification.ts) requires the org to ALREADY be in
+    place.orgIdsWithAccess, so a genuine owner of an orphan stub is locked out.
+    Separately, PlaceOwnership.verified / proof / reviewerHumanId columns exist
+    but nothing ever exercises them — ownership is never reviewed.
+  solution: >
+    Add a claim-venue flow. A signed-in human (for themselves) or org admin
+    (for their org) claims an unclaimed Place. Automated proof (verified account
+    email domain matches the venue website, a domain-mailbox code, OR an uploaded
+    document) is required. On a passing claim we, in one motion, create a
+    PROVISIONAL PlaceOwnership row (verified=false) — which grants edit access
+    immediately — set Place.verification=PENDING, and open a
+    PlaceVerificationRequest of source=OWNERSHIP_CLAIM into the EXISTING platform
+    admin queue. Admin APPROVE flips PlaceOwnership.verified=true +
+    Place.verification=VERIFIED + listedInDirectory=true; REJECT revokes the
+    provisional ownership and reverts the Place. Venues already owned/verified by
+    someone else cannot be instantly claimed — the page shows "Already claimed"
+    and offers a dispute/transfer request routed to an admin.
+  users:
+    - venue operator (human) claiming their own venue page
+    - org admin claiming a venue on behalf of their organization
+    - platform admin / reviewer (ADMIN, REVIEWER) confirming or rejecting claims
+    - prior verified owner (notified on a dispute)
+  surfaces:
+    - web            # public place page + claim wizard + platform queue
+    - jobs           # notifications, email-domain challenge expiry (optional)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        The public place page (/places/id/[placeId] and /p/[slug]) shows a
+        "Claim this venue" CTA when the place is CLAIMABLE: status != ARCHIVED,
+        Place.verification in {UNVERIFIED, REJECTED}, and it has no verified
+        PlaceOwnership row and no active OWNERSHIP_CLAIM request.
+    - id: FR-002
+      description: >
+        A signed-in user opens a claim wizard and chooses the owner identity:
+        themselves (ownerType=HUMAN, ownerId=actorHumanId) or an org they
+        administer (ownerType=ORGANIZATION; requires ORG_ADMIN_ROLES on that org).
+    - id: FR-003
+      description: >
+        The claim requires ONE automated proof of one of these kinds:
+        (a) email_domain_match — the claimant's Better-Auth-verified account email
+        domain equals the registrable domain of Place.website (truly one motion,
+        zero extra steps). See FR-010 for the trusted-domain fast-track.
+        (b) email_domain_challenge — claimant enters an address at the venue's
+        website domain, receives a 6-digit code, and confirms it (proves mailbox
+        control at that domain);
+        (c) document — claimant uploads 1-5 proof docs (PDF/JPEG/PNG, <=10MB each)
+        via the existing PlaceVerificationDocument pipeline for admin review.
+        Public/free email providers (gmail.com, outlook.com, etc.) NEVER satisfy
+        (a) or (b).
+    - id: FR-004
+      description: >
+        On a claim that passes its proof step, in a single transaction:
+        create PlaceOwnership {placeId, ownerType, ownerId, verified:false,
+        proof:<claim proof metadata>}; set Place.verification=PENDING; create a
+        PlaceVerificationRequest {placeId, source:OWNERSHIP_CLAIM,
+        claimantHumanId, ownerType, ownerId, ownershipId, status:PENDING} with any
+        uploaded documents attached; write an audit entry
+        (place.ownership_claim_submitted); notify platform admins.
+        Idempotent per (placeId, ownerType, ownerId) via clientKey. A single human
+        may hold at most 20 provisional (verified=false) ownership claims at once
+        (CLAIM_LIMIT_REACHED beyond that) — anti-squatting cap.
+    - id: FR-005
+      description: >
+        A provisional PlaceOwnership row (verified=false) marks WHO claimed the
+        venue but is READ-MOSTLY: it does NOT confer write/edit access. The
+        claimant sees a "pending owner" view (owner-style dashboard, claim status,
+        withdraw action) but cannot edit venue fields until the claim is VERIFIED.
+        Write access is gated on a PlaceOwnership row with verified=true — this
+        preserves today's behavior since all existing ownership rows are
+        verified=true. The public page shows a "Claim pending review" badge; the
+        venue is NOT listedInDirectory and NOT eligible for booking surfaces until
+        VERIFIED.
+    - id: FR-006
+      description: >
+        Platform admins see OWNERSHIP_CLAIM requests in the SAME queue as
+        org verification requests (getPlatformVerificationQueue), visually tagged
+        as a claim, showing claimant identity + proof kind + documents. Acknowledge
+        / release locking is reused unchanged.
+    - id: FR-007
+      description: >
+        Admin APPROVE of an OWNERSHIP_CLAIM: flip PlaceOwnership.verified=true
+        (set reviewerHumanId, reviewedAt), set Place.verification=VERIFIED and
+        listedInDirectory=true, mark request APPROVED, delete proof docs, notify
+        the claimant. Admin REJECT: delete (or revoke) the provisional
+        PlaceOwnership row, revert Place.verification to UNVERIFIED, mark request
+        REJECTED with notes (>=10 chars), notify the claimant with the reason.
+    - id: FR-008
+      description: >
+        Collision — if the place already has a VERIFIED PlaceOwnership (or
+        Place.verification==VERIFIED), the instant claim is BLOCKED
+        (PLACE_ALREADY_CLAIMED). The page shows "Already claimed" and offers a
+        "Dispute / request transfer" action that files a PlaceVerificationRequest
+        of source=OWNERSHIP_DISPUTE routed to admins and notifies the current
+        owner. Disputes are NEVER auto-approved; they require admin action.
+    - id: FR-009
+      description: >
+        Only one active OWNERSHIP_CLAIM per place at a time. A second claimant on a
+        place with a pending claim is blocked (CLAIM_ALREADY_PENDING) and may file
+        a dispute instead.
+    - id: FR-010
+      description: >
+        Trusted-domain fast-track. When proof kind (a) email_domain_match succeeds
+        AND the matched Place.website was set by a TRUSTED source (a VERIFIED
+        import / PRO list / Google Places — i.e. NOT set by an anonymous
+        review-created stub), the claim skips the admin queue and goes straight to
+        VERIFIED in one motion: PlaceOwnership.verified=true (reviewer stamped as
+        SYSTEM/auto), Place.verification=VERIFIED, listedInDirectory=true, audit
+        action place.ownership_claim_autoverified. All OTHER proof paths
+        (challenge, document, or a domain that came from an untrusted stub) remain
+        provisional + admin-reviewed. Requires a way to record website provenance
+        on the Place (e.g. a websiteSource / verified-source marker).
+    - id: FR-011
+      description: >
+        Stub venue pages are noindex until claimed/verified. Change the place
+        detail page indexing rule from `status === "ACTIVE"` to require
+        Place.verification == VERIFIED (equivalently: only listedInDirectory /
+        VERIFIED venues are indexable). Unverified/stub pages still RENDER (so a
+        direct share link works) but emit robots noindex, closing the original
+        consent gap where anonymous-review-created stubs were crawlable.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Anti-abuse: the claim endpoint is authedProcedure + rate-limited per
+        actor and per placeId. email_domain proofs must reject public/free email
+        providers via a maintained blocklist. Place.website is attacker-influenced
+        (stubs are created from anonymous reviews), so email_domain proof is a
+        SIGNAL, not a guarantee — the admin backstop is mandatory before VERIFIED.
+    - id: NFR-002
+      description: >
+        Audit every ownership transition (claim submitted, approved, rejected,
+        disputed, provisional access granted/revoked) with actor + reason, mirroring
+        the existing verification audit actions.
+    - id: NFR-003
+      description: >
+        A rejected/revoked claim must fully undo provisional access (no dangling
+        PlaceOwnership) and leave no VERIFIED/listed side effects.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+# core → ports → adapters → transport → UI. Reuse the verification-request +
+# document-upload + admin-queue machinery; do NOT build a parallel system.
+
+architecture:
+  core:
+    use_cases:
+      - name: submit-place-claim
+        description: >
+          Net-new. Validates the place is CLAIMABLE, resolves + authorizes the
+          owner identity (self, or org admin via requireOrgMembership/hasOrgRole
+          ORG_ADMIN_ROLES), validates the chosen proof, then transactionally
+          creates the provisional PlaceOwnership + PENDING Place.verification +
+          OWNERSHIP_CLAIM PlaceVerificationRequest (+docs), audits, notifies admins.
+          Mirrors submit-place-verification.ts but for NON-owners and supports a
+          HUMAN claimant.
+        input: actorHumanId, placeId, owner {kind: human|org, id}, proof {kind, email?, documents?}, clientKey
+        output: requestId, ownershipId, placeVerification: PENDING, proofStatus
+        idempotent: true
+        money: false
+      - name: request-claim-email-challenge  # only for proof kind (b)
+        description: >
+          Issues a 6-digit code to an address at the venue's registrable domain,
+          storing a short-lived hashed challenge. Rejects free-email domains and
+          domains not matching Place.website.
+        input: actorHumanId, placeId, email
+        output: challengeId, expiresAt
+        idempotent: true
+        money: false
+      - name: confirm-claim-email-challenge  # only for proof kind (b)
+        description: Verifies the code, marks the challenge satisfied so submit-place-claim can consume it.
+        input: actorHumanId, challengeId, code
+        output: verified: boolean
+        idempotent: true
+        money: false
+      - name: review-place-verification  # EXTEND existing
+        description: >
+          Extend the existing approve/reject use case so that when the request
+          source==OWNERSHIP_CLAIM, APPROVE also flips PlaceOwnership.verified=true
+          (reviewerHumanId, reviewedAt) and REJECT deletes/revokes the provisional
+          PlaceOwnership and reverts Place.verification to UNVERIFIED. Org-submission
+          behavior is unchanged. Note: FR-010 trusted-domain fast-track bypasses
+          this queue entirely — those claims are auto-verified inside
+          submit-place-claim and never create a PENDING request.
+        input: actorHumanId, requestId, decision, reviewerNotes?
+        output: request status, place verification, ownership state
+        idempotent: true
+        money: false
+      - name: file-place-ownership-dispute
+        description: >
+          Net-new. For already-verified/owned places. Files a
+          source=OWNERSHIP_DISPUTE request routed to admins; notifies the current
+          verified owner. Never mutates ownership directly.
+        input: actorHumanId, placeId, owner {kind, id}, reason, documents?
+        output: requestId
+        idempotent: true
+        money: false
+
+  ports:
+    new:
+      - PlaceClaimEmailChallengesRepo   # create / getById / markVerified / expire (proof kind b only)
+    existing:
+      - PlacesRepo                       # getById, upsert (writes PlaceOwnership + verification/listedInDirectory)
+      - PlaceVerificationRequestsRepo    # create, listQueue, updateDecision, acknowledge, release
+      - PlaceVerificationDocumentsRepo   # createMany, listByRequestId, markDeleted
+      - FileStoragePort                  # presigned proof-doc upload/read/delete
+      - AuthZPort                        # hasOrgRole, hasStaffRole
+      - NotificationsRepo / notification port  # NEW usage: admin-on-claim + claimant-on-decision + owner-on-dispute
+      - AuditPort
+
+  adapters:
+    new:
+      - prisma PlaceClaimEmailChallenges adapter (proof kind b)
+    existing:
+      - packages/adapters/src/db/prisma/places.ts   # allow PlaceOwnership.upsert with verified:false + write reviewer fields on approve; today hardcodes verified:true
+      - place-verification-requests prisma adapter    # persist new source/claimant/ownership columns + filter/return them in listQueue
+
+  transport:
+    trpc_procedures:
+      - places.submitPlaceClaim              # authedProcedure
+      - places.requestClaimEmailChallenge    # authedProcedure (proof kind b)
+      - places.confirmClaimEmailChallenge    # authedProcedure (proof kind b)
+      - places.filePlaceOwnershipDispute     # authedProcedure
+      - places.getPlaceClaimEligibility      # publicProcedure (drives the CTA state on the page)
+      # reviewPlaceVerification / acknowledge / release / getPlatformVerificationQueue: reused, extended payloads
+    webhooks: []
+
+  ui:
+    pages:
+      - apps/web/src/app/places/id/[placeId]/claim   # (or a modal) claim wizard
+    components:
+      - ClaimVenueCta            # on PlacePageHeader / EntityPageShell — claim | pending | already-claimed(dispute)
+      - ClaimVenueWizard         # owner-identity step + proof step (domain-match / email-code / document)
+      - PlatformVerificationQueue (modify)  # tag + render OWNERSHIP_CLAIM & OWNERSHIP_DISPUTE rows, show claimant + proof
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - PlaceClaimEmailChallenge   # id, placeId, humanId, email, codeHash, expiresAt, verifiedAt, attempts (proof kind b)
+  modified_models:
+    - PlaceVerificationRequest   # add: source enum (ORG_SUBMISSION|OWNERSHIP_CLAIM|OWNERSHIP_DISPUTE), claimantHumanId?, ownerType?, ownerId?, ownershipId?; make orgId NULLABLE (human claims have no org)
+    - PlaceOwnership             # no new columns needed — reuse existing verified/proof/reviewerHumanId/reviewedAt; consider adding revokedAt for soft-revoke on reject
+    - Place                      # add websiteSource marker (e.g. TRUSTED_IMPORT | USER_STUB | UNKNOWN) so FR-010 can tell a trusted-import domain from a stub-set one; default existing rows conservatively (UNKNOWN → no fast-track)
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Place.website (the domain used for email_domain proof) is set by whoever
+      created the stub — including anonymous review submitters — so it can be
+      spoofed to match an attacker's domain.
+    severity: HIGH
+    mitigation: >
+      email_domain proof only ever yields a PROVISIONAL claim; VERIFIED requires
+      the admin backstop. Log the domain used. Consider requiring admin review for
+      ALL first-party claims and only fast-tracking when the website domain was set
+      by a prior VERIFIED import, not a stub.
+  - risk: >
+      FR-010 fast-track auto-verifies without a human. If an attacker can set a
+      Place.website to a domain they control AND is recorded as a trusted source,
+      they self-verify instantly.
+    severity: MEDIUM
+    mitigation: >
+      Fast-track ONLY fires when websiteSource == TRUSTED_IMPORT (set exclusively
+      by verified import paths, never by the stub/review or freeform-edit path).
+      Stub- or user-set domains stay provisional + admin-reviewed. Existing rows
+      default to UNKNOWN (no fast-track). Audit place.ownership_claim_autoverified.
+  - risk: >
+      A verified=false PlaceOwnership row must NOT leak write access. The access
+      check historically treated any PlaceOwnership row as an access grant.
+    severity: MEDIUM
+    mitigation: >
+      Gate write/edit access on verified=true (FR-005). Add a test asserting a
+      provisional owner cannot edit venue fields. All pre-existing rows are
+      verified=true, so current behavior is unchanged.
+  - risk: >
+      Public/free email domains (gmail, outlook) would trivially defeat domain
+      proof if not excluded.
+    severity: HIGH
+    mitigation: Maintained free-email-provider blocklist; reject in FR-003 (a)/(b).
+  - risk: >
+      Race between two simultaneous claimants on the same stub.
+    severity: LOW
+    mitigation: >
+      DB unique constraint on one active OWNERSHIP_CLAIM per place; second claimant
+      gets CLAIM_ALREADY_PENDING and is offered the dispute path.
+
+open_questions:
+  # RESOLVED 2026-07-05:
+  #  - Fast-track: YES for trusted-import domains (FR-010); all other paths admin-reviewed.
+  #  - Provisional claimants get a READ-MOSTLY "pending owner" view, no edits until VERIFIED (FR-005).
+  #  - Cap: 20 provisional claims per human (FR-004).
+  #  - Stub noindex-until-verified folded IN (FR-011).
+  - Dispute resolution UX for admins: reuse review-place-verification decision, or a dedicated dispute resolver that can transfer ownership between parties? (v1 only FILES the dispute; resolution mechanics deferred.)
+  - websiteSource backfill: can we retroactively mark any existing Place.website values as TRUSTED_IMPORT, or do all pre-existing rows stay UNKNOWN (no fast-track) until re-imported?
+  # 2026-07-07 follow-up, NOT resolved:
+  #  - This flow introduced three FK-less/PII-bearing rows that account
+  #    deletion does not handle today: PlaceOwnership (polymorphic
+  #    ownerType/ownerId), PlaceVerificationRequest.claimantHumanId (bare
+  #    scalar, no @relation), and PlaceClaimEmailChallenge (humanId scalar +
+  #    claimant email PII). A deleted human leaves a dangling verified
+  #    "ghost owner" and orphaned claimant PII (see
+  #    docs/account-deletion.md, "Polymorphic / FK-less references — open
+  #    follow-ups"). E2E 22/22 covers the claim flow itself, but this feature
+  #    should NOT be considered fully shipped until it has a deletion story —
+  #    tracked, not solved, by docs/specs/2026-07-07/
+  #    anonymize-buyer-instead-of-block.spec.yaml.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - DNS TXT-record domain verification (only account-email-domain + mailbox-code + document in v1).
+  - Bulk/CSV claiming of multiple venues.
+  - Transferring ownership between two existing verified owners without an admin (dispute only files a request in v1).
+  - Org membership management / inviting co-owners to a claimed venue.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A signed-in human whose verified account email domain matches an unclaimed venue's website can claim it, and in one action the venue shows "Claim pending review", a provisional PlaceOwnership (verified=false) exists, Place.verification==PENDING, and an OWNERSHIP_CLAIM request appears in the platform queue.
+  - A claimant with no matching domain can instead verify a domain-mailbox code OR upload a document, reaching the same provisional state.
+  - Free-email domains (gmail.com etc.) are rejected for domain proof.
+  - Admin APPROVE flips the venue to VERIFIED + listedInDirectory=true and PlaceOwnership.verified=true with reviewer stamped; the claimant is notified.
+  - Admin REJECT removes/revokes the provisional PlaceOwnership, reverts Place.verification to UNVERIFIED, and notifies the claimant with the reason; no VERIFIED/listed side effects remain.
+  - Claiming a venue that already has a VERIFIED owner is blocked with PLACE_ALREADY_CLAIMED; the page offers a dispute that files an OWNERSHIP_DISPUTE request and notifies the current owner; ownership is not mutated.
+  - A second claimant on a place with a pending claim gets CLAIM_ALREADY_PENDING.
+  - A provisional (verified=false) claimant sees a pending-owner view but CANNOT edit venue fields; edit access unlocks only on VERIFIED.
+  - A domain-match claim on a venue whose website was set by a TRUSTED import auto-verifies in one motion (no admin queue); the same match on a stub-set website stays provisional + queued.
+  - A human at 20 provisional claims is blocked from a 21st with CLAIM_LIMIT_REACHED.
+  - An unverified/stub place page renders but emits robots noindex; only VERIFIED places are indexable.
+  - Every ownership transition is audit-logged with actor and reason.

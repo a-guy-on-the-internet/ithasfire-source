@@ -44,9 +44,31 @@ export const AUTH_RATE_LIMIT_CUSTOM_RULES = {
   "/sign-in/email": { window: 60, max: 5 },
   "/sign-in/username": { window: 60, max: 5 },
 
+  // ── Account creation. Until 2026-09-29 this sat on the 100/60s global
+  // floor; an automated attacker made 29 accounts in 35 minutes (~1 per 72s).
+  // The ask was 3 per 10 minutes, but the TTL INVARIANT above caps every
+  // window at 120s, so this is 3 per the largest allowed window.
+  //
+  // What it buys, with Better Auth's semantics (api/rate-limiter/index.mjs:
+  // the counter resets only after a QUIET gap > `window` since the last
+  // ALLOWED request): at that night's 72s cadence the attacker gets 3
+  // accounts, is refused until 120s of silence, then gets 3 more, about 3
+  // per 288s against their 4. A client that waits more than 120s between
+  // sign-ups is never limited, and like every rule here it's a floor under
+  // concurrency (see /token). A real N-per-10-minutes cap needs a limiter
+  // whose window isn't bound by the storage TTL. NOT in AUTH_GUESS_SPACE_PATHS:
+  // a fixed 3/120s window in the atomic pre-limiter allows 1.5/min, LOOSER
+  // than this quiet-gap rule at that cadence, and there's no account
+  // identifier to bucket on (every sign-up is a new email).
+  "/sign-up/email": { window: AUTH_RATE_LIMIT_MAX_WINDOW_SECONDS, max: 3 },
+
   // ── OTP-based sign-in and verification: small guess space (6 digits)
   "/sign-in/email-otp": { window: 60, max: 5 },
   "/email-otp/verify-email": { window: 60, max: 5 },
+  // Completes a proven email change with the code mailed to the NEW address
+  // (the only email-change path left after review round 3). Same 6-digit
+  // guess space; keyed per new address in the atomic layer.
+  "/email-otp/change-email": { window: 60, max: 5 },
   // Resend/send endpoints: not brute-forceable, but capped to stop
   // email/SMS-bombing a victim address/number.
   "/email-otp/send-verification-otp": { window: 60, max: 3 },
@@ -54,10 +76,42 @@ export const AUTH_RATE_LIMIT_CUSTOM_RULES = {
   "/phone-number/verify": { window: 60, max: 5 },
   "/phone-number/send-otp": { window: 60, max: 3 },
 
+  // ── Other outbound-mail/SMS senders (2026-09-29 review, F8). Until then
+  // each sat on the 100/60s global floor, so any of them could be aimed at a
+  // victim's inbox 100 times a minute per IP. Same 3/60s as the two send
+  // rules above and, like them, in AUTH_GUESS_SPACE_PATHS (atomic) as "send"
+  // paths keyed per recipient. Every path was confirmed as a
+  // `createAuthEndpoint("…")` literal in the installed better-auth 1.6.9
+  // dist; there is no bare `/forget-password` endpoint in 1.6.9 (it became
+  // `/request-password-reset`), only the email-otp plugin's deprecated
+  // `/forget-password/email-otp` alias, which is covered.
+  //   /sign-in/magic-link                 — "Sign in to … scanner" link
+  //   /request-password-reset             — reset link
+  //   /email-otp/request-password-reset   — reset code
+  //   /forget-password/email-otp          — reset code (deprecated alias)
+  //   /phone-number/request-password-reset — reset code by SMS
+  //   /change-email                       — REFUSED outright in hooks.before
+  //       since review round 3 (see REFUSED_AUTH_ENDPOINTS); the cap stays
+  //       as defence in depth should that refusal ever be removed.
+  "/sign-in/magic-link": { window: 60, max: 3 },
+  "/request-password-reset": { window: 60, max: 3 },
+  "/email-otp/request-password-reset": { window: 60, max: 3 },
+  "/forget-password/email-otp": { window: 60, max: 3 },
+  "/phone-number/request-password-reset": { window: 60, max: 3 },
+  "/change-email": { window: 60, max: 3 },
+
   // ── Two-factor verification: small guess space, highest-value target
   "/two-factor/verify-totp": { window: 60, max: 5 },
   "/two-factor/verify-otp": { window: 60, max: 5 },
   "/two-factor/verify-backup-code": { window: 60, max: 5 },
+  // Sends the 2FA code, by text when the account has a verified US number.
+  // On the global floor alone, one attacker with their own account and
+  // number could spend the shared hourly 2FA text pool (`otp-sms-budget.ts`)
+  // in minutes, pushing everyone else's codes to email and costing money.
+  // Same 3/60s as the other send rules. The body carries no account
+  // identifier (the account is the two-factor cookie), so the atomic layer
+  // keys this per IP only, like the verify routes above.
+  "/two-factor/send-otp": { window: 60, max: 3 },
 
   // ── Magic link / passkey verification: high-entropy token or WebAuthn
   // signature, not realistically brute-forceable, but still capped tighter
@@ -80,6 +134,14 @@ export const AUTH_RATE_LIMIT_CUSTOM_RULES = {
   // and those requests carry no `cf-connecting-ip` — they never transit
   // Cloudflare — so they all collapse onto ONE key: the web service's Cloud
   // Run egress IP, SHARED BY EVERY SIGNED-IN USER.
+  //
+  // MITIGATED, NOT REMOVED (2026-09-30): those callers now sign the visitor's
+  // IP onto the call (x-th-client-ip*), plugins/verified-client-ip.ts stamps
+  // it as `x-th-verified-client-ip`, and Better Auth reads that header first,
+  // so a forwarded call keys on the visitor. The aggregation still applies
+  // whenever no forward is accepted: ORIGIN_SHARED_SECRET unset on either
+  // side, an inbound request without a valid `cf-connecting-ip`, or a
+  // rejected signature. Keep the 300 below sized for that fallback.
   //
   // On the global 100/60s floor that is a silent, staff-wide lockout waiting
   // to happen: exhausting the key makes the mint return a non-2xx, the edge
@@ -176,6 +238,7 @@ export const AUTH_GUESS_SPACE_PATHS = [
   // OTP verification — 6-digit guess space.
   "/sign-in/email-otp",
   "/email-otp/verify-email",
+  "/email-otp/change-email",
   "/phone-number/verify",
   // Two-factor verification — small guess space, highest-value target.
   "/two-factor/verify-totp",
@@ -189,6 +252,14 @@ export const AUTH_GUESS_SPACE_PATHS = [
   // free email/SMS cannon pointed at a victim address/number.
   "/email-otp/send-verification-otp",
   "/phone-number/send-otp",
+  "/sign-in/magic-link",
+  "/request-password-reset",
+  "/email-otp/request-password-reset",
+  "/forget-password/email-otp",
+  "/phone-number/request-password-reset",
+  "/change-email",
+  // Spends the shared 2FA text budget; IP-keyed only (no body identifier).
+  "/two-factor/send-otp",
 ] as const satisfies readonly RuleBackedAuthPath[];
 
 export type AuthGuessSpacePath = (typeof AUTH_GUESS_SPACE_PATHS)[number];
@@ -223,6 +294,7 @@ const AUTH_PATH_KIND = {
   "/sign-in/phone-number": "guess",
   "/sign-in/email-otp": "guess",
   "/email-otp/verify-email": "guess",
+  "/email-otp/change-email": "guess",
   "/phone-number/verify": "guess",
   "/two-factor/verify-totp": "guess",
   "/two-factor/verify-otp": "guess",
@@ -231,6 +303,13 @@ const AUTH_PATH_KIND = {
   "/passkey/verify-authentication": "guess",
   "/email-otp/send-verification-otp": "send",
   "/phone-number/send-otp": "send",
+  "/sign-in/magic-link": "send",
+  "/request-password-reset": "send",
+  "/email-otp/request-password-reset": "send",
+  "/forget-password/email-otp": "send",
+  "/phone-number/request-password-reset": "send",
+  "/change-email": "send",
+  "/two-factor/send-otp": "send",
 } as const satisfies Record<AuthGuessSpacePath, "guess" | "send">;
 
 /**

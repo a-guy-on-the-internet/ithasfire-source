@@ -1,0 +1,52 @@
+title: use-case | comms.previewAnnouncement
+owner: comms
+file: packages/core/src/use-cases/comms/previewAnnouncement.ts
+goal: >
+  Render a single announcement preview (HTML + TEXT + subject) using ui-email templates or raw body,
+  without persisting a send. Optionally send a preview to a specific test email (through Mail adapter).
+
+ports:
+  - Repos (announcements, authz)
+  - UI-Email renderer (render({templateId, props}) -> {html, text, subject})
+  - CommsMailPort (optional sendPreview)
+  - Logger
+  - Idempotency (optional—pure render can skip)
+  - Clock
+
+invariants:
+  - Actor must own rights to view the announcement.
+  - For template-based content, template must exist and render with given props.
+  - For raw body, sanitize + convert to email-safe minimal HTML.
+
+input_schema:
+  actorHumanId: uuid
+  announcementId: uuid
+  sendToEmail?: string # if present, send preview to this address
+  locale?: string
+
+output_schema:
+  subject: string
+  html: string
+  text: string
+  sentToEmail?: string
+
+side_effects:
+  - Optional: send preview via CommsMailPort with a [PREVIEW] prefix in subject.
+  - Audit: comms.announcement.preview (no PII)
+
+idempotency:
+  - If sendToEmail provided, protect with key: comms:previewSend:${announcementId}:${sendToEmail}
+  - ttl_sec: 60
+  - Behavior: replay ok
+
+errors:
+  - invalid_input(422): bad template props; invalid email
+  - forbidden(403): no rights
+  - not_found(404): announcement missing
+  - dependency_failed(424): renderer or mail adapter failure
+
+notes:
+  - Prefix subjects with "[PREVIEW]" for any actual send.
+  - Locale hook is pass-through to renderer; default en-US.
+tests:
+  - render-only; render+preview; template missing; bad props

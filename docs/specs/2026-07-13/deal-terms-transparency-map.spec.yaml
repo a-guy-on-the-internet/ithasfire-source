@@ -1,0 +1,432 @@
+# deal-terms-transparency-map.spec.yaml
+#
+# The economic-sunlight layer: opt-in, aggregate-only publication of live-music
+# deal terms (guarantees, splits, deductions) rendered as an adaptive hex map.
+# Lights up the 200-2,000-cap middle that Pollstar/Billboard Boxscore ignores,
+# while a suppression policy protects exactly the contributors the shadow was
+# protecting. Qualitative venue data (load-in, FOH, room quality) is NOT this
+# spec — that is the place-review surface and its anonymization policy.
+#
+# Non-negotiables encoded here, not in UI copy:
+#   1. Name attachment is opt-in forever. No ratchet, no later "expose" phase.
+#   2. Monetary data only ever displays in aggregate — including venue-side
+#      opt-in data shown on a venue's own page.
+#   3. The dataset is never sold and there is no pay-to-adjust. Ticket fees
+#      keep the lights on; this layer is a public good.
+#   4. Suppression sets the display-resolution floor. Zoom is a camera, never
+#      a query that mints finer disclosure.
+#
+# Related specs:
+#   - specs/2026-07-13/completed/place-review-anonymization.spec.yaml (policy-module +
+#     snapshot-not-live pattern this spec deliberately mirrors; thresholds and
+#     coarsening philosophy shared)
+#   - specs/2026-04-05/completed/place-reviews-and-stats.spec.md (qualitative
+#     sibling surface — the daily-use layer; monetary review fields there stay
+#     behind that spec's aggregates)
+#   - specs/2026-07-13/completed/booking-review-data-weave.spec.yaml (WS3 owns the unified
+#     post-gig prompt this spec's FR-003 rides; seam: per-venue money = review
+#     surface only; deal-structure money = this surface only, never per-venue)
+#   - specs/2026-06-05 booking-request + Agreement negotiation (deal-type
+#     vocabulary source: Agreement/PayoutTerms)
+#   - specs/2026-03-06 settlements (platform-sourced contribution trigger)
+#   - specs/2026-03-18 artist-earnings (earnings data a performer may elect to
+#     contribute from)
+
+version: "1.0"
+updated: "2026-07-13"
+status: draft
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Working musicians negotiate blind. Deal terms at the club/theater tier are
+    private, so each artist underbids against numbers they could have known,
+    and each is privately sure they're the only one getting squeezed. The
+    existing "transparency" in the industry (Pollstar/Billboard Boxscore) is
+    voluntary, promoter-reported, top-line-gross-only, and skews to arenas —
+    it says nothing about guarantees, splits, or settlement deductions, and
+    nothing at all about the 200-2,000-cap middle where working artists live.
+  solution: >
+    An opt-in contribution pipeline (platform settlements one-tap; manual
+    entry with private verification) feeding a nightly aggregation job that
+    bins deals into H3 hex cells, merges sparse cells up the hierarchy until
+    every displayed cell clears a distinct-contributor threshold, coarsens all
+    values, and materializes a public-safe snapshot. A MapLibre map renders
+    the snapshot with a global max zoom. The entire surface stays dark until
+    a data-sufficiency gate is met. Aggregation runs behind a port
+    ("points in, safe cells out") so the v1 TS/h3-js adapter can later be
+    swapped for a density-clustering adapter without upstream change.
+  users:
+    - Performers (contribute their own deals; consume aggregates to negotiate)
+    - Venues (opt in to feed their own deal data; shown only in aggregate)
+    - Fans/public (see the economics of live music at safe resolution)
+  surfaces:
+    - web (map + contribution flow)
+    - jobs (nightly cell recompute, snapshot)
+    - api
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        DealContribution model capturing one deal's terms from one party.
+        Fields: contributor (humanId or orgId — exactly one), side
+        (ARTIST | VENUE), source (PLATFORM_SETTLEMENT | MANUAL), dealType
+        (FLAT_GUARANTEE | DOOR_SPLIT | GUARANTEE_VS_PERCENTAGE |
+        GUARANTEE_PLUS_BACKEND), monetary fields per type (guaranteeCents,
+        splitBps, breakpointCents, backendBps), soft-cost fields
+        (merchCutBps?, compCount?, deductionsCents?), capBand (enum, below),
+        geo point (lat/lng of the venue), eventDate, optional platform refs
+        (agreementId?, eventId?, placeId?) when source=PLATFORM_SETTLEMENT.
+        Platform refs are NEVER readable outside audited staff surfaces.
+    - id: FR-002
+      description: >
+        Consent flags on DealContribution: displayNameOptIn (default false,
+        forever revocable, controls whether the contributor's name may appear
+        on any surface tied to their own contribution) and venue-side
+        contributions carry no per-deal display at all — venue opt-in data
+        enters the same aggregate cells only. Revoking opt-in or deleting a
+        contribution removes it from the next snapshot recompute.
+    - id: FR-003
+      description: >
+        Contribution as a byproduct, riding the unified post-gig flow: the
+        post-gig prompt (booking-review-data-weave WS3, one outbox, review-ask
+        leads) gains a final one-tap step — "add this deal (anonymized) to the
+        transparency index?" — shown only when a finalized platform settlement
+        exists for the gig. Never a second standalone notification. Accepting
+        creates a PLATFORM_SETTLEMENT contribution prefilled from
+        Agreement/PayoutTerms/settlement data. Declining is frictionless and
+        never re-prompted for that settlement. Settlements without a preceding
+        booking-request gig (no post-gig prompt) may fall back to an in-app
+        surface, still one-tap, still once.
+    - id: FR-004
+      description: >
+        Manual contributions require private verification before counting
+        toward public cells: contributor uploads a proof document (settlement
+        sheet / deal memo) through a flow that instructs and assists redaction
+        of counterparty-identifying terms. Proof is staff-visible only,
+        audit-logged on read (pattern: place-review staff reads), and
+        contributions are status PENDING_VERIFICATION until reviewed.
+        Unverified manual contributions never enter the snapshot.
+    - id: FR-005
+      description: >
+        Core policy module (deal-transparency/suppression-policy.ts), pure and
+        unit-tested, built on the shared aggregate-suppression primitives
+        (place-review-anonymization FR-009: k-threshold gate, bucket rounding,
+        top-coding, count bands) with its own domain constants. Constants:
+        MIN_DISTINCT_CONTRIBUTORS per cell (default 5), cap bands
+        (LT_200, C200_700, C700_1500, C1500_3500, C3500_10K, GTE_10K),
+        season buckets (quarterly), money coarsening (guarantees rounded to
+        $50 buckets; bps to 250-bp buckets), top-coding ceiling per cap band
+        (values above ceiling display as "$X+"). A cell = (h3CellId, capBand,
+        dealType, seasonBucket). Distinctness counts contributors, not
+        contributions.
+    - id: FR-006
+      description: >
+        Merge-up: any cell below MIN_DISTINCT_CONTRIBUTORS rolls to its H3
+        parent (h3-js cellToParent), recursively, until the merged cell clears
+        the threshold or reaches the configured coarsest resolution; a cell
+        that cannot clear it even at coarsest resolution is omitted entirely,
+        not zeroed. Cap band and dealType never merge across their boundaries
+        (mixing deal forms produces a number describing no real show); season
+        may merge to ALL_YEAR as a final step before omission.
+    - id: FR-007
+      description: >
+        Snapshot, never live: a nightly job recomputes all safe cells into
+        DealCellSnapshot rows (cellId, resolution, capBand, dealType,
+        seasonBucket, contributorBand, coarsened stats JSON, computedAt).
+        Public reads serve snapshots only. A fresh contribution is publicly
+        invisible until the next nightly run and indistinguishable within the
+        batch thereafter (temporal-correlation defense, same rationale as
+        place-review weekly snapshots).
+    - id: FR-008
+      description: >
+        Aggregation behind a port: DealAggregationPort with the single
+        contract "contribution points in, safe cells out." v1 adapter is pure
+        TypeScript using h3-js (bin -> count distinct -> merge-up -> coarsen).
+        The port exists so a later density-clustering adapter (HDBSCAN,
+        containerized job meeting TS at object storage) can replace it with no
+        transport/UI change. v1 ships NO Python.
+    - id: FR-009
+      description: >
+        Map rendering: MapLibre layer fed by snapshot cells as GeoJSON
+        (h3-js cellToBoundary). Fill = median headline stat for the selected
+        dealType/capBand filter; opacity/legend = contributorBand. A global
+        MAX_MAP_ZOOM constant caps the camera; displayed resolution is
+        whatever the snapshot blessed per area — zooming past data density
+        shows the same coarse cells or nothing. The client can never request
+        finer resolution than the snapshot contains.
+    - id: FR-010
+      description: >
+        Launch gate: the entire map surface is feature-flagged dark until a
+        platform-level sufficiency check passes (>= N total verified
+        contributions AND >= M displayable cells; constants in the policy
+        module). Before the gate, the contribution flow still runs and shows
+        contributors a private "what you'll unlock" preview with current
+        counts. An empty map teaches people there's nothing here; do not ship
+        one.
+    - id: FR-011
+      description: >
+        Venue page aggregate block: a venue that opts in gets a
+        "deal transparency" block on its own page showing ONLY the same
+        safe-cell aggregates its area/capBand already displays publicly,
+        badged "this venue contributes." Opt-in is a flex, never a per-deal
+        disclosure. Cross-check design (artist-side vs venue-side divergence
+        on the same deal) is out of scope but both sides MUST land in the
+        same cells so the seam exists.
+    - id: FR-012
+      description: >
+        Big-room taper (phase 2, recorded now): suppression keys on
+        re-identification risk, not size. GTE_10K cells whose shows are
+        already publicly reported may display at finer resolution/lower
+        thresholds. v1 applies uniform thresholds; do not build the taper
+        yet, but the policy module's threshold lookup takes capBand as an
+        input so the taper is a constant change, not a refactor.
+    - id: FR-013
+      description: >
+        No inducement: contribution UX must never target a specific deal or
+        person ("tell us what X paid"), never reference NDA breach as
+        acceptable, and copy must state plainly what is published (aggregates)
+        and what is never published (names without opt-in, individual deals,
+        counterparty terms, proof documents). Legal review of the contribution
+        flow + copy is a launch blocker (see risks).
+    - id: FR-014
+      description: >
+        Shared deal-shape vocabulary: a core module defining the canonical
+        deal-shape terms and the mappings between the three existing enums —
+        BookingFeeType (GUARANTEE | DOOR_SPLIT | NEGOTIABLE),
+        PlaceReview.paymentMethod (GUARANTEE | DOOR_SPLIT | TICKET_SALES |
+        BAR_PERCENTAGE | TIPS_ONLY | PAY_TO_PLAY | UNPAID | OTHER), and this
+        spec's dealType. dealType derives from the canonical set; the module
+        provides paymentMethod->dealType and feeType->dealType mappings (with
+        explicit unmappable cases) so review payout aggregates, booking-form
+        fee prefs, and deal cells stay comparable. No existing enum is
+        migrated; this is a mapping layer, not a schema change.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Suppression-policy module is pure with table-driven tests pinning:
+        cell display at 4 vs 5 distinct contributors; merge-up paths;
+        omission at coarsest resolution; bucket alignment of every emitted
+        number; top-coding at each cap band's ceiling; one contributor with
+        many contributions counts once.
+    - id: NFR-002
+      description: >
+        Nightly job is idempotent, full-recompute (no incremental deltas —
+        deltas leak), reports failures via ReporterPort, and serves the stale
+        snapshot on failure (fail-closed for anonymity, degraded freshness).
+    - id: NFR-003
+      description: >
+        No tRPC procedure outside audited staff routers returns contributor
+        identity, platform refs, exact (uncoarsened) monetary values, or
+        proof documents. CI-level test asserts the public router's output
+        types structurally cannot carry these fields.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: create-deal-contribution
+        description: >
+          Validates consent flags, capBand, dealType-consistent monetary
+          fields; MANUAL source lands PENDING_VERIFICATION, PLATFORM_SETTLEMENT
+          (from the one-tap prompt) lands VERIFIED with refs attached.
+        input: contributor, side, source, deal fields, consent flags, proof?
+        output: DealContribution
+        idempotent: false
+        money: false
+      - name: revoke-deal-contribution
+        description: >
+          Contributor withdraws a contribution or its name opt-in; row is
+          soft-deleted / flag cleared and drops out at next recompute.
+        input: contributionId, actor
+        output: updated contribution
+        idempotent: true
+        money: false
+      - name: review-deal-contribution (staff)
+        description: >
+          Approve/reject PENDING_VERIFICATION manual contributions after
+          proof check. Reads of proof are audit-logged (place-review pattern).
+        input: contributionId, decision, actor
+        output: updated contribution
+        idempotent: false
+        money: false
+      - name: recompute-deal-cells
+        description: >
+          Nightly job use case: load verified contributions, run
+          DealAggregationPort, replace DealCellSnapshot set atomically,
+          evaluate the launch-gate sufficiency check.
+        input: "now (clock)"
+        output: "cell count, gate status"
+        idempotent: true
+        money: false
+      - name: get-deal-cells
+        description: >
+          Public read: snapshot cells for a viewport/filter. Serves snapshot
+          only; never computes from live rows; returns nothing pre-gate.
+        input: bbox, dealType?, capBand?, seasonBucket?
+        output: GeoJSON-ready cell list
+        idempotent: true
+        money: false
+
+  ports:
+    new:
+      - "DealAggregationPort — contract: verified contribution points in,
+         suppressed/coarsened cells out. v1 adapter TS/h3-js in-process;
+         future adapter may be an external clustering job meeting core at
+         storage. Policy module is consumed BY adapters so the guarantee
+         travels with the port, not one implementation."
+    existing:
+      - reporter (job failures)
+      - audit (staff proof reads, reviews)
+      - storage/R2 (proof documents)
+
+  adapters:
+    new:
+      - "h3 aggregation adapter (TS, h3-js): bin -> distinct-count ->
+         merge-up -> coarsen -> snapshot rows"
+      - prisma repos for DealContribution / DealCellSnapshot
+    existing:
+      - settlement finalization hook (emits the one-tap prompt eligibility)
+
+  transport:
+    trpc_procedures:
+      - "dealTransparency.contribute"
+      - "dealTransparency.revoke"
+      - "dealTransparency.myContributions"
+      - "dealTransparency.getCells (public, snapshot-only, gate-aware)"
+      - "dealTransparency.staffReview (staff router)"
+    webhooks: []
+
+  ui:
+    pages:
+      - "/transparency — MapLibre map, filters (dealType, capBand, season),
+         legend with contributorBand, gate-aware empty state"
+    components:
+      - "post-settlement one-tap contribution prompt (performer surface)"
+      - "manual contribution wizard incl. proof upload + redaction guidance"
+      - "venue-page deal-transparency aggregate block (opt-in badge)"
+      - "contributor dashboard: my contributions, opt-in toggles, revoke"
+
+  jobs:
+    - "deal-transparency.recompute-cells (nightly; pattern:
+       place-reviews.recompute-public-snapshots)"
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - "DealContribution (fields per FR-001/FR-002, status enum
+       PENDING_VERIFICATION | VERIFIED | REJECTED | REVOKED)"
+    - "DealCellSnapshot (cellId, resolution, capBand, dealType, seasonBucket,
+       contributorBand, statsJson, computedAt)"
+    - "DealContributionProof (R2 ref, contributionId, staff-only)"
+  modified_models: []
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      NDA exposure: contributors sharing their own terms may breach their own
+      confidentiality clauses; the platform inducing or enabling targeted
+      disclosure could face tortious-interference claims.
+    severity: HIGH
+    mitigation: >
+      Aggregate-only display, FR-013 no-inducement rules, redaction step on
+      proofs, and a mandatory entertainment-lawyer review of the contribution
+      flow and all copy BEFORE the surface or the contribution prompt ships.
+      Launch blocker, not a fast-follow.
+  - risk: >
+      Re-identification by geometry: one 1,200-cap room in a small town makes
+      "that cell" that venue even with no name attached.
+    severity: HIGH
+    mitigation: >
+      Distinct-contributor threshold + merge-up + banded caps + coarsened
+      values + top-coded outliers + nightly-batch snapshots + global max zoom.
+      Policy module owns all of it; nothing displays that didn't pass it.
+  - risk: >
+      Data poisoning / gaming (a venue submitting fake artist-side lowball
+      deals to depress the visible market).
+    severity: MEDIUM
+    mitigation: >
+      Manual contributions are proof-verified before counting; platform-
+      sourced contributions are inherently verified; distinctness counted per
+      contributor; staff review queue. Statistical outlier flagging is an
+      open question below.
+  - risk: >
+      Cold start: thresholds hide everything early, making the surface look
+      dead and discouraging contribution.
+    severity: MEDIUM
+    mitigation: >
+      FR-010 gate keeps the map dark until it looks alive; pre-gate
+      contributors see private progress counts; the one-tap settlement prompt
+      accretes data as a byproduct of normal platform use rather than begging.
+  - risk: >
+      Mission drift: pressure will eventually arrive to sell benchmark access
+      to promoters/agencies or accept payment to adjust numbers.
+    severity: MEDIUM
+    mitigation: >
+      Stated in the header as a non-negotiable; mirror the levels.fyi
+      "never accept payment to adjust" stance publicly in the surface's
+      about copy so the commitment is externally auditable.
+
+open_questions:
+  - >
+    Exact launch-gate constants (N contributions, M cells) — pick at
+    implementation once contribution rate from the settlement prompt is
+    observable.
+  - >
+    Statistical outlier / anomaly flagging for verified-but-suspicious
+    contributions: worth a v1 heuristic or defer entirely?
+  - >
+    Does venue-side opt-in require org-level role gating beyond existing
+    org-admin (who may bind the venue to ongoing data contribution)?
+  - >
+    Season bucket granularity: quarterly vs summer/not-summer — decide from
+    early data variance.
+  - >
+    Should artist-earnings (2026-03-18) surfaces link into the contribution
+    wizard as a prefill source for MANUAL contributions?
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Qualitative venue data (load-in, FOH, sound) — place-review surface owns
+    it, including its own anonymization policy
+  - Artist-vs-venue cross-check/reconciliation UI (seam preserved by FR-011;
+    not designed here)
+  - HDBSCAN / density-clustering adapter and any Python runtime (port contract
+    written for it; build only when hex tiling visibly misfits real clusters)
+  - Big-room suppression taper (FR-012 records the design; phase 2)
+  - Per-cell drilldowns, time-series charts, CSV export of aggregates
+  - Any sale, licensing, or partner API of the dataset (non-negotiable no)
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A cell with 4 distinct contributors displays nothing at its own
+    resolution and merges up; at 5 it displays with all values
+    bucket-aligned and outliers top-coded.
+  - One contributor submitting 10 deals in one cell counts as 1 toward the
+    threshold.
+  - A new verified contribution changes no public cell until the nightly job
+    runs; the job is idempotent on re-run.
+  - Zooming to MAX_MAP_ZOOM over a sparse area shows the same coarse cells or
+    nothing; no client request can return finer cells than the snapshot holds.
+  - Pre-gate, dealTransparency.getCells returns the gated-empty response and
+    the /transparency page shows the pre-launch state; post-gate it renders.
+  - Revoking a contribution removes its effect at the next recompute;
+    revoking name opt-in removes the name everywhere immediately.
+  - No public procedure returns contributor identity, platform refs, exact
+    monetary values, or proof documents (NFR-003 structural test passes).
+  - Venue opt-in block shows only cell aggregates + the contributes badge —
+    never a per-deal figure — and both sides' contributions land in the same
+    cells.
+  - Suppression-policy unit tests pin every threshold, band boundary, bucket,
+    and top-code ceiling.

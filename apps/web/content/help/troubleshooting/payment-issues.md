@@ -18,7 +18,7 @@ Check in this order:
 2. **Bank block** — banks commonly block unfamiliar merchants on the first purchase. Call the number on the back of your card.
 3. **Insufficient funds** — especially common with debit cards and prepaid cards.
 4. **3-D Secure** — if your bank requires verification, you'll be prompted. Complete the challenge and try again.
-5. **Try a wallet method** — Apple Pay, Google Pay, or Cash App Pay often bypass bank blocks.
+5. **Try a wallet method** — Apple Pay or Google Pay often bypass bank blocks.
 
 :::tip
 Ask your bank to whitelist "Ithas Fire" or "Stripe" if you plan to buy tickets regularly. That prevents future declines.
@@ -48,7 +48,7 @@ Some banks reject the first 3DS challenge silently. Try in this order:
 
 1. Close checkout and reopen the event
 2. Use a different browser or clear cookies
-3. Switch to Apple Pay, Google Pay, or Cash App Pay — they handle 3DS differently
+3. Switch to Apple Pay or Google Pay — they handle 3DS differently
 
 ## ACH / US bank account
 

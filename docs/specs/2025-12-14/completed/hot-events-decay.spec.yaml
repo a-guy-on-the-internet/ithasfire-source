@@ -1,0 +1,96 @@
+status: complete
+# Spec: Hot Events Decay Job
+meta:
+  owner: core-platform
+  status: completed
+  reviewers:
+    - growth-eng
+    - data
+  last_updated: 2025-11-25
+summary: |
+  BullMQ-driven maintenance job that periodically decays hot-event scores and prunes stale
+  leaderboard entries in Redis so discovery surfaces stay fresh and memory-neutral.
+scope:
+  included:
+    - Apply exponential decay to per-event scores and persist updated values in metadata hashes.
+    - Remove events whose decayed score drops below the configured threshold.
+    - Maintain the Redis bucket index (`hot:buckets`) so empty buckets disappear.
+    - Allow per-geohash fan-out when city-specific leaderboards require targeted decay.
+  excluded:
+    - Writing to downstream caches or search indices (handled by search refresh job).
+    - Adjusting signal weights; those remain defined in `RedisHotEventsAdapter`.
+    - Surfacing real-time analytics dashboards (metrics only).
+execution:
+  orchestration: bullmq + argo-cron
+  queue: th-hot-events-maintenance
+  image: ghcr.io/ithasfire/jobs:core-latest
+  command: ["node", "dist/jobs/run-cron.js"]
+  automation:
+    validation_workflow: infra/argo/apps/cron/base/workflows.yaml
+  validation_script: apps/jobs/src/scripts/hot-events/cron-smoke.ts
+  env:
+    JOBS_CRON_TASK: hot-events.decay
+    HOT_EVENTS_REDIS_URL: ${HOT_EVENTS_REDIS_URL}
+    HOT_EVENTS_REDIS_NAMESPACE: ${HOT_EVENTS_REDIS_NAMESPACE}
+  triggers:
+    - Hourly Argo CronWorkflow (global bucket) at HH:05.
+    - Nightly geo fan-out that walks metro prefixes.
+    - Manual CLI trigger for backfills.
+  scaling:
+    max_concurrency: 2 workers per queue (configurable via job definition).
+inputs:
+  redis:
+    namespace: th:hot-events
+    tau_seconds: env `HOT_EVENTS_DECAY_TAU_SECONDS` (default 3600).
+  geohash_strategy:
+    default_precision: 5 # ~4.9km cells, aligns with event discovery.
+    metro_radius_km: 25 # Same radius used by events discovery (`DEFAULT_RADIUS_KM`).
+    selection: |
+      For each active metro, derive the city center geohash via `GeoIndexPort.hash(lat,lng, precision=5)`
+      and walk outward up to 25km radius, queueing one decay job per unique prefix. Global bucket
+      (null prefix) runs every hour to catch long-tail events.
+  payload:
+    geohashPrefix?: nullable string (3..12 chars)
+    asOfEpochSeconds?: unix timestamp; defaults to enqueue time if omitted.
+outputs:
+  metrics:
+    - hot_events.decay.processed_total (labels: bucket, outcome)
+    - hot_events.decay.duration_ms
+    - hot_events.decay.failures_total
+  logs:
+    - Structured log per run: `{ bucket, processed, durationMs, ttlRefreshed }`.
+  alerts:
+    - PagerDuty when failure rate ≥ 3 consecutive runs.
+    - Slack warning when processed count is zero for >6 hours (suggests idle feed).
+failure_modes:
+  - name: redis_unavailable
+    mitigation: retry with built-in backoff, alert if >15 minutes, fall back to skip to avoid queue pile-up.
+  - name: payload_drift
+    mitigation: validate schema via `decayHotEventsPayloadSchema`; invalid jobs sent to DLQ for triage.
+  - name: bucket_scan_regression
+    mitigation: unit tests w/ `InMemoryRedis`, plus integration smoke before deploy.
+acceptance_criteria:
+  - Freshness: ≥99% of entries returned by `listHotEvents` have `lastSignalAt` within 18h after two consecutive decay runs. Verified via nightly watchdog that samples API output + Redis metadata.
+  - Footprint: Total `hot:meta:*` key count ≤110% of the trailing 7-day moving average; measured via `redis_exporter` gauge with alert when breached.
+  - Runtime: P95 BullMQ job duration <30s when processing ≤15k members per payload, using queue-level metrics.
+  - Bucket hygiene: Buckets that reach zero members are removed from `hot:buckets` within two runs; enforced by integration test that seeds + prunes a bucket nightly.
+  - Reliability: Global bucket sees ≤1 failed run per rolling 50 executions; breach auto-pages SRE.
+  - Geo coverage: Nightly metro fan-out touches ≥95% of metros with ≥50 signals/day, logged as `hot_events.decay.coverage_ratio`.
+testing:
+  unit:
+    - `packages/adapters` provides deterministic suites for `RedisHotEventsAdapter` using `InMemoryRedis` to catch math regressions.
+    - Schema guards live with `decayHotEventsPayloadSchema`; extend Vitest coverage whenever the payload surface changes.
+  integration:
+  - `pnpm -C apps/jobs vitest --run hot-events-decay.e2e` spins up an in-memory queue + Redis to assert the worker decays and prunes a seeded bucket via the domain layer.
+  smoke:
+  - Argo CronWorkflow `infra/argo/apps/cron/base/workflows.yaml` executes `apps/jobs/src/scripts/hot-events/cron-smoke.ts`, which seeds fixtures, invokes `run-cron`, and verifies decay end-to-end.
+  - For local CLI smoke, `pnpm -C apps/jobs smoke:hot-events` (or `tsx src/scripts/hot-events/cron-smoke.ts`) points at dev Redis with isolated namespaces.
+rollout_notes:
+  - Start with manual cron trigger in staging to compare before/after metrics.
+  - Once stable, enable hourly global + nightly metro fan-out; log bucket coverage ratios weekly.
+  - Future: consider adaptive cadence for high-traffic metros based on signal throughput.
+
+refinement_ideas:
+  - Add adaptive job sizing that chunks large buckets into multiple payloads when member count exceeds 20k to keep runtimes predictable.
+  - Introduce a canary bucket whose decay run is duplicated in staging hourly to surface regressions before prod rollout.
+  - Evaluate a `dry_run` flag for Argo to validate queue wiring during infra changes without touching Redis state.

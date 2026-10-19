@@ -1,0 +1,363 @@
+# volunteer-comp-tickets.spec.yaml
+#
+# Reward volunteers with comped or discounted tickets when they're approved
+# or checked in — the money-path sibling of generic-volunteering-asks.
+
+version: "1.0"
+updated: "2026-06-29"
+status: draft
+priority: P2 # High Value — turns volunteering into a retention/incentive lever
+depends_on:
+  - docs/specs/2026-06-29/generic-volunteering-asks.spec.yaml # asks, roles, signups, groups
+  - packages/db/prisma/volunteer.prisma # VolunteerSignup, EventVolunteerRole
+  - packages/db/prisma/order.prisma # Order (source=COMP), OrderItem (kind="ticket")
+  - packages/db/prisma/ticket.prisma # Ticket (code/QR), TicketType (priceCents), Promo, PromoRedemption
+  - packages/core/src/use-cases/comp/issue-comp-tickets.ts # createCompOrder() helper + mintTicketsForOrder()
+  - packages/core/src/use-cases/promos/create-promo.ts # createPromo() — mints a Promo
+  - packages/core/src/use-cases/orders/checkout-promos.ts # evaluatePromoApplications() — redeems at checkout
+  - packages/core/src/use-cases/orders/checkout-helpers.ts # free-order fee/tax short-circuit (isFreeOrder)
+  - packages/core/src/lib/pricing # all money math routes through here
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Volunteering is currently pure altruism — there is no built-in incentive. The
+    oldest, most effective volunteer recruiting lever in live events is "work the
+    door, get into the show." Organizers want to grant a free or discounted ticket
+    as a thank-you, but today they'd have to hand-issue comps out of band, with no
+    link to who actually showed up, no cap, and no audit trail.
+  solution: >
+    Let an ask (or a role within it) define a volunteer reward: a comp ticket (100%
+    off) or a percentage/fixed discount toward a chosen ticket type, with a per-ask
+    budget cap. The reward is granted automatically at a configurable trigger —
+    APPROVED or CHECKED_IN — by issuing a comp ticket / single-use discount through
+    the EXISTING ticketing path, idempotently, so a volunteer can never be double-
+    comped and the org can never exceed its cap. Every grant is auditable and
+    revocable (e.g. on NO_SHOW).
+  users:
+    - Organizers / Place owners offering an incentive to recruit volunteers
+    - Volunteers receiving a comp or discount as a reward
+    - Finance / org admins who need the comps capped and auditable
+  surfaces:
+    - web
+
+# ── Decisions (carry into implementation) ─────────────────────────────────────
+
+decisions:
+  reuse_comp_helper_not_wrapper: >
+    A COMP is issued through the EXISTING comp path so scanning/transfer/refunds
+    behave normally — but we reuse the lower-level `createCompOrder(tx, {...})`
+    helper + `mintTicketsForOrder()` (system actor `{ kind: "system", reason:
+    "volunteer_reward" }`), NOT the top-level `issueCompTickets()` use case.
+    Reason: `issueCompTickets` enforces ORG-admin RBAC on `actorHumanId`, but a
+    grant fires from a system trigger (check-in / approval) with no admin actor.
+    A comp is `Order.source = "COMP"`, `amountGrossCents = 0`, OrderItem
+    `kind = "ticket"`, `unitPriceCents = 0`; fees/tax auto-zero via the existing
+    free-order short-circuit. This spec adds the reward CONFIG and the grant
+    TRIGGER, not a new kind of ticket.
+  discount_is_a_promo: >
+    DISCOUNT rewards reuse the existing `Promo` model — we do NOT build a new
+    discount-code entity. A per-volunteer single-use reward = one `Promo` minted
+    per grant via `createPromo()`: unique `code`, `scope = TICKET_TYPE` (or EVENT)
+    bound to the reward's `ticketTypeId`, `maxRedemptions = 1`, `isPublic = false`
+    (manual-entry, sent to the volunteer). `percentOff` → `kind = PERCENT`,
+    `amountOffCents` → `kind = AMOUNT`. Redemption happens through the normal
+    checkout promo path (`evaluatePromoApplications`); we add nothing to checkout.
+    Note: `Promo` has NO email binding, so single-use is enforced by per-grant
+    code + `maxRedemptions = 1`, not by recipient identity.
+  org_funds_the_reward: >
+    The ORGANIZER funds the reward, mirroring how promos already work (GLOBAL promo
+    scope is deliberately disabled precisely because a discount comes off organizer
+    revenue, not platform margin). A COMP is a forgone seat (no revenue); a DISCOUNT
+    reduces the organizer's payout on that order. The face value is recorded for
+    reporting only — there is no platform-funded credit here. (UserCredit is a
+    separate, platform-funded mechanism we are NOT using.)
+  money_in_cents: >
+    All amounts are integer cents and route through packages/core/src/lib/pricing.
+    Discounts are expressed as either `percentOff` (0–100) or `amountOffCents`,
+    never floats.
+  trigger_choice: >
+    Reward trigger is per-ask: ON_APPROVAL (incentivize commitment) or
+    ON_CHECK_IN (incentivize actually showing up). Default ON_CHECK_IN — it's the
+    safer money posture and pairs with the auto-no-show job.
+  idempotent_grant: >
+    Each grant is keyed on (signupId, rewardId) via IdempotencyPort so retries,
+    re-approval, or a re-run trigger job never issue a second comp. One signup →
+    at most one live grant.
+  budget_cap: >
+    An ask reward carries an optional `maxGrants` cap. Granting checks remaining
+    budget inside the same tx (FOR UPDATE on the reward row) so concurrent check-ins
+    cannot overshoot the cap. When exhausted, further eligible volunteers get no
+    reward (logged), not an error.
+  revocation: >
+    A grant can be revoked when a signup is withdrawn or auto-marked NO_SHOW before
+    the reward is used, returning the budget slot. COMP revoke = set the comp
+    Ticket.status to INVALID and CANCEL its COMP order (only if not yet SCANNED).
+    DISCOUNT revoke = archive the single-use Promo (status ARCHIVED) if it has no
+    PromoRedemption yet. A reward already redeemed (Ticket SCANNED / Promo redeemed)
+    is NOT auto-clawed back — that's a manual refund decision.
+  eligibility: >
+    Only a signup that has reached the trigger state is eligible. Reward applies to
+    the volunteer's own Human/contactEmail; shadow profiles get a claim link tied to
+    contactEmail (mirrors existing signup-received flow).
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        An ask owner can attach a reward to an ask (or a specific role): type =
+        COMP (free ticket to a chosen ticket type) or DISCOUNT (percentOff or
+        amountOffCents toward a chosen ticket type), with optional `maxGrants` cap
+        and a trigger (ON_APPROVAL | ON_CHECK_IN).
+    - id: FR-002
+      description: >
+        When a signup hits the configured trigger, the system grants the reward
+        idempotently: COMP issues a $0 comp ticket via `createCompOrder` +
+        `mintTicketsForOrder` (Order.source=COMP); DISCOUNT mints one single-use
+        `Promo` (unique code, scope bound to the ticket type, maxRedemptions=1) via
+        `createPromo` and sends the code to the volunteer. The recipient is resolved
+        with `humans.ensureGuestHuman` for shadow profiles.
+    - id: FR-003
+      description: >
+        Granting respects the budget cap atomically — concurrent grants can never
+        exceed `maxGrants`. Exhausted budget yields no grant (audited), not a crash.
+    - id: FR-004
+      description: >
+        A volunteer is granted at most one live reward per reward definition; double
+        triggers are no-ops. The volunteer receives an email (or claim link for
+        shadow profiles) with their comp ticket or discount.
+    - id: FR-005
+      description: >
+        Withdrawal or auto-NO_SHOW (before redemption) revokes an unused grant and
+        frees the budget slot. A redeemed reward is left intact (manual refund only).
+    - id: FR-006
+      description: >
+        Owners/finance see a reward ledger per ask: granted, redeemed, revoked,
+        remaining budget, and total face value comped (in cents). Coordinators see
+        grant STATUS on their group's roster but cannot configure rewards.
+  non_functional:
+    - id: NFR-001
+      description: >
+        Money-moving: the grant use case uses IdempotencyPort and a single
+        repos.tx() per grant, with budget decrement and audit log in the same tx.
+    - id: NFR-002
+      description: >
+        All math in integer cents via packages/core/src/lib/pricing; comp = 100%
+        off; tax/fees follow whatever the existing comp-order path already does (do
+        not re-derive fee logic here).
+    - id: NFR-003
+      description: >
+        Authz: configuring a reward spends organizer revenue, so it requires
+        ORG_FINANCE_ROLES on the owning org — the SAME gate `createPromo` already
+        enforces — not merely ask ownership. Coordinators are read-only on reward
+        status. Reward config changes are audit-logged (action: "volunteer_reward_set").
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: set-volunteer-reward
+        description: Create/update/remove the reward attached to an ask or role.
+        input: "{ actorHumanId, askId, roleId?, type, percentOff?|amountOffCents?, ticketTypeId, trigger, maxGrants? }"
+        output: "{ ok: true, rewardId: uuid }"
+        idempotent: false
+        money: true # defines money policy
+      - name: grant-volunteer-reward
+        description: >
+          Issue the comp/discount for a signup that reached the trigger. COMP →
+          createCompOrder + mintTicketsForOrder (system actor). DISCOUNT → createPromo
+          (single-use). Wraps both in IdempotencyPort + a budget check the existing
+          comp/promo use cases do NOT provide.
+        input: "{ signupId, rewardId, trigger }"
+        output: "{ ok: true, grantId: uuid, skipped?: 'BUDGET_EXHAUSTED' | 'ALREADY_GRANTED' }"
+        idempotent: true # key: (signupId, rewardId); also @@unique([rewardId, signupId])
+        money: true
+      - name: revoke-volunteer-reward
+        description: Void an unused grant (withdraw / no-show) and return the budget slot.
+        input: "{ actorHumanId?, grantId, reason }"
+        output: "{ ok: true }"
+        money: true
+      - name: list-ask-reward-ledger
+        description: Owner/finance ledger — granted/redeemed/revoked/remaining/face-value.
+        input: "{ actorHumanId, askId }"
+        output: "{ reward, grants[], remaining, faceValueCents }"
+  ports:
+    existing:
+      - OrdersRepo # createPending, markSucceeded (Order.source="COMP")
+      - TicketsRepo # mint via mintTicketsForOrder helper; create, countIssuedForTicketType
+      - PromosRepo # create (mint single-use Promo); redemption tracked via existing checkout path
+      - HumansRepo # ensureGuestHuman for shadow recipients
+      - EventsRepo # getById, listTicketTypes (resolve ticketTypeId + face value)
+      - IdempotencyPort # the comp/promo use cases lack this — the grant adds it
+      - AuthZPort # reward CONFIG only (owners); grant/revoke fire system-side
+      - MailerPort # deliver comp ticket / discount code (or claim link for shadow profiles)
+      - ClockPort
+    new: [] # no new ports — pure reuse of the ticketing/promo repos
+  transport:
+    trpc_procedures:
+      - volunteering.setReward
+      - volunteering.rewardLedger
+      # grant/revoke are triggered internally (review/check-in use cases + jobs),
+      # not directly client-callable.
+  ui:
+    pages:
+      - apps/web/src/app/(dashboard)/.../volunteers/[askId]/rewards # configure + ledger
+    components:
+      - VolunteerRewardForm # type, ticket type, percent/amount, trigger, cap
+      - RewardLedgerTable # granted / redeemed / revoked / remaining / face value
+      - RewardStatusBadge # on roster rows (granted / redeemed / revoked / none)
+
+# ── Data Model ───────────────────────────────────────────────────────────────
+
+data:
+  new_enums:
+    - >
+      VolunteerRewardType { COMP  DISCOUNT }
+    - >
+      VolunteerRewardTrigger { ON_APPROVAL  ON_CHECK_IN }
+    - >
+      VolunteerRewardGrantStatus { GRANTED  REDEEMED  REVOKED }
+  new_models:
+    - >
+      VolunteerReward — reward policy attached to an ask (and optionally a role).
+        id            String  @id @default(uuid())
+        askId         String
+        roleId        String?                       // null = applies to whole ask
+        type          VolunteerRewardType
+        ticketTypeId  String                        // which ticket the comp/discount targets
+        percentOff    Int?                          // 0–100, DISCOUNT only
+        amountOffCents Int?                         // integer cents, DISCOUNT only
+        trigger       VolunteerRewardTrigger @default(ON_CHECK_IN)
+        maxGrants     Int?                          // null = uncapped
+        grantsUsed    Int     @default(0)           // decremented-against cap; FOR UPDATE on grant
+        active        Boolean @default(true)
+        createdAt DateTime @default(now())
+        updatedAt DateTime @updatedAt
+        // exactly one of (percentOff | amountOffCents) set when type=DISCOUNT; none when COMP
+        // @@index([askId])
+    - >
+      VolunteerRewardGrant — one issued reward; idempotency + audit + revocation unit.
+        id            String  @id @default(uuid())
+        rewardId      String
+        signupId      String
+        humanId       String?                       // null for shadow profiles pre-claim
+        contactEmail  String
+        status        VolunteerRewardGrantStatus @default(GRANTED)
+        compOrderId   String?                       // COMP: the Order.source=COMP issued
+        ticketId      String?                       // COMP: the minted Ticket (for void/scan tracking)
+        promoId       String?                       // DISCOUNT: the single-use Promo minted (FK -> Promo)
+        faceValueCents Int                          // TicketType.priceCents (COMP) or capped discount (DISCOUNT), for ledger
+        grantedAt   DateTime @default(now())
+        redeemedAt  DateTime?                       // COMP: Ticket scanned; DISCOUNT: PromoRedemption created
+        revokedAt   DateTime?
+        revokeReason String?
+        // @@unique([rewardId, signupId])  // idempotency: one grant per signup per reward
+        // @@index([signupId])
+        // @@index([status])
+  modified_models:
+    - >
+      VolunteerSignup — no new columns required (grant links back via signupId), but
+      review-signup and check-in-volunteer use cases gain a post-commit hook to fire
+      grant-volunteer-reward when a matching reward's trigger is met.
+  migrations_needed: true
+
+# ── Trigger Wiring ───────────────────────────────────────────────────────────
+
+triggers:
+  on_approval: >
+    review-volunteer-signup (from the asks spec) — after APPROVED commits, if the
+    signup's ask/role has an active reward with trigger=ON_APPROVAL, enqueue/call
+    grant-volunteer-reward (signupId, rewardId).
+  on_check_in: >
+    check-in-volunteer — after CHECKED_IN commits, same for trigger=ON_CHECK_IN.
+  on_revocable_exit: >
+    withdraw + the volunteers.auto-no-show job — on WITHDRAWN/NO_SHOW, call
+    revoke-volunteer-reward for any GRANTED (un-redeemed) grant on that signup.
+  note: >
+    Grants/revokes fire post-commit and are idempotent, so a retried trigger or an
+    overlapping cron tick cannot double-issue or double-void.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - An owner can attach a COMP reward (free GA ticket) to an ask with maxGrants = 50 and trigger ON_CHECK_IN.
+  - Checking in a volunteer issues exactly one $0 comp ticket via the existing issuance path; checking them in again issues nothing.
+  - With maxGrants = 1 and two simultaneous check-ins, exactly one grant succeeds and the other is skipped with BUDGET_EXHAUSTED — never two.
+  - A DISCOUNT reward mints a single-use code bound to the volunteer's email and the chosen ticket type, emailed (or claim-linked for shadow profiles).
+  - Auto-NO_SHOW before redemption revokes the grant and returns the budget slot; a redeemed comp is left intact.
+  - The reward ledger reports granted/redeemed/revoked counts, remaining budget, and total face value comped in cents.
+  - Coordinators can see reward status on their group roster but cannot configure or change rewards (forbidden).
+  - All amounts are integer cents; no float appears in any reward computation.
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Money path: a non-idempotent grant double-comps a volunteer, or a race lets
+      the org blow past its budget cap.
+    severity: HIGH
+    mitigation: >
+      Unique (rewardId, signupId) + IdempotencyPort; FOR UPDATE on the reward row
+      and budget decrement in the same tx; concurrency test for the cap.
+  - risk: >
+      The reused helpers (`createCompOrder`, `createPromo`) do NOT enforce a budget
+      cap or idempotency on their own — naive reuse could double-issue or overshoot.
+    severity: HIGH
+    mitigation: >
+      grant-volunteer-reward owns the cap (FOR UPDATE on VolunteerReward.grantsUsed,
+      same pattern as the existing capacity `counts` check) and idempotency
+      (@@unique([rewardId, signupId]) + IdempotencyPort) — the helpers only mint.
+  - risk: >
+      `issueCompTickets` enforces ORG-admin RBAC; calling it from a system trigger
+      would either fail or require faking an actor.
+    severity: MEDIUM
+    mitigation: >
+      Reuse the lower-level `createCompOrder` + `mintTicketsForOrder` with the
+      existing system actor, not the admin-facing `issueCompTickets` wrapper.
+  - risk: >
+      Tax/fees on comp tickets vary by jurisdiction (ZipTax origin-based).
+    severity: LOW
+    mitigation: >
+      RESOLVED by reuse — free orders short-circuit fees/tax to zero in
+      checkout-helpers (isFreeOrder); we set face value for reporting only and never
+      re-derive fee/tax logic.
+
+open_questions:
+  - Reward target — fixed ticketTypeId, or "cheapest available" / "any GA" so it survives ticket-type edits? (Leaning fixed ticketTypeId for v1, matching Promo TICKET_TYPE scope.)
+  - DISCOUNT stacking — default to the minted Promo's `stackable = false` (exclusive), or allow combining with public promos? (Recommend false for v1.)
+  - Transferable comps — governed by the target `TicketType.transferAllowed`; do we force-lock volunteer comps regardless? (Open: default = inherit the ticket type.)
+  - Expiry — should an un-redeemed discount Promo carry `endsAt` (e.g. event start) and return budget on expiry, alongside the revoke path?
+  - For ONGOING / non-EVENT asks there is no ticketTypeId to target — restrict rewards to EVENT-subject asks in v1, or design a credit-toward-future-event variant later? (Recommend: rewards only on EVENT-subject asks for v1.)
+  - Should finance (ORG_FINANCE_ROLES, the same gate createPromo uses) approve a reward before it goes live, given it spends organizer revenue?
+
+# ── Resolutions (user decisions, 2026-07-01) ─────────────────────────────────
+# These OVERRIDE the sections above where they conflict.
+
+resolutions:
+  date: "2026-07-01"
+  decisions:
+    - id: comp_only
+      resolution: >
+        Rewards are COMP-only — "a free ticket is the max." The DISCOUNT /
+        minted-Promo path is cut entirely (no createPromo reuse, no
+        stacking/expiry questions to answer).
+    - id: event_subject_only
+      resolution: >
+        Rewards attach to EVENT-subject asks only in v1. No
+        credit-toward-future-event variant for ONGOING / non-EVENT asks.
+    - id: revocation
+      resolution: >
+        Revocation happens on signup WITHDRAWN plus a manual revoke action —
+        nothing else auto-revokes.
+    - id: transferability
+      resolution: >
+        Comps inherit the target `TicketType.transferAllowed` — volunteer
+        comps are never force-locked.
+    - id: no_finance_preapproval
+      resolution: >
+        No finance pre-approval step — reward creation uses the same
+        organizer gate as the rest of volunteering.

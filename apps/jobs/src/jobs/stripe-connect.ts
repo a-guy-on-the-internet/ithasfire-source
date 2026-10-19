@@ -114,16 +114,17 @@ export const reconcileCapabilities = defineScheduledTask({
 
     // Drift in the OTHER direction, on a clock.
     //
-    // This job runs 22:20 America/Chicago; `settlements.run-batch` runs 00:00
+    // This job runs 22:30 America/Chicago (on a :00/:30 slot the */30 jobs
+    // already wake the database for); `settlements.run-batch` runs 00:00
     // in the same timezone. A payee we just demoted hits the
-    // `payee.payoutsEnabled` eligibility gate in run-batch 100 minutes from
+    // `payee.payoutsEnabled` eligibility gate in run-batch 90 minutes from
     // now and is SKIPPED — their ledger credits are left unconsumed, so
     // nothing is lost and the next batch after the capability is fixed pays
     // them in full (ledger-authoritative cutover, spec 2026-08-10: there is
     // no failed settlement row to reset any more).
     //
     // Still an error-level page, not an FYI: it is "N payees do not get paid
-    // tonight unless someone looks", and the 100 minutes is the whole window
+    // tonight unless someone looks", and the 90 minutes is the whole window
     // in which looking is cheaper than explaining a missed payout.
     if (result.demotedFromPayable > 0) {
       await logAndReport({

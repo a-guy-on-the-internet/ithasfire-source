@@ -1,0 +1,428 @@
+version: 1
+name: admin-tables-audit
+status: shipped  # 2026-10-08 docs consolidation; was: draft
+date: 2026-04-28
+owners: [ui]
+
+summary: |
+  Audit of every admin list/table page under apps/web/src/app/admin/[slug]/**
+  and the unification plan to bring the small handful of stragglers onto the
+  shared DataTable + AdminTableParts + useAdminTableParams stack. Step 1 of
+  the events-list migration is implemented in this PR; the remaining tables
+  are sequenced for follow-up PRs.
+
+primitives:
+  data_table:
+    path: packages/ui/src/ui/tamagui/components/data/DataTable.tsx
+    re_export: "@th/ui"
+    capabilities:
+      - sortable headers (clientSort or controlled sort)
+      - per-column align (left | center | right)
+      - per-column width (flex weight on native, % on web)
+      - per-column noWrap
+      - clientSearch (auto or controlled)
+      - selection checkboxes
+      - row hover + focus-visible highlight (web)
+      - column resize handles (web, on by default)
+      - sticky <thead>
+      - mobile FlashList virtualization (native)
+      - skeleton loading (loadingRowCount)
+      - emptyState slot
+      - rowActions / inline edit
+      - renderExpandedRow
+  admin_table_parts:
+    path: apps/web/src/components/AdminTableParts.tsx
+    exports:
+      - SkeletonEmptyState
+      - ActionBar
+      - TableContainer
+      - SearchBar
+      - FilterChips
+      - FilterRow
+      - Pagination
+      - NoResults
+      - ColumnSelector
+      - AdminTableErrorState   # added in this PR
+  hook:
+    path: apps/web/src/hooks/useAdminTableParams.ts
+    url_keys: [q, p, ps]
+    notes: |
+      Owns search (debounced 300ms) + page + pageSize and writes them to the
+      URL via router.replace. Filter chips are NOT URL-synced today — every
+      consumer keeps statusFilter/etc in local React state.
+
+inventory:
+  legend:
+    "✅": already on DataTable + AdminTableParts + useAdminTableParams
+    "🟡": partial (DataTable but custom toolbar/state/empty/error UI)
+    "🔴": fully custom (no shared primitives)
+  rows:
+    - path: events/_components/EventsManager.tsx
+      table_component: DataTable
+      search: { loc: SearchBar, mode: client, debounce_via: useAdminTableParams }
+      filters: { style: none, sticky: false }
+      column_alignment: per-column via DataTable
+      sort: clientSort
+      pagination: page+pageSize via useAdminTableParams + Pagination
+      row_hover_click: row click toggles expanded row
+      empty_loading_error: "🟡 inlined ~80-line skeleton+overlay; inlined error state"
+      bulk_actions: none
+      status: "🟡"
+      notes: column visibility via useColumnVisibility; expanded row renders EventDetailPanel; cancel via ConfirmDialog
+    - path: events/[id]/applications/page.tsx
+      table_component: DataTable
+      search: { loc: custom <TextInput>, mode: client, debounce_via: useDebouncedValue }
+      filters: { style: FilterChips, sticky: false, url_synced: true (status param) }
+      column_alignment: per-column via DataTable
+      sort: controlled (sort/setSort local state)
+      pagination: cursor-based (custom — fetchNextPage not used; manual ref/cursor)
+      row_hover_click: row click expands details
+      empty_loading_error: inline empty + Spinner; no shared parts
+      bulk_actions: select-all + approve/reject batches
+      status: "🟡"
+      notes: heavy custom — selection set, bulk actions, manual ref-based pagination. Out of scope for this PR.
+    - path: events/[id]/volunteers/_components/SignupsTab.tsx
+      table_component: DataTable
+      search: none
+      filters: { style: FilterChips (custom inline), sticky: false }
+      column_alignment: per-column via DataTable
+      sort: clientSort
+      pagination: none (single fetch)
+      row_hover_click: none
+      empty_loading_error: NoResults + inline custom
+      bulk_actions: none
+      status: "🟡"
+    - path: events/new/_components/AttendeesTab.tsx
+      table_component: DataTable
+      search: custom local <TextInput>
+      filters: { style: none, sticky: false }
+      column_alignment: per-column via DataTable
+      sort: clientSort
+      pagination: none (single fetch)
+      row_hover_click: row click toggles expanded
+      empty_loading_error: inline custom empty
+      bulk_actions: none
+      status: "🟡"
+    - path: orders/_components/OrdersTable.tsx
+      table_component: DataTable
+      search: { loc: SearchBar, mode: server (debouncedSearch -> tRPC), debounce_via: useAdminTableParams }
+      filters: { style: FilterChips + FilterRow, sticky: false, url_synced: false (local) }
+      column_alignment: per-column via DataTable
+      sort: server-side via serverSort (clientSort=true for header UI only)
+      pagination: page+pageSize via useAdminTableParams + Pagination
+      row_hover_click: row click toggles expanded
+      empty_loading_error: NoResults + custom skeleton empty + inline error
+      bulk_actions: CSV export via mutation
+      status: "🟡"
+    - path: orders/_components/SettlementsTable.tsx
+      table_component: DataTable
+      search: none
+      filters: { style: FilterChips + FilterRow, sticky: false, url_synced: false }
+      column_alignment: per-column via DataTable
+      sort: clientSort
+      pagination: page+pageSize via useAdminTableParams + Pagination
+      row_hover_click: row click toggles expanded
+      empty_loading_error: NoResults + inline custom
+      bulk_actions: CSV export
+      status: "🟡"
+    - path: places/_components/PlacesTable.tsx
+      table_component: DataTable
+      search: { loc: SearchBar, mode: server, debounce_via: useAdminTableParams }
+      filters: { style: custom verifiedOnly + orgIds chips, sticky: false }
+      column_alignment: per-column via DataTable
+      sort: controlled (sort/setSort local state)
+      pagination: page+pageSize via useAdminTableParams + Pagination
+      row_hover_click: row click opens detail panel
+      empty_loading_error: NoResults + inline custom skeleton-empty + inline error
+      bulk_actions: none
+      status: "🟡"
+    - path: audiences/_components/AudiencesView.tsx
+      table_component: DataTable
+      search: { loc: SearchBar, mode: client, debounce_via: useAdminTableParams }
+      filters: { style: none, sticky: false }
+      column_alignment: per-column via DataTable
+      sort: clientSort
+      pagination: page+pageSize via useAdminTableParams + Pagination
+      row_hover_click: row click navigates to detail
+      empty_loading_error: SkeletonEmptyState (canonical) + NoResults + inline error
+      bulk_actions: none
+      status: "🟡"
+    - path: audiences/[listId]/_components/AudienceDetail.tsx
+      table_component: AudienceEntriesTable (wrapper around DataTable)
+      search: custom local debounced <TextInput>
+      filters: none
+      column_alignment: per-column via DataTable
+      sort: controlled sort
+      pagination: custom local setPage; "Load more"-style hasMore
+      row_hover_click: inline-edit row
+      empty_loading_error: inline custom empty + Spinner
+      bulk_actions: none
+      status: "🔴"
+      notes: Nested table with raw <table> for the add-row composer; complex inline editing.
+    - path: audiences/[listId]/_components/AudienceEntriesTable.tsx
+      table_component: DataTable + raw <table>
+      search: parent-controlled
+      filters: none
+      column_alignment: per-column via DataTable
+      sort: parent-controlled
+      pagination: parent-controlled
+      row_hover_click: parent-controlled
+      empty_loading_error: inline custom
+      bulk_actions: none
+      status: "🔴"
+      notes: Renders an inline add-row editor as a parallel raw <table>. Treat as a special editor, not a list.
+    - path: audiences/import/_components/AudienceImport.tsx
+      table_component: DataTable (preview)
+      search: none
+      filters: none
+      column_alignment: per-column via DataTable
+      sort: none
+      pagination: none
+      row_hover_click: none
+      empty_loading_error: inline
+      bulk_actions: none
+      status: "🟡"
+      notes: One-shot CSV preview table; minimal toolbar needed.
+    - path: announcements/_components/AnnouncementsView.tsx
+      table_component: DataTable
+      search: { loc: SearchBar, mode: client, debounce_via: useAdminTableParams }
+      filters: { style: none, sticky: false }
+      column_alignment: per-column via DataTable
+      sort: clientSort
+      pagination: page+pageSize via useAdminTableParams + Pagination
+      row_hover_click: row click opens dialog
+      empty_loading_error: SkeletonEmptyState + NoResults + inline error
+      bulk_actions: none
+      status: "🟡"
+    - path: volunteer-templates/_components/VolunteerTemplatesView.tsx
+      table_component: DataTable
+      search: none
+      filters: none
+      column_alignment: per-column via DataTable
+      sort: clientSort
+      pagination: none
+      row_hover_click: none
+      empty_loading_error: inline custom + TableContainer
+      bulk_actions: none
+      status: "🟡"
+    - path: team/_components/TeamView.tsx
+      table_component: DataTable
+      search: { loc: SearchBar, mode: client, debounce_via: useAdminTableParams }
+      filters: { style: none, sticky: false }
+      column_alignment: per-column via DataTable
+      sort: clientSort
+      pagination: page+pageSize via useAdminTableParams + Pagination
+      row_hover_click: none
+      empty_loading_error: SkeletonEmptyState + inline error
+      bulk_actions: none
+      status: "🟡"
+    - path: promos/_components/PromosView.tsx
+      table_component: DataTable
+      search: { loc: SearchBar, mode: client, debounce_via: useAdminTableParams }
+      filters: { style: FilterChips + FilterRow, sticky: false, url_synced: false }
+      column_alignment: per-column via DataTable
+      sort: clientSort
+      pagination: page+pageSize via useAdminTableParams + Pagination
+      row_hover_click: row click toggles expanded
+      empty_loading_error: SkeletonEmptyState + NoResults + inline error
+      bulk_actions: none
+      status: "🟡"
+    - path: resale/page.tsx
+      table_component: DataTable (two — listings + claims tabs)
+      search: none
+      filters: { style: custom event chips, sticky: false }
+      column_alignment: per-column via DataTable
+      sort: none
+      pagination: page+pageSize via useAdminTableParams + Pagination
+      row_hover_click: none
+      empty_loading_error: inline custom
+      bulk_actions: none
+      status: "🟡"
+
+design_decision:
+  chosen_path: B
+  rationale: |
+    Path A (a single <AdminTable> wrapper composing DataTable + toolbar +
+    useAdminTableParams) would either need ~25 props (replicating most of
+    DataTable's surface) or hide so much that consumers immediately drop down
+    to primitives anyway. The current friction is not "the assembly is hard";
+    it is that two states — first-time-empty (skeleton + overlay CTA) and
+    error (message + retry) — are reimplemented per-page. Path B closes those
+    gaps by adding one new helper to AdminTableParts (AdminTableErrorState),
+    promoting the existing SkeletonEmptyState as the canonical first-empty,
+    and documenting the assembly. Less code, less indirection, no new layer.
+
+new_part:
+  name: AdminTableErrorState
+  location: apps/web/src/components/AdminTableParts.tsx
+  prop_api: |
+    interface AdminTableErrorStateProps {
+      /** Required. Already-formatted error message. */
+      message: string;
+      /** Required. Called when the user presses retry. */
+      onRetry: () => void;
+      /** Optional override label for the retry button. Defaults to admin.atRetry. */
+      retryLabel?: string;
+      /** Optional automation ids. */
+      testId?: string;
+    }
+  rendering: |
+    YStack padding=$4 gap=$3 with a bordered, no-radius surface.
+    h4 weight=bold "Failed to load" (or no heading — message is primary).
+    Body (tone=error) message text.
+    Outlined Button with RefreshCw icon + retryLabel.
+
+canonical_assembly: |
+  ```tsx
+  // 1. URL-synced state
+  const { searchQuery, debouncedSearch, page, pageSize,
+    handleSearchChange, setPage, setPageSize } = useAdminTableParams();
+
+  // 2. Feature-specific filters live in local state (statusFilter etc).
+  const [statusFilter, setStatusFilter] = useState<Status | undefined>();
+
+  // 3. Data
+  const { data, isLoading, error, refetch } = trpc.thing.list.useQuery({...});
+
+  // 4. Error short-circuit
+  if (error) {
+    return <AdminTableErrorState
+      message={String(t("..."))}
+      onRetry={() => refetch()}
+    />;
+  }
+
+  // 5. First-time empty short-circuit (no rows, not loading, no filters)
+  if (!isLoading && rows.length === 0 && !hasActiveFilters) {
+    return <SkeletonEmptyState
+      title={...} description={...}
+      ctaLabel={...} onCtaPress={...} />;
+  }
+
+  // 6. Toolbar + table + pagination
+  return (
+    <YStack flex={1}>
+      <ActionBar onRefresh={() => refetch()} countLabel={summaryLabel}>
+        <SearchBar value={searchQuery} onChangeText={handleSearchChange} />
+        <ColumnSelector ... />
+      </ActionBar>
+      {hasFilters && (
+        <FilterRow hasActiveFilters={hasActiveFilters} onClearAll={...}>
+          <FilterChips ... />
+        </FilterRow>
+      )}
+      <TableContainer>
+        <DataTable
+          columns={visibleColumns} rows={rows} getRowKey={(r) => r.id}
+          isLoading={isLoading}
+          emptyState={<NoResults onClearFilters={...} />}
+          clientSort
+          rowActions={...}
+        />
+      </TableContainer>
+      <Pagination page={page} totalPages={...} onPageChange={setPage}
+        pageSize={pageSize} onPageSizeChange={setPageSize} />
+    </YStack>
+  );
+  ```
+
+migration_plan:
+  approach: "PR-sized chunks of 3–4 tables each, ordered by traffic + risk."
+  prs:
+    - id: 1
+      title: "events list (this PR)"
+      tables: [events/_components/EventsManager.tsx]
+      diff_intent: |
+        Replace the inlined ~80-line skeleton-empty-overlay-with-CTA block with
+        <SkeletonEmptyState>. Replace the inlined error YStack with
+        <AdminTableErrorState>. No behavioural changes to URL state, filtering,
+        sorting, pagination, expanded rows, RowActionMenu, ConfirmDialog, or
+        EventDetailPanel.
+      preserved:
+        - URL sync (q, p, ps)
+        - clientSort on DataTable
+        - column visibility via useColumnVisibility
+        - row click toggles expanded row (renderExpandedRow)
+        - cancel-event ConfirmDialog flow with series scope chooser
+      dropped:
+        - Real column-header text inside the skeleton (replaced with generic
+          ghost rows — matches Audiences/Promos/Team)
+        - The custom $surfaceOverlay background tone on the empty-state overlay
+          (SkeletonEmptyState uses the default surface; overlay still reads as
+          a CTA card)
+      controversial: |
+        Empty state visual changes are minor; functional content (heading,
+        copy, primary CTA) is identical.
+      server_changes_needed: none
+    - id: 2
+      title: "orders + settlements + promos"
+      tables:
+        - orders/_components/OrdersTable.tsx
+        - orders/_components/SettlementsTable.tsx
+        - promos/_components/PromosView.tsx
+      diff_intent: |
+        Adopt AdminTableErrorState; verify SkeletonEmptyState use; document
+        statusFilter as local-only (or migrate to extraKeys on
+        useAdminTableParams in a follow-up).
+      server_changes_needed: |
+        Optional: add a `?status=` URL param via useAdminTableParams.extraKeys.
+    - id: 3
+      title: "places + audiences + announcements + team"
+      tables:
+        - places/_components/PlacesTable.tsx
+        - audiences/_components/AudiencesView.tsx
+        - announcements/_components/AnnouncementsView.tsx
+        - team/_components/TeamView.tsx
+      diff_intent: Adopt AdminTableErrorState; trim duplicated empty-skeleton wrappers.
+    - id: 4
+      title: "event sub-pages: applications + signups + attendees"
+      tables:
+        - events/[id]/applications/page.tsx
+        - events/[id]/volunteers/_components/SignupsTab.tsx
+        - events/new/_components/AttendeesTab.tsx
+      diff_intent: |
+        Replace useDebouncedValue + custom search input with SearchBar +
+        useAdminTableParams. Replace inline empty/error states. Larger blast
+        radius (bulk actions, cursor pagination); needs separate review.
+      server_changes_needed: |
+        applications already has cursor pagination. Consider exposing a
+        canonical "Load more" pattern in AdminTableParts (today only Pagination
+        exists).
+    - id: 5
+      title: "smaller tables + cleanup"
+      tables:
+        - volunteer-templates/_components/VolunteerTemplatesView.tsx
+        - audiences/import/_components/AudienceImport.tsx
+        - audiences/[listId]/_components/AudienceDetail.tsx
+        - audiences/[listId]/_components/AudienceEntriesTable.tsx
+        - resale/page.tsx
+      diff_intent: |
+        Wrap remaining tables in TableContainer; adopt AdminTableErrorState
+        where applicable. AudienceEntriesTable retains its raw <table> add-row
+        composer (it is an editor surface, not a list).
+
+tanstack_proposal:
+  decision: REJECT
+  reasoning: |
+    DataTable already delivers sortable headers, column resizing, sticky
+    headers, selection, expanded rows, mobile virtualization (FlashList), and
+    server- or client-side sort/search/pagination. TanStack Table would add a
+    parallel headless layer with no incremental capability we currently need
+    and would force a duplicate code path on native (FlashList) and web (DOM).
+    Revisit only if/when we adopt: pinned columns, group-by, true virtualised
+    rendering on web for >5k rows, or column drag-and-drop reordering.
+
+locale_keys_needed:
+  - key: admin.atRetry
+    fallback: "Retry"
+    used_by: AdminTableErrorState button label (default)
+    note: |
+      `admin.retryLoad` already exists and is reused by EventsManager; we add
+      `admin.atRetry` ("at" = admin-table prefix) for parts-level fallback.
+      Add to all locale messages files manually if accepted.
+
+out_of_scope:
+  - column drag-and-drop reorder
+  - per-user persisted column widths (today only column visibility persists)
+  - keyboard shortcuts (Cmd-F focus search, etc.)
+  - density toggle (compact vs comfortable rows)

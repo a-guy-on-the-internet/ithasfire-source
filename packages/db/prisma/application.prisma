@@ -1,0 +1,441 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Application — Event applications, waitlists, invite lists, contact imports.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model EventApplicationForm {
+  id               String   @id @default(uuid())
+  /// Exactly one of eventId / seriesId is set (SQL CHECK
+  /// "EventApplicationForm_one_owner_check"). An event can hold one ATTEND
+  /// and one PERFORM form; a series holds at most one PERFORM form.
+  eventId          String?
+  /// Series-wide open call (open calls v1). Non-null ⇒ purpose = PERFORM
+  /// (SQL CHECK "EventApplicationForm_series_perform_check").
+  seriesId         String?
+  purpose          ApplicationFormPurpose @default(ATTEND)
+  /// Short random public id for `/call/<publicId>` (spec FR-003) — never the
+  /// event id or slug. 10-char base-36, same shape as Event.shortId.
+  publicId         String   @unique
+  /// Posted pay terms (spec FR-002). Null on ATTEND forms; core requires it
+  /// on PERFORM forms.
+  payKind          OpenCallPayKind?
+  payDetails       String?
+  /// Set when someone with edit rights presses Close (spec FR-004/005).
+  /// Distinct from closesAt (the deadline, which only stops new
+  /// applications). Cleared on reopen.
+  closedAt         DateTime?
+  closedByHumanId  String?
+  /// Set by "Post call" (owner ruling Q41). Saving a PERFORM form makes a
+  /// DRAFT call; only a posted call is public, listed on the poster's page
+  /// and accepts applications. One-way (Close stops a call). PERFORM only
+  /// (SQL CHECK "EventApplicationForm_posted_perform_only_check").
+  postedAt         DateTime?
+  postedByHumanId  String?
+  introText        String?
+  defaults         Json     @default("{}")
+  /// Application window start (spec Phase 2). Null = open immediately.
+  /// `submit-event-application` rejects submissions before this instant
+  /// (APPLICATION_WINDOW_NOT_OPEN); exactly-at opensAt is allowed.
+  opensAt          DateTime?
+  /// Application window end. Null = never closes. Submissions strictly
+  /// after this instant reject (APPLICATION_WINDOW_CLOSED); exactly-at
+  /// closesAt is allowed. Also drives the nightly expiry sweep
+  /// (events.expire-applications): PENDING submissions past
+  /// closesAt + grace flip to EXPIRED.
+  closesAt         DateTime?
+  /// Submission cap. Null = uncapped. Counted over non-WITHDRAWN /
+  /// non-EXPIRED submissions (withdrawn + expired free their slot).
+  maxSubmissions   Int?
+  /// "Registration with questions" mode (parity with volunteerAutoApprove):
+  /// submissions are created APPROVED with a minted unlock + approval token,
+  /// and the applicant gets the APPROVAL email instead of the received ack.
+  autoApprove      Boolean  @default(false)
+  updatedByHumanId String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  event       Event?                       @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  series      EventSeries?                 @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+  questions   EventApplicationQuestion[]
+  submissions EventApplicationSubmission[]
+  eventSubmissions EventApplicationSubmission[] @relation("SubmissionFormEvent")
+  updatedBy   Human?                       @relation("ApplicationFormUpdatedBy", fields: [updatedByHumanId], references: [id], onDelete: SetNull)
+  closedBy    Human?                       @relation("ApplicationFormClosedBy", fields: [closedByHumanId], references: [id], onDelete: SetNull)
+  postedBy    Human?                       @relation("ApplicationFormPostedBy", fields: [postedByHumanId], references: [id], onDelete: SetNull)
+
+  @@unique([eventId, purpose])
+  @@unique([seriesId, purpose])
+  @@unique([id, eventId])
+  @@index([updatedByHumanId])
+  @@index([closedByHumanId])
+  @@index([postedByHumanId])
+}
+
+model EventApplicationQuestion {
+  id          String                  @id @default(uuid())
+  formId      String
+  type        ApplicationQuestionType
+  label       String
+  description String?
+  options     Json?
+  isRequired  Boolean                 @default(false)
+  order       Int                     @default(0)
+  createdAt   DateTime                @default(now())
+  updatedAt   DateTime                @updatedAt
+
+  form EventApplicationForm @relation(fields: [formId], references: [id], onDelete: Cascade)
+
+  @@index([formId, order])
+}
+
+model EventApplicationSubmission {
+  id              String                      @id @default(uuid())
+  /// The form this submission answers — THE key (open calls v1). Backfilled
+  /// from the event's ATTEND form by migration 20261005120000_open_calls.
+  formId          String
+  /// Null on series-call submissions (the series form has no single event);
+  /// formId is the key. Kept for event-scoped reads and the cascade.
+  eventId         String?
+  humanId         String?
+  /// Signed-in applicant applying on behalf of an organisation they belong
+  /// to (spec FR-006). Null for "as myself" and for guests.
+  applyingAsOrgId String?
+  /// Guest applicant identity (spec FR-006); guests never apply as an org.
+  guestName       String?
+  guestUrl        String?
+  /// "Keep my application private" (spec FR-008): hides the row from the
+  /// peer list on the call page.
+  isPrivate       Boolean                     @default(false)
+  /// First time someone on the organizer side opened the card (spec FR-010).
+  /// Non-null ⇒ the applicant can no longer edit.
+  openedAt        DateTime?
+  /// sha256 of the guest status-link token (spec FR-009). The raw token is
+  /// only ever in the email.
+  statusTokenHash String?                     @unique
+  /// Picked act dropped out (spec FR-017); status goes WITHDRAWN.
+  droppedOutAt    DateTime?
+  /// Picked act later removed from the lineup (spec FR-019); status stays
+  /// APPROVED so the history stays true.
+  removedFromLineupAt DateTime?
+  contactEmail    String?
+  /// The language an open-call applicant applied in ("en" / "es"; core's
+  /// NOTIFICATION_LOCALES, SQL CHECK below). Null = unknown → platform
+  /// default. Read for a GUEST's later emails (migration
+  /// 20261007120000_open_call_contact_locale).
+  contactLocale   String?
+  contactPhone    String?
+  status          ApplicationSubmissionStatus @default(PENDING)
+  answers         Json                        @default("{}")
+  /// Reviewer-provided reason for the decision (today: rejection only).
+  /// Optional, attendee-facing — included in the rejection email when present.
+  decisionReason  String?
+  /// Snapshot of the form's questions at SUBMIT time, keyed by question id:
+  /// { [questionId]: { label, type, options? } } (options only for choice
+  /// types). Waiver-style integrity (spec D3): the review queue renders
+  /// answers from this snapshot, never from live questions, so editing or
+  /// deleting a question can no longer orphan historical answers.
+  questionsSnapshot Json                      @default("{}")
+  reviewerHumanId String?
+  reviewedAt      DateTime?
+  approvalToken   String?                     @unique
+  tokenExpiresAt  DateTime?
+  metadata        Json                        @default("{}")
+  /// Set when the submission was created or approved by an invite redemption
+  /// (gated-event invite links, FR-005). Such submissions are excluded from
+  /// the event's maxSubmissions cap (R11) and labelled "Via invite" in the
+  /// review queue (FR-009). SetNull: deleting the invite keeps the decision.
+  inviteId        String?
+  createdAt       DateTime                    @default(now())
+  updatedAt       DateTime                    @updatedAt
+
+  form         EventApplicationForm @relation(fields: [formId], references: [id], onDelete: Cascade)
+  event        Event?               @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  formEvent    EventApplicationForm? @relation("SubmissionFormEvent", fields: [formId, eventId], references: [id, eventId], onDelete: NoAction, onUpdate: Cascade)
+  human        Human?               @relation("ApplicationSubmissionHuman", fields: [humanId], references: [id], onDelete: SetNull)
+  applyingAsOrg Organization?       @relation("ApplicationSubmissionApplyingAsOrg", fields: [applyingAsOrgId], references: [id], onDelete: SetNull)
+  reviewer     Human?               @relation("ApplicationSubmissionReviewer", fields: [reviewerHumanId], references: [id], onDelete: SetNull)
+  invite       EventInvite?         @relation(fields: [inviteId], references: [id], onDelete: SetNull)
+  dateChoices  OpenCallDateChoice[]
+  votes        ApplicationVote[]
+  notes        ApplicationNote[]
+  messages     ApplicationMessage[]
+
+  @@index([eventId, status])
+  @@index([formId, status, createdAt])
+  @@index([humanId])
+  @@index([applyingAsOrgId])
+  @@index([reviewerHumanId])
+  @@index([inviteId])
+  // Guest dedupe lookups (contactEmail is lowercased app-side, so plain
+  // equality matches the lower(contactEmail) index expression below).
+  // Re-keyed eventId → formId with the partial indexes (open calls v1).
+  @@index([formId, contactEmail])
+  // NOTE: three partial unique indexes enforcing "one OPEN application per
+  // applicant ENTITY per FORM" (spec Phase 3 item 2 / D5; open calls FR-011,
+  // owner ruling Q42) exist in SQL only — Prisma can't express partial or
+  // expression indexes:
+  //   "EventApplicationSubmission_open_guest_key" on
+  //     (formId, lower(contactEmail)) WHERE humanId IS NULL AND
+  //     contactEmail IS NOT NULL AND status IN
+  //     ('PENDING','APPROVED','WAITLISTED')
+  //   "EventApplicationSubmission_open_human_key" on (formId, humanId)
+  //     WHERE humanId IS NOT NULL AND applyingAsOrgId IS NULL AND status IN
+  //     (same set) — a person applying as themselves
+  //   "EventApplicationSubmission_open_org_key" on (formId, applyingAsOrgId)
+  //     WHERE applyingAsOrgId IS NOT NULL AND status IN (same set) — one
+  //     open application per organisation, whoever submits it (Q42: a person
+  //     in three bands may apply as each of them, and as themselves)
+  // (Q42 split self / org rows: migration 20261006120000_open_calls_entity_dedupe;
+  // created keyed on eventId by migration
+  // 20260811140000_application_submission_open_dedupe; re-keyed to formId by
+  // 20261005120000_open_calls so one person can hold an ATTEND and a PERFORM
+  // application on the same event). Same trick
+  // as BookingRequest's open-pair indexes. WITHDRAWN / REJECTED / EXPIRED are
+  // deliberately outside the set so an applicant can re-apply. The adapter
+  // maps their P2002 to `duplicate_open_application`; the use-case pre-check
+  // in submit-event-application.ts races, these are the backstop.
+}
+
+/// One date an open-call applicant says they can do (open calls v1,
+/// spec FR-007). Stored as a pointer, never as text. Exactly one target is
+/// set (SQL CHECK "OpenCallDateChoice_one_target_check"):
+///   occurrenceId — a series call: one EventSeriesOccurrence
+///   eventDateId  — an event call on a multi-date event (community listing)
+///   eventId      — a dated Event (e.g. a materialised occurrence's event)
+model OpenCallDateChoice {
+  id           String   @id @default(uuid())
+  submissionId String
+  eventId      String?
+  occurrenceId String?
+  eventDateId  String?
+  createdAt    DateTime @default(now())
+
+  submission EventApplicationSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  event      Event?                     @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  occurrence EventSeriesOccurrence?     @relation(fields: [occurrenceId], references: [id], onDelete: Cascade)
+  eventDate  EventDate?                 @relation(fields: [eventDateId], references: [id], onDelete: Cascade)
+
+  @@unique([submissionId, eventId])
+  @@unique([submissionId, occurrenceId])
+  @@unique([submissionId, eventDateId])
+  @@index([eventId])
+  @@index([occurrenceId])
+  @@index([eventDateId])
+}
+
+/// One organizer-side member's vote on one application (spec FR-014):
+/// changeable, one per (submission, human). Organizer side only.
+model ApplicationVote {
+  id           String               @id @default(uuid())
+  submissionId String
+  humanId      String
+  vote         ApplicationVoteValue
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+
+  submission EventApplicationSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  human      Human                      @relation("ApplicationVoteHuman", fields: [humanId], references: [id], onDelete: Cascade)
+
+  @@unique([submissionId, humanId])
+  @@index([humanId])
+}
+
+/// Organizer-side note on an application (spec FR-014). Never shown to the
+/// applicant.
+model ApplicationNote {
+  id            String   @id @default(uuid())
+  submissionId  String
+  /// Nullable: author reference is detached (SetNull) on account deletion so
+  /// the rest of the organizer side keeps the note.
+  authorHumanId String?
+  body          String   @db.Text
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  submission EventApplicationSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  author     Human?                     @relation("ApplicationNoteAuthor", fields: [authorHumanId], references: [id], onDelete: SetNull)
+
+  @@index([submissionId, createdAt])
+  @@index([authorHumanId])
+}
+
+/// The one thread between an applicant and the organizer side (spec
+/// FR-015). Mirrors BookingRequestMessage: author side, body, readAt.
+model ApplicationMessage {
+  id           String                       @id @default(uuid())
+  submissionId String
+  authorSide   ApplicationMessageAuthorSide
+  /// The human who wrote it. Null for guest applicants (they reply through
+  /// their status link). No FK relation — a plain id, as on
+  /// BookingRequestMessage.authorHumanId.
+  authorHumanId String?
+  body         String                       @db.Text
+  /// Read receipt — set when the counterparty has seen the message.
+  readAt       DateTime?
+  createdAt    DateTime                     @default(now())
+
+  submission EventApplicationSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+
+  @@index([submissionId, createdAt])
+}
+
+model EventWaitlistEntry {
+  id               String              @id @default(uuid())
+  eventId          String
+  humanId          String?
+  contactEmail     String?
+  contactPhone     String?
+  source           WaitlistEntrySource @default(PUBLIC)
+  status           WaitlistEntryStatus @default(PENDING)
+  metadata         Json                @default("{}")
+  notifiedAt       DateTime?
+  convertedOrderId String?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  event Event  @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  human Human? @relation("WaitlistEntryHuman", fields: [humanId], references: [id], onDelete: SetNull)
+
+  @@index([eventId, status])
+  @@index([humanId])
+}
+
+model InviteList {
+  id           String              @id @default(uuid())
+  ownerType    InviteListOwnerType
+  ownerId      String
+  name         String
+  description  String?
+  passwordHint String?
+  contactCount Int                 @default(0)
+  lastImportAt DateTime?
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  entries    InviteListEntry[]
+  eventLinks EventInviteList[]
+  imports    ContactImport[]
+
+  @@index([ownerType, ownerId])
+}
+
+model InviteListEntry {
+  id                String    @id @default(uuid())
+  inviteListId      String
+  humanId           String?
+  contactEmail      String?
+  contactPhone      String?
+  displayName       String?
+  notes             String?
+  tags              String[]  @default([])
+  lastInvitedAt     DateTime?
+  metadata          Json      @default("{}")
+  importId          String?
+  consentSource     String?
+  consentRecordedAt DateTime?
+  unsubscribedAt    DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  inviteList    InviteList     @relation(fields: [inviteListId], references: [id], onDelete: Cascade)
+  human         Human?         @relation("InviteListEntryHuman", fields: [humanId], references: [id], onDelete: SetNull)
+  contactImport ContactImport? @relation(fields: [importId], references: [id], onDelete: SetNull)
+  eventInvites  EventInvite[]
+
+  @@unique([inviteListId, contactEmail])
+  @@unique([inviteListId, contactPhone])
+  @@index([inviteListId])
+  @@index([humanId])
+  @@index([importId])
+}
+
+model ContactImport {
+  id               String                  @id @default(uuid())
+  ownerType        InviteListOwnerType
+  ownerId          String
+  inviteListId     String
+  fileName         String
+  fileFormat       ContactImportFileFormat
+  totalRows        Int
+  importedCount    Int                     @default(0)
+  skippedCount     Int                     @default(0)
+  rejectedCount    Int                     @default(0)
+  chunksReceived   Int                     @default(1)
+  totalChunks      Int?
+  completedAt      DateTime?
+  createdByHumanId String
+  createdAt        DateTime                @default(now())
+  updatedAt        DateTime                @updatedAt
+
+  inviteList InviteList        @relation(fields: [inviteListId], references: [id], onDelete: Cascade)
+  createdBy  Human             @relation("ContactImportCreatedBy", fields: [createdByHumanId], references: [id], onDelete: Cascade)
+  entries    InviteListEntry[]
+
+  @@index([ownerType, ownerId])
+  @@index([inviteListId])
+  @@index([createdByHumanId])
+}
+
+model EventInviteList {
+  id           String   @id @default(uuid())
+  eventId      String
+  inviteListId String
+  context      Json     @default("{}")
+  createdAt    DateTime @default(now())
+
+  event      Event      @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  inviteList InviteList @relation(fields: [inviteListId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, inviteListId])
+  @@index([inviteListId])
+}
+
+/// Reusable application-form template (application-driven-events spec Phase 4,
+/// decision D4). SNAPSHOT, NOT REFERENCE: `questions` holds an ordered JSON
+/// array of `{type,label,description?,options?,isRequired}` and applying a
+/// template FORKS those entries into real `EventApplicationQuestion` rows —
+/// exactly the fork-on-use contract of `fork-platform-ticket-template.ts`.
+/// There is no live link back, so editing a template never mutates a form
+/// that already shipped.
+///
+/// Two kinds of row share this table, same shape as `TicketTypeTemplate`:
+///
+///   - OWNED    — `ownerId` set, `isPlatform` false. An org's or a human's
+///                library entry.
+///   - PLATFORM — `ownerId` NULL, `isPlatform` true. The starter catalogue
+///                (spec Phase 4 "Platform starter catalogue"), seeded by
+///                apps/api/src/scripts/seed/application-form-templates.ts and
+///                read-only to organizers. `ownerScope` is ORGANIZATION by
+///                convention on those rows and ignored.
+///
+/// Every consumer of `ownerId` resolves the null deliberately — "not owner
+/// B's" is a different test from "not null", and the read-only gate is
+/// `isPlatform` checked on its own so a mis-shaped row fails CLOSED.
+model ApplicationFormTemplate {
+  id          String             @id @default(uuid())
+  ownerScope  TemplateOwnerScope
+  /// Which kind of form this template seeds (open calls v1). The seeded
+  /// "Performer / artist application" template is PERFORM.
+  purpose     ApplicationFormPurpose @default(ATTEND)
+  /// NULL = platform catalogue row (see `isPlatform`).
+  ownerId     String?
+  name        String
+  description String?
+  /// Copied onto `EventApplicationForm.introText` at apply time.
+  introText   String?
+  /// Ordered array of question definitions. Options are stored in the
+  /// CANONICAL `{ id, label }` shape (packages/core/.../_shared/question-options.ts).
+  questions   Json
+  /// True only on catalogue rows, which always have `ownerId` NULL.
+  isPlatform  Boolean            @default(false)
+  archivedAt  DateTime?
+  /// Nullable: creator reference is detached (SetNull) on account deletion.
+  createdByHumanId String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  createdByHuman Human? @relation("ApplicationFormTemplateCreatedBy", fields: [createdByHumanId], references: [id], onDelete: SetNull)
+
+  @@index([ownerScope, ownerId, archivedAt])
+  @@index([createdByHumanId])
+  @@index([isPlatform])
+}

@@ -109,6 +109,11 @@ Direct invocation endpoint for testing/debugging.
 | `HLS_AUDIO_SAMPLE_RATE` | No       | `44100`           | Sample rate in Hz                  |
 | `HLS_AUDIO_CHANNELS`    | No       | `2`               | Number of audio channels           |
 | `REDIS_URL`             | No       | -                 | Optional Redis URL for idempotency |
+| `REDIS_NAMESPACE`       | No       | -                 | Optional Redis key namespace       |
+| `IDEMPOTENCY_BACKEND`   | No       | `auto`            | `auto`, `redis`, `postgres` or `noop` |
+| `SEARCH_BACKEND`        | No       | `postgres`        | `meili` or `postgres`. Parsed by the schema and read by nothing else; the transcoder does not search |
+
+The schema is `apps/audio-transcoder/src/lib/env.ts`. It also accepts the `SEARCH_W_*` weights, which nothing in this service reads either. In local development the service loads `apps/audio-transcoder/.env.local`, then the repo-root `.env.local`.
 
 ## Local Development
 
@@ -146,7 +151,7 @@ pnpm -C apps/audio-transcoder dev
 
 ```bash
 # Run unit tests
-pnpm -C apps/audio-transcoder test
+pnpm -C apps/audio-transcoder test      # includes e2e-* tests; `test:ci` excludes them
 
 # Manual test via direct invoke
 curl -X POST http://localhost:8080/transcode \
@@ -171,7 +176,7 @@ curl -X POST http://localhost:8080/pubsub/push \
 
 ## Deployment
 
-The service is deployed to Google Cloud Run via Terraform.
+The service runs on Google Cloud Run. The Terraform module is `infra/terraform/modules/cloud-run-audio-transcoder`; the image is built by `.github/workflows/deploy-dev.yml` and promoted to `:prod` by `deploy-prod.yml`. Do not deploy by hand; `docs/deploy.md` covers the pipeline.
 
 ### Docker Build
 
@@ -185,13 +190,7 @@ docker run -p 8080:8080 --env-file apps/audio-transcoder/.env.local audio-transc
 
 ### Terraform
 
-```bash
-cd infra/terraform
-
-# Set audio_transcoder_image variable
-terraform plan -var="audio_transcoder_image=gcr.io/th-dev/audio-transcoder:latest"
-terraform apply
-```
+The root module takes the image through the `audio_transcoder_image` variable (`infra/terraform/variables.tf`). The deploy workflows set it; do not run `terraform apply` yourself.
 
 ## Idempotency
 
@@ -201,7 +200,7 @@ The service achieves idempotency through **path overwriting**:
 2. Retries overwrite existing files with identical content
 3. The playlist URL remains stable across retries
 
-This eliminates the need for explicit idempotency tracking (Redis/database) for the transcoding operation itself.
+This makes the transcode safe to retry on its own. The container also wires an idempotency backend (`IDEMPOTENCY_BACKEND`: Redis, Postgres, or a no-op that relies on path overwriting alone; `apps/audio-transcoder/src/lib/container.ts`).
 
 ## Error Handling
 
@@ -223,7 +222,7 @@ Non-retryable errors return HTTP 200 to acknowledge the message and prevent infi
 
 ### Dead Letter Queue
 
-After 5 failed delivery attempts, messages are sent to the dead letter topic (`*-transcode-dlq`) for manual inspection.
+After 5 failed delivery attempts (Terraform default `pubsub_dead_letter_max_delivery_attempts`), messages are sent to the dead letter topic (`*-transcode-dlq`) for manual inspection.
 
 ## Monitoring
 

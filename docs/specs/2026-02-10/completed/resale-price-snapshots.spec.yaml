@@ -1,0 +1,79 @@
+# Spec: Resale Price Snapshots Job
+meta:
+  owner: platform-eng
+  status: complete
+  reviewers:
+    - revenue-ops
+    - product-eng
+summary: |
+  Nightly job that computes suggested resale prices for ticket types on upcoming events.
+  Replaces the heuristic-only estimate in `estimate-resale-price` with data-backed values
+  derived from completed resale transactions, sell-through rates (from EventDailyStats),
+  and time-to-event demand curves. Results are stored in ResalePriceSnapshot so the
+  estimate-resale-price use-case can read a cached value instead of computing on the fly.
+scope:
+  included:
+    - Loading upcoming events that have resale enabled (resalePayoutTermsId is set).
+    - For each event + ticket type, computing a suggested resale price from:
+        a. Recent completed resale transactions (rolling 7-day median ask price).
+        b. Sell-through rate from EventDailyStats.
+        c. Time-to-event demand curve (same heuristic as estimate-resale-price, but calibrated).
+    - Writing ResalePriceSnapshot rows (eventId, ticketTypeId, date, suggestedPriceCents,
+      demandTier, sellThroughRate, sampleSize).
+    - Respecting resaleCapCents from TicketType — clamping suggested price to cap.
+  excluded:
+    - Real-time price updates on each sale (too noisy; nightly is sufficient).
+    - Setting or enforcing listing prices (that is the seller's choice, we just suggest).
+    - Events that have already ended.
+execution:
+  orchestration: keda-cronjob
+  image: ghcr.io/ithasfire/jobs:analytics-latest
+  command: ["node", "dist/analytics/resale-price-snapshots.js"]
+  schedule:
+    cron: "0 4 * * *"   # 04:00 UTC daily — after event-daily-stats completes
+inputs:
+  postgres_tables:
+    - events
+    - ticket_types
+    - listings
+    - ticket_transfers  (reason = 'resale')
+    - orders            (source = 'RESALE')
+    - order_items
+    - EventDailyStats   (for sell-through)
+  config:
+    # Only events starting within this window
+    lookahead_days: 180
+    # Minimum resale transactions needed to use median; below this, fall back to heuristic.
+    min_sample_size: 3
+    # Rolling window for recent resale completions
+    resale_lookback_days: 30
+outputs:
+  postgres_tables:
+    - ResalePriceSnapshot (upsert on eventId + ticketTypeId + date)
+  metrics:
+    - analytics.resale_snapshots.events_processed
+    - analytics.resale_snapshots.snapshots_upserted
+    - analytics.resale_snapshots.data_backed_count   # had enough samples
+    - analytics.resale_snapshots.heuristic_count      # fell back to heuristic
+    - analytics.resale_snapshots.duration_ms
+  notifications:
+    - Slack alert to #platform-eng on failure or > 10 minute runtime.
+failure_modes:
+  - name: no_resale_data
+    mitigation: Fall back to the existing time+sellThrough heuristic gracefully.
+  - name: stale_daily_stats
+    mitigation: If EventDailyStats for today is missing, use yesterday's row. Log warning.
+  - name: cap_violation
+    mitigation: Clamp suggestedPriceCents to min(computed, resaleCapCents). Log event.
+acceptance_criteria:
+  - Every resale-enabled upcoming event + ticket type has a snapshot for today's date.
+  - suggestedPriceCents never exceeds resaleCapCents when cap is set.
+  - demandTier is consistent with sell-through thresholds (>0.8 high, >0.5 medium, else low).
+  - Heuristic fallback produces the same results as the inline estimate-resale-price use-case.
+  - Idempotent on re-run: upsert, no duplicate rows.
+rollout_notes:
+  - Deploy ResalePriceSnapshot migration alongside EventDailyStats.
+  - Run in parallel with the heuristic path for two weeks; compare outputs in a validation job.
+  - Once validated, update estimate-resale-price use-case to prefer snapshot data over heuristic.
+depends_on:
+  - event-daily-stats  # must run first to provide sell-through data

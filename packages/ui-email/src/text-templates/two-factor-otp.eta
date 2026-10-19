@@ -1,0 +1,9 @@
+{{= it.productName }} sign-in code
+
+Hi!
+Your one-time code is {{= it.otpCode }}.
+Enter it to finish signing in.
+
+If you didn’t try to sign in, ignore this message and consider changing your password.
+Thanks,
+The {{= it.productName }} team

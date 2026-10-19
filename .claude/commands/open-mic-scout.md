@@ -24,7 +24,7 @@ For each region × category, run focused web searches (venue listing sites, loca
 
 Before proposing anything, check it isn't already on the platform. This repo is hexagonal ("Ithas Fire"). Prefer a **read-only** check:
 - The domain models live in `packages/db/prisma/*.prisma` — `Event` (with `stewardship` = OWNED/COMMUNITY, `attendanceMode` = TICKETED/RSVP), `EventSeries`/`EventSeriesOccurrence`, and `Place` (venues, dedup key `addressHash`, plus `geohash6`).
-- Query existing PUBLISHED events + places near each region. **Connection (read-only, SELECT only):** prefer **`$CURATION_DB_URL`** if set (prod read-only, injected by `.claude/curation/run.sh` and forced read-only via `PGOPTIONS`); else fall back to the localhost `DATABASE_URL` in `.env.local`. Strip any `?query` params for `psql`. Match candidates by **venue + title + geohash6 proximity** within `dedupeWindowDays`.
+- Query existing PUBLISHED events + places near each region. **Connection (read-only, SELECT only):** prefer **`$CURATION_DB_URL`** if set (prod read-only, injected by `.claude/curation/run.sh` and forced read-only via `PGOPTIONS`); else fall back to the localhost `DATABASE_URL` in `.env.local`. When `$CURATION_DB_URL` is set, use it or nothing: if it fails to connect, never fall back to the local DB — mark every candidate UNVERIFIED and say so in the artifact. Strip any `?query` params for `psql`. Record which DB you used: the artifact's FIRST line under the H1 title must be `DB: prod` if `$CURATION_DB_URL` was used, or `DB: local — not actionable` if you fell back to the local DB (`/curation-apply` refuses local-DB artifacts). Match candidates by **venue + title + geohash6 proximity** within `dedupeWindowDays`.
 - If you cannot get a DB connection, DO NOT guess — proceed but clearly mark every candidate as **"dedupe: UNVERIFIED (no DB access)"** so the user checks manually.
 
 Drop candidates that already exist. Keep the rest, capped at `maxNewPerRun`.
@@ -41,6 +41,7 @@ Write to `docs/curation/<YYYY-MM-DD>/open-mic-scout.md` (get the date via `date 
 
 ```
 # Open-Mic Scout — <date>
+DB: prod | DB: local — not actionable
 
 ## Summary
 - Regions scanned: <list>

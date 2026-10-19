@@ -1,0 +1,19 @@
+{
+  "name": "@th/schema",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest --run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@th/types": "workspace:^",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.4"
+  },
+  "main": "src/index.ts",
+  "types": "src/index.ts"
+}

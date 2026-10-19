@@ -55,8 +55,4 @@ Do not use any of the following phrases or close variants:
 
 ## Instead
 
-Vary your openings, structures, and phrasing every time. Write like a specific human with a specific voice would — not like a median of all writing on the internet. For Ithas Fire user-facing copy specifically: plain, direct, second person only where the reader acts, and the user-facing vocabulary from `CONTEXT.md` (e.g. "action bar", never "CAB").
-
-## Generating narrower profiles
-
-This avoid-list is for general prose. For a narrower domain (e.g. "event marketing emails", "help-center articles"), generate a measured profile instead of guessing: clone `https://github.com/mshumer/unslop`, run `python3 unslop.py --domain "<domain>"`, review `unslop-output/analysis.md` for specificity, and add the resulting `skill.md` next to this file as `<domain>-profile.md` with a pointer here.
+Vary your openings, structures, and phrasing every time. Write like a specific human with a specific voice would — not like a median of all writing on the internet. For Ithas Fire user-facing copy specifically: plain, direct, second person only where the reader acts, in the user-facing vocabulary from `CONTEXT.md`.

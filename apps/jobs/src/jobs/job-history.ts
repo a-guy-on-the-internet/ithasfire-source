@@ -13,7 +13,7 @@
  * 2026-07-28 and was relocated to Postgres by the fix for that.
  *
  * Daily is O(1/day) and the table only overshoots by one day of runs per job
- * in between (~96 rows for a 15-minute-cron job). A daily job costs one Cloud Run
+ * in between (~48 rows for a 30-minute-cron job). A daily job costs one Cloud Run
  * invocation — the cron-load concern from the 2026-07-30 retune was about the
  * 2- and 5-minute jobs, not this.
  *

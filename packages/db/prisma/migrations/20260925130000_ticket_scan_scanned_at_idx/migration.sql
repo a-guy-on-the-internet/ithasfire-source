@@ -1,0 +1,22 @@
+-- Venue track record (docs/specs/2026-09-24/venue-track-record-and-review-switch,
+-- R11 re-ruled 2026-09-25 / FU-005): attendance is counted from the
+-- append-only `TicketScan` log, not `Ticket.scannedAt` (which every refund
+-- path clears). The "a ticket at this place was ADMITTED since
+-- lastCalculatedAt" arm of PlaceStatsRepo.listStalePlaceIds therefore ranges
+-- over recent `TicketScan.scannedAt` platform-wide and joins to Event for the
+-- place. The existing `TicketScan(eventId, scannedAt)` leads with eventId and
+-- cannot serve that range; this bare index can. Same shape and reasoning as
+-- 20260924130000_ticket_scanned_at_idx, which it replaces as the arm's index
+-- (`Ticket_scannedAt_idx` stays — dropping it is a separate decision).
+--
+-- `TicketScan` takes a write on every door scan. A plain `CREATE INDEX` would
+-- take a SHARE lock and block scans for the build, so this is `CONCURRENTLY`
+-- — which cannot run inside a transaction, so this file is kept to a single
+-- statement so Prisma migrate can execute it without an implicit
+-- BEGIN/COMMIT (precedent: 20260924130000, 20260707120000).
+--
+-- `IF NOT EXISTS`: a CONCURRENTLY build that fails part-way leaves an INVALID
+-- index behind under this name, and a re-run then SKIPS it rather than
+-- rebuilding. If a deploy fails here, `DROP INDEX "TicketScan_scannedAt_idx"`
+-- before retrying.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "TicketScan_scannedAt_idx" ON "TicketScan"("scannedAt");

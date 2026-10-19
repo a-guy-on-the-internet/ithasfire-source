@@ -1,0 +1,135 @@
+# Spec: Place Layout Import & Publish Pipeline
+meta:
+  owner: marketplace-platform
+  status: draft
+  reviewers:
+    - data-eng
+    - ops
+    - core
+  last_updated: 2025-11-14
+summary: |
+  Define the ingestion and publication pipeline for new or updated place layouts.
+  Covers trigger modalities (CLI, admin UI), worker orchestration, validation,
+  draft management, publish/rollback flows, and operational safeguards so that
+  venues reach production quality layouts with deterministic tracing.
+
+actors:
+  - venue_ops: initiates imports, reviews diff reports.
+  - worker_service: parses and validates uploads asynchronously.
+  - organizer_admin: approves publish for event-specific overrides.
+
+entry_points:
+  cli:
+    command: pnpm --filter @th/tools place-layouts import
+    inputs:
+      - venueId (uuid)
+      - source (svg | cad | csv)
+      - filePath (local path)
+      - sectionMap (optional json mapping)
+      - publish (bool)
+      - notes (string)
+  admin_ui:
+    route: apps/web/src/app/admin/place-layouts/import/page.tsx
+    features:
+      - drag-and-drop upload
+      - validation report preview
+      - diff viewer vs last published layout
+      - role gating: org role `manage_layouts`
+
+pipeline:
+  steps:
+    - name: enqueue-import
+      trigger: CLI or admin UI uploads file to object storage `place-layouts/raw/{venue}/{uploadId}`
+      side_effects:
+        - Write ImportJob record (status=PENDING) with checksum + metadata.
+        - Emit metric `placeLayout.import.enqueued`.
+    - name: parse-geometry
+      worker: queue `placeLayout.parse`
+      behavior:
+        - Fetch raw asset via signed URL.
+        - Invoke PlaceLayoutParserPort to convert raw format -> PlaceLayoutGlyph[] + section transforms.
+        - Persist intermediate geometry snapshot `place-layouts/normalized/{venue}/{uploadId}.json`.
+        - Capture `ParserIssue[]`; mark job status=VALIDATED or FAILED.
+        - Emit histogram metrics for duration + seat counts.
+    - name: validate-dataset
+      worker: queue `placeLayout.validate`
+      checks:
+        - seat count parity vs previous published version (threshold ±10%).
+        - duplicate seatIds / sectionIds.
+        - overlapping seats >1cm.
+        - seats outside section bounds.
+        - tier + pricing references exist.
+      outcomes:
+        - On errors: job status=FAILED, notify venue_ops via email + Slack channel.
+        - On warnings: job status=REVIEW_REQUIRED with issues attached.
+    - name: create-draft-version
+      service: PlaceLayoutRepo.createDraft
+      behavior:
+        - Create draft layout version referencing geometry snapshot + diff summary.
+        - Attach issues report + screenshot thumbnail.
+        - Generate admin review task (`ops-tasks` integration).
+    - name: review-and-annotate
+      ui:
+        - Venue ops uses diff viewer to accept/reject flagged issues.
+        - Comments stored in `place_layout_review_notes` table.
+      SLA: < 1 business day.
+    - name: publish-or-rollback
+      triggers:
+        - Publish: organizer_admin confirms layout (optionally event-scoped) -> `PlaceLayoutRepo.publish`.
+        - Rollback: revert to previous published version via `PlaceLayoutRepo.rollback`.
+      effects:
+        - Publish: write glyph blob to PlaceLayoutBlobRepo, update seats table layoutVersion, enqueue thumbnail regeneration, notify streaming port.
+        - Rollback: update venue/event reference, mark newer version archived.
+    - name: post-publish-reconciliation
+      worker: queue `placeLayout.reconcile`
+      tasks:
+        - Compare seat statuses vs checkout holds to ensure parity.
+        - Trigger PlaceLayoutStatusRepo to rehydrate caches + SSE streams.
+        - Record metrics `placeLayout.reconcile.discrepancies`.
+
+artifacts:
+  - ImportJob table: { id, venueId, uploadId, status, issues, createdAt, createdBy, notes }
+  - Geometry snapshot blobs: normalized JSON stored in object storage.
+  - Diff report JSON: { added: PlaceLayoutGlyph[], removed: PlaceLayoutGlyph[], moved: Array<{ seatId, from, to }> }
+  - Review notes table for Ops annotations.
+
+slo_sla:
+  - Parsing duration: p95 < 3 minutes for 20k seats.
+  - Validation completion: < 5 minutes end-to-end for uploads < 25 MB.
+  - Review queue: 95% processed within 1 business day.
+  - Publish promotion: < 10 minutes from approval to caches warmed.
+
+observability:
+  metrics:
+    - placeLayout.import.duration_ms (per step)
+    - placeLayout.import.issues_total (by severity)
+    - placeLayout.publish.duration_ms
+    - placeLayout.publish.rollback_count
+    - placeLayout.reconcile.discrepancies
+  logging:
+    - Structured logs per step with `venueId`, `uploadId`, `layoutVersionId`, actor.
+  tracing:
+    - Link job spans with traceId stored in ImportJob record for troubleshooting.
+  alerts:
+    - PagerDuty on `placeLayout.import.failed` > 2 per hour.
+    - Slack warning on `placeLayout.reconcile.discrepancies` > 0.
+
+failure_modes:
+  - parser_failure: invalid CAD -> status=FAILED, notify, allow re-upload.
+  - validation_blocker: overlapping seats -> job halted until corrected.
+  - publish_conflict: new draft created during pending publish; require manual resolution.
+  - reconcile_mismatch: seat statuses out of sync; auto-trigger job to regenerate availability cache.
+
+security:
+  - Uploaded assets scanned via AV pipeline before parsing.
+  - Access to import UI limited to org roles + IP allowlist for Ops.
+  - Signed URLs expire after 15 minutes; workers fetch via service account.
+
+runbook_links:
+  - ../../prompts/place-layout.md
+  - ../../engineering-standards.md#async-jobs
+  - ../../hot-paths.md#place-layout
+
+open_items:
+  - Determine quota enforcement (uploads/day per venue).
+  - Formalize diff visual baseline storage for compliance.

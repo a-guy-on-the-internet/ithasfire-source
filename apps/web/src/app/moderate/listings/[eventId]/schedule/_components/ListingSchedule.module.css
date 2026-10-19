@@ -1,0 +1,243 @@
+/* The full schedule of a community listing, for a moderator.
+   Strict Swiss: rectangles, hairlines, the mono label idiom, tabular digits.
+   Every colour is a var() onto a theme key with the STUB value as the
+   fallback — the fallback is what SSR paints before ActiveThemeInjector runs. */
+
+/* ── The date list ────────────────────────────────────────────────────────
+   ITS OWN SCROLLPORT, and taller than the event page's 320px peephole.
+
+   There the schedule is one section competing with the rest of a listing, so
+   a peephole is right. Here it IS the page, and 52 rows unbounded is ~2,400px
+   of list that pushes the rule box and the consequence band off screen — you
+   end up reading "14 dates would come off" and then scrolling away from it to
+   look at the dates it is talking about.
+
+   62vh keeps both in view on a laptop while still showing a dozen rows; the
+   320px floor stops it collapsing to nothing on a short window, and the 720px
+   ceiling stops it becoming the unbounded list again on a tall one. Sticky
+   month heads mean the scroll never loses its place. */
+.list {
+  max-height: clamp(320px, 62vh, 720px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+  background: var(--surface, #fdfaf3);
+}
+
+/* The scrollport is focusable so a keyboard reader can reach the bottom of it
+   even when every row's control is skipped over, which is the state a
+   non-scrolling container would leave them in. */
+.list:focus-visible {
+  outline: 2px solid var(--accent, #e2481d);
+  outline-offset: -2px;
+}
+
+.monthGroup {
+  min-width: 0;
+}
+
+.monthHead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 2px 10px;
+  padding: 8px 12px;
+  background: var(--surfaceMuted, #efe7d6);
+  border-bottom: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+.monthGroup + .monthGroup .monthHead {
+  border-top: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+.monthName {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--fs-mono-sm, 11px);
+  font-weight: 600;
+  letter-spacing: var(--tr-mono-sm, 2px);
+  text-transform: uppercase;
+  color: var(--color, #211c16);
+}
+
+.monthCount {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--fs-mono-md, 11.5px);
+  letter-spacing: var(--tr-mono-md, 1.4px);
+  text-transform: uppercase;
+  color: var(--colorMuted, #5c544a);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A table-like row, so GRID: the date column has to line up down the list or
+   the eye cannot scan it. `minmax(0, 1fr)` (never `1fr`) is what lets the date
+   cell shrink instead of forcing the row wider than 320px. */
+.row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px 10px;
+  padding: 2px 12px;
+  min-height: 44px;
+}
+
+.row + .row {
+  border-top: 1px solid
+    color-mix(
+      in srgb,
+      var(--borderColorSoft, rgba(33, 28, 22, 0.3)) 45%,
+      transparent
+    );
+}
+
+/* Marked while a rule change is staged: this is one of the dates that would
+   come off. A 3px accent rule inset on the leading edge — accent as a GRAPHIC
+   (3:1 floor), never as the label. */
+.rowDoomed {
+  box-shadow: inset 3px 0 0 0 var(--accent, #e2481d);
+  background: color-mix(
+    in srgb,
+    var(--accent, #e2481d) 5%,
+    transparent
+  );
+}
+
+.rowDate {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  padding: 6px 0;
+}
+
+.dateText {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--fs-mono-md, 11.5px);
+  letter-spacing: var(--tr-mono-md, 1.4px);
+  text-transform: uppercase;
+  color: var(--color, #211c16);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The strike is the glance signal and announces nothing; the word beside it is
+   what a screen reader reads. Both, always. */
+.struck {
+  text-decoration: line-through;
+  text-decoration-color: var(--accent, #e2481d);
+  text-decoration-thickness: 2px;
+  color: var(--colorMuted, #5c544a);
+}
+
+/* Row marks are BOXED rather than left as bare mono text.
+   Unboxed, a row reads "WED, SEP 23 · 8:00 PM COMES OFF YOUR RSVP" — three
+   independent facts in one typeface at one size, which the eye takes as one
+   string. The hairline is the separator; the tracking stays the label idiom's. */
+.tag {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--fs-mono-2xs, 9.5px);
+  font-weight: 700;
+  letter-spacing: var(--tr-mono-2xs, 2.5px);
+  text-transform: uppercase;
+  color: var(--colorMuted, #5c544a);
+}
+
+/* The STAGED-destruction mark. Accent as a border and a 10% tint (graphic, 3:1
+   floor); the label itself is `accentText`, the AA-legible rung — `accent` at
+   this size clears nothing in either polarity. */
+.tagDoomed {
+  composes: tag;
+  border-color: var(--accent, #e2481d);
+  background: color-mix(in srgb, var(--accent, #e2481d) 10%, transparent);
+  color: var(--accentText, #a8300f);
+}
+
+/* A night that is already off. Ink, not muted: the strike beside it is already
+   carrying the "diminished" signal, and this is the part a screen reader reads. */
+.tagCalledOff {
+  composes: tag;
+  color: var(--color, #211c16);
+}
+
+/* ── The per-date moderator control ───────────────────────────────────────
+   44px tall because it is destructive and lives on a touch surface. Quiet by
+   construction — the page's one filled control is "Apply new rule", and a
+   second emphatic button repeated 52 times would out-shout it. */
+.dateAction {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 44px;
+  min-width: 44px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--fs-mono-sm, 11px);
+  font-weight: 600;
+  letter-spacing: var(--tr-mono-sm, 2px);
+  text-transform: uppercase;
+  color: var(--accentText, #a8300f);
+  cursor: pointer;
+  transition: background-color 150ms ease, border-color 150ms ease;
+}
+
+.dateAction:hover {
+  border-color: var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+  background: color-mix(
+    in srgb,
+    var(--accent, #e2481d) 8%,
+    transparent
+  );
+}
+
+/* A called-off row on a closed listing takes focus after its Call off button
+   is gone (see `calledOffIdRef` in ScheduleDateList). */
+.row:focus-visible,
+.dateAction:focus-visible {
+  outline: 2px solid var(--accent, #e2481d);
+  outline-offset: -2px;
+}
+
+.dateAction[aria-busy="true"] {
+  opacity: 0.55;
+  cursor: progress;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dateAction {
+    transition: none;
+  }
+}
+
+/* ── Narrow ───────────────────────────────────────────────────────────────
+   At 320px the date and its control stop sharing a line: two columns leave the
+   date ~150px, which wraps "WED, SEP 16" onto two lines under a control that
+   is already 44px tall. One column, control left-aligned under the date. */
+@media (max-width: 380px) {
+  .row {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 4px 10px;
+  }
+
+  .dateAction {
+    justify-content: flex-start;
+    padding-left: 0;
+  }
+
+  .monthHead,
+  .row {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+}

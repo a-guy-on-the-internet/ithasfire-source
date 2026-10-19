@@ -19,13 +19,13 @@ A comp reward is always a **free ($0) ticket** of a type you pick. There are no 
 
 ## Before you start
 
-Comp rewards attach to **event** volunteering only — they grant a real ticket, so they need one of that event's ticket types to point at. You can't add a reward to a standing [volunteer ask](/help/organising-events/recruit-standing-volunteers) that isn't tied to an event.
+Comp rewards attach to **event** volunteering only — they grant a real ticket, so they need one of that event's ticket types to point at. You can't add a reward to a standing [volunteer ask](/help/organising-events/recruit-standing-volunteers) that isn't tied to an event. The event also has to be run by an organisation: events on your personal profile can't take volunteer sign-ups, so they have no rewards either.
 
-Because a comp spends the event's revenue (a given-away seat is a seat you didn't sell), configuring rewards requires a finance role. **Only owners, admins, and finance team members** see and edit the reward settings; editors managing volunteers won't see the tab.
+Because a comp spends the event's revenue (a given-away seat is a seat you didn't sell), configuring rewards needs both the right to manage the event's volunteers and a finance role. **Only owners and admins** see and edit the reward settings; editors and finance team members won't see the page.
 
 ## Set up a reward
 
-Open your event in the admin dashboard, go to **Volunteers**, and open the **Comp rewards** tab. Choose:
+Open your event in the admin dashboard and choose **Comp rewards** under **Volunteers** in the event's side menu. Choose:
 
 - **Comp ticket type** — which ticket the volunteer receives. Its face value is recorded for reporting.
 - **Grant the comp** — the trigger: **When approved** (rewards commitment) or **When checked in** (rewards actually showing up). Check-in is the default and the safer money posture — you only comp people who turned up.
@@ -39,18 +39,20 @@ A comp is a real ticket against your event's inventory and revenue. Set a **budg
 
 ## The reward ledger
 
-The same tab shows a **Reward ledger**: how many comps have been **granted**, **used** (scanned at the door), and **voided**, the **remaining budget**, and the total face value comped. Each volunteer's row on the sign-ups list also carries a status chip — **Comp granted**, **Comp used**, or **Comp voided** — so you can see at a glance who's been rewarded. Coordinators can see these chips on their group's roster but can't configure or change rewards.
+The same page shows a **Reward ledger**: how many comps have been **granted**, **used** (scanned at the door), and **voided**, the **remaining budget**, and the total face value comped. Each volunteer's row on the sign-ups list also carries a status chip — **Comp granted**, **Comp used**, or **Comp voided** — so you can see at a glance who's been rewarded. Coordinators can see these chips on their group's roster but can't configure or change rewards.
 
 ## When comps are voided
 
 A comp is returned to your budget automatically if the volunteer **withdraws** before using it — the unused ticket is voided and the budget slot frees up for someone else.
 
-You can also void a granted comp yourself from the reward ledger. Each granted, unused comp carries a **Void comp** action (finance roles only); confirming it invalidates the volunteer's free ticket, cancels the comp order, and returns the budget slot. Use it when you comped the wrong person or need the seat back.
+You can also void a granted comp yourself from the reward ledger. Each granted, unused comp carries a **Void comp** action; confirming it invalidates the volunteer's free ticket, cancels the comp order, and returns the budget slot. Use it when you comped the wrong person or need the seat back. The voided comp goes back on sale as a ticket.
+
+If the volunteer has already sold or given the comp to someone else, or a buyer is part-way through paying for it, voiding the reward leaves that ticket valid. The person who now holds it keeps it, and the budget slot stays used.
 
 A comp that's already been **used** (scanned at the door) can't be voided this way — the **Void comp** action disappears once a comp is used, and if the volunteer scans in during the moment between you opening the ledger and confirming, the void is refused and the row simply updates to **Comp used**. Reversing a genuinely used comp is a deliberate [refund](/help/buying-tickets/refunds-and-cancellations) decision.
 
 ## What can go wrong
 
-- **The Comp rewards tab isn't there** — you're not on a finance role for this organisation, or you're looking at a standing ask rather than an event. Rewards are finance-gated and event-only.
+- **Comp rewards isn't in the side menu** — you're not an owner or admin of this organisation, the event is on your personal profile rather than run by an organisation, or you're looking at a standing ask rather than an event.
 - **No ticket types to choose** — the event has no ticket types yet. Create at least one first; the comp has to grant a specific type.
 - **A volunteer didn't get their comp** — check the ledger. If the budget cap is exhausted, later volunteers get no comp by design; if the reward's trigger is **When checked in**, the comp only issues once you actually check them in.

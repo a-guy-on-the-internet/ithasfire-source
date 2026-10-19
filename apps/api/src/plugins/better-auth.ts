@@ -86,12 +86,21 @@ const plugin: FastifyPluginAsync = async (app) => {
       } catch (error) {
         // This branch swallows a THROW out of Better Auth and answers with a
         // generic 500, so it is the only place the real cause is ever
-        // visible. It was previously log-only, and the log did not survive:
-        // a total dev sign-in outage (every `/sign-in/*` 500ing while
-        // `/get-session` stayed 200) ran for THREE WEEKS with nothing in
-        // Sentry and no `better_auth_handler_failed` line in Cloud Logging to
-        // grep for. Report explicitly per the ReporterPort convention in
-        // CLAUDE.md — never demote this back to a bare log.
+        // visible. It was previously log-only, and the log did not survive.
+        //
+        // What that cost, concretely: dev sign-in 500'd on every
+        // `/sign-in/*` for ~3 weeks (last success 2026-08-06) while
+        // `/get-session` kept returning 200 — the split being that
+        // `/get-session` is the one path exempted from rate limiting in
+        // `auth/rate-limit-rules.ts`. Root cause was NOT in this repo's
+        // source: the container re-resolved `better-auth` ^1.6.9 → 1.7.2
+        // (pnpm deploy ignores the lockfile), fixed by exact-pinning in
+        // 3a59c580. Diagnosing it took a full local rebuild of the deployed
+        // environment because this catch produced no Sentry event and no
+        // greppable `better_auth_handler_failed` line in Cloud Logging.
+        //
+        // Report explicitly per the ReporterPort convention in CLAUDE.md —
+        // never demote this back to a bare log.
         //
         // `err` (not `error`) is the key Sentry's pinoIntegration serialises
         // as an exception; the old `{ error }` shape logged an opaque object.

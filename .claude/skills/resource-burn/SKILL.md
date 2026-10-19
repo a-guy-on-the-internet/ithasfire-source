@@ -1,6 +1,6 @@
 ---
 name: resource-burn
-description: "Query Sentry spans for how fast we are consuming each metered dependency (Upstash, Neon, Resend, Expo, ZipTax), compare against quota, and maintain docs/ops/resource-burn.md as a living headroom report. Invoke weekly via the scheduled automation, or manually when a quota scare is suspected."
+description: "Query Sentry spans for how fast we are consuming each metered dependency (Upstash, Neon, Resend, Expo, ZipTax), compare against quota, and maintain docs/ops/resource-burn.md as a living headroom report. Use when a quota scare is suspected, before raising a plan tier, or when asked how close a dependency is to its ceiling."
 ---
 
 # Resource Burn
@@ -36,13 +36,16 @@ funeral.**
 
 ## When to run
 
-- **Weekly, Monday** — via the scheduled automation.
+Nothing runs this on a schedule: launchd carries only the two curation
+commands. Run it by hand; if the owner wants it weekly, add a plist that calls
+`.claude/curation/run.sh resource-burn` and change this line.
+
 - **Manually** — when a dependency looks hot, before raising a plan tier, or
   after shipping anything that adds per-request calls to a metered service.
 
 ## Prerequisites — TWO paths, pick by how you were invoked
 
-### Scheduled / headless → `scripts/sentry-burn.mjs`
+### Headless (curation runner, CI, a script) → `scripts/sentry-burn.mjs`
 
 ```bash
 node scripts/sentry-burn.mjs --period 7d            # human-readable
@@ -50,19 +53,20 @@ node scripts/sentry-burn.mjs --period 7d --json     # machine-readable
 ```
 
 Needs `SENTRY_AUTH_TOKEN` (already exported from the operator's `~/.zshrc`;
-also lives in Forgejo as `TF_VAR_SENTRY_AUTH_TOKEN`). `SENTRY_ORG` defaults to
+also a GitHub Actions secret, `TF_VAR_SENTRY_AUTH_TOKEN`). `SENTRY_ORG` defaults to
 `hearth-fire`.
 
 **Do NOT reach for the Sentry MCP on this path.** The MCP authenticates by
 interactive OAuth, that token expires, and a headless run cannot refresh it —
 an expired OAuth token is exactly what killed the 2026-08-10 scheduled curation
 run, silently, for weeks. The script exits non-zero on auth or transport
-failure rather than reporting zeroes, so `.claude/curation/run.sh` surfaces it
+failure, and exits 1 with `postgres.status: "unverified"` (other numbers still
+printed) when the Prisma span filter matches nothing, rather than reporting zeroes, so a headless runner can surface it
 instead of writing a report that reads like "no usage".
 
 ### Interactive → the Sentry MCP is fine
 
-`mcp__sentry__search_events` with `dataset: "spans"` is more flexible for
+`mcp__sentry__search_traces` (span queries; `search_sentry_tools` lists the rest) is more flexible for
 follow-up questions once a number looks wrong. Same data; the script is just
 the queries this report always needs.
 
@@ -103,10 +107,12 @@ upgraded, or the numbers stop making sense.
 
 Pick a signal whose true rate is knowable independently of Sentry, and compare.
 `POST /jobs/:name` is ideal: Cloud Scheduler fires it on a fixed cron, so
-`apps/jobs/jobs.manifest.json` is a hard ceiling on how often it *can* occur.
+the deployed cron is a hard ceiling on how often it *can* occur.
 
-- Sum the manifest's `scheduled` crons into runs/day (**~1,635/day** as of the
-  2026-07-30 retune; it was 3,591 before).
+- Prod cadence = `apps/jobs/jobs.manifest.json` with
+  `jobs_scheduler_overrides` in `infra/terraform/envs/prod/prod.tfvars`
+  applied on top (the manifest alone is tuned for dev's faster ticks). Sum the
+  resulting `scheduled` crons into runs/day.
 - Query `transaction:"POST /jobs/:name" AND is_transaction:true` over 24h.
 - `multiplier ≈ manifest_runs_per_day / observed`.
 
@@ -128,7 +134,7 @@ failure mode this section exists to prevent.
 | Dependency | Ceiling | Span signature |
 |---|---|---|
 | Upstash Redis | 500K commands/month (free tier) | `span.op:db.redis OR span.description:*redis*` |
-| Neon Postgres | compute-hours (plan-dependent) | `span.op:db OR span.op:db.sql.prisma` |
+| Neon Postgres | compute-hours (plan-dependent) | `span.op:db sentry.origin:auto.db.otel.prisma` (every statement also emits an `auto.db.otel.postgres` twin, and `manual` spans are pool bookkeeping: an unfiltered `span.op:db` count is ~2× the real queries) |
 | Resend | plan send limit | `span.description:*resend*` + `notify` use-case logs |
 | Expo Push | unauthenticated tier, soft | `span.description:*expo*` |
 | ZipTax | per-lookup billing | `span.description:*ziptax*` |
@@ -141,7 +147,7 @@ worse than an absent one.
 
 ## Per-run procedure
 
-1. **Per-dependency volume** — for each row above, run `search_events` over
+1. **Per-dependency volume** — for each row above, run a span query (`search_traces`; headless: the script's output) over
    `period: 7d`, `environment:production`, grouped by `span.description` with
    `count()`. Note the top consumer per dependency.
 2. **Attribute the top consumer** — re-run the hottest signature grouped by
@@ -150,8 +156,9 @@ worse than an absent one.
    actionable.
 3. **Project against ceiling** — normalise to per-day, multiply to the quota
    window, divide by the ceiling. Apply the sampling rule above.
-4. **Trend** — read last run's committed file via
-   `git show HEAD~1:docs/ops/resource-burn.md` and compare per-dependency
+4. **Trend** — before rewriting it, read the current
+   `docs/ops/resource-burn.md` in the working tree (the last run's numbers,
+   committed or not) and compare per-dependency
    projected utilisation:
    - `new ≥ 1.5× old` → **↗**
    - `new ≤ 0.67× old` → **↘**
@@ -162,8 +169,8 @@ worse than an absent one.
    - `50–79%` → **WATCH**
    - `≥ 80%` → **ACT** (this is the actionable line; 80% of a monthly quota on
      day 20 is fine, 80% on day 8 is not — weight by position in the window)
-6. **Write and commit** — if anything changed, update the doc and commit as
-   `chore(ops): resource-burn weekly run YYYY-MM-DD`.
+6. **Write** — if anything changed, update the doc. Leave the commit to the
+   user or the orchestrator (temp-index, explicit path).
 
 ## Reporting rules
 

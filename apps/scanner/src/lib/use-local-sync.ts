@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AppState } from "react-native";
 
 import { narrowAccessibleEvents } from "../features/auth/use-scanner-session";
 import { trpc } from "../trpc";
 import {
-  clearAll,
   dropPeopleForEvent,
+  dropEventsNotIn,
   dropStalePeople,
   upsertEvents,
   upsertPeople,
@@ -14,6 +14,7 @@ import {
   type LocalTicketInput,
   type ManifestPerson,
 } from "./local-db";
+import { reportRetentionIssue } from "./report";
 
 const MANIFEST_INTERVAL_MS = 60_000;
 const EVENTS_STALE_MS = 10 * 60_000;
@@ -74,11 +75,54 @@ const narrowManifest = (
   };
 };
 
+/**
+ * A manifest that arrived but could not be written to SQLite. Reported once
+ * per app run: the same failure would otherwise send an event for every listed
+ * event every minute. Network failures never reach this (the fetch wrapper in
+ * `trpc.ts` captures those).
+ */
+let manifestWriteFailureReported = false;
+
+/**
+ * Report a failure of a step that runs on every sync tick, once per app run
+ * per branch. Each tick would otherwise send the same failure every minute.
+ */
+const reportedTickBranches = new Set<string>();
+const reportTickFailureOnce = (branch: string, err: unknown): void => {
+  if (reportedTickBranches.has(branch)) return;
+  reportedTickBranches.add(branch);
+  reportRetentionIssue(err, { branch });
+};
+
+/**
+ * The raw `events` array of a `listAccessibleEvents` answer, or null when the
+ * answer does not have one. `narrowAccessibleEvents` turns any other shape
+ * into `[]`, which must never be read as "this operator has no events".
+ */
+const listedEvents = (data: unknown): unknown[] | null => {
+  const events = (data as { events?: unknown } | null | undefined)?.events;
+  return Array.isArray(events) ? events : null;
+};
+
 export function useLocalSync(enabled: boolean) {
   const utils = trpc.useUtils();
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const eventIdsRef = useRef<string[]>([]);
   const previousEventIdsRef = useRef<string[]>([]);
+  // False until the first confirmed event list of this signed-in stretch has
+  // been compared with what SQLite holds. `previousEventIdsRef` lives in
+  // memory and starts empty on a cold start, so without this an event the
+  // operator lost while the app was closed kept its people rows until the 24h
+  // sweep. Reset whenever sync is switched off (sign-out, access denied).
+  const reconciledWithDbRef = useRef(false);
+  // When sync was last switched on. A list the query cache already held at
+  // that moment was answered for an earlier stretch (possibly another
+  // operator), so it is not an answer for this one.
+  const enabledAtRef = useRef<number | null>(null);
+  // True once a list of this stretch has filled `eventIdsRef`; starts the
+  // manifest sync. `accessibleEvents` cannot stand in for it: it also shows a
+  // cached list that `eventIdsRef` was never filled from.
+  const [hasListedEvents, setHasListedEvents] = useState(false);
   const eventEndsAtRef = useRef<Map<string, number | null>>(new Map());
 
   const eventsQuery = trpc.scanner.listAccessibleEvents.useQuery(
@@ -87,6 +131,26 @@ export function useLocalSync(enabled: boolean) {
   );
 
   const accessibleEvents = narrowAccessibleEvents(eventsQuery.data);
+
+  // Declared before the list effect below: on the render that switches sync
+  // on, `enabledAtRef` must be set before that effect reads it.
+  useEffect(() => {
+    if (!enabled) {
+      enabledAtRef.current = null;
+      reconciledWithDbRef.current = false;
+      // Nothing listed any more: a manifest still on the wire is not written.
+      eventIdsRef.current = [];
+      previousEventIdsRef.current = [];
+      setHasListedEvents(false);
+      return;
+    }
+    enabledAtRef.current = Date.now();
+    // A list left in the cache is not trusted (see `enabledAtRef`); ask for
+    // this stretch's own instead of waiting out the 10 minute refresh.
+    if (utils.scanner.listAccessibleEvents.getData({}) !== undefined) {
+      void utils.scanner.listAccessibleEvents.invalidate();
+    }
+  }, [enabled, utils]);
 
   // Keep a stable ref of current event IDs for the interval callback. Detect
   // events that disappeared from the accessible list (FR-008 case b: operator
@@ -100,24 +164,40 @@ export function useLocalSync(enabled: boolean) {
     // rotation or cache invalidation. Only diff against a confirmed-fresh
     // success result.
     if (!eventsQuery.isSuccess) return;
+    // Nor against a list answered before sync was switched on, or an answer
+    // that is not a list of events at all (a wrong-shape 200 narrows to `[]`).
+    const enabledAt = enabledAtRef.current;
+    if (enabledAt === null || eventsQuery.dataUpdatedAt < enabledAt) return;
+    const rawEvents = listedEvents(eventsQuery.data);
+    if (!rawEvents) return;
+    // An entry that failed to narrow would read as an event that left. Such a
+    // list still drives the sync, but nothing is dropped on its word.
+    const everyEntryRead = rawEvents.length === accessibleEvents.length;
 
     const nextIds = accessibleEvents.map((e) => e.eventId);
     const prev = previousEventIdsRef.current;
     const removed = prev.filter((id) => !nextIds.includes(id));
-    for (const removedId of removed) {
+    // The first confirmed list is compared with SQLite itself, later ones with
+    // the list before them. Either way everything outside the list goes in one
+    // call, and a successful EMPTY list is a real answer: it drops everyone.
+    const firstAnswer = !reconciledWithDbRef.current;
+    if (everyEntryRead && (firstAnswer || removed.length > 0)) {
+      reconciledWithDbRef.current = true;
       try {
-        dropPeopleForEvent(removedId);
+        dropEventsNotIn(nextIds);
       } catch (err) {
         if (__DEV__) {
-          console.warn(
-            `[sync] dropPeopleForEvent failed for ${removedId}`,
-            err,
-          );
+          console.warn("[sync] dropEventsNotIn failed", err);
         }
+        reportRetentionIssue(err, {
+          branch: "event_list_people_drop",
+          extra: { listedEvents: nextIds.length, firstAnswer },
+        });
       }
     }
     previousEventIdsRef.current = nextIds;
     eventIdsRef.current = nextIds;
+    setHasListedEvents(nextIds.length > 0);
 
     // Cache endsAt for FR-008 case c (end-time + 24h grace wipe).
     const map = new Map<string, number | null>();
@@ -131,7 +211,13 @@ export function useLocalSync(enabled: boolean) {
       map.set(e.eventId, Number.isFinite(ts as number) ? (ts as number) : null);
     }
     eventEndsAtRef.current = map;
-  }, [accessibleEvents, eventsQuery.isSuccess]);
+  }, [
+    enabled,
+    accessibleEvents,
+    eventsQuery.isSuccess,
+    eventsQuery.dataUpdatedAt,
+    eventsQuery.data,
+  ]);
 
   // Persist events to SQLite whenever the list changes.
   useEffect(() => {
@@ -175,6 +261,7 @@ export function useLocalSync(enabled: boolean) {
               err,
             );
           }
+          reportTickFailureOnce("ended_event_people_drop", err);
         }
         continue;
       }
@@ -184,6 +271,10 @@ export function useLocalSync(enabled: boolean) {
         .then((manifest) => {
           const data = narrowManifest(manifest);
           if (!data) return;
+          // The event left the list (or sync was switched off) while this
+          // was on the wire: its people have been dropped, so do not write
+          // them back.
+          if (!eventIdsRef.current.includes(eventId)) return;
           const localTickets: LocalTicketInput[] = data.tickets.map((t) => ({
             ticketId: t.ticketId,
             code: t.code,
@@ -194,8 +285,21 @@ export function useLocalSync(enabled: boolean) {
             ticketTypeName: t.ticketTypeName ?? null,
             orderId: t.orderId ?? null,
           }));
-          upsertTickets(localTickets);
-          upsertPeople(eventId, data.people);
+          // A local write that fails is not a fetch failure: the `.catch`
+          // below only warns in dev, which is how `upsertPeople` throwing on
+          // every re-sync went unseen in production.
+          try {
+            upsertTickets(localTickets);
+            upsertPeople(eventId, data.people);
+          } catch (err) {
+            if (__DEV__) {
+              console.warn(`[sync] manifest write failed for ${eventId}`, err);
+            }
+            if (!manifestWriteFailureReported) {
+              manifestWriteFailureReported = true;
+              reportRetentionIssue(err, { branch: "manifest_local_write" });
+            }
+          }
         })
         .catch((err: unknown) => {
           if (__DEV__) {
@@ -205,8 +309,13 @@ export function useLocalSync(enabled: boolean) {
     }
 
     // FR-008 case d: stale-event sweep. Drop any people rows older than 24h
-    // whose event is no longer in the active list (catches anything that
-    // escaped the per-event diff above, e.g. across cold starts).
+    // whose event is no longer in the active list.
+    //
+    // Only against a confirmed list. Before one (a cold start, offline, or
+    // Home's refresh at mount) `ids` is empty, and an empty list here means
+    // "no active events": every person synced more than 24h ago would go, so
+    // an offline start the day after the last sync would empty the cache.
+    if (!reconciledWithDbRef.current) return;
     try {
       dropStalePeople({
         staleAfterMs: PEOPLE_STALE_MS,
@@ -216,12 +325,13 @@ export function useLocalSync(enabled: boolean) {
       if (__DEV__) {
         console.warn("[sync] dropStalePeople failed", err);
       }
+      reportTickFailureOnce("stale_people_sweep", err);
     }
   }, [utils]);
 
   // Initial sync + recurring interval.
   useEffect(() => {
-    if (!enabled || accessibleEvents.length === 0) return;
+    if (!enabled || !hasListedEvents) return;
 
     syncManifests();
 
@@ -233,7 +343,7 @@ export function useLocalSync(enabled: boolean) {
         intervalRef.current = null;
       }
     };
-  }, [enabled, accessibleEvents.length > 0, syncManifests]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [enabled, hasListedEvents, syncManifests]);
 
   // Re-sync immediately when the app comes back to foreground.
   useEffect(() => {
@@ -248,19 +358,9 @@ export function useLocalSync(enabled: boolean) {
     return () => sub.remove();
   }, [enabled, syncManifests]);
 
-  const reset = useCallback(() => {
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
-    clearAll();
-    eventIdsRef.current = [];
-  }, []);
-
   return {
     isSyncing: eventsQuery.isFetching,
     accessibleEvents,
-    reset,
     refresh: syncManifests,
   };
 }

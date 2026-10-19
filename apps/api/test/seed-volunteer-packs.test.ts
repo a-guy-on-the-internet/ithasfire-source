@@ -1,6 +1,6 @@
 /**
  * Launch volunteer-role catalogue (FR-018,
- * docs/specs/2026-07-27/volunteer-role-packs.spec.yaml).
+ * docs/specs/2026-07-27/completed/volunteer-role-packs.spec.yaml).
  *
  * Two things are under test and neither needs a database:
  *

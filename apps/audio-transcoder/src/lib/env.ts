@@ -13,6 +13,12 @@ const envSchema = z.object({
 
   // Redis (for idempotency, if needed)
   REDIS_URL: z.string().optional(),
+  /**
+   * Key namespace for every Redis key this service writes (ioredis
+   * `keyPrefix`). Terraform emits `ithasfire:<env>`; dev and prod share one
+   * Upstash database, so without this their keys collide.
+   */
+  REDIS_NAMESPACE: z.string().optional(),
   IDEMPOTENCY_BACKEND: z
     .enum(["auto", "redis", "postgres", "noop"])
     .default("auto"),

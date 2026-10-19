@@ -1,0 +1,73 @@
+title: use-case | place-layouts.delete-place-layout
+owner: core
+file: packages/core/src/use-cases/place-layouts/delete-place-layout.ts
+goal: >
+  Remove a place's canonical layout during teardown or data correction moments while
+  keeping downstream availability tables and caches consistent.
+
+ports:
+  - PlaceLayoutRepo
+  - PlaceLayoutBlobRepo
+  - PlaceLayoutStatusRepo
+  - PlaceLayoutStreamingPort
+  - Repos
+  - Clock
+  - Logger
+  - Metrics
+
+invariants:
+  - Deletion is restricted to operators with organizer-level permissions for the place's org.
+  - Feature flag `feature.placeLayout` gate must be respected; if disabled, return `forbidden`.
+  - Use a single `repos.tx()` to remove layout metadata, glyph blob, and availability rows to
+    prevent dangling references.
+  - Downstream caches and subscribers must be notified when the canonical layout disappears.
+
+input_schema:
+  placeId: uuid # required
+  actorHumanId: uuid # organizer performing the deletion
+  reason?: string # optional operator-provided audit note (<=500 chars)
+
+preconditions:
+  - Validate `placeId` and `actorHumanId` via zod; missing data => `invalid_input`.
+  - Authorize actor via AuthzRepo for organizer role on the place's org (transport-layer check).
+  - Confirm place layout feature flag enabled before invoking the use case.
+  - Ensure no future or active events depend on the layout; otherwise bubble `conflict` with event ids.
+  - Query PlaceLayoutRepo.getByPlace. If absent, treat as idempotent delete and return `deleted=false`.
+
+execution:
+  1. Load current layout snapshot + checksum for metrics and auditing.
+  2. Within repos.tx():
+     a. Delete PlaceLayoutStatusRepo availability rows for the place (clears seats for dependent events).
+     b. Delete glyph snapshot via PlaceLayoutBlobRepo.deleteForPlace.
+     c. Remove layout metadata via PlaceLayoutRepo.deleteForPlace.
+     d. Write audit log entry `placeLayout.deleted` capturing actor, previousChecksum, reason.
+  3. If deletion succeeded, emit `PlaceLayoutStreamingPort.publishPlaceLayoutReplaced` with checksum=null.
+  4. Return `{ deleted, deletedChecksum }` to caller.
+
+output_schema:
+  deleted: boolean
+  deletedChecksum: string | null
+
+side_effects:
+  - Deletes place layout metadata and glyph blob entries.
+  - Clears availability rows tied to the removed layout.
+  - Broadcasts removal event to streaming consumers for cache invalidation.
+  - Emits audit + metric records capturing actor and counts.
+
+errors:
+  - invalid_input(422): malformed uuid or missing actor information.
+  - forbidden(403): actor lacks permissions or feature flag disabled.
+  - conflict(409): venue has active/future events blocking deletion.
+  - dependency_failed(424): blob deletion or repo tx failure.
+  - transient(503): upstream timeout (repos, blob store).
+
+notes:
+  - Consider soft-delete metadata for audit in the future; current implementation performs hard delete.
+  - Downstream analytics pipelines must tolerate null layout after deletion; ensure dashboards receive checksum=null.
+  - If deletion is triggered by re-import pipeline, pair with replace use case to avoid layout gaps.
+
+tests:
+  - happy path deletion returns deleted=true and emits streaming event.
+  - deletion blocked when active event found returns conflict with event ids.
+  - idempotent second call returns deleted=false without throwing.
+  - dependency failure during blob delete triggers transaction rollback.

@@ -1,4 +1,5 @@
 import Fastify from "fastify";
+import * as Sentry from "@sentry/node";
 import { z, ZodError } from "zod";
 
 import { buildContainer, type TranscoderContainer } from "./lib/container";
@@ -33,6 +34,28 @@ const pubSubEnvelopeSchema = z.object({
  * Decoded message payload schema
  */
 const transcodeMessageSchema = transcodeAudioInputSchema;
+
+/**
+ * Warm-up message, published by the API when an organiser STARTS an audio
+ * upload (`warmTranscoder` in packages/transport/trpc/src/routers/events.ts).
+ * Prod runs this service at min 0 instances; the push request is what boots an
+ * instance, so its cold start overlaps the file upload. The handler acks it
+ * with a 200 and does nothing else. It is recognised by its body or by its
+ * `kind` attribute (the API sets both).
+ */
+export const transcoderWarmMessageSchema = z
+  .object({ kind: z.literal("warm") })
+  .strict();
+
+function isWarmMessage(
+  attributes: Record<string, string> | undefined,
+  decoded: unknown,
+): boolean {
+  return (
+    attributes?.kind === "warm" ||
+    transcoderWarmMessageSchema.safeParse(decoded).success
+  );
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // App Builder
@@ -97,10 +120,16 @@ export async function createApp() {
   app.post("/pubsub/push", async (request, reply) => {
     const requestLogger = logger.child({ route: "pubsub_push" });
 
+    // Hoisted out of the try so the catch below can attribute the failure to a
+    // specific message and upload. Both stay at their defaults if we fail
+    // before parsing, which is itself the useful signal.
+    let messageId = "unknown";
+    let audioUploadId: string | undefined;
+
     try {
       // Parse Pub/Sub envelope
       const envelope = pubSubEnvelopeSchema.parse(request.body);
-      const messageId = envelope.message.messageId ?? "unknown";
+      messageId = envelope.message.messageId ?? "unknown";
 
       requestLogger.info("pubsub_message_received", { messageId });
 
@@ -114,11 +143,21 @@ export async function createApp() {
         decodedData = JSON.parse(jsonString);
       } catch (err) {
         requestLogger.error("pubsub_decode_failed", { messageId, err });
-        // Return 400 to tell Pub/Sub not to retry (bad message format)
+        // 400 does NOT stop a retry: Pub/Sub push treats any non-2xx as a
+        // nack and redelivers (10s-600s backoff) until max_delivery_attempts
+        // (5), then dead-letters to *-transcode-dlq. An undecodable message
+        // therefore lands in the DLQ, which nothing alerts on yet.
         return reply.status(400).send({
           error: "invalid_message_format",
           message: "Failed to decode message data",
         });
+      }
+
+      // A warm-up carries no job: ack it before validation so it is never
+      // logged as a bad payload, never retried, never dead-lettered.
+      if (isWarmMessage(envelope.message.attributes, decodedData)) {
+        requestLogger.info("pubsub_warm_acked", { messageId });
+        return reply.status(200).send({ ok: true, warm: true });
       }
 
       // Parse and validate the transcode message
@@ -128,7 +167,8 @@ export async function createApp() {
           messageId,
           errors: parseResult.error.format(),
         });
-        // Return 400 - bad message, don't retry
+        // 400 is a nack, not "don't retry": Pub/Sub redelivers up to
+        // max_delivery_attempts, then dead-letters (see the decode branch).
         return reply.status(400).send({
           error: "invalid_message_payload",
           details: parseResult.error.format(),
@@ -136,6 +176,7 @@ export async function createApp() {
       }
 
       const input = parseResult.data;
+      audioUploadId = input.audioUploadId;
       requestLogger.info("transcode_job_start", {
         messageId,
         audioUploadId: input.audioUploadId,
@@ -172,6 +213,34 @@ export async function createApp() {
         err,
         retryable: isRetryable,
       });
+
+      // Deliberate swallow: both branches below convert the error into an HTTP
+      // response rather than letting it propagate, so nothing else can capture
+      // it. The non-retryable branch is the dangerous one — it acks the message
+      // and the upload is abandoned in TRANSCODING with no further signal.
+      // Guarded so a failing reporter never changes the response.
+      try {
+        Sentry.captureException(err, {
+          tags: {
+            service: "audio-transcoder",
+            route: "pubsub_push",
+            retryable: String(isRetryable),
+          },
+          extra: { messageId, audioUploadId },
+        });
+        // The module hardcodes `cpu_idle = true`
+        // (modules/cloud-run-audio-transcoder/main.tf), so CPU is throttled the
+        // moment this handler returns. Without a flush the ingest POST can be
+        // frozen mid-flight and the event never arrives — worst on the
+        // non-retryable branch, which acks the message and is terminal, so
+        // there is no redelivery to report it a second time.
+        //
+        // `flush` resolves false on timeout rather than throwing, and 2s is
+        // well inside the Pub/Sub ack deadline.
+        await Sentry.flush(2000);
+      } catch {
+        // Reporting must never be the reason a transcode result changes.
+      }
 
       if (isRetryable) {
         // Return 500 to trigger Pub/Sub retry
@@ -215,6 +284,18 @@ export async function createApp() {
           error: "invalid_input",
           details: err.format(),
         });
+      }
+
+      // Same deliberate swallow as the Pub/Sub branch. ZodError is excluded
+      // above — a malformed debug-route payload is caller error, not a fault
+      // worth alerting on.
+      try {
+        Sentry.captureException(err, {
+          tags: { service: "audio-transcoder", route: "transcode_direct" },
+        });
+        await Sentry.flush(2000);
+      } catch {
+        // Reporting must never be the reason a transcode result changes.
       }
 
       const typedErr = err as { code?: string; message?: string };

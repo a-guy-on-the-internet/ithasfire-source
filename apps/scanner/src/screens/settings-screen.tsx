@@ -330,7 +330,7 @@ export const SettingsScreen = ({
             */}
             <SettingRow
               label="Dark theme"
-              description="Navy instead of warm paper. Easier on your eyes in a dark venue; the camera view stays dark either way."
+              description="Navy instead of warm paper. Easier on your eyes in a dark room; the camera view stays dark either way."
               icon={
                 isDarkTheme ? (
                   <Moon size={18} color={colors.color} />

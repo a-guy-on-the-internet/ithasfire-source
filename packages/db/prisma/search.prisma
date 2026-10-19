@@ -1,0 +1,122 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Search — Denormalized PostgreSQL search documents.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model SearchDocument {
+  id                    String    @id
+  type                  String
+  title                 String
+  subtitle              String?
+  helper                String?
+  imageUrl              String?   @map("image_url")
+  eventId               String?   @map("event_id")
+  humanId               String?   @map("human_id")
+  placeId               String?   @map("place_id")
+  orgIdRef              String?   @map("org_id_ref")
+  slug                  String?
+  username              String?
+  profileSlug           String?   @map("profile_slug")
+  orgSlug               String?   @map("org_slug")
+  startsAt              DateTime? @map("starts_at") @db.Timestamptz(6)
+  endsAt                DateTime? @map("ends_at") @db.Timestamptz(6)
+  /// `Event.timezone` (IANA), the zone `helper` was formatted in, so a card
+  /// stamps the time in the event's zone. Null on rows indexed before the
+  /// column existed and on non-event rows; readers fall back to the platform
+  /// default (`resolveTimeZone`). Filled by the next reindex.
+  timezone              String?
+  addressText           String?   @map("address_text")
+  eventStatus           String?   @map("event_status")
+  regionCode            String?   @map("region_code")
+  countryCode           String?   @map("country_code")
+  city                  String?
+  lat                   Float?
+  lng                   Float?
+  /// How to DRAW lat/lng: a pin only when true. Written from the redacted
+  /// document (events: `projectPublicEventLocation`; places:
+  /// `redactPlaceLocation`). Defaults false so a row indexed before the column
+  /// existed fails closed (never drawn as a pin).
+  locationIsExact       Boolean   @default(false) @map("location_is_exact")
+  /// Published approximate-area radius in metres; null unless a circle is drawn.
+  locationRadiusMeters  Int?      @map("location_radius_meters")
+  tags                  String[]  @default([])
+  /// The event's category name in every language (English + translations).
+  /// Searchable text at weight D of `search_vector`; never a filter.
+  categoryNames         String[]  @default([]) @map("category_names")
+  artists               String[]  @default([])
+  venueName             String?   @map("venue_name")
+  orgId                 String?   @map("org_id")
+  ownerHumanId          String?   @map("owner_human_id")
+  summary               String?
+  popularityScore       Int       @default(0) @map("popularity_score")
+  lowestPriceCents      Int?      @map("lowest_price_cents")
+  lowestBuyerTotalCents Int?      @map("lowest_buyer_total_cents")
+  currency              String?
+  paidTierCount         Int       @default(0) @map("paid_tier_count")
+  hasFreeTier           Boolean   @default(false) @map("has_free_tier")
+  /// A floor-0 pay-what-you-want tier is on sale (owner ruling 2026-10-06, F2:
+  /// listings say "Pay what you want", never "Free"). Separate from
+  /// hasFreeTier, which is genuinely free tiers only.
+  hasPayWhatYouWantTier Boolean   @default(false) @map("has_pay_what_you_want_tier")
+  isPublic              Boolean   @default(false) @map("is_public")
+  eventsHostedCount     Int       @default(0) @map("events_hosted_count")
+  capacity              Int?
+  eventCount            Int       @default(0) @map("event_count")
+  placeStatus           String?   @map("place_status")
+  verificationStatus    String?   @map("verification_status")
+  listedInDirectory     Boolean   @default(false) @map("listed_in_directory")
+  orgStatus             String?   @map("org_status")
+  memberCount           Int       @default(0) @map("member_count")
+  indexedAt             DateTime  @default(now()) @map("indexed_at") @db.Timestamptz(6)
+  /// Write marker for the NON-DESTRUCTIVE full rebuild: the database clock at
+  /// the moment of the write (`clock_timestamp()`, set by the insert default
+  /// and by every upsert's UPDATE). The rebuild deletes the documents of a
+  /// type whose marker is older than the run's start — the ones nothing
+  /// rewrote. NOT `indexed_at`: that is the writer's app clock at build time,
+  /// so a write that read before the run and landed after it would look old.
+  indexedMarker         DateTime? @default(dbgenerated("clock_timestamp()")) @map("indexed_marker") @db.Timestamptz(6)
+
+  searchVector  Unsupported("tsvector")? @map("search_vector")
+  trigramCorpus String?                  @map("trigram_corpus") @ignore
+  geoPoint      Unsupported("cube")?     @map("geo_point")
+}
+
+/// Durable "this entity's search document may be stale" list (edit-triggered
+/// batched reindex). A write that changes anything a search document shows
+/// marks the entity IN ITS OWN TRANSACTION (`markForSearchReindex`), so the
+/// mark commits exactly when the edit does. After commit the writer tries the
+/// incremental reindex at once and clears the mark on success; a scheduled
+/// drain (`search.drain-reindex-pending`, apps/jobs) retries whatever is left.
+/// The nightly `search.full-reindex` is the backstop and clears it too.
+///
+/// `generation` is the clear guard. Every mark bumps it; a clear deletes a row
+/// only if its generation still equals the one read BEFORE the reindex read
+/// the source rows. A concurrent edit's newer mark therefore survives a clear
+/// that raced it — no timestamp comparison, so no clock skew and no
+/// same-millisecond collision can drop a mark.
+model SearchReindexPending {
+  /// "event" | "human" | "place" | "organization" (core validates).
+  entityType    String    @map("entity_type")
+  entityId      String    @map("entity_id") @db.Uuid
+  generation    Int       @default(1)
+  markedAt      DateTime  @default(now()) @map("marked_at") @db.Timestamptz(6)
+  /// Failed drain attempts since the last mark. A new mark resets it.
+  attempts      Int       @default(0)
+  lastError     String?   @map("last_error")
+  lastAttemptAt DateTime? @map("last_attempt_at") @db.Timestamptz(6)
+
+  @@id([entityType, entityId])
+}
+
+/// Singleton row (`id = "search"`) recording which SEARCH_INDEX_FORMAT_VERSION
+/// the index was last fully rebuilt at, plus the claim that lets exactly one
+/// `search.ensure-format` delivery run the rebuild after a format change
+/// (Pub/Sub may redeliver while a rebuild is still running).
+model SearchIndexState {
+  id                    String    @id
+  /// Format version of the last SUCCESSFUL full rebuild.
+  formatVersion         Int       @default(0) @map("format_version")
+  /// Version a `search.ensure-format` run claimed the rebuild for.
+  rebuildClaimedVersion Int?      @map("rebuild_claimed_version")
+  rebuildClaimedAt      DateTime? @map("rebuild_claimed_at") @db.Timestamptz(6)
+  updatedAt             DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+}

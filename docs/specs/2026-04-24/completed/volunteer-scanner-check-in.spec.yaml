@@ -1,0 +1,435 @@
+# volunteer-scanner-check-in.spec.yaml
+#
+# Volunteer check-in in the scanner app.
+
+version: "2.2"
+updated: "2026-04-24"
+related:
+  - docs/specs/2026-03-23/volunteering.spec.md
+  - docs/specs/2026-04-24/volunteer-shift-schedule-timeline.spec.yaml
+  - docs/specs/2026-04-24/volunteer-shift-composer.spec.yaml
+  - docs/specs/2026-04-24/scanner-foundation.spec.yaml
+
+scope_note: >
+  This spec defines the volunteer check-in experience inside the scanner app
+  only. It assumes the scanner app shell (authenticated operator entry,
+  event selection, camera scan plumbing) already exists or is delivered by
+  a separate scanner-foundation spec. Ticket admission scanning is untouched
+  except for an opt-in enrichment that surfaces volunteer context when a
+  scanned attendee is also an approved volunteer.
+
+dependencies:
+  hard:
+    - dedicated scanner shell
+      (docs/specs/2026-04-24/scanner-foundation.spec.yaml)
+    - scanner app shell with operator auth + selected event context
+    - existing `checkInVolunteer` use case
+      (packages/core/src/use-cases/volunteering/volunteer-signups.ts)
+  soft:
+    - volunteer email/account surfaces to distribute the volunteer QR
+    - ticket validation pipeline (for enrichment only)
+
+summary:
+  problem: >
+    Today, volunteer check-in is a manual admin action on the web dashboard.
+    At event-day speed, staff need a scanner-native flow that confirms the
+    right volunteer for the right shift, tolerates no dedicated QR, and
+    reuses existing attendee scans when the same human is both ticketed and
+    rostered.
+  solution: >
+    Add a volunteer check-in mode to the scanner app with three entry points
+    that all route to the same `checkInVolunteer` mutation:
+      1. Volunteer QR scan (new human+event-scoped signed token).
+      2. Manual search fallback (name / email).
+      3. Bi-directional enrichment between attendee ticket scans and
+         volunteer scans when the same human holds both.
+    Check-in windows are advisory only and never block. Multi-shift humans
+    are fully supported via a disambiguation picker.
+  users:
+    - Scanner operators with org edit role
+    - Event-day staffing leads
+  surfaces:
+    - scanner
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        The scanner app must expose a "Volunteer check-in" mode selectable
+        after the operator chooses an event. Mode is visually distinct from
+        ticket admission scanning (different accent color, explicit title,
+        non-overlapping copy) to prevent confusing volunteer shift arrival
+        with attendee admission.
+    - id: FR-002
+      description: >
+        In volunteer mode, camera scans of a Ithas Fire volunteer QR token
+        must resolve to the target human's eligible signup(s) for the
+        selected event. If a single eligible signup exists, the operator
+        confirms it and the app calls `checkInVolunteer`. If multiple
+        eligible signups exist (same human, same event, multiple shifts
+        and/or roles), see FR-006.
+    - id: FR-003
+      description: >
+        If the QR is for a different event than the currently selected one,
+        show an explicit "Wrong event" error with the event title the QR
+        belongs to and do not call the mutation.
+    - id: FR-004
+      description: >
+        A search fallback must let the operator look up approved signups for
+        the current event by volunteer name or email, and initiate check-in
+        from a tap on the result row. Search is scoped to status in
+        {APPROVED, CHECKED_IN, NO_SHOW}. PENDING, REJECTED, and WITHDRAWN
+        signups are excluded from results.
+    - id: FR-005
+      description: >
+        The result surface for every entry point must show:
+          - Volunteer display name and masked contact (per existing PII rules)
+          - Role label
+          - Shift label and start/end in the event's local timezone
+          - Current signup status badge (APPROVED / CHECKED_IN / NO_SHOW)
+          - Check-in window state (within window / before window / after window)
+    - id: FR-006
+      description: >
+        Multi-shift disambiguation. When a human has more than one signup
+        eligible for check-in for the current event, the result surface
+        renders a selectable list of signups ordered by:
+          1. Signups whose shift is currently in progress.
+          2. Signups whose shift begins within the next check-in window.
+          3. Remaining eligible signups by start time ascending.
+        The operator must select one before confirming check-in. No silent
+        auto-pick.
+    - id: FR-007
+      description: >
+        Check-in windows are ADVISORY ONLY. The app classifies each shift as
+        before_window / within_window / after_window using an EARLY_WINDOW
+        and LATE_WINDOW (defaults 60 min each) for display purposes. The
+        window state is surfaced as a descriptive note on the result card
+        (e.g. "Shift starts in 45 min", "Shift ended 20 min ago") but NEVER
+        blocks the check-in and NEVER requires an extra confirmation tap.
+        The operator is always trusted to decide. A small `scanWindowNote`
+        field is included in the candidate payload so the UI copy is
+        server-rendered and consistent across surfaces.
+    - id: FR-008
+      description: >
+        Confirming a check-in calls
+        `checkInVolunteer({ signupId, actorHumanId, scannerDeviceId? })`.
+        The app surfaces the returned status and timestamp. Idempotent
+        re-scans of an already CHECKED_IN signup show a neutral "Already
+        checked in at HH:mm by <operator>" state without calling the
+        mutation a second time. The audit entry recorded by the use case
+        MUST include the scanner operator's `actorHumanId` and an optional
+        `scannerDeviceId` (stable per-install UUID from the scanner app) so
+        post-event reports can show who scanned whom on which device.
+        Undoing a check-in is admin-only from the web dashboard; the
+        scanner app has no undo affordance in v1.
+    - id: FR-009
+      description: >
+        Bi-directional ticket / volunteer enrichment.
+          (a) Attendee → volunteer: a normal ticket scan that resolves to a
+              human with any APPROVED / CHECKED_IN / NO_SHOW signup for the
+              current event renders an "Also volunteering" chip on the
+              ticket result screen. Tapping the chip opens the volunteer
+              result surface (FR-005 / FR-006).
+          (b) Volunteer → attendee: in volunteer mode, if the resolved human
+              also holds an attendee ticket for the current event, the
+              volunteer result card shows a secondary "Also ticketed" chip
+              that links to the existing ticket result screen.
+        Ticket admission and volunteer check-in remain SEPARATE writes in
+        both directions — there is no combined one-tap write. If feasible,
+        the attendee ticket QR payload is extended to include a
+        `volunteerSignupIds` hint so (a) can render without an extra RTT
+        (see FR-010b); the hint is non-authoritative and the server
+        re-resolves the signup before any write.
+    - id: FR-010
+      description: >
+        Volunteer QR token (human+event scoped, NOT signup-scoped — so one
+        token covers all of a volunteer's shifts/roles for the event):
+          - Format: URL-safe compact JWS / HMAC token.
+          - Two TTL classes:
+              * `short` — default 24h, configurable via
+                `VOLUNTEER_QR_TTL_HOURS`. Used for email + in-app + wallet.
+              * `print` — long-lived (valid through event end + 24h).
+                Used only for printed badges minted by org admins.
+          - Payload claims: `humanId`, `eventId`, `kind`, `iat`, `exp`, `kid`.
+            No `signupId`, no PII in the token.
+          - Keys live in secret manager alongside existing ticket QR keys,
+            but in a distinct key scope.
+    - id: FR-010b
+      description: >
+        Volunteer QR delivery surfaces (v1):
+          - Volunteer approval email embeds the QR as an image + deep link.
+          - In-app volunteer signup page exposes a "Show my QR" action.
+        Wallet passes and printed badges are deferred to follow-up specs
+        (`volunteer-wallet-pass-designer`, `volunteer-badge-designer`).
+    - id: FR-010d
+      description: >
+        Attendee ticket QR extension. The attendee ticket QR payload gains
+        an optional `volunteerSignupIds: string[]` hint so the scanner can
+        render the "Also volunteering" chip on the first RTT. The hint is
+        advisory and the server always re-resolves before any volunteer
+        write. No backward-compat constraint applies in v1 (no third-party
+        scanners deployed).
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Scan → result latency target p95 ≤ 500 ms on a healthy network.
+        Confirm → success target p95 ≤ 800 ms.
+    - id: NFR-002
+      description: >
+        Network unavailable states are explicit. v1 requires network for
+        the `checkInVolunteer` write and for QR verification; the app must
+        show a clear offline banner rather than silent failure. No offline
+        queueing in v1.
+    - id: NFR-003
+      description: >
+        Authorization: the resolve procedures must enforce org edit role
+        for the event's org. Scanner UI must degrade gracefully if the
+        operator loses authorization mid-session.
+    - id: NFR-004
+      description: >
+        Visual accessibility for bright outdoor use: status badges must
+        satisfy 4.5:1 contrast against their surface in both themes.
+
+architecture:
+  core:
+    use_cases:
+      - name: mintVolunteerScanToken
+        description: >
+          Mint a short-lived volunteer QR token for an APPROVED signup.
+          Called by the email-dispatch pipeline and by the in-app signup
+          page's "Show my QR" action.
+        input: { actorHumanId, signupId, kind: "short" | "print" }
+        output: { token, expiresAt }
+        idempotent: true  (same inputs within TTL return a valid token)
+        money: false
+      - name: resolveVolunteerSignupByToken
+        description: >
+          Verify and decode a volunteer scan token, returning ALL eligible
+          signups (APPROVED / CHECKED_IN / NO_SHOW) for the token's human
+          on the token's event. Returns a typed rejection on
+          expired / wrong_event / invalid. The mutation is NOT called here.
+        input: { actorHumanId, eventId, token }
+        output: VolunteerCheckInCandidate[]
+        idempotent: true
+        money: false
+      - name: searchVolunteerSignupsForCheckIn
+        description: >
+          Org-edit-scoped search across eligible signups for an event,
+          filtered to APPROVED / CHECKED_IN / NO_SHOW, ranked by the
+          disambiguation order in FR-006.
+        input: { actorHumanId, eventId, query, limit }
+        output: VolunteerCheckInCandidate[]
+        idempotent: true
+        money: false
+      - name: getVolunteerContextForTicketScan
+        description: >
+          Given an attendee ticket scan result (humanId + eventId), return
+          any eligible volunteer signups for the same event. Returns empty
+          when none. Does not trigger a write.
+        input: { actorHumanId, eventId, humanId }
+        output: VolunteerCheckInCandidate[]
+        idempotent: true
+        money: false
+      - name: checkInVolunteer (existing, extended)
+        description: >
+          The authoritative write. Already idempotent on CHECKED_IN and
+          gated on APPROVED + org edit role. Extended to accept an
+          optional `scannerDeviceId` and to record it in the audit entry
+          alongside `actorHumanId`.
+        input: { actorHumanId, signupId, scannerDeviceId? }
+        output: VolunteerSignupRecord
+        idempotent: true
+        money: false
+
+  ports:
+    new:
+      - VolunteerScanTokenPort
+        # sign/verify + kid-aware rotation; adapter wraps the existing
+        # crypto primitives used by ticket QR, with a distinct key scope.
+    existing:
+      - VolunteerRepo
+      - EventsRepo
+      - AuthzRepo
+      - AuditRepo
+
+  adapters:
+    new:
+      - JoseVolunteerScanTokenAdapter (or reuse the ticket QR adapter's
+        underlying primitive with a dedicated key scope).
+    existing:
+      - Prisma volunteering adapter (no schema changes required)
+      - Email dispatch adapter (to embed the minted token in confirmations)
+
+  transport:
+    trpc_procedures:
+      - volunteer.signups.mintScanToken
+      - volunteer.signups.resolveByToken
+      - volunteer.signups.searchForCheckIn
+      - volunteer.signups.getContextForTicketScan
+      - volunteer.signups.checkIn  (existing)
+    webhooks: []
+
+  ui:
+    pages:
+      - scanner: Volunteer Mode entry + camera + search fallback
+      - scanner: Volunteer Result screen (single + multi-signup)
+      - scanner: Ticket Result (enrichment chip only; ticket pipeline owns
+        everything else)
+      - web: volunteer signup page shows operator-facing "Show my QR"
+    components:
+      - VolunteerCheckInScreen
+      - VolunteerScanResultCard (single signup)
+      - VolunteerMultiSignupPicker (FR-006)
+      - VolunteerSearchSheet (FR-004)
+      - VolunteerContextChip (ticket result enrichment)
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+  notes: >
+    Volunteer scan tokens are stateless (signed). No DB table required.
+    Revocation is time-bounded via short TTL; explicit revocation is out
+    of scope for v1.
+
+shared_types:
+  VolunteerCheckInCandidate:
+    signupId: uuid
+    humanId: uuid
+    humanDisplayName: string
+    humanContactMasked: string
+    eventId: uuid
+    eventTitle: string
+    roleId: uuid
+    roleLabel: string
+    shiftId: uuid
+    shiftLabel: string
+    shiftStartAt: ISO datetime
+    shiftEndAt: ISO datetime
+    status: "APPROVED" | "CHECKED_IN" | "NO_SHOW"
+    checkedInAt: ISO datetime | null
+    checkedInByHumanId: uuid | null
+    window: "before" | "within" | "after"
+    scanWindowNote: string   # server-rendered copy, e.g. "Shift starts in 45 min"
+    alsoHoldsTicket: boolean # drives FR-009 (b)
+
+errors:
+  codes:
+    - volunteer_qr_expired
+    - volunteer_qr_wrong_event
+    - volunteer_qr_invalid
+    - signup_not_approved
+    - signup_not_found
+    - forbidden  (existing; org role check)
+    - conflict   (existing; check-in state machine)
+
+rollout_phases:
+  - phase: 1
+    scope: >
+      Core + transport: mintScanToken, resolveByToken,
+      searchForCheckIn, getContextForTicketScan. Emit tokens in the
+      existing volunteer approval email. No scanner UI yet.
+  - phase: 2
+    scope: >
+      Scanner app volunteer mode with search fallback + confirmation UI.
+      Hard network requirement.
+  - phase: 3
+    scope: >
+      Camera QR scan flow using the phase-1 tokens, multi-signup picker,
+      and check-in windows.
+  - phase: 4
+    scope: >
+      Ticket-scan enrichment chip on the existing ticket result screen.
+
+risks:
+  - risk: >
+      Operators confusing volunteer check-in with attendee admission.
+    severity: HIGH
+    mitigation: >
+      Distinct mode entry, distinct accent color, distinct success copy,
+      and no shared shortcut that writes both in a single tap. The ticket
+      enrichment chip always requires an explicit second tap.
+  - risk: >
+      Volunteer QR tokens leaking via screenshots / forwarded emails.
+    severity: MEDIUM
+    mitigation: >
+      Short TTL (24h default), signup-scoped claim, and mutation still
+      requires the operator's actor context. Printed badges use a longer
+      TTL and are distributed by org admins only.
+  - risk: >
+      A human with many shifts causes the multi-signup picker to scroll
+      long and slow operators down.
+    severity: LOW
+    mitigation: >
+      Ranking rules in FR-006 push the in-progress / imminent shift to
+      the top; cap visible count to 5 with "show all" affordance.
+  - risk: >
+      Scanner app shell is not yet delivered; this spec assumes it.
+    severity: MEDIUM
+    mitigation: >
+      Phase 1 ships the core + transport behind a feature flag and is
+      exercised via integration tests only, so volunteer work is not
+      blocked on shell completion.
+
+resolved_questions:
+  - id: OQ-1
+    resolution: >
+      No backward-compatibility constraint. Add the `volunteerSignupIds`
+      hint to the ticket QR payload directly.
+  - id: OQ-2
+    resolution: >
+      DEFERRED to a follow-up spec (`volunteer-wallet-pass-designer`).
+      v1 of THIS spec does NOT ship wallet passes; FR-010b reduced to
+      email + in-app "Show my QR" only. Wallet pass + designer is a
+      separate feature.
+  - id: OQ-3
+    resolution: >
+      DEFERRED to a follow-up spec (`volunteer-badge-designer`). v1 of
+      THIS spec does NOT ship printed badges or templates; FR-010b and
+      FR-010c reduced accordingly. A4 is the default when implemented.
+  - id: OQ-4
+    resolution: >
+      DEFERRED until issued scanner devices exist. The `scannerDeviceId`
+      field stays optional in the use-case input and is simply ignored
+      when absent. No client-side device-ID minting in v1.
+
+out_of_scope:
+  - Scanner app shell (auth, event selection, camera plumbing)
+  - Offline queueing of volunteer check-ins
+  - Explicit token revocation endpoint (relies on short TTL in v1)
+  - NO_SHOW automation (check-in stays permissive and un-strict per
+    product direction; NO_SHOW is admin-set only)
+  - Scanner-side UNDO of a check-in (admin via web only)
+  - Shift-window enforcement / blocking
+  - Apple/Google Wallet passes (separate spec)
+  - Printed badges + designer (separate spec)
+  - Volunteer scheduling/roster planning UI
+
+acceptance_criteria:
+  - >
+    A scanner operator with org edit role can check in an APPROVED
+    volunteer for the current event by scanning their volunteer QR,
+    with end-to-end latency within NFR-001 targets.
+  - >
+    The operator can check in the same volunteer via manual search when
+    the QR is unavailable, with identical result semantics.
+  - >
+    Scanning a volunteer QR for a different event shows the wrong-event
+    error and does NOT call `checkInVolunteer`.
+  - >
+    Scanning an already CHECKED_IN signup shows the prior check-in
+    timestamp and does not re-write.
+  - >
+    A volunteer with two APPROVED shifts in the current event surfaces
+    the multi-signup picker with ordering per FR-006 before any write.
+  - >
+    An attendee ticket scan for a human who also has an APPROVED signup
+    surfaces the "Also volunteering" chip; tapping it opens the volunteer
+    result surface; the ticket admission write is not affected.
+  - >
+    An expired QR token fails with `volunteer_qr_expired` and no write
+    occurs.
+  - >
+    A scanner operator without org edit role cannot see candidate data or
+    perform check-ins; all four new procedures return `forbidden`.

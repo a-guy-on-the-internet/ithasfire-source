@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   # Shared group with terraform-apply so a deploy-dev and a manual
@@ -55,8 +56,8 @@ jobs:
       # token in the `scope` step. Never 'true' on a push.
       skip_migrate: ${{ steps.scope.outputs.skip_migrate }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v4
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
@@ -71,12 +72,14 @@ jobs:
             api:
               - *shared
               - 'apps/api/**'
+              - 'scripts/bundle-service.mjs'
             web:
               - *shared
               - 'apps/web/**'
             jobs:
               - *shared
               - 'apps/jobs/**'
+              - 'scripts/bundle-service.mjs'
             tileserver:
               - 'infra/docker/tileserver/**'
               - 'infra/docker/Dockerfile.tileserver'
@@ -281,20 +284,173 @@ jobs:
   # few seconds on a single-capacity runner.
   ci_coverage_guard:
     name: CI coverage guard
-    runs-on: ubuntu-latest
+    # Self-hosted Linux runner; clear CI_GATE_RUNNER to fall back to hosted.
+    # See the note on quality_gate for why.
+    runs-on: ${{ vars.CI_GATE_RUNNER || 'ubuntu-latest' }}
+    # Narrower than the workflow-level grant, which includes `id-token: write`.
+    # This job never authenticates to GCP, so it has no business holding a
+    # credential that can be exchanged at the WIF provider — and it now runs on
+    # a personal machine.
+    permissions:
+      contents: read
+    timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           lfs: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v4
         with:
           node-version: 22
 
       - name: Check CI test coverage is real
         run: node scripts/ci/check-ci-test-coverage.mjs
+
+  # Terraform override drift guard — section 5 of
+  # apps/jobs/src/scripts/validate-manifest.ts. A per-environment
+  # `jobs_scheduler_overrides` entry in infra/terraform/envs/*/*.tfvars must be
+  # DECLARED on the manifest entry (`schedulerOverriddenIn`), because
+  # `GET /jobs/status` — and so /platform/jobs and the /platform/settlements
+  # payout clock — reports the MANIFEST schedule, not the deployed one.
+  #
+  # It lives HERE, not in quality_gate, because the commit it exists to catch
+  # is a tfvars-only push: that sets only the `infra` filter, quality_gate is
+  # skipped (its gate is do_api|web|jobs|tileserver|audio|migrate), and the
+  # `terraform` job applied the override with nothing having looked at it.
+  # ci.yml carries the same step, but ci.yml is manual-dispatch only.
+  #
+  # Gated on terraform OR jobs being in scope — a strict superset of the
+  # `terraform` job's own gate, which is why `terraform` requires this job's
+  # result to be `success` and does NOT accept `skipped`: whenever terraform
+  # runs, this has run. If that superset is ever broken, terraform blocks
+  # loudly instead of applying an unchecked override.
+  #
+  # Node + a filtered pnpm install of apps/jobs and its workspace deps; tsx is
+  # an apps/jobs devDependency, which the install (not --prod) includes, and
+  # the validator imports only node builtins. Deliberately NOT a step inside
+  # the terraform job: that job holds the GCP OIDC credential, and a
+  # dependency install has no business sharing a job with it.
+  #
+  # Hosted runner on purpose, unlike ci_coverage_guard: this job is small and
+  # credential-free, and a tfvars-only push must not queue behind the
+  # self-hosted Mac — which stalls CI silently when it sleeps — under a cap a
+  # cold `pnpm install` might then miss. The terraform job it gates is hosted
+  # too.
+  manifest_drift_guard:
+    name: Jobs manifest / Terraform override drift guard
+    needs: [changes]
+    if: >-
+      needs.changes.outputs.do_terraform == 'true' ||
+      needs.changes.outputs.do_jobs == 'true'
+    runs-on: ubuntu-latest
+    # Never authenticates to GCP — same narrowing as ci_coverage_guard.
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install apps/jobs and its workspace dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts --filter jobs...
+
+      - name: Validate jobs manifest and Terraform override drift
+        run: pnpm -C apps/jobs validate:manifest
+
+  typecheck:
+    name: Typecheck (packages + apps)
+    needs: [changes]
+    # Same scope gate as quality_gate — a superset of every build gate, so a
+    # build always has its typecheck.
+    if: >-
+      needs.changes.outputs.do_api == 'true' ||
+      needs.changes.outputs.do_web == 'true' ||
+      needs.changes.outputs.do_jobs == 'true' ||
+      needs.changes.outputs.do_tileserver == 'true' ||
+      needs.changes.outputs.do_audio == 'true' ||
+      needs.changes.outputs.do_migrate == 'true'
+    # Self-hosted Linux runner; clear CI_GATE_RUNNER to fall back to hosted.
+    # See the note on quality_gate for why.
+    runs-on: ${{ vars.CI_GATE_RUNNER || 'ubuntu-latest' }}
+    # See ci_coverage_guard: no GCP auth here, so no `id-token: write`.
+    permissions:
+      contents: read
+    # 45, not 20. `pnpm typecheck` walks all of packages/** AND every app, and
+    # on the self-hosted box it is at the mercy of whatever else the host Mac is
+    # running — measured at 1-3 h under heavy contention from parallel agent
+    # sessions. At the 20 cap it was cancelled mid-step twice on 2026-09-15
+    # (20m26s and 20m27s), each time taking the whole run with it, which is why
+    # no :dev image had been built in over a dozen commits. Self-hosted minutes
+    # are free, so a bigger cap costs only runner occupancy; the alternative was
+    # flipping CI_GATE_RUNNER back to metered GitHub-hosted minutes.
+    timeout-minutes: 45
+    env:
+      # ubuntu-latest is UTC; a self-hosted box inherits whatever zone its host
+      # has. This repo resolves ambiguous DST by wall clock (Luxon
+      # fromObject/fromISO via Settings.now()), so an unpinned TZ changes
+      # outcomes with no code change.
+      TZ: UTC
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # setup-node FIRST: corepack ships with Node, and a self-hosted Linux box
+      # has no system Node at all, so the old order died on
+      # `corepack: command not found`. Harmless reorder on hosted runners.
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Enable corepack and pnpm
+        run: |
+          corepack enable
+          corepack prepare --activate
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Prisma Client types. Unbuilt, every `prisma.*` call is an implicit any
+      # and the run drowns in hundreds of phantom errors.
+      - name: Prisma generate
+        run: pnpm -C packages/db run generate
+
+      # @th/ui-email resolves through its BUILT dist by design; unbuilt it
+      # produces a wall of phantom "cannot find module '@th/ui-email'".
+      - name: Build @th/ui-email
+        run: pnpm -F @th/ui-email run build
+
+      # `pnpm typecheck` covers packages/** ONLY — tsconfig.base.json's exclude
+      # ends with "apps/**" — so every app needs its own `tsc -p`. Before this
+      # job existed, typecheck ran NOWHERE in CI: the word did not appear in any
+      # workflow, and the service images' `pnpm --filter <svc>... build` ended in
+      # `|| true`.
+      #
+      # Runs every target and reports all failures instead of stopping at the
+      # first, so one red workspace cannot hide another.
+      #
+      # 8 GB heap: tsc on an app pulls the whole transitive graph (core,
+      # adapters, ports, trpc) through the checker and dies on the default heap
+      # at exit 134. That is what `|| true` had been swallowing in the images.
+      #
+      # Covers packages/** and EVERY app under apps/ — mobile and mcp joined on
+      # 2026-09-29. The list lives in scripts/typecheck-targets.mjs, shared
+      # with the local `pnpm typecheck:all`, so CI and a developer's machine
+      # cannot drift.
+      - name: Typecheck packages and every app
+        run: pnpm typecheck:all
 
   quality_gate:
     name: Server-side quality gate
@@ -307,8 +463,37 @@ jobs:
       needs.changes.outputs.do_tileserver == 'true' ||
       needs.changes.outputs.do_audio == 'true' ||
       needs.changes.outputs.do_migrate == 'true'
-    runs-on: ubuntu-latest
+    # Self-hosted Linux runner on the Mac (label `hf-linux`), because
+    # GitHub-hosted minutes are metered on this private repo and Deploy dev ran
+    # 76 times in the first 11 days of Sep 2026 — 2,180 of the 2,000 free
+    # minutes. This job is the single biggest slice of that (~21-25 min of every
+    # run) and needs nothing a Mac-hosted Ubuntu VM cannot give it: Node, a
+    # Linux userland, and Docker for the service containers below.
+    #
+    # The indirection is the escape hatch. Clearing the CI_GATE_RUNNER repo
+    # variable sends this straight back to ubuntu-latest with no commit and no
+    # PR — do that whenever the Mac is off, asleep, or otherwise not claiming
+    # jobs, since a label with no online runner just queues for 24h and then
+    # fails. Set ONE label: the expression yields a string, not a label set, so
+    # "self-hosted,hf-linux" is read as a single literal label and never
+    # matches. A label set needs fromJSON.
+    #
+    # The trade is minutes for wall clock, not a free win. One runner process
+    # claims one job at a time, so this job, `typecheck` and `ci_coverage_guard`
+    # stop running in parallel and serialize instead — the builds unblock a few
+    # minutes later than they do on hosted runners.
+    runs-on: ${{ vars.CI_GATE_RUNNER || 'ubuntu-latest' }}
+    # See ci_coverage_guard: this job installs and executes the whole dependency
+    # tree, so it is the LAST place that should hold an exchangeable OIDC
+    # credential. It authenticates to nothing.
+    permissions:
+      contents: read
+    # The gate has hung before (1h37m in run 614). On elastic hosted runners a
+    # hang cost one job; on a single-capacity self-hosted runner it blocks every
+    # job on the label until the 6h default expires.
+    timeout-minutes: 60
     env:
+      TZ: UTC
       NEXT_PUBLIC_TILESERVER_URL: "https://tiles-dev.ithasfire.com"
       NEXT_PUBLIC_GEOAPIFY_API_KEY: ${{ vars.NEXT_PUBLIC_GEOAPIFY_API_KEY }}
     services:
@@ -319,7 +504,7 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: dev
         ports:
-          - 5432
+          - 5432:5432
         options: >-
           --health-cmd="pg_isready -U postgres" --health-interval=5s --health-timeout=2s --health-retries=10
       # Required by apps/api's auth-atomic-rate-limit-concurrency suite, which
@@ -333,55 +518,131 @@ jobs:
       redis:
         image: redis:7-alpine
         ports:
-          - 6379
+          - 6379:6379
         options: >-
           --health-cmd="redis-cli ping" --health-interval=5s --health-timeout=2s --health-retries=10
     steps:
+      # MUST precede checkout: actions/checkout shells out to `git lfs` when
+      # lfs:true, and the hf-linux VM shipped without it — a fresh runner would
+      # silently check out ~130-byte pointer stubs and fail the OG tests exactly
+      # as it did on 2026-09-15. Idempotent, so it costs nothing once installed.
+      - name: Ensure git-lfs (self-hosted runner)
+        run: |
+          if ! git lfs version >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq git-lfs
+          fi
+          git lfs version
+
+          # A self-hosted runner REUSES its workspace, so .git/config survives
+          # between runs — and `pnpm install`'s `prepare` script sets
+          # core.hooksPath=.githooks. On the next run, actions/checkout's
+          # `git lfs install --local` follows that hooksPath and tries to write
+          # .githooks/pre-push, which is a TRACKED file with different content:
+          # "Hook already exists: pre-push", and checkout fails outright.
+          # Clearing the local setting sends LFS back to .git/hooks where it
+          # belongs; `prepare` re-sets it during install a few steps later, and
+          # nothing in CI pushes, so the repo's own pre-push hook is not needed
+          # here. Do NOT "fix" this with `git lfs install --force` — that
+          # overwrites a tracked file in the working tree.
+          if [ -d "${GITHUB_WORKSPACE}/.git" ]; then
+            git -C "${GITHUB_WORKSPACE}" config --unset-all core.hooksPath || true
+          fi
+
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
+        with:
+          # NOTE: needs git-lfs on the runner — see the step above. This job is
+          # the only LFS consumer that runs on `hf-linux`; both build_web jobs
+          # are GitHub-hosted, where git-lfs ships preinstalled.
+          #
+          # The OG font-coverage and Date-Stub route tests read the four real
+          # TTFs in apps/web/public/fonts/og, and `*.ttf` is LFS-tracked (the
+          # .gitattributes exception un-tracks only `public/**/*.woff2`).
+          # Without this the runner gets ~130-byte pointer stubs, Satori parses
+          # no glyph table, `hasRenderableGlyph` answers true for CJK/emoji it
+          # cannot draw, and the rendered card collapses to 8 bytes — which is
+          # exactly how this gate failed on 2026-09-15 while the same tests
+          # passed on every developer machine.
+          lfs: true
+
+      # `lfs: true` alone is NOT enough on a runner that REUSES its workspace.
+      # actions/checkout runs `git lfs fetch`, which populates .git/lfs/objects
+      # but does NOT rewrite working-tree files — the smudge filter only fires
+      # for paths git actually checks out, and the pointer files are already
+      # on disk from the previous run at the same OIDs, so git sees nothing to
+      # do. Result: a fully-populated object store next to 131-byte pointers.
+      #
+      # Measured on this runner: .git/lfs/objects held 17 objects / 8.2MB while
+      # public/fonts/og/Montserrat-900.ttf was still 131 bytes, which is why
+      # the OG tests reported "Montserrat-900.ttf has no OS/2 table" and an
+      # 8-byte render. `git lfs checkout` materialised 39 objects / 9.4MB and
+      # took that file to its real 462844 bytes.
+      #
+      # Cheap and idempotent: it reads the local store, no network. The
+      # GitHub-hosted build_web jobs do not need it — they get a fresh clone
+      # each run, so the smudge filter fires normally there.
+      - name: Materialise LFS files (reused workspace)
+        run: git -C "${GITHUB_WORKSPACE}" lfs checkout
+
+      # setup-node FIRST — see the note in `typecheck`. corepack comes from
+      # Node, and a self-hosted Linux box has no system Node.
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
 
       - name: Enable corepack and pnpm
         run: |
           corepack enable
           corepack prepare pnpm@10.16.1 --activate
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: "24"
-
+      # Answers "why did this suite behave differently over there" from the log
+      # instead of by re-running. Cheap, and the runner is no longer a known
+      # quantity the way a hosted image is.
+      - name: Runner facts
+        run: |
+          echo "arch=$(uname -m) node=$(node -p process.arch) cpus=$(nproc) tz=$TZ"
+          free -h || true
+          df -h / | tail -1
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Wait for Postgres
         run: |
+          # This loop used to pass without checking anything: a missing
+          # pg_isready exits 127, `|| sleep 3` swallows it, and the loop's last
+          # command is the sleep — so it burned 60s and returned 0. Assert the
+          # binary, then assert the wait actually succeeded.
+          command -v pg_isready >/dev/null || { echo "pg_isready missing on this runner"; exit 1; }
           for i in {1..20}; do
-            pg_isready -h postgres -p 5432 -U postgres && break || sleep 3
+            pg_isready -h localhost -p 5432 -U postgres && break || sleep 3
           done
+          pg_isready -h localhost -p 5432 -U postgres
 
       - name: Prisma validate + generate + migrate
         env:
-          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dev
         run: |
-          pnpm -F @th/db exec prisma validate
+          pnpm -F @th/db exec prisma validate --config ../../prisma.config.ts
           pnpm exec prisma generate
           pnpm -F @th/db exec prisma migrate deploy --config ../../prisma.config.ts
 
       - name: Lint + Test (parallel)
         env:
-          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dev
           # Explicitly point @th/test-utils' Postgres helper at the service
           # container instead of letting it try to spawn its own with
           # Testcontainers. Forgejo Actions doesn't reliably set CI=true, and
           # nested-docker testcontainers don't work from job containers anyway.
-          TESTCONTAINERS_REUSE_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+          TESTCONTAINERS_REUSE_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dev
           # Same deal for Redis: apps/api's auth-atomic-rate-limit-concurrency
           # suite needs a REAL Redis to prove the auth pre-limiter is atomic
           # under concurrency (a mocked RateLimitPort is atomic by construction
           # and proves nothing). Points @th/test-utils' startRedisContainer at
           # the `redis` service container declared on this job.
-          TESTCONTAINERS_REUSE_REDIS_URL: redis://redis:6379
+          TESTCONTAINERS_REUSE_REDIS_URL: redis://localhost:6379
           CI: "true"
           NODE_OPTIONS: "--max-old-space-size=4096"
         run: |
@@ -488,8 +749,8 @@ jobs:
       # Until 2026-07-17 these ran in no gate, so breakage reached main unseen.
       - name: Web unit tests
         env:
-          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
-          TESTCONTAINERS_REUSE_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dev
+          TESTCONTAINERS_REUSE_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dev
           CI: "true"
           NODE_OPTIONS: "--max-old-space-size=4096"
         # NO flags here, DELIBERATELY — same `--` trap as the audio-transcoder
@@ -512,64 +773,71 @@ jobs:
   # ── Build jobs ────────────────────────────────────────────────────────
   build_api:
     name: Build + push api:dev
-    needs: [changes, quality_gate]
+    needs: [changes, quality_gate, typecheck]
     if: needs.changes.outputs.do_api == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           lfs: false
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
-      # ── Setup gcloud, retried once ──────────────────────────────────────
-      # THE CANONICAL COPY OF THIS NOTE. The same three steps appear at every
-      # `setup-gcloud` call site across the deploy, hotfix and terraform
-      # workflows; they all point back here.
-      #
-      # The action downloads and untars the Cloud SDK, and that is the one
-      # genuinely flaky thing these jobs do. Run #661 died inside
-      # `tar xz --warning=no-unknown-keyword ...` with no further output, which
-      # failed `Post-deploy verification` before it ran a single probe — a
-      # healthy dev deploy (build, migrate, roll and seed all green, both public
-      # endpoints serving the new revision) reported red by a download.
-      #
-      # A `uses:` step cannot be wrapped in a retry action, since those only
-      # re-run shell. So the retry IS a second invocation, gated on the first
-      # one's outcome. Re-running is safe: the action re-resolves the SDK and
-      # re-adds it to PATH, and holds no state between attempts.
-      #
-      # `outcome`, not `conclusion`: `continue-on-error` rewrites conclusion to
-      # 'success', so gating on that would mean the retry never fires.
-      #
-      # The `gcloud version` check is what keeps this honest. `continue-on-error`
-      # makes a first-attempt failure quiet, so without it a run where BOTH
-      # attempts failed would carry on and die at some later step with a
-      # confusing error instead of "gcloud is missing". It also means this
-      # construction degrades safely if the runner's expression support ever
-      # disagrees with us about `outcome` — the worst case is a loud, accurate
-      # failure here rather than a silent one further down.
       - name: Setup gcloud
-        id: setup_gcloud
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v3
 
       - name: Configure docker auth for Artifact Registry
         run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
+
+      # Cold builds of the three `pnpm deploy --legacy` services (api, jobs,
+      # audio-transcoder) filled the runner's root disk and killed the VM: the
+      # step never completed, the job failed after 400-700s, and NO logs were
+      # uploaded at all (a normal non-zero exit always uploads them). Measured
+      # 2026-09-11 on run 34549669880 — attempt 1 lost api, jobs and
+      # audio-transcoder exactly that way while web, whose image has no
+      # duplicated node_modules, passed. Those three build the full workspace
+      # node_modules, then `pnpm deploy --legacy` writes a SECOND hoisted copy
+      # under /opt/<svc>, and the registry cache's `--cache-to mode=max`
+      # serialised every layer of every stage to local blobs before pushing.
+      # Since 2026-10-17 the cache is gha mode=min, which exports the runtime
+      # stage only; the disk reclaim stays.
+      # The `df -h` lines either side are the evidence for next time; keep them.
+      - name: Reclaim runner disk
+        run: |
+          echo "--- before ---"; df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/share/swift || true
+          sudo docker image prune -af || true
+          echo "--- after ---"; df -h /
+
+      # buildx reads the Actions cache credentials from the environment, and a
+      # `run:` step does not get them (only JS actions do). Without them buildx
+      # drops `type=gha` silently and the build runs uncached; the build step
+      # warns when they are missing.
+      - name: Expose GitHub Actions cache credentials
+        uses: actions/github-script@v8
+        with:
+          script: |
+            for (const k of ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RESULTS_URL']) {
+              if (process.env[k]) core.exportVariable(k, process.env[k]);
+            }
 
       - name: Build and push (api)
         env:
@@ -588,56 +856,111 @@ jobs:
             build_args+=(--build-arg SKIP_BUILD=1)
           fi
 
-          # mode=max, NOT min: multi-stage build — the expensive `install`
-          # stage (pnpm install, prisma generate, app build) is discarded into
-          # the slim runtime stage, so mode=min would cache almost nothing and
-          # every build re-ran a cold install.
+          if [[ -z "${ACTIONS_RUNTIME_TOKEN:-}" || -z "${ACTIONS_RESULTS_URL:-}" ]]; then
+            echo "::warning::Actions cache credentials missing: buildx ignores type=gha and this build runs without a layer cache"
+          fi
+
+          # Layer cache: GitHub Actions cache (type=gha), mode=min, one scope per
+          # service (<svc>-dev). The prod web build takes no cache (see
+          # deploy-prod.yml); the other images reach prod by retag of these.
+          # Replaced a mode=max registry cache (:buildcache-v2) on 2026-10-17:
+          # pulling those ~2 GB cache images onto GitHub-hosted
+          # runners was most of Artifact Registry's internet egress, and mode=max
+          # (~10 GB across services) does not fit the repo's 10 GB Actions cache.
+          # mode=min exports only the runtime stage's layers, so the `install`
+          # stage (pnpm install, prisma generate, app build) runs on every build.
+          # Little is lost: on 7 api/web builds in Deploy dev runs 38843971208,
+          # 38963043541, 39064200928 and 39077643645, mode=max hit `pnpm install`
+          # once, and its cache export took 140-210 s on each miss.
+          # version=2: cache service v1 is retired. ignore-error=true: a failed
+          # cache write must never fail a deploy (a cache read miss never does).
           docker buildx build \
             --platform linux/amd64 \
             --provenance=false \
             --push \
-            --cache-from=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2 \
-            --cache-to=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2,mode=max \
+            --cache-from=type=gha,scope=${SERVICE}-dev,version=2 \
+            --cache-to=type=gha,scope=${SERVICE}-dev,version=2,mode=min,ignore-error=true \
             "${build_args[@]}" \
             -f apps/api/Dockerfile \
             -t "${image_ref}" \
             -t "${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:dev-${GITHUB_SHA::7}" \
             .
 
+      # Source maps to Sentry, matched by the debug IDs the Dockerfile injects
+      # (the image runs without --enable-source-maps and ships no .map). The
+      # token is a step env, never a --build-arg. One upload here also covers
+      # prod, which promotes this image by retag. Never fails the deploy: the
+      # script warns and exits 0 (continue-on-error is the backstop).
+      - name: Upload source maps to Sentry (api)
+        continue-on-error: true
+        # A builder-cache miss rebuilds the install stage (minutes); cap it.
+        timeout-minutes: 15
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.TF_VAR_SENTRY_AUTH_TOKEN }}
+        run: scripts/ci/upload-service-sourcemaps.sh api apps/api/Dockerfile
+
   build_web:
     name: Build + push web:dev
-    needs: [changes, quality_gate]
+    needs: [changes, quality_gate, typecheck]
     if: needs.changes.outputs.do_web == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
-          lfs: false
+          # MUST be true: the Dockerfile copies apps/web/public into the image
+          # and the OG renderer reads the four LFS-tracked TTFs from
+          # public/fonts/og at request time. With lfs:false the image ships
+          # pointer stubs and every share card renders blank in the deployed
+          # app — a failure the unit tests would NOT catch on their own.
+          lfs: true
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        id: setup_gcloud
-        # Retried below — see the note at the first occurrence in deploy-dev.yml.
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v3
 
       - name: Configure docker auth for Artifact Registry
         run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
+
+      # Same step as build_api: web now fills the root disk too. deploy-dev
+      # runs 38363414045 and 38448102851 (2026-10-13) died mid-build with
+      # "No space left on device" and uploaded no logs.
+      - name: Reclaim runner disk
+        run: |
+          echo "--- before ---"; df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/share/swift || true
+          sudo docker image prune -af || true
+          echo "--- after ---"; df -h /
+
+      # buildx reads the Actions cache credentials from the environment, and a
+      # `run:` step does not get them (only JS actions do). Without them buildx
+      # drops `type=gha` silently and the build runs uncached; the build step
+      # warns when they are missing.
+      - name: Expose GitHub Actions cache credentials
+        uses: actions/github-script@v8
+        with:
+          script: |
+            for (const k of ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RESULTS_URL']) {
+              if (process.env[k]) core.exportVariable(k, process.env[k]);
+            }
 
       - name: Build and push (web)
         env:
@@ -706,16 +1029,18 @@ jobs:
           build_args+=(--build-arg "NEXT_PUBLIC_BUILD_SHA=${NEXT_PUBLIC_BUILD_SHA:0:7}")
           build_args+=(--build-arg "NEXT_PUBLIC_APP_VERSION=${NEXT_PUBLIC_APP_VERSION:-dev}")
 
-          # mode=max, NOT min: multi-stage build — the expensive `install`
-          # stage (pnpm install, prisma generate, app build) is discarded into
-          # the slim runtime stage, so mode=min would cache almost nothing and
-          # every build re-ran a cold install.
+          if [[ -z "${ACTIONS_RUNTIME_TOKEN:-}" || -z "${ACTIONS_RESULTS_URL:-}" ]]; then
+            echo "::warning::Actions cache credentials missing: buildx ignores type=gha and this build runs without a layer cache"
+          fi
+
+          # Layer cache: type=gha, mode=min, scope <svc>-dev. Why, and why
+          # mode=min is enough: see build_api.
           docker buildx build \
             --platform linux/amd64 \
             --provenance=false \
             --push \
-            --cache-from=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2 \
-            --cache-to=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2,mode=max \
+            --cache-from=type=gha,scope=${SERVICE}-dev,version=2 \
+            --cache-to=type=gha,scope=${SERVICE}-dev,version=2,mode=min,ignore-error=true \
             "${build_args[@]}" \
             -f apps/web/Dockerfile \
             -t "${image_ref}" \
@@ -724,38 +1049,71 @@ jobs:
 
   build_jobs:
     name: Build + push jobs:dev
-    needs: [changes, quality_gate]
+    needs: [changes, quality_gate, typecheck]
     if: needs.changes.outputs.do_jobs == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           lfs: false
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        id: setup_gcloud
-        # Retried below — see the note at the first occurrence in deploy-dev.yml.
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v3
 
       - name: Configure docker auth for Artifact Registry
         run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
+
+      # Cold builds of the three `pnpm deploy --legacy` services (api, jobs,
+      # audio-transcoder) filled the runner's root disk and killed the VM: the
+      # step never completed, the job failed after 400-700s, and NO logs were
+      # uploaded at all (a normal non-zero exit always uploads them). Measured
+      # 2026-09-11 on run 34549669880 — attempt 1 lost api, jobs and
+      # audio-transcoder exactly that way while web, whose image has no
+      # duplicated node_modules, passed. Those three build the full workspace
+      # node_modules, then `pnpm deploy --legacy` writes a SECOND hoisted copy
+      # under /opt/<svc>, and the registry cache's `--cache-to mode=max`
+      # serialised every layer of every stage to local blobs before pushing.
+      # Since 2026-10-17 the cache is gha mode=min, which exports the runtime
+      # stage only; the disk reclaim stays.
+      # The `df -h` lines either side are the evidence for next time; keep them.
+      - name: Reclaim runner disk
+        run: |
+          echo "--- before ---"; df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/share/swift || true
+          sudo docker image prune -af || true
+          echo "--- after ---"; df -h /
+
+      # buildx reads the Actions cache credentials from the environment, and a
+      # `run:` step does not get them (only JS actions do). Without them buildx
+      # drops `type=gha` silently and the build runs uncached; the build step
+      # warns when they are missing.
+      - name: Expose GitHub Actions cache credentials
+        uses: actions/github-script@v8
+        with:
+          script: |
+            for (const k of ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RESULTS_URL']) {
+              if (process.env[k]) core.exportVariable(k, process.env[k]);
+            }
 
       - name: Build and push (jobs)
         env:
@@ -774,56 +1132,77 @@ jobs:
             build_args+=(--build-arg SKIP_BUILD=1)
           fi
 
-          # mode=max, NOT min: multi-stage build — the expensive `install`
-          # stage (pnpm install, prisma generate, app build) is discarded into
-          # the slim runtime stage, so mode=min would cache almost nothing and
-          # every build re-ran a cold install.
+          if [[ -z "${ACTIONS_RUNTIME_TOKEN:-}" || -z "${ACTIONS_RESULTS_URL:-}" ]]; then
+            echo "::warning::Actions cache credentials missing: buildx ignores type=gha and this build runs without a layer cache"
+          fi
+
+          # Layer cache: type=gha, mode=min, scope <svc>-dev. Why, and why
+          # mode=min is enough: see build_api.
           docker buildx build \
             --platform linux/amd64 \
             --provenance=false \
             --push \
-            --cache-from=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2 \
-            --cache-to=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2,mode=max \
+            --cache-from=type=gha,scope=${SERVICE}-dev,version=2 \
+            --cache-to=type=gha,scope=${SERVICE}-dev,version=2,mode=min,ignore-error=true \
             "${build_args[@]}" \
             -f apps/jobs/Dockerfile \
             -t "${image_ref}" \
             -t "${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:dev-${GITHUB_SHA::7}" \
             .
 
+      # Source maps to Sentry, matched by the debug IDs the Dockerfile injects
+      # (the image runs without --enable-source-maps and ships no .map). The
+      # token is a step env, never a --build-arg. One upload here also covers
+      # prod, which promotes this image by retag. Never fails the deploy: the
+      # script warns and exits 0 (continue-on-error is the backstop).
+      - name: Upload source maps to Sentry (jobs)
+        continue-on-error: true
+        # A builder-cache miss rebuilds the install stage (minutes); cap it.
+        timeout-minutes: 15
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.TF_VAR_SENTRY_AUTH_TOKEN }}
+        run: scripts/ci/upload-service-sourcemaps.sh jobs apps/jobs/Dockerfile
+
   build_tileserver:
     name: Build + push tileserver:dev
-    needs: [changes, quality_gate]
+    needs: [changes, quality_gate, typecheck]
     if: needs.changes.outputs.do_tileserver == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           lfs: false
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        id: setup_gcloud
-        # Retried below — see the note at the first occurrence in deploy-dev.yml.
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v3
 
       - name: Configure docker auth for Artifact Registry
         run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
+
+      # buildx reads the Actions cache credentials from the environment, and a
+      # `run:` step does not get them (only JS actions do). Without them buildx
+      # drops `type=gha` silently and the build runs uncached; the build step
+      # warns when they are missing.
+      - name: Expose GitHub Actions cache credentials
+        uses: actions/github-script@v8
+        with:
+          script: |
+            for (const k of ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RESULTS_URL']) {
+              if (process.env[k]) core.exportVariable(k, process.env[k]);
+            }
 
       - name: Build and push (tileserver)
         env:
@@ -836,16 +1215,18 @@ jobs:
           repo_host="${REGION}-docker.pkg.dev"
           image_ref="${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:${TAG}"
 
-          # mode=max, NOT min: multi-stage build — the expensive `install`
-          # stage (pnpm install, prisma generate, app build) is discarded into
-          # the slim runtime stage, so mode=min would cache almost nothing and
-          # every build re-ran a cold install.
+          if [[ -z "${ACTIONS_RUNTIME_TOKEN:-}" || -z "${ACTIONS_RESULTS_URL:-}" ]]; then
+            echo "::warning::Actions cache credentials missing: buildx ignores type=gha and this build runs without a layer cache"
+          fi
+
+          # Layer cache: type=gha, mode=min, scope <svc>-dev. Why, and why
+          # mode=min is enough: see build_api.
           docker buildx build \
             --platform linux/amd64 \
             --provenance=false \
             --push \
-            --cache-from=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2 \
-            --cache-to=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2,mode=max \
+            --cache-from=type=gha,scope=${SERVICE}-dev,version=2 \
+            --cache-to=type=gha,scope=${SERVICE}-dev,version=2,mode=min,ignore-error=true \
             -f infra/docker/Dockerfile.tileserver \
             -t "${image_ref}" \
             -t "${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:dev-${GITHUB_SHA::7}" \
@@ -853,38 +1234,71 @@ jobs:
 
   build_audio_transcoder:
     name: Build + push audio-transcoder:dev
-    needs: [changes, quality_gate]
+    needs: [changes, quality_gate, typecheck]
     if: needs.changes.outputs.do_audio == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           lfs: false
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        id: setup_gcloud
-        # Retried below — see the note at the first occurrence in deploy-dev.yml.
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v3
 
       - name: Configure docker auth for Artifact Registry
         run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
+
+      # Cold builds of the three `pnpm deploy --legacy` services (api, jobs,
+      # audio-transcoder) filled the runner's root disk and killed the VM: the
+      # step never completed, the job failed after 400-700s, and NO logs were
+      # uploaded at all (a normal non-zero exit always uploads them). Measured
+      # 2026-09-11 on run 34549669880 — attempt 1 lost api, jobs and
+      # audio-transcoder exactly that way while web, whose image has no
+      # duplicated node_modules, passed. Those three build the full workspace
+      # node_modules, then `pnpm deploy --legacy` writes a SECOND hoisted copy
+      # under /opt/<svc>, and the registry cache's `--cache-to mode=max`
+      # serialised every layer of every stage to local blobs before pushing.
+      # Since 2026-10-17 the cache is gha mode=min, which exports the runtime
+      # stage only; the disk reclaim stays.
+      # The `df -h` lines either side are the evidence for next time; keep them.
+      - name: Reclaim runner disk
+        run: |
+          echo "--- before ---"; df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/share/swift || true
+          sudo docker image prune -af || true
+          echo "--- after ---"; df -h /
+
+      # buildx reads the Actions cache credentials from the environment, and a
+      # `run:` step does not get them (only JS actions do). Without them buildx
+      # drops `type=gha` silently and the build runs uncached; the build step
+      # warns when they are missing.
+      - name: Expose GitHub Actions cache credentials
+        uses: actions/github-script@v8
+        with:
+          script: |
+            for (const k of ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RESULTS_URL']) {
+              if (process.env[k]) core.exportVariable(k, process.env[k]);
+            }
 
       - name: Build and push (audio-transcoder)
         env:
@@ -897,16 +1311,18 @@ jobs:
           repo_host="${REGION}-docker.pkg.dev"
           image_ref="${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:${TAG}"
 
-          # mode=max, NOT min: multi-stage build — the expensive `install`
-          # stage (pnpm install, prisma generate, app build) is discarded into
-          # the slim runtime stage, so mode=min would cache almost nothing and
-          # every build re-ran a cold install.
+          if [[ -z "${ACTIONS_RUNTIME_TOKEN:-}" || -z "${ACTIONS_RESULTS_URL:-}" ]]; then
+            echo "::warning::Actions cache credentials missing: buildx ignores type=gha and this build runs without a layer cache"
+          fi
+
+          # Layer cache: type=gha, mode=min, scope <svc>-dev. Why, and why
+          # mode=min is enough: see build_api.
           docker buildx build \
             --platform linux/amd64 \
             --provenance=false \
             --push \
-            --cache-from=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2 \
-            --cache-to=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2,mode=max \
+            --cache-from=type=gha,scope=${SERVICE}-dev,version=2 \
+            --cache-to=type=gha,scope=${SERVICE}-dev,version=2,mode=min,ignore-error=true \
             -f apps/audio-transcoder/Dockerfile \
             -t "${image_ref}" \
             -t "${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:dev-${GITHUB_SHA::7}" \
@@ -936,10 +1352,17 @@ jobs:
     # created hf-dev-database-url, which would deadlock — dispatch
     # `services=terraform,skip-migrate` once to break the circle (same one-time
     # bootstrap caveat deploy-prod.yml documents on its migrate_db).
-    needs: [changes, quality_gate, migrate_db]
+    #
+    # manifest_drift_guard is required to be `success`, not success-or-skipped
+    # like quality_gate: its gate (do_terraform || do_jobs) is a superset of
+    # this job's (do_terraform), so it cannot be skipped in a run where this
+    # job runs. See its own note.
+    needs: [changes, quality_gate, typecheck, manifest_drift_guard, migrate_db]
     if: >-
       always() && !cancelled() &&
       (needs.quality_gate.result == 'success' || needs.quality_gate.result == 'skipped') &&
+      (needs.typecheck.result == 'success' || needs.typecheck.result == 'skipped') &&
+      needs.manifest_drift_guard.result == 'success' &&
       (
         needs.migrate_db.result == 'success' ||
         (needs.changes.outputs.skip_migrate == 'true' && needs.migrate_db.result == 'skipped')
@@ -949,32 +1372,26 @@ jobs:
     environment: dev
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v4
+        uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.6
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        id: setup_gcloud
-        # Retried below — see the note at the first occurrence in deploy-dev.yml.
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
 
-      - name: Terraform init (cached + retry)
+      - name: Terraform init (cached)
         run: bash infra/terraform/scripts/tf-init-cached.sh infra/terraform -input=false
 
       - name: Select dev workspace
@@ -1043,6 +1460,7 @@ jobs:
       [
         changes,
         quality_gate,
+        typecheck,
         build_api,
         build_web,
         build_jobs,
@@ -1100,6 +1518,7 @@ jobs:
     if: >-
       always() && !cancelled() &&
       (needs.quality_gate.result == 'success' || needs.quality_gate.result == 'skipped') &&
+      (needs.typecheck.result == 'success' || needs.typecheck.result == 'skipped') &&
       (needs.build_api.result == 'success' || needs.build_api.result == 'skipped') &&
       (needs.build_web.result == 'success' || needs.build_web.result == 'skipped') &&
       (needs.build_jobs.result == 'success' || needs.build_jobs.result == 'skipped') &&
@@ -1119,22 +1538,16 @@ jobs:
     environment: dev
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        id: setup_gcloud
-        # Retried below — see the note at the first occurrence in deploy-dev.yml.
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
@@ -1150,10 +1563,10 @@ jobs:
           echo "DATABASE_URL=${url}" >> "$GITHUB_ENV"
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@v4
 
       - name: Setup Node
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v4
         with:
           node-version: 22
 
@@ -1219,7 +1632,7 @@ jobs:
       # Fail loudly.
       - name: Seed platform fee policy
         id: seed_fee_policy
-        run: pnpm -F api exec tsx src/scripts/seed-platform-fee-policy.ts
+        run: pnpm -F api exec tsx src/scripts/reference-data/seed-platform-fee-policy.ts
 
       # WITHOUT THIS BLOCK A RED FEE-POLICY SEED IS A SILENT RED RUN. The only
       # other reporter in this job is the migration alert above, which is
@@ -1254,6 +1667,7 @@ jobs:
       [
         changes,
         quality_gate,
+        typecheck,
         build_api,
         build_web,
         build_jobs,
@@ -1261,6 +1675,7 @@ jobs:
         build_audio_transcoder,
         migrate_db,
         terraform,
+        manifest_drift_guard,
       ]
     # A build that's out of scope is 'skipped' (its do_* flag is false); a build
     # that ran and broke is 'failure'. Requiring every build to be success-OR-
@@ -1283,9 +1698,17 @@ jobs:
     # failure cases, and an out-of-scope run is rejected by the do_* clause
     # below. A red migration therefore blocks the roll outright instead of
     # surfacing later as a confusing seed failure.
+    #
+    # manifest_drift_guard is in the gate for the same reason: `terraform`
+    # accepts a skipped terraform, and a RED guard skips terraform — so without
+    # this clause a red gate would read as an out-of-scope skip and the roll
+    # would proceed past it. 'skipped' stays legitimate here (a web-only push
+    # never runs the guard); 'failure' blocks the roll.
     if: >-
       always() && !cancelled() &&
       (needs.quality_gate.result == 'success' || needs.quality_gate.result == 'skipped') &&
+      (needs.typecheck.result == 'success' || needs.typecheck.result == 'skipped') &&
+      (needs.manifest_drift_guard.result == 'success' || needs.manifest_drift_guard.result == 'skipped') &&
       (needs.build_api.result == 'success' || needs.build_api.result == 'skipped') &&
       (needs.build_web.result == 'success' || needs.build_web.result == 'skipped') &&
       (needs.build_jobs.result == 'success' || needs.build_jobs.result == 'skipped') &&
@@ -1308,19 +1731,13 @@ jobs:
     environment: dev
     steps:
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        id: setup_gcloud
-        # Retried below — see the note at the first occurrence in deploy-dev.yml.
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
@@ -1361,14 +1778,21 @@ jobs:
               --region "$REGION" --to-latest --quiet
           }
 
+          # Consumer before producer: the API publishes messages (the upload-start
+          # warm-up) that only a current transcoder acks.
+          if [[ "$DO_AUDIO" == "true" && -n "${SERVICE_AUDIO_TRANSCODER_NAME:-}" ]]; then
+            deploy_service "${SERVICE_AUDIO_TRANSCODER_NAME}" "${repo_host}/${PROJECT_ID}/${AR_REPO}/audio-transcoder:${TAG}"
+          fi
+
           [[ "$DO_API" == "true" ]]        && deploy_service "${SERVICE_API_NAME}"        "${repo_host}/${PROJECT_ID}/${AR_REPO}/api:${TAG}"
           [[ "$DO_WEB" == "true" ]]        && deploy_service "${SERVICE_WEB_NAME}"        "${repo_host}/${PROJECT_ID}/${AR_REPO}/web:${TAG}"
           [[ "$DO_JOBS" == "true" ]]       && deploy_service "${SERVICE_JOBS_NAME}"       "${repo_host}/${PROJECT_ID}/${AR_REPO}/jobs:${TAG}"
           [[ "$DO_TILESERVER" == "true" ]] && deploy_service "${SERVICE_TILESERVER_NAME}" "${repo_host}/${PROJECT_ID}/${AR_REPO}/tileserver:${TAG}"
-
-          if [[ "$DO_AUDIO" == "true" && -n "${SERVICE_AUDIO_TRANSCODER_NAME:-}" ]]; then
-            deploy_service "${SERVICE_AUDIO_TRANSCODER_NAME}" "${repo_host}/${PROJECT_ID}/${AR_REPO}/audio-transcoder:${TAG}"
-          fi
+          # A skipped `[[ … ]] && …` line returns 1. As the script's last line it
+          # would be the step's exit status, so end on an explicit success. A
+          # failing deploy_service still fails the step: bash -e honours the
+          # last command of an && list.
+          exit 0
 
   post_deploy_verify:
     name: Post-deploy verification
@@ -1388,19 +1812,13 @@ jobs:
     environment: dev
     steps:
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        id: setup_gcloud
-        # Retried below — see the note at the first occurrence in deploy-dev.yml.
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
@@ -1414,6 +1832,7 @@ jobs:
           SERVICE_JOBS_NAME: ${{ vars.CLOUD_RUN_DEV_JOBS_SERVICE }}
           SERVICE_TILESERVER_NAME: ${{ vars.CLOUD_RUN_DEV_TILESERVER_SERVICE }}
           SERVICE_AUDIO_TRANSCODER_NAME: ${{ vars.CLOUD_RUN_DEV_AUDIO_TRANSCODER_SERVICE }}
+          WIF_SA: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
           # Scope flags — only describe/probe a service that was actually
           # rolled by deploy_dev. Services outside the scope are skipped, not
           # probed, so we never imply a deploy that didn't happen.
@@ -1465,9 +1884,23 @@ jobs:
             local body rc=0
             body="$(mktemp)"
             if [[ "$auth" == "authed" ]]; then
-              local token
-              token="$(gcloud auth print-identity-token --audiences="$url")"
-              curl "${curl_args[@]}" -o "$body" -H "Authorization: Bearer ${token}" "$url" || rc=$?
+              # Private service under Workload Identity Federation: there is no SA
+              # key, so `print-identity-token --audiences` fails ("Invalid account
+              # type for --audiences") — mint via impersonation instead. Both the
+              # mint and the run.invoker binding for the CI SA may be absent, so
+              # this HTTP probe is BEST-EFFORT (rc stays 0): the authoritative
+              # readiness gate is the Cloud Run `Ready` condition already asserted
+              # by describe_service above. Mirrors deploy-prod.yml.
+              local token=""
+              token="$(gcloud auth print-identity-token \
+                --impersonate-service-account="${WIF_SA}" \
+                --audiences="$url" --include-email 2>/dev/null)" || true
+              if [[ -n "$token" ]]; then
+                curl "${curl_args[@]}" -o "$body" -H "Authorization: Bearer ${token}" "$url" \
+                  || echo "::warning::${label} HTTP probe failed (non-fatal; readiness gated via describe_service)"
+              else
+                echo "::warning::${label} HTTP probe skipped — could not mint an OIDC token under WIF (non-fatal; readiness gated via describe_service)"
+              fi
             else
               curl "${curl_args[@]}" -o "$body" "$url" || rc=$?
             fi
@@ -1519,6 +1952,29 @@ jobs:
             [[ -n "$transcoder_url" ]]
           fi
 
+      # Search index format check (search.ensure-format). Fired once, AFTER
+      # the jobs service rolled, so the revision that compares
+      # SEARCH_INDEX_FORMAT_VERSION is the one that rebuilds. Non-destructive
+      # and idempotent (a claim absorbs redelivery); a current index is a
+      # one-row read. NON-FATAL: the nightly search.full-reindex records the
+      # version too, so a missed publish self-heals by the next night.
+      - name: Trigger search index format check
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          DO_JOBS: ${{ needs.changes.outputs.do_jobs }}
+        run: |
+          # Only when this run rolled the jobs service.
+          if [[ "$DO_JOBS" != "true" ]]; then
+            echo "jobs not rolled this run; skipping"
+            exit 0
+          fi
+          topic="projects/${PROJECT_ID}/topics/dev-hf-trigger-search-ensure-format"
+          if gcloud pubsub topics publish "$topic" --message='{}' --project "$PROJECT_ID"; then
+            echo "Published search.ensure-format trigger to ${topic}"
+          else
+            echo "::warning::Could not publish search.ensure-format (non-fatal; the nightly search.full-reindex records the format version)"
+          fi
+
   # ── Seed admin ────────────────────────────────────────────────────────
   # Dev is a known-fixture environment: the admin account is intentionally
   # the same as local seed (apps/api/src/scripts/seed/ids.ts) so scanners,
@@ -1555,13 +2011,13 @@ jobs:
     environment: dev
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@v4
 
       - name: Setup Node
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v4
         with:
           node-version: 22
 
@@ -1573,19 +2029,13 @@ jobs:
         run: pnpm prisma:gen
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        id: setup_gcloud
-        # Retried below — see the note at the first occurrence in deploy-dev.yml.
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
@@ -1598,17 +2048,17 @@ jobs:
 
       - name: Seed platform admin
         run: |
-          pnpm -F api exec tsx src/scripts/seed-platform-admin.ts \
+          pnpm -F api exec tsx src/scripts/reference-data/seed-platform-admin.ts \
             --email 'admin@ithasfire.com' \
             --password 'Dev-Login-2026!' \
             --name 'Platform Admin' \
             --email-verified
 
       - name: Seed platform categories
-        run: pnpm -F api exec tsx src/scripts/seed-platform-categories.ts
+        run: pnpm -F api exec tsx src/scripts/reference-data/seed-platform-categories.ts
 
       - name: Seed platform tags
-        run: pnpm -F api exec tsx src/scripts/seed-platform-tags.ts
+        run: pnpm -F api exec tsx src/scripts/reference-data/seed-platform-tags.ts
 
       # Volunteer role packs (FR-018). Runs AFTER categories: pack targeting is
       # resolved by category slug.
@@ -1631,7 +2081,7 @@ jobs:
       - name: Seed volunteer role packs
         id: seed_volunteer_packs
         continue-on-error: true
-        run: pnpm -F api exec tsx src/scripts/seed-volunteer-packs.ts
+        run: pnpm -F api exec tsx src/scripts/reference-data/seed-volunteer-packs.ts
 
       # Same shape as the migration-failure alert above. `failure()` would not
       # fire — `continue-on-error` keeps the job green — so this keys off the
@@ -1655,7 +2105,7 @@ jobs:
       - name: Seed ticket-type packs
         id: seed_ticket_packs
         continue-on-error: true
-        run: pnpm -F api exec tsx src/scripts/seed-ticket-packs.ts
+        run: pnpm -F api exec tsx src/scripts/reference-data/seed-ticket-packs.ts
 
       # Application-form starter catalogue (application-driven-events spec
       # Phase 4). INSTALL-ONLY, non-blocking. To force the git baseline over a
@@ -1664,7 +2114,7 @@ jobs:
       - name: Seed application-form templates
         id: seed_application_form_templates
         continue-on-error: true
-        run: pnpm -F api exec tsx src/scripts/seed-application-form-templates.ts
+        run: pnpm -F api exec tsx src/scripts/reference-data/seed-application-form-templates.ts
 
       - name: Report ticket-pack seed failure to Discord
         if: steps.seed_ticket_packs.outcome == 'failure'
@@ -1701,6 +2151,7 @@ jobs:
       [
         changes,
         quality_gate,
+        typecheck,
         build_api,
         build_web,
         build_jobs,

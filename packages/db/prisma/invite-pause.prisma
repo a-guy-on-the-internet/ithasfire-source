@@ -1,0 +1,112 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Invite complaint auto-pause (W4, owner ruling 2026-10-06):
+//   "auto-pause an organiser's invites after complaints (start: 3 complaints,
+//    or >1% of recent sends), staff review to lift, organiser told why + how
+//    to ask for review."
+// Migration 20261007160000_event_invite_complaint_pause.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Why an organiser's invite emails were paused.
+enum EventInvitePauseReason {
+  /// 3 or more distinct recipients complained within the window.
+  COMPLAINT_COUNT
+  /// Complaints were more than 1% of the invites sent within the window.
+  COMPLAINT_RATE
+}
+
+/// Staff's answer to a pause.
+enum EventInvitePauseDecision {
+  /// Invites may go out again (`liftedAt` is set).
+  LIFTED
+  /// The pause stays; the organiser may ask for another review.
+  KEPT
+}
+
+/// One spam complaint ("mark as spam") from the mail provider's webhook on a
+/// personal invite email, attributed to the event OWNER that sent it (an
+/// org, or the human owning a person-owned event: exactly one is set, CHECK
+/// "EventInviteComplaint_one_owner_check").
+///
+/// The address is never stored: `emailHash` is core `hashInviteOptOutEmail`
+/// of the canonical address (43 base64url chars, CHECK
+/// "EventInviteComplaint_email_hash_check"), the same hash the opt-out list
+/// uses. Webhook replays are no-ops (unique `providerEventId`).
+model EventInviteComplaint {
+  id              String   @id @default(uuid())
+  /// The provider's event id (Resend/Svix), unique: a redelivered webhook
+  /// inserts nothing.
+  providerEventId String   @unique
+  orgId           String?
+  humanOwnerId    String?
+  /// The event the complained-about invite was for, when it still exists.
+  eventId         String?
+  emailHash       String
+  /// When the complained-about invite was SENT (the mail's `inviteSentAt`
+  /// tag). Null for mail sent before the tag existed; the trip count then
+  /// uses `occurredAt`. Counting by send time keeps a late complaint about
+  /// pre-LIFT mail from re-pausing the organiser.
+  sentAt          DateTime?
+  /// When the recipient complained (the provider's timestamp).
+  occurredAt      DateTime
+  createdAt       DateTime @default(now())
+
+  org        Organization? @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  humanOwner Human?        @relation("EventInviteComplaintOwner", fields: [humanOwnerId], references: [id], onDelete: Cascade)
+  event      Event?        @relation(fields: [eventId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, occurredAt])
+  @@index([humanOwnerId, occurredAt])
+  @@index([eventId])
+  // NOTE: SQL-only (migration 20261007160000_event_invite_complaint_pause):
+  //   "EventInviteComplaint_one_owner_check" CHECK (exactly one owner set)
+  //   "EventInviteComplaint_email_hash_check" CHECK (emailHash ~ '^[A-Za-z0-9_-]{43}$')
+  //   "EventInviteComplaint_provider_event_id_check" CHECK (length 1..255)
+}
+
+/// An organiser's invite emails are paused (personal invite create + resend
+/// refused with INVITES_PAUSED) from `pausedAt` until staff LIFT it
+/// (`liftedAt`). At most ONE open pause (liftedAt IS NULL) per owner: SQL-only
+/// partial uniques. Lifted rows stay as history; a lift also restarts the
+/// complaint window.
+model EventInvitePause {
+  id                String                    @id @default(uuid())
+  orgId             String?
+  humanOwnerId      String?
+  reason            EventInvitePauseReason
+  /// Distinct complaining recipients in the window when it tripped.
+  complaintCount    Int
+  /// Personal invites sent in the window when it tripped.
+  recipientCount    Int
+  pausedAt          DateTime
+  /// Set while the organiser's review request is waiting on staff. Cleared
+  /// by a KEEP so they can ask again.
+  reviewRequestedAt DateTime?
+  /// The organiser's optional note with the request (<= 1000 chars, CHECK).
+  reviewRequestNote String?
+  decision          EventInvitePauseDecision?
+  decidedAt         DateTime?
+  decidedByHumanId  String?
+  /// Staff's note; shown to the organiser (<= 2000 chars, CHECK).
+  decisionNote      String?
+  liftedAt          DateTime?
+  createdAt         DateTime                  @default(now())
+  updatedAt         DateTime                  @updatedAt
+
+  org        Organization? @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  humanOwner Human?        @relation("EventInvitePauseOwner", fields: [humanOwnerId], references: [id], onDelete: Cascade)
+  decidedBy  Human?        @relation("EventInvitePauseDecider", fields: [decidedByHumanId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, liftedAt])
+  @@index([humanOwnerId, liftedAt])
+  @@index([decidedByHumanId])
+  // NOTE: SQL-only (migration 20261007160000_event_invite_complaint_pause):
+  //   "EventInvitePause_org_open_key" UNIQUE (orgId)
+  //     WHERE orgId IS NOT NULL AND liftedAt IS NULL
+  //   "EventInvitePause_human_open_key" UNIQUE (humanOwnerId)
+  //     WHERE humanOwnerId IS NOT NULL AND liftedAt IS NULL
+  //   "EventInvitePause_awaiting_review_idx" (reviewRequestedAt)
+  //     WHERE liftedAt IS NULL AND reviewRequestedAt IS NOT NULL
+  //   "EventInvitePause_one_owner_check", "EventInvitePause_counts_check",
+  //   "EventInvitePause_review_note_check", "EventInvitePause_decision_note_check",
+  //   "EventInvitePause_decision_check", "EventInvitePause_lifted_check"
+}

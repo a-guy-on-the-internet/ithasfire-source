@@ -1,5 +1,5 @@
 /**
- * FR-003 / NFR-002 — the tone-contrast guard.
+ * The tone-contrast guard.
  *
  * ## Why this file lives in `apps/scanner` and not in `packages/ui-native`
  *
@@ -18,9 +18,14 @@
  * Every value comes from `@th/ui-native/palette` and every PAIRING comes from
  * `TONE_FILL_TOKENS` — the same map `ToneResultState` renders from. A guard
  * that re-declares the mapping guards a copy of the mapping: someone could
- * repoint ALREADY IN at `accent` (which has no legal foreground in either
- * polarity) and this file would still be green. There is not one transcribed
- * hex below.
+ * repoint FAIL at `accent` (which has no legal foreground in either polarity)
+ * and this file would still be green. There is not one transcribed hex below.
+ *
+ * That matters more under the Design System's two tones than it did under four,
+ * because the FAIL pair INVERTS between the palettes — ink on bright orange for
+ * Ember, white on deep flame for Stub. A transcribed expectation would be right
+ * on one theme and wrong on the other, and whichever theme the author had open
+ * is the one that would look fine.
  *
  * ## Positives AND negatives
  *
@@ -33,7 +38,7 @@
 import { describe, expect, it } from "vitest";
 
 import { FIXED, palettes, type NativeThemeName } from "@th/ui-native/palette";
-import { TONE_FAMILIES, TONE_FILL_TOKENS } from "@th/ui-native/tone";
+import { TONE_FILL_TOKENS, VERDICT_TONES } from "@th/ui-native/tone";
 
 // ── WCAG 2.x relative luminance, with alpha compositing ─────────────────────
 
@@ -123,21 +128,21 @@ const round = (n: number) => Math.round(n * 100) / 100;
 // ── A — full-bleed tone fills, straight from the map the app renders ────────
 
 describe("A — tone fills (the pairs ToneResultState actually renders)", () => {
-  for (const family of TONE_FAMILIES) {
-    const { fill, on } = TONE_FILL_TOKENS[family];
+  for (const tone of VERDICT_TONES) {
+    const { fill, on } = TONE_FILL_TOKENS[tone];
     for (const theme of THEMES) {
-      it(`${family}: ${on} on ${fill} clears the TEXT floor on ${theme}`, () => {
+      it(`${tone}: ${on} on ${fill} clears the TEXT floor on ${theme}`, () => {
         const r = check(theme, on, fill);
         expect(
           r,
-          `${family} ${on}/${fill} on ${theme} = ${round(r)}:1`,
+          `${tone} ${on}/${fill} on ${theme} = ${round(r)}:1`,
         ).toBeGreaterThanOrEqual(TEXT);
       });
 
-      // §2.3 — the inverted chip is the tone pair REVERSED, so it is the same
-      // number. Asserted anyway: if someone ever gives the inverted chip its
-      // own tokens, this is where that stops being free.
-      it(`${family}: inverted chip (${fill} on ${on}) clears TEXT on ${theme}`, () => {
+      // The inverted chip is the tone pair REVERSED, so it is the same number.
+      // Asserted anyway: if someone ever gives the inverted chip its own
+      // tokens, this is where that stops being free.
+      it(`${tone}: inverted chip (${fill} on ${on}) clears TEXT on ${theme}`, () => {
         const r = check(theme, fill, on);
         expect(
           r,
@@ -147,21 +152,61 @@ describe("A — tone fills (the pairs ToneResultState actually renders)", () => 
     }
   }
 
-  it("ALREADY IN is the only LIGHT fill (lightness is the fourth channel)", () => {
-    // In a dark room, at arm's length, "the bright one" is a decision before
-    // hue, before glyph, before reading. If a palette change makes ADMIT or
-    // STOP light, that channel silently disappears.
+  /**
+   * The two fills must stay far enough apart to be two THINGS at a glance.
+   *
+   * This is why the FAIL fill is PINNED to flame-600 rather than following the
+   * themed `ctaFill`. With `ctaFill`, amber #F59E0B against Ember's orange
+   * #FF5721 measured **1.47:1** — the same colour at a distance, in the
+   * dark-venue theme, which is the one condition the surface exists for.
+   * Pinned, both themes sit at **2.76:1**.
+   *
+   * The floor is 2.7 rather than WCAG's 3:1 because 3:1 is not reachable
+   * between two adjacent-hue brand fills and inventing an unmeetable floor is
+   * how a guard gets deleted. 2.7 locks the measured value: any edit that
+   * darkens amber, lightens flame, or repoints FAIL at a themed token trips it.
+   */
+  const MIN_FILL_SEPARATION = 2.7;
+
+  it("keeps the two fills ≥2.7:1 apart on BOTH themes", () => {
     for (const theme of THEMES) {
-      const lums = Object.fromEntries(
-        TONE_FAMILIES.map((f) => [
-          f,
-          luminance(hexToRgb(resolve(theme, TONE_FILL_TOKENS[f].fill))),
-        ]),
-      ) as Record<(typeof TONE_FAMILIES)[number], number>;
-      expect(lums.alreadyIn, `alreadyIn on ${theme}`).toBeGreaterThan(0.3);
-      expect(lums.admit, `admit on ${theme}`).toBeLessThan(0.3);
-      expect(lums.stop, `stop on ${theme}`).toBeLessThan(0.3);
-      expect(lums.redirect, `redirect on ${theme}`).toBeLessThan(0.3);
+      const r = check(
+        theme,
+        TONE_FILL_TOKENS.pass.fill,
+        TONE_FILL_TOKENS.fail.fill,
+      );
+      expect(
+        r,
+        `pass/fail fills on ${theme} = ${round(r)}:1 — if this dropped, check ` +
+          `whether FAIL was repointed at the themed \`ctaFill\` (1.47:1 on Ember)`,
+      ).toBeGreaterThanOrEqual(MIN_FILL_SEPARATION);
+    }
+  });
+
+  it("keeps PASS the LIGHT fill — 'the bright one' is a decision before hue", () => {
+    for (const theme of THEMES) {
+      const lum = (tone: (typeof VERDICT_TONES)[number]) =>
+        luminance(hexToRgb(resolve(theme, TONE_FILL_TOKENS[tone].fill)));
+      expect(
+        lum("pass"),
+        `pass ${round(lum("pass"))} vs fail ${round(lum("fail"))} on ${theme}`,
+      ).toBeGreaterThan(lum("fail"));
+    }
+  });
+
+  it("keeps both verdict FILLS theme-invariant", () => {
+    // The property that protects the separation above. A themed verdict fill
+    // is exactly the change that cost 1.87× on Ember, and the failure is
+    // invisible in whichever theme the author had open — `ctaFill` looks
+    // perfectly reasonable on Stub.
+    //
+    // Only the FILLS. `onSupport` is legitimately two different inks (#0F1B33
+    // navy on Ember, #211C16 on Stub) because each is tuned to its theme's
+    // canvas; both clear AA on the same amber (7.98 / 7.87) and neither moves
+    // the pass↔fail gap. `onVerdictFail` is white in both.
+    for (const tone of VERDICT_TONES) {
+      const { fill } = TONE_FILL_TOKENS[tone];
+      expect(resolve("ember", fill), `${tone} fill`).toBe(resolve("stub", fill));
     }
   });
 });
@@ -184,42 +229,64 @@ describe("B — banned pairings still fail (negatives)", () => {
       floor: TEXT,
     },
     { label: "color on structure", fg: "color", bg: "structure", floor: TEXT },
-    // The documented worst defect in the app's history. ALREADY IN carries ink.
+    // The documented worst defect in the app's history, and `support` is now
+    // the PASS verdict fill — so this is the one that must never come back.
     { label: "#FFFFFF on support", fg: "#FFFFFF", bg: "support", floor: TEXT },
     { label: "#FFFFFF on accent", fg: "#FFFFFF", bg: "accent", floor: TEXT },
     { label: "color on accent", fg: "color", bg: "accent", floor: TEXT },
     // The reflex for "a secondary line on the verdict".
     {
-      label: "colorMuted on successFill",
+      label: "colorMuted on the PASS fill",
       fg: "colorMuted",
-      bg: "successFill",
+      bg: "support",
       floor: TEXT,
     },
     {
-      label: "colorMuted on dangerFill",
+      label: "colorMuted on the FAIL fill",
       fg: "colorMuted",
-      bg: "dangerFill",
+      bg: "verdictFail",
       floor: TEXT,
     },
-    // Alpha-muting a foreground to make a hierarchy. Fails at 70% and it is
-    // NOT obvious. No alpha foregrounds on tone fills, ever.
+    /**
+     * THE crossed-pair trap, and the reason `toneColors()` takes a tone rather
+     * than a colour. FAIL's foreground inverts between the palettes, so reading
+     * one side of a pair and pairing it with the other tone's fill measures
+     * fine on ONE theme and fails on the other. Whichever theme the author had
+     * open is the one that would have looked correct.
+     */
     {
-      label: "onSuccessFill at 70% alpha on successFill",
-      fg: "rgba(255,255,255,0.7)",
-      bg: "successFill",
+      label: "the PASS foreground on the FAIL fill",
+      fg: "onSupport",
+      bg: "verdictFail",
+      floor: TEXT,
+    },
+    {
+      // With FAIL pinned, this IS the historic white-on-amber defect: 2.15:1.
+      label: "the FAIL foreground on the PASS fill",
+      fg: "onVerdictFail",
+      bg: "support",
+      floor: TEXT,
+    },
+    // Alpha-muting a foreground to make a hierarchy. `emphasis="subtle"` is
+    // 0.65, and on the FAIL pair that is ~3.3:1 — NOT obvious by eye. No alpha
+    // foregrounds on tone fills, ever; hierarchy comes from size and weight.
+    {
+      label: "the FAIL foreground at 65% alpha on the FAIL fill",
+      fg: "rgba(255,255,255,0.65)",
+      bg: "verdictFail",
       floor: TEXT,
     },
     // Tone-on-tone.
     {
-      label: "success as text on successFill",
-      fg: "success",
-      bg: "successFill",
+      label: "the PASS fill as text on the FAIL fill",
+      fg: "support",
+      bg: "verdictFail",
       floor: TEXT,
     },
     {
-      label: "danger as text on dangerFill",
-      fg: "danger",
-      bg: "dangerFill",
+      label: "warningSoft as text on the PASS fill",
+      fg: "warningSoft",
+      bg: "support",
       floor: TEXT,
     },
     // DS v2 §9 — `accent` is a fill/graphic value, never a label.
@@ -372,9 +439,9 @@ describe("F — camera chrome on the black feed", () => {
 // ── G — on-fill chrome (offline chip border + label) on EVERY tone ──────────
 
 describe("G — on-fill chrome clears TEXT on every tone", () => {
-  for (const family of TONE_FAMILIES) {
-    const { fill, on } = TONE_FILL_TOKENS[family];
-    it(`offline provenance chip on ${family}`, () => {
+  for (const tone of VERDICT_TONES) {
+    const { fill, on } = TONE_FILL_TOKENS[tone];
+    it(`offline provenance chip on ${tone}`, () => {
       for (const theme of THEMES) {
         expect(check(theme, on, fill)).toBeGreaterThanOrEqual(TEXT);
       }

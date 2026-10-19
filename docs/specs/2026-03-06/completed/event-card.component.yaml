@@ -1,0 +1,93 @@
+# event-card.component.yaml
+meta:
+  goal: Upgrade the EventCard primitive to support rich media, badges, and favorite interactions across web and native surfaces.
+  files:
+    shared:
+      component: packages/ui/src/ui/tamagui/components/event-grid/EventCard.tsx
+      image: packages/ui/src/ui/tamagui/components/event-grid/EventCardImage.tsx
+      tests: packages/ui/src/ui/tamagui/components/__tests__/EventCard.test.tsx
+      stories: packages/ui/src/ui/tamagui/components/EventCard.stories.tsx
+  exports:
+    - EventCard
+    - EventCardImage
+  types:
+    - EventSummary:
+        id: string
+        title: string
+        date: string
+        venue: string
+        priceLabel: string
+        media:
+          url: string
+          alt: string
+          aspectRatio?: number # width / height, default 4/3
+        badge?:
+          text: string
+          tone?: "promo" | "hot" | "cold" | "default"
+        favorite?: boolean
+        metadata?:
+          category?: string
+          organizer?: string
+          status?: "onsale" | "soldout" | "cancelled" | string
+props:
+  required:
+    - event: EventSummary
+  optional:
+    - onPress?: (event: EventSummary) => void
+    - onFavoriteToggle?: (event: EventSummary, next: boolean) => void
+    - layout?: "vertical" | "horizontal" (default vertical)
+    - showFavorite?: boolean (default true)
+    - showBadge?: boolean (default true)
+    - mediaLoadingStrategy?: "eager" | "lazy"
+    - placeholderColor?: string
+    - testIdBase?: string (default `event-card-${event.id}`)
+    - qaId?: string
+layout:
+  structure:
+    - Card surface (CardSurface) with configurable `hover` elevation on web.
+    - Media wrapper:
+        - Fixed aspect ratio container using `aspectRatio` token (web) / Tamagui `aspectRatio` prop (native).
+        - Lazy-loaded `Image` (or Expo `ImageBackground` native) with overlay gradient for text legibility when needed.
+        - Badge anchored top-left; favorite button top-right.
+    - Content stack with:
+        - Title (Text h6, single line on mobile, two lines desktop).
+        - Metadata row showing date + venue, wrap when narrow.
+        - Price label and optional status pill.
+        - Optional secondary metadata (category, organizer) collapsed behind tooltip on mobile.
+  responsive:
+    - Mobile: full-width card; typography reduced to `subtitle`/`body` variants; favorite uses icon-only button.
+    - Desktop: allow horizontal layout variant for carousel rows (image left, content right).
+interactions:
+  - Entire card clickable: triggers `onPress` with event payload; ensure `Button` semantics on native.
+  - Favorite button toggles state; optimistic UI handled by parent but component anticipates toggling visuals.
+  - Badge optional tooltip on hover describing promotional reason (phase 2).
+states:
+  - default, hovered (web), pressed (both), disabled (when event.status indicates sold out; dims card, disables CTA).
+  - loading placeholder for image until loaded; uses shimmer overlay.
+a11y:
+  - Root accessible element with `role="link"` on web when `onPress` provided.
+  - Provide concise `aria-label` summarizing title, date, venue, price.
+  - Favorite button exposes `aria-pressed` state and label ("Add to favorites" / "Remove from favorites").
+  - Badge text announced with card title.
+rendering:
+  - Use `Image` from `expo-image` on native for caching + placeholder support; default to `next/image` on web when SSR; fallback to `<img>` inside Tamagui `Stack`.
+  - Precompute gradient overlay when badge tone indicates highlight (hot/promo) to maintain contrast.
+  - Use Tamagui tokens for spacing, border radius from design system ($4 default, $6 when horizontal).
+  - Provide CSS clamp for title line clamp (1-2 lines) on web.
+quality:
+  - Strict TypeScript types; no `@ts-nocheck`.
+  - Snapshot tests for badge/favorite states.
+  - Supports theming (dark/light) by reading from Tamagui tokens; avoid hard-coded colors.
+tests:
+  - Renders required metadata and image alt text.
+  - Favorite toggle event fires with correct next state.
+  - `onPress` called on card activation (click + keyboard). Ensure prevents event propagation from favorite button.
+  - Horizontal layout renders expected structure (media + content stack side-by-side).
+  - Accessibility assertions for `aria-label`, `aria-pressed`.
+non_goals:
+  - Inline ticket purchasing actions (future CTA patterns).
+  - Handling video media; limited to static images for v1.
+implementation_notes:
+  - Extract `EventBadge` for reuse (Badge with tone mapping) inside same module.
+  - Provide lazy import guard for `next/image`; load dynamically w/ fallback for non-web bundlers.
+  - Re-export `EventCard` from `packages/ui/src/ui/tamagui/components/index.ts`.

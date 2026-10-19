@@ -8,6 +8,7 @@
  * statuses so the admin orders/events/places tables can be exercised e2e.
  */
 import type { FastifyPluginAsync } from "fastify";
+import { mintApplicationFormPublicId } from "@th/core/lib/application-form-public-id";
 import { randomUUID } from "node:crypto";
 import { prisma } from "@th/db";
 import {
@@ -62,7 +63,6 @@ const seedAdminTables: FastifyPluginAsync = async (app) => {
       const placeActive = await prisma.place.create({
         data: {
           name: "E2E Main Venue",
-          slug: `e2e-main-venue-${seedSuffix}`,
           address: "123 Main St, Testville, TS 00001",
           addrLine1: "123 Main St",
           city: "Testville",
@@ -80,7 +80,6 @@ const seedAdminTables: FastifyPluginAsync = async (app) => {
       const placeArchived = await prisma.place.create({
         data: {
           name: "E2E Old Hall",
-          slug: `e2e-old-hall-${seedSuffix}`,
           address: "456 Archive Ave, Testville, TS 00002",
           addrLine1: "456 Archive Ave",
           city: "Testville",
@@ -283,7 +282,11 @@ const seedAdminTables: FastifyPluginAsync = async (app) => {
       });
 
       const appForm = await prisma.eventApplicationForm.create({
-        data: { eventId: eventAppGated.id },
+        data: {
+          eventId: eventAppGated.id,
+          purpose: "ATTEND",
+          publicId: mintApplicationFormPublicId(),
+        },
       });
 
       await prisma.eventApplicationQuestion.createMany({

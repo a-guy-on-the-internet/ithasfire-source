@@ -1,0 +1,81 @@
+# Spec: Mobile & Scanner Ticket Localization
+meta:
+  owner: mobile
+  status: draft
+  reviewers:
+    - platform
+    - design-system
+    - qa
+  last_updated: 2025-11-14
+summary: |
+  Localize ticket wallet, purchase tracking, and scanning experiences in the
+  Expo-powered mobile app and the dedicated scanner app. Leverage the shared
+  `@th/locale` dictionaries and formatting helpers while handling device locale
+  detection, offline scenarios, and OTA bundle updates.
+objectives:
+  - Load ticket dictionaries from `@th/locale` at app startup and provide React context hooks equivalent to the web (`useTranslations`, `useFormatters`).
+  - Detect device locale (via `expo-localization`), map to supported locales, and allow user override stored in secure storage.
+  - Ensure scanner workflows (ticket scan success/error screens) render localized copy even when offline.
+  - Provide automated E2E tests (Detox) covering at least two locales.
+  - Keep bundle size impact under 200 KB per additional locale by dynamically importing dictionaries.
+scope:
+  in_scope:
+    - Apps: `apps/mobile` (buyer wallet, ticket list, order detail) and `apps/scanner` (check-in flows).
+    - Shared mobile utilities under `packages/ui` if consumed by Expo clients.
+    - Locale persistence (AsyncStorage/SecureStore) and in-app language selector.
+    - Polyfills required for `Intl` APIs on Hermes runtime (`@formatjs/intl` packages).
+    - OTA update pipeline adjustments if locale assets delivered separately.
+  out_of_scope:
+    - Push notification localization (separate notifications spec).
+    - Offline font fallback for non-Latin scripts (tracked separately once locales expand).
+architecture:
+  detection_flow:
+    - On boot, call `getLocales()` from `expo-localization`.
+    - Intersect with `SUPPORTED_LOCALES`; fallback to server-provided default from user profile API.
+    - Persist chosen locale in `SecureStore` (auth) or AsyncStorage (guest) for reuse.
+  dictionary_loading:
+    - Utilize Metro's asset system to bundle locale JSON under `packages/locale/messages`.
+    - `loadMessages(locale)` returns promise; results cached in memory.
+    - For scanner offline mode, preload dictionaries for primary locales in build.
+  provider:
+    - Create `MobileTranslationProvider` inside `apps/mobile/src/providers/translation.tsx` using React context.
+    - Export hooks `useTranslations`, `useFormatters`, `useLocale`, and `useLocaleSwitcher`.
+  formatting:
+    - Use `@formatjs/intl-messageformat` with polyfills (`@formatjs/intl-pluralrules`, `@formatjs/intl-datetimeformat/locale-data`).
+    - Monetary formatting defers to core helpers (convert cents to major units) before applying locale-specific currency symbol.
+  offline_support:
+    - Scanner app caches dictionaries keyed by version; fallback to embedded `en` if load fails.
+    - Display explicit badge when fallback triggered to assist agents.
+  UI_changes:
+    - Ticket wallet labels, status chips, seat info localized via `t()`.
+    - Scanner success/error screens show localized instructions, hold countdowns.
+    - In-app settings page exposes language selector (if organizer allows overrides).
+rollout_plan:
+  - Phase 0: Integrate polyfills, add provider scaffolding guarded by `feature.localization.mobile` flag.
+  - Phase 1: Localize ticket wallet screens; run Detox tests for `en` + `es`.
+  - Phase 2: Localize scanner flows, verify offline behavior during field tests.
+  - Phase 3: Update QA scripts, enable flag for pilot organizers.
+  - Phase 4: Roll out globally; monitor metrics and crash logs.
+testing:
+  - Unit: Jest/Vitest tests for hooks verifying locale switching.
+  - E2E: Detox scenario loads wallet in `es`, switches to `en`, asserts copy updates without reload.
+  - Manual: Field test scanning in offline mode to confirm fallback messaging.
+metrics:
+  - mobile.localization.init_ms
+  - mobile.localization.locale_switch.duration_ms
+  - scanner.localization.fallback_count
+risks:
+  - Polyfills increasing bundle size beyond performance budgets; mitigate via selective locale data imports.
+  - OTA updates not syncing with dictionaries, causing mismatched copy; require versioned assets.
+  - Offline fallback might confuse agents if language unexpectedly changes; need clear indicator.
+open_questions:
+  - Should scanner app lock locale per event (organizer preference) or per device setting?
+  - Do we need runtime download of new locales or ship with fixed set for initial rollout?
+  - How will we handle RTL layout in React Native (Yoga) once we add RTL locales?
+dependencies:
+  - Shared `@th/locale` package with mobile-friendly exports.
+  - Expo SDK upgrade if required for latest `Intl` polyfills.
+  - Secure storage integration for locale preferences.
+references:
+  - ../../platform/localization-platform.spec.yaml
+  - ../../ui/components/ticket-components-localization.component.yaml

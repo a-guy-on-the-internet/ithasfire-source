@@ -1,0 +1,26 @@
+{
+  "applinks": {
+    "details": [
+      {
+        "appIDs": [
+          "FJG7F43395.com.ithasfire.app"
+        ],
+        "components": [
+          { "/": "/events/*" },
+          { "/": "/event/*" },
+          { "/": "/orgs/*" },
+          { "/": "/places/*" },
+          { "/": "/p/*" },
+          { "/": "/my-tickets*" },
+          { "/": "/tickets/qr/*" }
+        ]
+      }
+    ]
+  },
+  "webcredentials": {
+    "apps": [
+      "FJG7F43395.com.ithasfire.scan",
+      "FJG7F43395.com.ithasfire.app"
+    ]
+  }
+}

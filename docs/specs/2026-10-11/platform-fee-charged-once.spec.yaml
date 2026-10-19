@@ -1,0 +1,186 @@
+# platform-fee-charged-once.spec.yaml
+#
+# The platform fee is taken once per paid ticket: the buyer pays it on top, the
+# organiser is credited the full ticket price.
+
+version: "1.0"
+updated: "2026-10-11"
+
+# ── Rulings (owner, 2026-10-11; full text in memory project_philosophy_consent_based.md) ──
+# R1  "It's consent based. We... the fuckig fee should only be taken once?"
+# R2  "I THOUGHT WE GOT RID OF THIS SHIT. yeah man WE SHOULD ONLY BE CHARGING
+#     THEM ONCE?" — in reply to "buyer pays the fee once, organiser gets the
+#     full price?". Decides: the fee is taken once; the buyer pays it on top;
+#     the organiser is credited the FULL ticket price.
+# Earlier rulings that still bind: ABSORB is removed (docs/decisions/absorb-removed.md);
+# a $0 ticket carries no fee (2026-10-10); a refund gives the platform fee back
+# (docs/decisions/absorb-refund-returns-platform-fee.md, Decision + Mechanism).
+# NOT ruled: orders already credited price minus fee (open_questions Q1).
+#
+# Orchestrator decisions (session 75773044, not the owner's):
+# D1  The rule an order was credited under is recorded on the order, in
+#     `feePolicySnapshot.organiserCredit`. No migration: a new column on the
+#     payment path would strand paid orders if code rolled out before it.
+# D2  A discounted ticket credits the organiser what the buyer paid for the
+#     ticket (post-discount price). The buyer pays the fee on top; the
+#     organiser no longer carries it. This is R2 applied, not a new choice.
+
+summary:
+  problem: >
+    Every paid sale takes the platform fee twice. The buyer pays face + fee,
+    and the organiser's SETTLEMENT_CREDIT is `amountGrossCents −
+    feesPlatformCents`. Measured 2026-10-10 on a dev order: face 7500, fee 50,
+    platform kept 100. The owner believed this was already gone.
+  solution: >
+    New sales credit the organiser `amountGrossCents` in full. Each order
+    records the credit rule it was sold under, and every reader that
+    re-derives a basis reads that record, so orders sold before the change
+    keep the amounts they were credited.
+  users:
+    - organiser (credited more per ticket)
+    - buyer (charge unchanged)
+    - platform admin (revenue page reports one unit on new orders)
+  surfaces: [api, web, jobs]
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        `buildFeePolicySnapshot` stamps `organiserCredit: "FULL_PRICE"` on
+        every snapshot it builds (createCheckout, updateOrderItems,
+        claimFreeTickets, createResaleCheckout, the embed guest checkout via
+        price-cart).
+    - id: FR-002
+      description: >
+        `computeAgreementBasis(order)` returns `max(amountGrossCents, 0)` when
+        the order's snapshot says `organiserCredit: "FULL_PRICE"`, and
+        `max(amountGrossCents − feesPlatformCents, 0)` otherwise (missing
+        snapshot, missing key, any other value). It is the only place the rule
+        is decided. No caller passes a bare gross/fee pair without a snapshot
+        except forward-looking previews, which pass the new marker explicitly.
+    - id: FR-003
+      description: >
+        Buyer charge is unchanged to the cent: face + platform fee + grossed-up
+        processing fee + tax. No pricing function changes.
+    - id: FR-004
+      description: >
+        Refunds are unchanged in code: the organiser debit reads the credit, so
+        a new order docks the full price and an old order docks price minus
+        fee. The buyer gets the platform fee back out of the platform's one
+        unit. Organiser debit ≤ organiser credit holds per item and per order.
+    - id: FR-005
+      description: >
+        Deal settlement (`settlement-sheet.ts`) sums `computeAgreementBasis`
+        per order with each order's own snapshot; the deals adapter's ticket
+        ledger read returns `feePolicySnapshot`.
+    - id: FR-006
+      description: >
+        Platform net-kept (`adapters/db/prisma/analytics.ts`) counts the
+        basis-side unit and its refund give-back only on orders WITHOUT the
+        marker. A FULL_PRICE pass-through order nets the buyer-side fee, minus
+        returned fee, minus credit redemptions. Comments in
+        `types/repos/analytics.ts` and `get-platform-revenue.ts` state both
+        cases.
+    - id: FR-007
+      description: >
+        `getEventFeePreview`'s `eventCreditCents` is the ticket price (the
+        API returns it; no builder line renders it yet). `computeBenefitBreakEven` uses owner net = face
+        and owner cost per ticket = min(discount, face).
+    - id: FR-008
+      description: >
+        The seed and e2e fixtures write splits through `computeAgreementBasis`
+        with the order's snapshot; no inline `gross − fee`.
+    - id: FR-009
+      description: >
+        Copy states the new rule: HostConvertBand support line, help
+        (payouts-and-settlements Fees, manage-ticket-types, memberships), the
+        builder fee line. A decision record supersedes the two-unit passages
+        of absorb-removed.md and absorb-refund-returns-platform-fee.md.
+  non_functional:
+    - id: NFR-001
+      description: >
+        No stored amount on an existing order, split, credit or debit changes.
+        No migration. No backfill.
+    - id: NFR-002
+      description: >
+        The pin in `compute-agreement-basis.test.ts` (5cad67f72) stays and
+        asserts one unit for a FULL_PRICE order and two for an unmarked one.
+
+architecture:
+  core:
+    use_cases:
+      - name: finalizePaymentIntent / createCheckout (zero-charge path)
+        description: basis comes from computeAgreementBasis(order) with the snapshot
+        idempotent: true
+        money: true
+      - name: getEventFeePreview, settlement-sheet, getPlatformRevenue
+        description: readers, see FR-005..FR-007
+        money: true
+  ports: { new: [], existing: [repos.orders, repos.deals, repos.analytics] }
+  adapters: { new: [], existing: [db/prisma/deals.ts, db/prisma/analytics.ts] }
+  transport: { trpc_procedures: [], webhooks: [] }
+  ui:
+    pages: []
+    components: [HostConvertBand, builder ticket fee line]
+
+data:
+  new_models: []
+  modified_models: ["Order.feePolicySnapshot JSON gains organiserCredit"]
+  migrations_needed: false
+
+risks:
+  - risk: A reader re-derives an old order's basis under the new rule.
+    severity: HIGH
+    mitigation: >
+      The rule is read from the order's snapshot in one function; absence means
+      the old rule. Tests cover unmarked, marked and malformed snapshots.
+  - risk: >
+      An order priced before deploy and paid after (held cart, ACH in
+      PROCESSING) has no marker and is credited price minus fee.
+    severity: LOW
+    mitigation: >
+      Carts expire in minutes; ACH can take days. These join the past-orders
+      measurement (Q1). Not stamped at finalize: one stamp site keeps the
+      record auditable.
+  - risk: >
+      Mixed code versions. If checkout stamps the marker and an OLD revision
+      finalizes the payment, splits are written at price minus fee on an order
+      marked FULL_PRICE. After a rollback, old settlement-sheet code computes
+      price minus fee for orders credited in full and throws
+      `ledger_inconsistent` for every event with a new order.
+    severity: MEDIUM
+    mitigation: >
+      Deploy without a traffic split. After deploy run the read-only check:
+      marked PRIMARY SUCCEEDED orders where Σ OrderSplit.amountCents <>
+      amountGrossCents (expect 0). A rollback needs a forward fix, not a
+      revert.
+  - risk: Net-kept reports two units on a new order.
+    severity: MEDIUM
+    mitigation: FR-006 with regression tests on both cases.
+  - risk: >
+      Session 0e23cb2c's uncommitted disclosure work (help copy saying the fee
+      is taken twice, the builder credited figure) is in the working tree and
+      now states the reversed rule.
+    severity: MEDIUM
+    mitigation: >
+      That session is not running. This work adopts its hunks, rewrites the
+      copy, and keeps the credited figure.
+
+open_questions:
+  - >
+    Q1 (owner): orders already credited price minus fee. Default: leave as
+    recorded; measure prod exposure (count, cents) read-only with the owner's
+    go; then ask whether to make organisers whole.
+
+out_of_scope:
+  - Making past orders whole (Q1).
+  - Method-aware processing fee (session 97eb7a25).
+  - Resale: the platform fee on a resale order is 0; its split is unchanged.
+  - Membership invoices: already credited in full.
+
+acceptance_criteria:
+  - New dev order, face 7500, fee 50: buyer charged 8473, SETTLEMENT_CREDIT 7500, platform keeps 50.
+  - Refund of that order: organiser REFUND_DEBIT 7500, buyer receives the fee back, no balance goes negative.
+  - An order without the marker still computes basis 7450 everywhere it is read.
+  - The two e2e pricing specs (0a2e42a1f) pass on an isolated stack with unchanged buyer totals.
+  - No shipped copy says the organiser is credited the price minus the fee.

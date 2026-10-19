@@ -1,0 +1,164 @@
+status: complete
+# embed-cms-quickstart-guides.spec.yaml
+#
+# Platform-specific paste-and-go guides for embedding on WordPress, Squarespace, Wix, etc.
+
+version: "1.0"
+updated: "2026-04-13"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Most embed consumers are not developers — they're venue owners, promoters,
+    or marketing staff using WordPress, Squarespace, or Wix. The current admin page
+    shows a raw HTML/React snippet with no guidance on where to paste it in their
+    specific CMS. This creates support tickets and abandoned embed setups.
+  solution: >
+    Add a "Setup Guides" section to the admin embeds page with platform-specific
+    step-by-step instructions for WordPress (Custom HTML block), Squarespace
+    (Code Injection / Code Block), Wix (HTML iFrame / Velo), and a generic
+    "Other" guide. Each guide shows the exact snippet pre-filled with the user's
+    embed ID and includes screenshots or diagrams of the CMS UI.
+  users:
+    - embed consumer (non-technical site owner)
+  surfaces:
+    - web (admin page)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        The admin embeds page includes a collapsible "Setup Guides" section below
+        the snippet tabs, visible once at least one domain is configured.
+    - id: FR-002
+      description: >
+        Guides are available for: WordPress, Squarespace, Wix, Shopify, and
+        "Other / Custom HTML". Each is a tab or accordion panel.
+    - id: FR-003
+      description: >
+        Each guide contains:
+        1. Platform logo/icon for quick recognition.
+        2. Step-by-step numbered instructions (3-5 steps).
+        3. The pre-filled embed snippet (HTML or JS SDK variant depending on
+           what works best for that platform).
+        4. A "Copy" button for the snippet.
+    - id: FR-004
+      description: >
+        WordPress guide: "Add a Custom HTML block → Paste the following code →
+        Preview/Publish". Uses the HTML iframe snippet (Custom HTML blocks
+        support iframes natively).
+    - id: FR-005
+      description: >
+        Squarespace guide: "Add a Code Block to your page → Paste in the HTML
+        tab → Save". Notes that Code Injection (site-wide header) is an
+        alternative for sitewide embedding.
+    - id: FR-006
+      description: >
+        Wix guide: "Add an HTML iFrame element from the Add menu → Paste the
+        embed URL in the Website Address field → Resize the element". Notes
+        that Velo (Wix's code editor) can use the JS SDK for more control.
+    - id: FR-007
+      description: >
+        Shopify guide: "Add a Custom Liquid section → Paste the embed code →
+        Save". Notes that Online Store 2.0 themes support custom liquid sections.
+    - id: FR-008
+      description: >
+        "Other" guide: Generic instructions for any platform that supports
+        custom HTML or iframe embedding. Includes CSP requirements
+        (`frame-src app.hearthfire.community`) for platforms behind strict CSP.
+    - id: FR-009
+      description: >
+        All guide text is internationalized using the existing i18n system
+        (`en.ts` / `es.ts` message keys under `admin.embed.guide.*`).
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Guides load instantly (no external fetches). Content is static and
+        bundled with the admin page.
+    - id: NFR-002
+      description: >
+        The guide section is collapsible and remembers open/closed state via
+        localStorage to avoid cluttering the page for returning users.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases: []
+
+  ports:
+    new: []
+    existing: []
+
+  adapters:
+    new: []
+    existing: []
+
+  transport:
+    trpc_procedures: []
+    webhooks: []
+
+  ui:
+    components:
+      - name: EmbedCmsGuides
+        location: apps/web/src/app/admin/[slug]/embeds/_components/EmbedCmsGuides.tsx
+        description: >
+          New component rendering the tabbed/accordioned CMS guides. Accepts the
+          embed snippet as a prop and renders platform-specific instructions
+          around it. Uses @th/ui primitives (Tabs, Text, CardSurface).
+      - name: EmbedsView (update)
+        location: apps/web/src/app/admin/[slug]/embeds/_components/EmbedsView.tsx
+        description: >
+          Import and render EmbedCmsGuides below the snippet section.
+    pages: []
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      CMS platforms update their UIs frequently. Step-by-step instructions
+      with specific menu locations may become outdated.
+    severity: MEDIUM
+    mitigation: >
+      Keep instructions generic enough to survive minor UI changes ("Add a
+      custom HTML block" rather than "Click the blue + button in the top-left
+      corner"). Include a "Last verified" date on each guide.
+  - risk: >
+      Adding 5 platform guides increases the admin page bundle size.
+    severity: LOW
+    mitigation: >
+      Guide content is mostly text + translation keys. No external images.
+      The accordion/tab UI lazy-renders inactive panels.
+
+open_questions:
+  - Should we include static screenshots of each CMS UI, or keep it text-only for easier maintenance?
+  - Should there be a "Request a platform" link for CMS platforms we don't cover?
+  - Should guides link to the CMS's own documentation for embedding custom HTML?
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Native CMS plugins/extensions (e.g., a WordPress plugin that wraps the JS SDK)
+  - Video tutorials
+  - In-app support chat for embed setup
+  - Automated embed verification ("test your embed" button that checks if the iframe loads)
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - The admin embeds page shows a "Setup Guides" section with tabs for WordPress, Squarespace, Wix, Shopify, and Other.
+  - Each guide contains numbered steps and a pre-filled, copyable embed snippet.
+  - Guide text is translated (en + es at minimum).
+  - The section is collapsible and remembers its state across page loads.
+  - Guides are only visible when at least one embed domain is configured.

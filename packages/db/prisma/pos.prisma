@@ -1,0 +1,55 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// POS — in-person point-of-sale hardware.
+//
+// Stripe Terminal readers are registered on the PLATFORM Stripe account (see
+// `ensurePlatformTerminalLocation` — under SCT every card-present PaymentIntent
+// is created on the platform, so the Reader/Location must live there too).
+//
+// The consequence: Stripe has NO notion of which org owns which reader. Every
+// reader on the platform account is addressable by any code path holding the
+// platform secret key. This table is the ONLY source of truth for reader
+// ownership, and every procedure that drives a reader MUST check
+// `PosReader.orgId` against the event's `orgId` before dispatching. Skipping
+// that check would let org A push a charge onto org B's reader.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model PosReader {
+  id String @id @default(uuid())
+
+  /// Owning org. Ownership is claimed at pairing time by whoever types the
+  /// registration code; there is no Stripe-side equivalent.
+  orgId String @map("org_id")
+
+  /// Stripe Terminal reader id (`tmr_xxx`) on the PLATFORM account. Unique
+  /// platform-wide: one piece of hardware belongs to exactly one org at a
+  /// time. Unpairing deletes the row (and deregisters at Stripe), so the same
+  /// hardware can be paired again afterwards — by anyone, since possession of
+  /// the device is the only claim that matters. Unpair events are recorded in
+  /// the audit log, not by a tombstone row.
+  stripeReaderId String @unique @map("stripe_reader_id")
+
+  /// Operator-facing name, e.g. "Front door", "Bar". Also sent to Stripe as
+  /// the reader label so the Terminal dashboard matches what staff see.
+  label String
+
+  /// Optional venue pin. A reader that lives permanently at one venue can be
+  /// scoped to it so the Sell screen can default sensibly; null = portable.
+  placeId String? @map("place_id")
+
+  /// Stripe device type at pairing time (e.g. `bbpos_wisepos_e`,
+  /// `stripe_s700`). Informational — drives the icon/help copy only.
+  deviceType String? @map("device_type")
+
+  pairedByHumanId String   @map("paired_by_human_id")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  place        Place?       @relation(fields: [placeId], references: [id], onDelete: SetNull)
+  pairedBy     Human        @relation(fields: [pairedByHumanId], references: [id])
+
+  @@index([orgId])
+  @@index([placeId])
+  @@index([pairedByHumanId])
+  @@map("pos_readers")
+}

@@ -142,7 +142,7 @@ export async function ensurePlatformWaivers(prisma: PrismaClient) {
   }
 
   // Platform default volunteer waiver (FR-010,
-  // docs/specs/2026-07-07/ask-level-volunteer-waivers.spec.yaml). Stays
+  // docs/specs/2026-07-07/completed/ask-level-volunteer-waivers.spec.yaml). Stays
   // FREEFORM and un-assembled on purpose: its employment-status and
   // follow-instructions clauses are volunteer-specific and deliberately not
   // in the attendee clause library. Prod gets this row from migration

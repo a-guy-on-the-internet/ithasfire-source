@@ -1,0 +1,654 @@
+# image-moderation-azure-content-safety.spec.yaml
+#
+# Introduce automated image moderation behind a provider-agnostic ModerationPort,
+# backed by Azure AI Content Safety (image:analyze). EVERY public-facing image
+# (event heroes, entity-page media, profile/org banners & avatars — anything
+# served publicly) is moderated ASYNCHRONOUSLY: finalize enqueues a moderation
+# job and the image starts life PENDING (hidden). The job runs the port, and a
+# single review threshold decides visibility: clean images become visible; images
+# at/above the threshold (Azure severity >= 4) are FLAGGED — the record persists
+# but the image stays hidden until a human moderator approves it in a new
+# /moderate/images queue. The uploader is notified on both hold and reject.
+# Fail-closed on provider error. Rationale: keep explicit content off every
+# public surface so the platform isn't flagged/deplatformed by app stores or
+# payment processors — not just the community UGC surface.
+#
+# Ithas Fire has ZERO image moderation today (only text profanity via `obscenity`)
+# and no vision dependency anywhere — this is a net-new trust surface, deliberately
+# built port-first so the provider can be swapped without touching core.
+
+version: "1.0"
+updated: "2026-07-08"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    We are about to let images onto community listings (see companion work:
+    images-at-community-create + the existing suggestion hero-image path in
+    apps/web/.../suggest/ProposeEditsForm.tsx). Community images are a new
+    user-generated-content trust surface with NO automated moderation in place
+    today: packages/ports/src/content-filter.ts is text-only, the only adapter
+    is profanity regex (packages/adapters/src/content-filter/
+    profanity-content-filter-adapter.ts), and a repo-wide grep for vision /
+    rekognition / nsfw / content-safety returns nothing. Without a gate, nothing
+    stops explicit imagery (nudity, gore) from going live on a public listing
+    the moment an image is attached. The current human backstop (the
+    /moderate/suggestions queue reviewing edit suggestions) only covers the
+    suggestion path and requires a moderator to eyeball every image manually —
+    it does not scale and does not cover the moderator-uploads-at-create path.
+  solution: >
+    Add a provider-agnostic `ModerationPort` (packages/ports) with one image
+    method, and an Azure AI Content Safety adapter (packages/adapters) that
+    calls the `image:analyze` REST endpoint and maps its per-category severities
+    to a normalized verdict. Wire the port into EVERY public-facing image
+    finalize path so each image is analyzed as it lands: event heroes (org +
+    community), entity-page block media, profile/org banners and avatars —
+    anything served on a public page. Genuinely private / non-public uploads
+    (ID-verification docs, venue-claim documents) are NOT sent to Azure — they
+    carry PII and are not a public-content risk. A single configurable
+    REVIEW_THRESHOLD (default Azure severity 4 — flag "high"+, auto-approve
+    "low"/none) governs outcome, stored on the Image row as a new
+    `moderationStatus`:
+      • max severity  <  threshold (0,2)  → APPROVED  → image is visible
+      • max severity  >= threshold (4,6)  → FLAGGED   → record succeeds, image
+        is withheld from public view (and cannot be a live hero/avatar/banner)
+        until a human approves it; it enters a new moderation queue. The
+        uploader is notified on hold and on reject.
+    There is NO automatic deletion/reject in v1 — flagged means "held for a
+    human", never "destroyed" (auto-reject is a config-gated open question).
+    On any Azure error/timeout the port fails CLOSED: the image is treated as
+    FLAGGED (held for review) and the failure is reported to Sentry via
+    ReporterPort per the swallow-and-fallback convention (CLAUDE.md).
+  users:
+    - any user uploading a public-facing image (org event hero, entity-page
+      media, profile/org avatar or banner, community listing hero)
+    - a community moderator attaching a hero image while creating a listing
+    - any signed-in user proposing a hero image via an edit suggestion
+    - platform/community moderators working the new image review queue
+  surfaces:
+    - api   # every public-image finalize path enqueues moderation; new moderation queue procedures
+    - web   # new /moderate/images review queue; public read paths respect moderationStatus across hero/avatar/banner/media
+    - jobs  # drain-pending-image-moderations worker calls Azure out of band
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        New `ModerationPort` (packages/ports/src/moderation.ts) exposing
+        `moderateImage(input) => Promise<ImageModerationResult>`. Input is the
+        raw bytes + type: `{ imageBytes: Uint8Array|Buffer, contentType: string,
+        imageId, ownerType, ownerId }` — the USE CASE fetches the bytes from R2
+        (FileStoragePort.getObject) and passes them in, so the adapter stays free
+        of storage concerns and is trivially unit-testable with a fixture image.
+        Result is normalized and provider-agnostic:
+        `{ verdict: "APPROVED" | "FLAGGED", maxSeverity: number,
+        categories: Array<{ category: "SEXUAL"|"VIOLENCE"|"HATE"|"SELF_HARM",
+        severity: number }>, provider: "azure-content-safety",
+        rawSeverityScale: "four" | "eight", degraded: boolean }`. `degraded=true`
+        signals the verdict came from the fail-closed path, not a real analysis.
+        The port defines NO threshold logic — it returns severities; the
+        threshold decision lives in the use case (FR-004) so it stays testable
+        and provider-independent.
+    - id: FR-002
+      description: >
+        Azure adapter (packages/adapters/src/moderation/
+        azure-content-safety-adapter.ts) implements ModerationPort by POSTing to
+        `{endpoint}/contentsafety/image:analyze?api-version=2024-09-01` with body
+        `{ image: { content: <base64 of the bytes passed in> } }` and
+        `outputType: "FourSeverityLevels"`, requesting categories
+        SEXUAL, VIOLENCE, HATE, SELF_HARM. Auth via `Ocp-Apim-Subscription-Key`
+        header (key from config). Maps Azure's `categoriesAnalysis[].severity`
+        (0/2/4/6 on the four-level scale) into the normalized result, uppercasing
+        + snake-normalizing Azure category names (Sexual→SEXUAL,
+        SelfHarm→SELF_HARM). Constructor takes `{ endpoint, apiKey, timeoutMs,
+        fetch }` for testability. On non-2xx, timeout, or parse failure it does
+        NOT throw a raw error to the use case — it returns a degraded FLAGGED
+        result (fail-closed) AND surfaces the underlying error so the use case
+        can report it (see FR-006).
+    - id: FR-003
+      description: >
+        ASYNC (decided). Applies to ALL public-facing image finalize paths
+        (decided — not community-only): finalize-event-image-upload (org +
+        community heroes), the entity-page media finalize
+        (entity-pages/request+finalize-page-image-upload), profile avatar +
+        banner finalize (profiles/request-avatar-upload,
+        request-banner-upload), and any place-layout image that renders
+        publicly. None of them call Azure inline. After the R2 object is
+        confirmed (headObject) each sets moderationStatus=PENDING (hidden — see
+        FR-005) and enqueues a row to a transactional outbox
+        (`pending_image_moderations`) in the SAME tx as the image record so the
+        enqueue can't be lost. A jobs-service worker drains the outbox and runs
+        moderate-image (FR-004). EXCLUDED (not sent to Azure): genuinely private
+        / non-public uploads — ID-verification documents and venue-claim
+        documents — which carry PII and are not a public-content risk; those
+        finalize as today (or APPROVED) without enqueue. The set of "public
+        image" finalize paths is enumerated once in a shared helper so a new
+        public upload path can't silently bypass moderation.
+    - id: FR-004
+      description: >
+        A new core use case `moderate-image` (packages/core/src/use-cases/
+        moderation/moderate-image.ts) owns the threshold decision. It fetches the
+        image bytes from R2 (FileStoragePort.getObject), downscales if they
+        exceed Content Safety's limit, calls
+        `deps.moderation.moderateImage({ imageBytes, contentType, ... })`,
+        compares `maxSeverity` against
+        `config.reviewThreshold`, and writes the outcome to the Image row:
+          • verdict APPROVED (maxSeverity < threshold) → moderationStatus=APPROVED
+          • verdict FLAGGED  (maxSeverity >= threshold) → moderationStatus=FLAGGED
+        It records `moderationSeverity` (the max), `moderationCategories` (the
+        per-category array as JSON), `moderationProvider`, `moderatedAt`, and (if
+        degraded) a `moderationDegraded=true` marker. Threshold is config, not
+        hardcoded — default proposed: four-level severity 4 (Azure "high"),
+        i.e. severity 4 or 6 → review, 0 or 2 → auto-approve (tune in
+        open_questions). The use case is idempotent on imageId (re-running
+        overwrites the verdict fields; safe to retry).
+    - id: FR-005
+      description: >
+        Visibility gating (all public image kinds). An Image with
+        moderationStatus != APPROVED is NOT publicly visible, whatever its role:
+          • event hero — public read path renders the event with no hero /
+            neutral placeholder until APPROVED (community hero attach in
+            review-event-edit-suggestion.ts `tx.images.attach` + the create-time
+            attach only promote to live `heroImageId` when APPROVED; otherwise
+            stored as "pending hero").
+          • profile/org avatar & banner — public profile renders the default/
+            initials avatar and the default banner until APPROVED; the previous
+            APPROVED image (if any) stays live until the new one clears, so an
+            update never blanks an already-good image.
+          • entity-page media & place-layout images — the public block renders
+            empty/placeholder until APPROVED.
+        Fail-closed everywhere: unknown/null moderationStatus is treated as
+        not-visible. Owner-facing/admin editing views MAY show the pending image
+        (with a "pending review" badge) so the uploader can see what they
+        submitted; only PUBLIC surfaces are gated.
+    - id: FR-006
+      description: >
+        Fail-closed + Sentry. When the adapter returns a degraded result (Azure
+        unreachable/errored/timed out), moderate-image sets FLAGGED +
+        moderationDegraded=true so the image is held for a human — it never
+        silently publishes on provider failure. Because this is a deliberate
+        swallow-and-fallback, the use case MUST declare `reportError?: ReporterPort`
+        and call `deps.reportError?.(err, { tags: { area: "image-moderation",
+        provider }, extra: { imageId } })` (guarded), per CLAUDE.md's error
+        convention. Wire it in the composition roots (apps/api/src/lib/dep.ts and
+        the jobs root if moderation runs in a job).
+    - id: FR-007
+      description: >
+        Human review queue. New moderator surface to work FLAGGED images:
+        transport procedures `moderation.listFlaggedImages` (paged, newest first,
+        returns image URL + severities + the owning entity — event / profile /
+        org / entity-page — with a deep link) and
+        `moderation.reviewImage({ imageId, decision: "APPROVE" | "REJECT",
+        note? })`. APPROVE → moderationStatus=APPROVED, records reviewer +
+        reviewedAt, and promotes the pending image to its live slot (heroImageId
+        / avatar / banner / entity-page media) so it becomes visible. REJECT →
+        moderationStatus=REJECTED, image is unlinked from any pending slot and
+        its R2 object is enqueued for deletion via the existing
+        pending_object_deletions outbox (targetKey = image key). Authz mirrors
+        the existing community moderation gate (COMMUNITY_MODERATION_ROLES /
+        platform ADMIN, 2FA-enforced like the rest of /moderate). Four-eyes is
+        NOT required for image review in v1 (open_questions).
+    - id: FR-008
+      description: >
+        Web UI: new `/moderate/images` route under the existing moderator-gated
+        apps/web/src/app/moderate/ shell (same layout guard: signed-in +
+        moderator + 2FA). Renders a queue of FLAGGED images with the image
+        preview, per-category severity chips (e.g. "Sexual: high"), the owning
+        entity link, a degraded badge when moderationDegraded, and
+        Approve / Reject actions wired to `moderation.reviewImage`. Add a count
+        badge/link from the moderation dashboard. Images render behind a
+        click-to-reveal blur by default so a moderator isn't ambushed by
+        explicit content.
+    - id: FR-009
+      description: >
+        Uploader notification on hold AND reject (decided). Fire an in-app +
+        email notification to the image's `createdByHumanId` via the existing
+        notify() outbox:
+          • HOLD — when moderate-image sets FLAGGED (image held for review before
+            going live): "Your image is being reviewed and will appear once
+            approved." Do NOT notify on the transient PENDING state (it flips in
+            ~seconds when the worker runs); notify only when the outcome is
+            FLAGGED.
+          • REJECT — when a moderator rejects in review-flagged-image: "Your
+            image wasn't approved" (+ optional reviewer note).
+          • APPROVE-AFTER-HOLD — when a moderator APPROVES an image that was
+            FLAGGED (i.e. a human review actually happened): "Your image is now
+            live." Do NOT notify on auto-approve (image went PENDING→APPROVED by
+            the worker with no human review) — only when the row was FLAGGED and
+            a moderator cleared it.
+        Skip notification when there is no human uploader (e.g. system/seed
+        images) or when createdByHumanId is an anonymized human. Notify keys must
+        be derived per channel (`{key}:email` / `{key}:in_app`) per the notify
+        idempotency convention, keyed on imageId+outcome so a worker/mod retry
+        doesn't double-send.
+  non_functional:
+    - id: NFR-001
+      description: >
+        Latency (ASYNC, decided): image analysis never blocks the upload. Finalize
+        returns immediately with moderationStatus=PENDING (hidden); a jobs-service
+        worker drains `pending_image_moderations` and runs moderate-image, flipping
+        the status to APPROVED/FLAGGED out of band. This matches the codebase's
+        outbox conventions (notify, pending_object_deletions,
+        community.dispatch-rsvp-confirmations). Consequence to design for: after a
+        moderator uploads a hero at create, there is a short window where the
+        listing renders with no hero until the worker runs — acceptable and
+        expected (see open_questions on the pending-window UX).
+    - id: NFR-002
+      description: >
+        Cost: Azure Content Safety image analysis is per-image, pay-per-call —
+        fits scale-to-zero, no idle cost. Now one call per finalized PUBLIC image
+        (all events/entity-media/banners/avatars), so volume is higher than a
+        community-only scope — still low in absolute terms but budget for it.
+        Only moderate on the FIRST finalize of a given image (or when its bytes
+        change), never re-call for unchanged images. Add rate-limit tolerance
+        (backoff on 429) in the adapter, mirroring the ZipTax 429 hardening.
+    - id: NFR-003
+      description: >
+        Provider-agnostic: core/use case/transport/UI reference only the
+        normalized ModerationPort result, never Azure-specific shapes. Swapping
+        to Rekognition/Cloud Vision/Hive later = one new adapter + a config
+        change, zero core edits. The port severity scale is normalized (expose
+        rawSeverityScale for adapters on 0-7 vs 0/2/4/6).
+    - id: NFR-004
+      description: >
+        Secrets: the Azure key never lands in the repo. Endpoint + key are read
+        from config/env (AZURE_CONTENT_SAFETY_ENDPOINT,
+        AZURE_CONTENT_SAFETY_KEY), sourced from the GCP secret manager in
+        deployed envs (consistent with existing secret wiring), and from
+        .env.local for dev. Document in apps/api/.env.example. Note the recent
+        committed-secrets incident — no key in git, ever.
+    - id: NFR-005
+      description: >
+        Retry / poison handling on the async worker. Transient Azure failures
+        (5xx, 429, timeout) increment `attempts` with exponential backoff via
+        `nextAttemptAt`. After a bounded number of attempts (config, e.g. 5) the
+        outbox row is marked DEAD and the image is set FLAGGED +
+        moderationDegraded=true so it surfaces in the human queue as
+        "couldn't scan" — it must NEVER remain PENDING/hidden indefinitely and
+        must NEVER auto-approve on exhaustion (fail-closed, FR-006). Every
+        exhaustion is reported via ReporterPort.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: moderate-image                                   # NEW
+        description: >
+          packages/core/src/use-cases/moderation/moderate-image.ts. Given an
+          ImageModerationRecord (by storageKey), fetches the bytes from R2
+          (FileStoragePort.getObject), downscales if needed, calls ModerationPort,
+          applies config reviewThreshold, and writes verdict + severities +
+          provider + moderatedAt back onto the record via ImageModerationRecordsRepo.
+          Fail-closed to FLAGGED + reportError on degraded results. Idempotent on
+          storageKey.
+        input: "{ storageKey }"
+        output: "{ status, maxSeverity, degraded }"
+        idempotent: true
+        money: false
+      - name: review-flagged-image                             # NEW
+        description: >
+          packages/core/src/use-cases/moderation/review-flagged-image.ts.
+          Moderator APPROVE/REJECT on a FLAGGED record. APPROVE → status=APPROVED
+          + reviewer/reviewedAt (image becomes visible via read-time gating; for
+          EVENT_HERO no separate promote step is needed — the gate simply passes).
+          REJECT → status=REJECTED + enqueue R2 deletion of storageKey via
+          pending_object_deletions (existing outbox). Fires the approve-after-hold
+          / reject notification (FR-009). Authz = COMMUNITY_MODERATION_ROLES/ADMIN.
+        input: "{ actorHumanId, recordId, decision, note? }"
+        output: "{ status }"
+        idempotent: true   # re-approving an approved record is a no-op
+        money: false
+      - name: drain-image-moderations                  # NEW (jobs)
+        description: >
+          packages/core/src/use-cases/moderation/drain-image-moderations.ts.
+          Jobs-service worker that claims due ImageModerationRecord rows
+          (status=PENDING AND nextAttemptAt <= now — the record IS its own outbox,
+          holding only the storageKey reference, NEVER bytes) and runs
+          moderate-image for each. Exponential backoff on transient Azure failure
+          (attempts++/nextAttemptAt); after maxAttempts the record is set FLAGGED
+          + degraded=true so it surfaces in the human queue rather than staying
+          hidden forever (NFR-005). Structure mirrors drain-pending-deletions.
+        idempotent: true
+        money: false
+      - name: enqueue at public-image finalize  # MODIFY (Phase 1: event hero only)
+        description: >
+          PHASE 1 (this build): finalize-event-image-upload.ts creates an
+          ImageModerationRecord (kind=EVENT_HERO, subjectType=EVENT,
+          subjectId=eventId, storageKey=image.key, publicUrl, contentType,
+          createdByHumanId) with status=PENDING in the SAME tx as markUploaded.
+          Route creation through ONE shared helper
+          `enqueueImageModeration({ storageKey, kind, subject, ... })` so Phases
+          2-3 (avatars/banners at set-*-from-upload; page media at
+          finalize-page-image-upload) reuse it. Private uploads never enqueue.
+      - name: review-event-edit-suggestion (hero)         # NOTE (Phase 1)
+        description: >
+          packages/core/src/use-cases/community/review-event-edit-suggestion.ts —
+          community hero also flows through finalize-event-image-upload, so it
+          gets a record automatically. No attach-time change needed: read-time
+          gating (FR-005) hides a hero whose record isn't APPROVED regardless of
+          heroImageId being set.
+  ports:
+    new:
+      - name: ModerationPort
+        path: packages/ports/src/moderation.ts
+        methods:
+          - moderateImage(input): Promise<ImageModerationResult>   # FR-001
+      - name: ImageModerationRecordsRepo
+        path: packages/ports/src/repos/image-moderation-records.ts
+        methods:
+          - "create / getByKey / resolveByKeys(keys) → Map (batch read-gating) / claimDue / markResult / markFailed / listFlagged / getById / review"   # single table, also the outbox
+    existing:
+      - ImagesRepo        # Phase 1: read hero Image by id for key + gating join
+      - FileStoragePort   # getObject (worker reads bytes for base64); NOTE: no getObject exists today — must ADD it to the port + S3 adapter
+      - ReporterPort      # fail-closed Sentry reporting (FR-006)
+      - AuditPort         # audit APPROVE/REJECT moderator decisions
+      - PendingObjectDeletionsRepo  # enqueueMany R2 delete on REJECT (existing outbox)
+      - notify()          # uploader hold + reject + approve-after-hold (FR-009), via a jobs dispatch closure; derived per-channel keys
+  adapters:
+    new:
+      - name: AzureContentSafetyModerationAdapter
+        path: packages/adapters/src/moderation/azure-content-safety-adapter.ts
+        notes: >
+          REST call to image:analyze, four-severity output, key-header auth,
+          timeout + 429 backoff, degraded-FLAGGED fallback. Constructor:
+          { endpoint, apiKey, timeoutMs, fetch }.
+      - name: (optional) NoopModerationAdapter / StubModerationAdapter
+        path: packages/adapters/src/moderation/stub-moderation-adapter.ts
+        notes: >
+          Deterministic adapter for dev/test/CI where no Azure key is present —
+          returns APPROVED (or a configurable verdict) so local flows aren't
+          blocked. Composition root picks Azure when key present, else stub.
+  transport:
+    trpc_procedures:
+      - moderation.listFlaggedImages   # moderator-gated, paged
+      - moderation.reviewImage         # moderator-gated APPROVE/REJECT
+    router: packages/transport/trpc/src/routers/moderation.ts (new or extend existing moderate area)
+  ui:
+    pages:
+      - apps/web/src/app/moderate/images/page.tsx   # NEW review queue, behind existing moderate/ layout guard
+    components:
+      - ImageModerationQueue (preview w/ click-to-reveal blur, severity chips, degraded badge, approve/reject)
+      - moderation dashboard: flagged-images count badge/link
+      - public read paths: render pending/flagged hero, avatar, banner, entity-page media as absent/placeholder; previous APPROVED image stays live during re-moderation (FR-005)
+      - owner/admin edit views: show pending image with a "pending review" badge (FR-005)
+  email_templates:
+    - "@th/ui-email: image-held (hold) + image-rejected (reject) templates — remember the ui-email dist rebuild footgun (build @th/ui-email or runtime send fails template_not_found)"
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  # KEY-BASED (decided) — moderation status is NOT a column on Image (only event
+  # heroes have Image rows; avatars/banners/page-media store bare urls). Instead
+  # ONE standalone table keyed by the R2 storage key tracks moderation for ANY
+  # uploaded object, and also serves as its own drain outbox (status=PENDING is
+  # the to-do state; no separate PendingImageModeration table needed).
+  new_models:
+    - ImageModerationRecord   # table image_moderation_records, keyed by storageKey:
+      #   id            String  @id @default(uuid())
+      #   storageKey    String  @unique   // the R2 key — the join key to any image
+      #   kind          String            // EVENT_HERO | AVATAR | BANNER | PAGE_MEDIA
+      #   status        String  @default("PENDING")  // PENDING|APPROVED|FLAGGED|REJECTED (house-style String, union in @th/types)
+      #   subjectType   String?           // EVENT | HUMAN | ORGANIZATION | PLACE (for the queue's owning-entity link + gating)
+      #   subjectId     String?
+      #   publicUrl     String?           // for queue preview
+      #   contentType   String?
+      #   createdByHumanId String?        // uploader, for notifications (SetNull on human delete)
+      #   maxSeverity   Int?
+      #   categories    Json?             // [{category, severity}]
+      #   provider      String?
+      #   degraded      Boolean @default(false)
+      #   moderatedAt   DateTime?
+      #   reviewedByHumanId String?
+      #   reviewedAt    DateTime?
+      #   reviewNote    String?
+      #   attempts      Int     @default(0)         // drain retry bookkeeping
+      #   lastError     String?
+      #   nextAttemptAt DateTime @default(now())
+      #   createdAt/updatedAt
+      #   @@index([status, nextAttemptAt])   // drain claim
+      #   @@index([status, moderatedAt])     // flagged queue, newest-first
+      #   @@index([subjectType, subjectId])
+  migrations_needed: true
+  notes: >
+    No backfill needed for the key-based table — the ABSENCE of an
+    ImageModerationRecord for a key means "not moderated by this system"
+    (legacy/pre-existing), which read-time gating must treat as APPROVED/visible
+    so nothing already-live disappears. Only images uploaded AFTER this ships get
+    a PENDING record and are gated. Private uploads (ID/claim docs) never get a
+    record (never sent to Azure).
+
+# ── Phasing (decided) ────────────────────────────────────────────────────────
+
+phasing:
+  note: >
+    Same ModerationPort + Azure adapter + moderate-image use case +
+    review-flagged-image + drain worker + moderation queue + notifications are
+    built ONCE and are kind-agnostic (keyed by storageKey). Only the ENQUEUE
+    points and READ-TIME gating differ per phase.
+  phase_1_event_heroes:   # THIS BUILD
+    - >
+      Enqueue — finalize-event-image-upload creates an ImageModerationRecord
+      (kind=EVENT_HERO, subjectType=EVENT, subjectId=eventId) at finalize.
+    - >
+      Gate — the public event read path (getPrimaryImageUrls + event detail hero)
+      hides a hero whose ImageModerationRecord.status != APPROVED; ABSENT record
+      (legacy) = visible. Keep-old-until-new-clears falls out naturally (the old
+      hero's record stays APPROVED).
+    - >
+      Full end-to-end — Azure worker, threshold, hold/flag, /moderate/images
+      queue, hold+reject+approve-after-hold notifications.
+  phase_2_avatars_banners:  # FOLLOW-UP
+    - >
+      Enqueue at set-avatar-from-upload / set-banner-from-upload; gate the single
+      EntityPage.avatarUrl / bannerUrl read (default/initials until APPROVED).
+  phase_3_page_block_media:  # FOLLOW-UP (hardest)
+    - >
+      Enqueue at finalize-page-image-upload; gate image urls embedded in
+      PageBlock.data JSON at render (the wide surface — design separately).
+  other_public_image_surfaces:  # FOLLOW-UP (found during Phase 1 build)
+    - >
+      Featured hero carousel (platform/featured-items — FeaturedItem.heroImageUrl,
+      list-featured-items.ts) is a prominent PUBLIC home surface fed by an
+      ADMIN-CURATED upload path (upsert-featured-item), NOT an event Image row —
+      so it's outside Phase 1 (event heroes) and authored by trusted staff, but
+      FR-003's "every public image" intent should eventually gate it too.
+    - >
+      Transactional email hero rendering (rsvp/waitlist/announcement renderers)
+      — 1:1 attendee emails, organizer-chosen hero; low risk, optional follow-up.
+
+# ── Infra / Provisioning ─────────────────────────────────────────────────────
+
+infra:
+  azure:
+    - Provision an Azure AI Content Safety resource (Cognitive Services kind
+      `ContentSafety`) — none exists yet in the subscription
+      (2c5bc798-3a82-4534-8f74-f2ecad1aa7f3, tenant micahhearthfire). e.g.
+      `az cognitiveservices account create -n ithasfire-content-safety
+       -g <rg> --kind ContentSafety --sku S0 -l <region> --yes`
+      then read endpoint + key via `az cognitiveservices account show/keys list`.
+      Pick a region close to prod; note data-residency (images sent to Azure).
+    - Store endpoint + key in GCP Secret Manager (prod + dev), surface as
+      AZURE_CONTENT_SAFETY_ENDPOINT / AZURE_CONTENT_SAFETY_KEY to api (+ jobs if
+      async). Do NOT commit. Add to apps/api/.env.example (empty) and
+      terraform secret wiring.
+  composition_root:
+    - >
+      apps/api/src/lib/dep.ts — wire PendingImageModerationsRepo enqueue into the
+      finalize path (the api enqueues; it does NOT call Azure).
+    - >
+      jobs root — construct AzureContentSafetyModerationAdapter when key present
+      (else stub), wire ModerationPort + ReporterPort + repos into
+      drain-pending-image-moderations. The Azure call lives in the jobs service,
+      not the request path.
+  scheduler:
+    - Add a Cloud Run scheduled job draining `pending_image_moderations`
+      (frequent cadence, e.g. every 1-2 min), alongside the existing drains.
+      Remember the prod cost kill-switch pauses schedulers — a prod terraform
+      apply re-enables; this new scheduler must be in tfvars so it's managed.
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      **BLOCKING ARCHITECTURE FINDING (2026-07-08, during build).** The "moderate
+      ALL public-facing images" decision rested on a false premise — that every
+      public image flows through the same finalize + `Image` row. It does NOT.
+      Verified against the code: only the EVENT HERO image uses the `Image` table
+      (event_images) with lifecycle fields (uploadedAt/attached/deletedAt) and a
+      moderation column could hang off it. The other kinds have NO per-image
+      record and NO moderation-capable field:
+        • avatar  → R2 url written straight into `EntityPage.avatarUrl`
+          (set-avatar-from-upload.ts); finalize creates no row.
+        • banner  → `EntityPage.bannerUrl` (set-banner-from-upload.ts); no row.
+        • entity-page media → `EntityPage.avatarUrl`/`bannerUrl` OR arbitrary
+          image URLs inside `PageBlock.data` JSON; finalize-page-image-upload
+          persists NOTHING (returns the url, client stores it). No row.
+        • place-layout → not a public image (private CSV → structured seating).
+      So a single `Image.moderationStatus` column only covers event heroes.
+      Covering avatars/banners/page-media needs a DIFFERENT model (moderation
+      keyed by R2 storage KEY, independent of where the url is stored) AND
+      gating at many render sites — worst of all `PageBlock.data` JSON, where
+      image urls are embedded in arbitrary block shapes.
+    severity: HIGH
+    mitigation: >
+      DECISION REQUIRED before continuing the build (see the top of
+      open_questions). Recommended: adopt a storage-key-keyed
+      `ImageModerationRecord` (not tied to the Image table) so any uploaded
+      object is trackable regardless of where its url lands, and phase the
+      rollout — Phase 1 event heroes (fits the existing Image lifecycle),
+      Phase 2 avatars/banners (single columns, tractable gating), Phase 3
+      PageBlock.data media (the hard render-gating surface). The port/adapter/
+      worker/queue are identical across phases; only the enqueue points and
+      read-time gating differ.
+  - risk: >
+      Fail-OPEN by mistake would publish explicit content on any Azure blip.
+      The whole design hinges on fail-CLOSED (FR-006) — a degraded result must
+      route to human review, never to auto-approve.
+    severity: HIGH
+    mitigation: >
+      moderate-image defaults degraded → FLAGGED; public read path treats
+      unknown/null status as not-visible for community images (FR-005). Add a
+      regression test asserting an Azure error yields FLAGGED (not APPROVED),
+      per the reportError test pattern in CLAUDE.md.
+  - risk: >
+      Sending user images to a third-party (Microsoft) is a privacy/data-
+      residency consideration; images leave our infra.
+    severity: MEDIUM
+    mitigation: >
+      Only PUBLIC-facing images (public-by-intent: event heroes, entity media,
+      profile/org banners & avatars) are sent — genuinely private uploads
+      (ID-verification & venue-claim documents, which carry PII) are explicitly
+      NOT sent (FR-003). Choose an Azure region consistent with our data posture;
+      document in privacy notes / the MoR-era ToS update.
+  - risk: >
+      Content Safety adult-nudity detection is NOT purpose-built CSAM detection.
+      CSAM is a separate legal regime (hash-matching / PhotoDNA / NCMEC, with a
+      mandatory-reporting obligation once a provider has actual knowledge).
+    severity: MEDIUM
+    mitigation: >
+      DECIDED: no separate CSAM track in v1. The working assumption is that the
+      SEXUAL nudity filter catches such imagery and routes it to human review
+      like anything else; we handle incidents as they arise. Honest caveat kept
+      on record: nudity scoring is not equivalent to CSAM detection, and if such
+      content is ever confirmed there is a legal reporting duty to act on —
+      revisit a dedicated track (PhotoDNA/NCMEC) if this surface sees real abuse.
+  - risk: >
+      A moderator could be exposed to explicit content in the review queue.
+    severity: LOW
+    mitigation: >
+      Click-to-reveal blur by default (FR-008); severity chips let a moderator
+      triage without necessarily viewing.
+  - risk: >
+      Threshold mis-tuning: too low floods the human queue; too high lets
+      borderline content through.
+    severity: LOW
+    mitigation: >
+      Threshold is config, not hardcoded (FR-004). Start conservative
+      (review at severity 4) and tune from real queue volume.
+
+open_questions:
+  # DECIDED (recorded, not open):
+  #  - async worker; threshold = severity 4+ (single max-severity).
+  #  - scope = ALL public-facing images (private ID/claim docs excluded).
+  #  - Azure input = base64 `content`: the worker FETCHES the bytes from R2
+  #    itself (getObject) and base64-encodes them. The outbox row holds ONLY the
+  #    imageId (a reference) — image BYTES are never put on the queue. Downscale
+  #    in the worker before send if the image exceeds Content Safety's max
+  #    dimension/size (~4MB / 2048px at time of writing).
+  #  - notify uploader on HOLD + REJECT + APPROVE-AFTER-HOLD (FR-009); no notify
+  #    on auto-approve.
+  #  - NO four-eyes on image review in v1 (a moderator may approve any image).
+  #  - keep-old-until-new-clears on replacement, for EVERY image kind (FR-005).
+  #  - no auto-reject in v1; CSAM handled via the nudity filter (no separate track).
+  - >
+    Per-category thresholds later? v1 uses a single max-severity cutoff at 4
+    across SEXUAL/VIOLENCE/HATE/SELF_HARM. If the queue shows the wrong mix
+    (e.g. too much violence noise, or suggestive-but-clothed slipping through on
+    SEXUAL), split into per-category thresholds — a straightforward FR-004
+    extension, no architecture change.
+  - >
+    Exact Content Safety image size/dimension ceiling to downscale against —
+    confirm current API limits at implementation time and set the worker's
+    downscale target accordingly.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - CSAM-specific detection / hash-matching / PhotoDNA / NCMEC reporting —
+    DECIDED out for v1; rely on the SEXUAL nudity filter + human review and
+    handle incidents as they arise (see risks for the legal caveat kept on
+    record).
+  - Text moderation changes (the existing profanity ContentFilterPort is
+    untouched; this spec is images only).
+  - Moderating genuinely PRIVATE / non-public uploads — ID-verification and
+    venue-claim documents are never sent to Azure (PII, not a public-content
+    risk).
+  - The images-at-community-create UI/upload plumbing itself — companion work;
+    this spec consumes its finalize/attach path and adds the moderation gate.
+  - Auto-reject / automatic deletion of high-severity images without a human
+    (open_questions; not in v1).
+  - Video / audio moderation.
+  - Re-moderating already-published (backfilled-APPROVED) historical images.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A ModerationPort exists in packages/ports with a normalized, provider-
+    agnostic ImageModerationResult; core/use-case/transport/UI reference only
+    that shape, never Azure types.
+  - The Azure adapter analyzes an image via image:analyze and maps its
+    categoriesAnalysis severities into the normalized result; a fed-in known
+    explicit test image yields a high SEXUAL severity (integration test, gated
+    on key present).
+  - Finalizing ANY public-facing image (event hero, entity-page media, profile/
+    org avatar or banner) sets moderationStatus=PENDING and enqueues a
+    `pending_image_moderations` row in the same tx; the request does NOT call
+    Azure. Private uploads (ID/claim docs) do not enqueue.
+  - The drain worker runs moderate-image — an image scoring < threshold (0,2)
+    becomes APPROVED and is publicly visible; an image >= threshold (4,6) becomes
+    FLAGGED and is NOT visible on any public surface (no live hero/avatar/
+    banner/media), while a previously-APPROVED image it replaces stays live.
+  - When Azure errors/times out, the worker retries with backoff; on exhaustion
+    the row goes DEAD and the image is FLAGGED + moderationDegraded=true (never
+    APPROVED, never stuck PENDING forever), and deps.reportError is called
+    (guarded) — asserted by a regression test.
+  - The uploader receives an in-app + email notification when their image is
+    HELD (FLAGGED) and when it is REJECTED; no notification fires on the
+    transient PENDING state; notify keys are per-channel + keyed on
+    imageId+outcome so worker retries don't double-send.
+  - A moderator sees FLAGGED images at /moderate/images (behind the existing
+    signed-in + moderator + 2FA guard), with severity chips, owning-entity link,
+    a degraded badge when moderationDegraded, and click-to-reveal blur.
+  - moderation.reviewImage APPROVE flips the image to APPROVED, records
+    reviewer + reviewedAt, and promotes the pending image to its live slot
+    (heroImageId / avatar / banner / media) so it becomes visible; REJECT flips
+    to REJECTED, unlinks any pending slot, and enqueues the R2 object for
+    deletion via pending_object_deletions.
+  - The Azure key is absent from the repo and read from config/secret manager;
+    apps/api/.env.example documents the two env vars with empty values.
+  - All existing pre-moderation Image rows are backfilled to APPROVED so nothing
+    already live disappears.

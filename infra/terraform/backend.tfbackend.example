@@ -1,0 +1,7 @@
+bucket = "hf-terraform"
+prefix = "hearthfire/infra"
+
+# Optional (recommended): impersonate a service account for Terraform.
+# Requires Application Default Credentials (ADC) on your machine.
+#
+# impersonate_service_account = "terraform@natural-choir-491400-b7.iam.gserviceaccount.com"

@@ -64,6 +64,7 @@ const BASE_RESULT = {
   itemsSkippedIneligible: 0,
   itemsSkippedPayableDropped: 0,
   itemsSkippedClaimLost: 0,
+  itemsFailedInsufficientPlatformBalance: 0,
   payeesDeferredByLimit: 0,
   itemsLedgerHealed: 0,
   itemsHeldForSuspension: 0,
@@ -84,19 +85,27 @@ describe("settlement jobs", () => {
   });
 
   describe("registration", () => {
-    it("exports run-batch and verify-ledger — execute-transfer died with the settlement claim machinery", () => {
-      expect(settlementJobs).toHaveLength(2);
-      expect(
-        settlementJobs.find((job) => job.name === "settlements.run-batch"),
-      ).toBeDefined();
-      expect(
-        settlementJobs.find((job) => job.name === "settlements.verify-ledger"),
-      ).toBeDefined();
-      expect(
-        settlementJobs.find(
-          (job) => job.name === "settlements.execute-transfer",
-        ),
-      ).toBeUndefined();
+    // Asserted as the exact NAME LIST, not a count plus a few `find`s. A bare
+    // `toHaveLength(n)` is what let this test rot: it fails on any change,
+    // says nothing about which, and the repair is always "make the number
+    // match reality" — which passes whether the new job is correct, misnamed
+    // or registered twice. It also cannot see a swap. The list below fails
+    // with the actual diff and cannot be quieted by editing a digit.
+    //
+    // This matters beyond tidiness: `registry.generated.ts` advertising a job
+    // whose handler does not exist is the exact bug that froze production, and
+    // a count-based assertion goes green again the moment the totals line up.
+    //
+    // `settlements.backfill-processor-fees` arrived with the platform-P&L cost
+    // columns — it reads each charge's real Stripe balance transaction to fill
+    // Order.processorFeeCents, which the schema deliberately leaves NULL
+    // rather than estimating.
+    it("registers exactly run-batch, verify-ledger and backfill-processor-fees — execute-transfer died with the settlement claim machinery", () => {
+      expect(settlementJobs.map((job) => job.name)).toEqual([
+        "settlements.run-batch",
+        "settlements.verify-ledger",
+        "settlements.backfill-processor-fees",
+      ]);
     });
   });
 
@@ -172,6 +181,10 @@ describe("settlement jobs", () => {
       // Clean run (all skip counters 0) must NOT emit a noisy "Skipped" field.
       expect(
         alertPayload?.fields?.some((f) => f.name === "Skipped"),
+      ).toBe(false);
+      // Same for the platform-float field: a healthy balance says nothing.
+      expect(
+        alertPayload?.fields?.some((f) => f.name === "Platform balance short"),
       ).toBe(false);
     });
 
@@ -284,6 +297,43 @@ describe("settlement jobs", () => {
       );
     });
 
+    it("calls out a platform-float shortfall as its own alert field", async () => {
+      const ctx = buildContext();
+      vi.mocked(runPayoutBatch).mockResolvedValueOnce({
+        ...BASE_RESULT,
+        payoutId: "payout_dry",
+        payeesConsidered: 3,
+        itemsCreated: 3,
+        itemsTransferred: 1,
+        itemsFailed: 2,
+        itemsFailedInsufficientPlatformBalance: 2,
+        totalTransferredCents: 1500,
+        totalPayableClaimedCents: 1500,
+      });
+
+      await job.handler({ input: { limit: 25 } as any, ctx: ctx as any });
+
+      const alertPayload = vi.mocked(fireDiscordAlert).mock.calls[0]?.[0];
+      // Distinct from "Failed": the remedy is operator-side and the payees are
+      // blameless, so the alert must not read as three broken accounts.
+      expect(alertPayload?.fields).toEqual(
+        expect.arrayContaining([
+          {
+            name: "Platform balance short",
+            value: "2 item(s) unfunded — top up; no payee is at fault",
+            inline: true,
+          },
+        ]),
+      );
+      expect(ctx.logger.log).toHaveBeenCalledWith(
+        "warn",
+        "settlements.run-batch.completed",
+        expect.objectContaining({
+          itemsFailedInsufficientPlatformBalance: 2,
+        }),
+      );
+    });
+
     it("sends a crash alert with error/runId/limit fields and rethrows when the batch handler throws", async () => {
       const ctx = buildContext();
       vi.mocked(runPayoutBatch).mockRejectedValueOnce(
@@ -338,11 +388,19 @@ describe("settlement jobs", () => {
       rollupDriftCount: 0,
       conservationViolationCount: 0,
       completenessGapCount: 0,
+      cancelledEventCashDebitCount: 0,
+      cancelledEventOpenDoorCardSaleCount: 0,
       samples: {
         rollupDrift: [],
         conservation: [],
         completeness: [],
+        cancelledEventCashDebit: [],
+        cancelledEventOpenDoorCardSale: [],
       },
+      // `null` is the honest clean-run value: these tests wire no processor, so
+      // the solvency leg never ran. It is NOT "measured and healthy" — the job
+      // reports the two states differently and so must the fixture.
+      solvency: null,
     } satisfies Awaited<ReturnType<typeof verifyLedgerInvariants>>;
 
     it("is registered with the manifest schedule (manifest entry parses)", () => {
@@ -379,6 +437,13 @@ describe("settlement jobs", () => {
           rollupDriftCount: 0,
           conservationViolationCount: 0,
           completenessGapCount: 0,
+          cancelledEventCashDebitCount: 0,
+          cancelledEventOpenDoorCardSaleCount: 0,
+          // Asserted EXPLICITLY, not omitted: the summary carries solvency on
+          // every run, and `null` means the leg did not run (no processor
+          // wired here). A clean sweep that silently stopped reporting
+          // solvency at all should fail this test, so the key must be pinned.
+          solvency: null,
         },
       );
     });
@@ -415,6 +480,50 @@ describe("settlement jobs", () => {
           rollupDriftCount: 2,
           completenessGapCount: 1,
         }),
+      );
+    });
+
+    it("a cancelled-event cash debit alone raises the alert, with its own field", async () => {
+      const ctx = buildContext();
+      vi.mocked(verifyLedgerInvariants).mockResolvedValueOnce({
+        ...CLEAN_RESULT,
+        cancelledEventCashDebitCount: 3,
+      });
+
+      await job.handler({ input: { graceMinutes: 30 } as any, ctx: ctx as any });
+
+      expect(fireDiscordAlert).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(fireDiscordAlert).mock.calls[0]?.[0]?.fields).toEqual(
+        expect.arrayContaining([
+          { name: "Cancelled-event cash debits", value: "3", inline: true },
+        ]),
+      );
+      expect(ctx.logger.log).toHaveBeenCalledWith(
+        "error",
+        "settlements.verify-ledger.violations",
+        expect.objectContaining({ cancelledEventCashDebitCount: 3 }),
+      );
+    });
+
+    it("an open door card sale on a cancelled event alone raises the alert, with its own field", async () => {
+      const ctx = buildContext();
+      vi.mocked(verifyLedgerInvariants).mockResolvedValueOnce({
+        ...CLEAN_RESULT,
+        cancelledEventOpenDoorCardSaleCount: 2,
+      });
+
+      await job.handler({ input: { graceMinutes: 30 } as any, ctx: ctx as any });
+
+      expect(fireDiscordAlert).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(fireDiscordAlert).mock.calls[0]?.[0]?.fields).toEqual(
+        expect.arrayContaining([
+          { name: "Cancelled-event door card sales", value: "2", inline: true },
+        ]),
+      );
+      expect(ctx.logger.log).toHaveBeenCalledWith(
+        "error",
+        "settlements.verify-ledger.violations",
+        expect.objectContaining({ cancelledEventOpenDoorCardSaleCount: 2 }),
       );
     });
 

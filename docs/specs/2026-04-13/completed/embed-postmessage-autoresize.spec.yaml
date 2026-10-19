@@ -1,0 +1,164 @@
+status: complete
+# embed-postmessage-autoresize.spec.yaml
+#
+# Cross-iframe postMessage bridge with automatic height synchronization.
+
+version: "1.0"
+updated: "2026-04-13"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The embed widget renders inside an iframe with a fixed height (default 600px),
+    causing either excessive whitespace or clipped content depending on the number of
+    events, ticket types, or checkout fields. There is currently zero postMessage
+    communication between the embed iframe and the host page.
+  solution: >
+    Introduce a lightweight postMessage bridge inside the embed iframe that observes
+    content height via ResizeObserver and emits structured messages to the parent
+    window. The parent (or the future JS SDK) listens for these messages and adjusts
+    the iframe height dynamically. Additional message types enable navigation callbacks
+    and checkout completion events.
+  users:
+    - embed consumer (third-party site owner embedding the widget)
+    - end user (ticket buyer interacting with the embed)
+  surfaces:
+    - embed
+    - web (admin snippet generation)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        The embed iframe emits a `hf:resize` postMessage whenever its content
+        height changes. Payload: `{ type: "hf:resize", height: number }`.
+    - id: FR-002
+      description: >
+        A companion `<script>` snippet (inlined in the embed HTML snippet or
+        served as a static asset) listens for `hf:resize` on the parent window
+        and sets `iframe.style.height` accordingly.
+    - id: FR-003
+      description: >
+        The embed iframe emits `hf:ready` once the widget has rendered its first
+        screen. Payload: `{ type: "hf:ready", embedId: string }`.
+    - id: FR-004
+      description: >
+        The embed iframe emits `hf:navigate` when the screen changes. Payload:
+        `{ type: "hf:navigate", screen: "grid"|"eventDetail"|"checkout"|"confirmation" }`.
+    - id: FR-005
+      description: >
+        The embed iframe emits `hf:orderComplete` when a checkout succeeds. Payload:
+        `{ type: "hf:orderComplete", orderId: string, totalCents: number, currency: string }`.
+    - id: FR-006
+      description: >
+        All postMessages use a namespaced `type` field prefixed with `hf:` to avoid
+        collision with third-party scripts on the host page.
+    - id: FR-007
+      description: >
+        The parent-side listener verifies `event.origin` matches the expected
+        Ithas Fire domain before processing any message.
+    - id: FR-008
+      description: >
+        The admin page embed snippet (EmbedsView.tsx) is updated to include the
+        auto-resize listener script alongside the iframe tag.
+    - id: FR-009
+      description: >
+        Height updates are debounced (100ms trailing) to avoid excessive DOM writes
+        during animations or rapid content changes.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        The ResizeObserver + postMessage bridge adds < 1KB gzipped to the embed bundle.
+    - id: NFR-002
+      description: >
+        Height messages fire within 150ms of a content size change.
+    - id: NFR-003
+      description: >
+        The bridge is a no-op when the embed is not inside an iframe (e.g., direct
+        navigation to the embed URL).
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases: []
+    # No new use cases — this is purely a client-side concern.
+
+  ports:
+    new: []
+    existing: []
+
+  adapters:
+    new: []
+    existing: []
+
+  transport:
+    trpc_procedures: []
+    webhooks: []
+
+  ui:
+    components:
+      - name: useEmbedBridge (hook)
+        location: apps/web/src/app/embed/[embedId]/_components/useEmbedBridge.ts
+        description: >
+          Custom React hook that attaches a ResizeObserver to the document body,
+          debounces height changes, and calls `window.parent.postMessage()` with
+          structured `hf:*` events. Used in the root embed page component.
+      - name: embed-resize-listener (static script)
+        location: apps/web/public/embed/hf-resize.js
+        description: >
+          ~30-line vanilla JS snippet for host pages. Listens for `hf:resize`
+          messages, validates origin, and sets iframe height. Can be inlined in
+          the snippet or loaded via `<script src>`.
+    pages: []
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Host pages with strict CSP may block inline scripts. The auto-resize
+      listener won't work unless the host adds the Ithas Fire domain to
+      script-src or uses the external script variant.
+    severity: MEDIUM
+    mitigation: >
+      Provide both an inline snippet and an external `<script src>` option.
+      Document CSP requirements in the admin page.
+  - risk: >
+      Infinite resize loops if the iframe height change causes the parent
+      layout to reflow, which changes the iframe content height.
+    severity: LOW
+    mitigation: >
+      Debounce + guard against emitting when the new height equals the last
+      emitted height (within a 2px tolerance).
+
+open_questions:
+  - Should we add a `hf:cartUpdate` message for real-time cart state? (Useful for analytics on the host page but adds surface area.) yeah sure why not 
+  - Max height cap — should we enforce a ceiling (e.g., 2000px) to prevent runaway expansion? Yes
+  - Should the parent listener snippet be hosted on a CDN subdomain for caching? I think this should be the point and will just need to become part of our deployment pipeline
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Full JS SDK (separate spec — embed-js-sdk.spec.yaml)
+  - Parent-to-iframe communication (theme overrides via postMessage — see embed-url-theme-overrides.spec.yaml)
+  - Modal/popup embed mode
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - Embed iframe auto-sizes to content height on initial load (no scrollbar, no excess whitespace).
+  - Height updates within 200ms when navigating between screens (grid → eventDetail → checkout).
+  - Admin HTML snippet includes the resize listener script.
+  - Messages include correct `hf:` prefix and are ignored when origin doesn't match.
+  - Direct navigation to /embed/[id] (no parent iframe) does not throw errors.

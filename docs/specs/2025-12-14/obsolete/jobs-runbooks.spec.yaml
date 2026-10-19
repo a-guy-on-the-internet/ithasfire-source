@@ -1,0 +1,83 @@
+# Spec: Jobs Runbooks & Operational Playbooks
+meta:
+  owner: sre
+  status: draft
+  reviewers:
+    - platform-eng
+    - support-oncall
+summary: |
+  Catalog the runbooks required for each batch job and queue worker, defining
+  triggers, diagnosis steps, and escalation paths.
+scope:
+  included:
+    - Runbook structure and required sections.
+    - Mapping jobs to runbooks and ownership groups.
+    - Alert routing expectations and tooling (Incident.io, PagerDuty).
+    - On-call preparation checklist.
+  excluded:
+    - Automated remediation code (tracked per job spec).
+requirements:
+  format:
+    location: docs/runbooks/jobs/<job-name>.md
+    template_sections:
+      - Overview
+      - Preconditions / Dependencies
+      - How to run manually (CLI + Argo trigger)
+      - Troubleshooting checklist
+      - Rollback / disable instructions
+      - Escalation contacts
+      - Post-incident notes
+  batch_jobs:
+    sitemap-generator:
+      owner: platform-eng
+      alerts:
+        - keda.job_failures > 0 for 10m
+        - sitemaps.missing_shard detected
+  smoke_test: pnpm -C apps/jobs run sitemap:dry-run
+    finance-payout-reconciliation:
+      owner: finance-eng
+      alerts:
+        - payouts.balance_mismatch
+        - postgres replication lag > 10m
+      manual_trigger: Argo workflow `finance-reconcile`
+    data-backfill:
+      owner: data-eng
+      condition: triggered manually; no automatic alerts
+      checklist:
+        - confirm isolation in dedicated namespace
+        - throttle via `BACKFILL_BATCH_SIZE`
+  workers:
+    ticket-issuance:
+      owner: fulfillment-eng
+      alerts:
+        - bullmq.queue_depth > 500 for 5m
+        - job.failures_rate > 2% over 15m
+      mitigation:
+        - scale deployment to max replicas
+        - inspect dead-letter queue
+    notifications-transactional:
+      owner: comms-eng
+      alerts:
+        - resend.api_errors > threshold
+        - redis.connection_loss events
+      manual_actions:
+  - rerun DLQ via pnpm -C apps/jobs run notifications:replay
+operations:
+  oncall_readiness:
+    - Quarterly tabletop exercise covering sitemap outage + queue congestion.
+    - Ensure `jobs runbooks` are bookmarked in Incident.io collections.
+    - Verify access to Redis, Postgres, Cloudflare R2 dashboards.
+  documentation_governance:
+    review_cadence: monthly
+    change_control:
+      - Pull request requires owner + sre approval.
+      - Incident retros must update runbook within 48h.
+  tooling:
+    - incident_platform: Incident.io
+    - paging: PagerDuty teams mapped to owner groups
+    - dashboards: Grafana folder `Jobs` with links from runbooks
+acceptance_criteria:
+  - Each job in the catalog has a corresponding runbook file and owner.
+  - Alerts link directly to runbooks in Incident.io.
+  - Runbooks include manual execution + rollback instructions verified quarterly.
+  - On-call checklist incorporated into onboarding documentation.

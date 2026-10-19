@@ -1,0 +1,167 @@
+# volunteer-shift-composer.spec.yaml
+#
+# Cleaner volunteer shift creation UX for event admins.
+
+version: "1.0"
+updated: "2026-04-24"
+related:
+  - docs/specs/2026-03-23/volunteering.spec.md
+
+scope_note: >
+  This follow-up spec only defines shift-composer UX improvements for admin
+  role scheduling. It does not replace or restate the full volunteering system
+  specification.
+
+summary:
+  problem: >
+    Creating multiple volunteer shifts is currently modal-heavy and repetitive.
+    Organizers must open and close the shift dialog for each shift, which slows
+    setup and makes it harder to reason about coverage across a role.
+  solution: >
+    Introduce an inline Shift Composer in the event volunteer roles surface with
+    quick-add rows, preset scaffolds, and duplicate actions. Keep the existing
+    shift dialog for advanced edits, but optimize the common "create several
+    shifts quickly" flow.
+  users:
+    - Org admins managing event volunteers
+    - Org editors managing event staffing
+  surfaces:
+    - web-admin
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        In the event volunteer Roles tab, each role must expose an inline shift
+        composer that allows creating shifts without opening a modal.
+    - id: FR-002
+      description: >
+        The composer must support quick-add rows with fields: start datetime,
+        end datetime, optional label, and optional capacity.
+    - id: FR-003
+      description: >
+        The composer must include preset actions (for example: setup, doors,
+        main shift, cleanup) that prefill row values relative to event start.
+    - id: FR-004
+      description: >
+        Organizers must be able to duplicate an existing shift row and edit the
+        copy before saving.
+    - id: FR-005
+      description: >
+        Saving from the composer must persist all valid rows and report
+        per-row validation errors inline (no global-only error toast).
+    - id: FR-006
+      description: >
+        Existing shift edit and delete behavior must remain available; advanced
+        edits can still use the current ShiftDialog.
+    - id: FR-007
+      description: >
+        The shift composer should use a batch-create write path for multi-row
+        saves (single submit for multiple new rows) to reduce repetitive network
+        round-trips and keep UX consistent as row count grows.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Keyboard-first workflow is required: tab order, enter-to-add-row,
+        escape-to-cancel-row, and visible focus states.
+    - id: NFR-002
+      description: >
+        Must respect existing admin authorization boundaries (org-scoped admin
+        event access) and not expose volunteer shift writes outside current RBAC.
+    - id: NFR-003
+      description: >
+        Shift create interactions should feel immediate on normal connections;
+        optimistic UI is allowed if rollback/error affordances are explicit.
+
+architecture:
+  core:
+    use_cases:
+      - name: manage-volunteer-shifts (existing)
+        description: >
+          Reuse existing create/update/delete shift use cases. Optional follow-up
+          adds a batch-create helper if row-by-row mutation overhead becomes a UX
+          bottleneck.
+        input: roleId, startsAt, endsAt, label?, capacity?
+        output: created/updated shift records
+        idempotent: false
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - VolunteerRepo (shift create/update/delete)
+
+  adapters:
+    new: []
+    existing:
+      - Prisma volunteering adapter
+
+  transport:
+    trpc_procedures:
+      - volunteer.shifts.create (existing)
+      - volunteer.shifts.update (existing)
+      - volunteer.shifts.delete (existing)
+    webhooks: []
+
+  ui:
+    pages:
+      - admin event volunteers page (/admin/[slug]/events/[id]/volunteers)
+    components:
+      - RolesTab (extend with inline shift composer)
+      - ShiftDialog (retain for advanced edit path)
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+
+risks:
+  - risk: >
+      Inline composer adds density and can overwhelm organizers if too much is
+      shown by default.
+    severity: MEDIUM
+    mitigation: >
+      Keep rows collapsed/minimal initially, add preset shortcuts, and preserve
+      optional advanced edit modal.
+  - risk: >
+      Multiple row saves may create partial success states that confuse users.
+    severity: MEDIUM
+    mitigation: >
+      Show per-row success/error state and keep unsaved/failed rows editable.
+
+product_decisions:
+  - id: PD-001
+    decision: >
+      Include a batch-create pattern for new shifts in this effort (rather than
+      sequential single-row create calls in UI).
+  - id: PD-002
+    decision: >
+      Prioritize preset packs for music venues and festivals first.
+
+out_of_scope:
+  - Volunteer schedule timeline/calendar view (tracked as a dedicated follow-up spec)
+  - Scanner-side volunteer check-in workflow changes (tracked as a dedicated follow-up spec)
+  - Per-role custom application forms
+
+follow_up_specs:
+  - path: docs/specs/2026-04-24/volunteer-shift-schedule-timeline.spec.yaml
+    focus: >
+      Timeline/calendar planning surface for volunteer coverage and shift
+      assignment visibility.
+  - path: docs/specs/2026-04-24/volunteer-scanner-check-in.spec.yaml
+    focus: >
+      Scanner app check-in flow for volunteers, including exploring whether
+      shift/check-in assignment metadata should be encoded in scan payloads.
+
+acceptance_criteria:
+  - >
+    From the Roles tab, an organizer can create at least three shifts for a role
+    without opening ShiftDialog.
+  - >
+    Preset action creates prefilled row(s) that can be adjusted before save.
+  - >
+    Category-level admin access rules are unchanged; unauthorized users cannot
+    create or modify shifts.
+  - >
+    Existing edit/delete shift actions continue to work after composer rollout.

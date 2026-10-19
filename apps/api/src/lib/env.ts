@@ -3,6 +3,12 @@ import { z } from "zod";
 const isProd = process.env.NODE_ENV === "production";
 
 const schema = z.object({
+  // Prod uses a RESTRICTED key (`rk_live_…`), whose per-resource scopes are
+  // listed in docs/ops/stripe-restricted-key-scopes.md. `min(1)` cannot check
+  // scope, and Stripe reports a missing permission at CALL time, not at boot —
+  // so an under-scoped key boots fine and then fails mid-checkout, mid-Connect
+  // onboarding, or inside a settlement transfer. Adding a new Stripe SDK call
+  // means adding its permission to the live key AND to that doc.
   STRIPE_SECRET_KEY: isProd ? z.string().min(1) : z.string().optional(),
   STRIPE_API_VERSION: z.string().optional(),
   // Optional: connected account id to use in E2E seed routes.
@@ -24,9 +30,10 @@ const schema = z.object({
   // Terraform omits the env var entirely when the tfvar is empty, so a missing
   // secret produced no error anywhere — connected-account deliveries simply
   // failed signature verification and were dropped with a Sentry-invisible
-  // `logger.warn`. `account.updated` is the ONLY writer of
-  // `Payee.payoutsEnabled = true`, so dropping it silently blocks orgs from
-  // publishing paid events with no signal to us. Fail at boot instead.
+  // `logger.warn`. `account.updated` is the only push writer of
+  // `Payee.payoutsEnabled = true` (the live status read and the reconcile job
+  // heal it later), so dropping it blocks orgs from publishing paid events
+  // until a pull heals the row. Fail at boot instead.
   //
   // Empty string is treated as unset so a blank tfvar/CI secret fails loudly
   // rather than being accepted as a (never-matching) signing key.
@@ -51,7 +58,11 @@ const schema = z.object({
   // the interim way to detect/deny direct-to-origin requests that bypassed
   // Cloudflare's WAF + rate limiting. Required in prod; unused locally
   // (there is no Cloudflare edge in front of local/preview).
-  ORIGIN_SHARED_SECRET: isProd ? z.string().min(32) : z.string().optional(),
+  // Length is checked AFTER trimming: Cloudflare stamps the trimmed value, so
+  // a 31-char secret plus a trailing newline must not pass as 32.
+  ORIGIN_SHARED_SECRET: isProd
+    ? z.string().trim().min(32)
+    : z.string().optional(),
   // Rollout flag for the origin-secret guard (see plugins/origin-guard.ts).
   // Defaults to false (log-only) on purpose: a misconfigured/missing secret
   // must never be able to 403 every request in prod. Flip to "true" only
@@ -62,6 +73,21 @@ const schema = z.object({
     .string()
     .optional()
     .transform((v) => v === "true" || v === "1"),
+  // Rollout mode for the tRPC whole-API `global:<actor>` rate-limit bucket
+  // (packages/transport/trpc/src/guard.ts defaultRateLimit). Its 600/min size
+  // is estimated from the code, not measured traffic, and SSR is charged to
+  // the visitor's IP, so a venue crowd on one IP could trip it. Unset →
+  // "shadow": the bucket is charged but a would-deny only increments
+  // `trpc.global_rate_limit.would_deny` and logs
+  // `global_rate_limit_would_deny`. Set "enforce" once that data looks sane;
+  // "off" is the kill switch.
+  //
+  // An empty or typo'd value (e.g. "Enforce", "") FAILS boot validation, so
+  // Cloud Run keeps serving the previous revision instead of rolling out.
+  // Exercise the switch in dev before you need it in an incident.
+  TRPC_GLOBAL_RATE_LIMIT_MODE: z
+    .enum(["enforce", "shadow", "off"])
+    .default("shadow"),
   // GDPR consent audit log — IP-hash salt. Required in prod so every
   // consent record carries a one-way device fingerprint; if unset, the
   // tRPC router silently writes `null` for ipHash and Article 7(1)
@@ -144,8 +170,26 @@ const schema = z.object({
   AWS_REGION: z.string().default("us-east-1"),
   AWS_ACCESS_KEY_ID: z.string().optional(),
   AWS_SECRET_ACCESS_KEY: z.string().optional(),
-  // SNS SMS sender ID (optional, used for branded SMS)
-  AWS_SNS_SENDER_ID: z.string().optional(),
+  // Registered US origination number (10DLC or toll-free; E.164 or
+  // phone-number ARN) per use case: passcodes and notifications. One number
+  // in both variables is the expected setup. Sent as
+  // AWS.MM.SMS.OriginationNumber; when only one is set it sends both kinds.
+  // SMS stays off (options hidden) until at least one is set. Empty string
+  // is unset.
+  AWS_SMS_ORIGINATION_OTP: z.preprocess(
+    (val) => (val === "" ? undefined : val),
+    z.string().min(1).optional(),
+  ),
+  AWS_SMS_ORIGINATION_NOTIFICATIONS: z.preprocess(
+    (val) => (val === "" ? undefined : val),
+    z.string().min(1).optional(),
+  ),
+  // Ceiling on passcode texts across ALL callers per rolling hour, applied
+  // to each of two pools: phone verification and 2FA
+  // (`auth/otp-sms-budget.ts`). Bounds SMS pumping once the per-IP /
+  // per-number limits are spread over many IPs and numbers. Phone OTP over
+  // the cap answers 429; 2FA over the cap falls back to email.
+  AUTH_OTP_SMS_MAX_PER_HOUR: z.coerce.number().int().positive().default(300),
   // Topic ARN allow-list for the AWS SNS two-way SMS inbound webhook
   // (POST /webhooks/aws/sms-inbound — STOP/START consent reconciliation).
   // The route answers 503 not_configured when unset; only envelopes whose
@@ -161,6 +205,12 @@ const schema = z.object({
   // and log noisy ECONNREFUSED errors in environments where Redis isn't
   // started (e.g. certain CI/E2E runs). Make it opt-in.
   REDIS_URL: z.string().optional(),
+  /**
+   * Key namespace for every Redis key this service writes (ioredis
+   * `keyPrefix`). Terraform emits `ithasfire:<env>`; dev and prod share one
+   * Upstash database, so without this their keys collide.
+   */
+  REDIS_NAMESPACE: z.string().optional(),
   IDEMPOTENCY_BACKEND: z.enum(["redis", "postgres"]).default("redis"),
   APP_BASE_URL: z.string().default("http://localhost:3001"),
   /** Public web app URL used in transactional email links (invitation accept, etc.). */
@@ -216,6 +266,10 @@ const schema = z.object({
 
   // HMAC secret for generating/verifying announcement unsubscribe tokens.
   // Required in production; optional locally (unsubscribe links won't work without it).
+  // ALSO the root the location obfuscation key is HKDF-derived from
+  // (`packages/core/src/lib/location/obfuscation-key.ts`), shared with the
+  // jobs service. Absent → every obscured location renders fully hidden.
+  // Rotating it moves every public obfuscation circle.
   UNSUBSCRIBE_SECRET: isProd
     ? z.string().min(32)
     : z.string().min(1).optional(),
@@ -297,8 +351,8 @@ const schema = z.object({
     .transform((v) => v !== undefined && (v === "true" || v === "1")),
 
   // Feature flag: when "true", the ticket-resale admin surfaces (resale
-  // listings page + resale-policy settings) are reachable. Off by default
-  // until the resale flow is vetted.
+  // listings page + the resale parts of the Default agreement settings) are
+  // reachable. Off by default until the resale flow is vetted.
   ENABLE_RESALE: z
     .string()
     .optional()
@@ -329,9 +383,46 @@ const schema = z.object({
   // Internal Jobs service URL (used to proxy staff admin calls)
   JOBS_SERVICE_URL: z.string().url().optional(),
 
+  // Pub/Sub topic prefix for waking outbox drains after a committed write
+  // (`projects/<project>/topics/<env>-`). Injected by Terraform
+  // (infra/terraform/main.tf); its presence selects the Pub/Sub trigger. See
+  // `DRAIN_TRIGGERS` in @th/ports/job-trigger.
+  JOB_TRIGGER_TOPIC_PREFIX: z.string().min(1).optional(),
+  // Local opt-in when no topic prefix is set: `http` wakes drains by POSTing
+  // JOBS_SERVICE_URL directly. Unset = no wake-ups (the scheduled safety net
+  // is the only trigger).
+  JOB_TRIGGER_BACKEND: z.enum(["http"]).optional(),
+
   // Shared secret for authenticating requests to the jobs service.
   // Must match JOBS_API_KEY on the jobs service side.
   JOBS_API_KEY: z.string().min(16).optional(),
+
+  // Edit-triggered search reindex drain (Cloud Tasks). Both set by Terraform;
+  // either unset = no delayed drain (marks wait for the nightly full reindex).
+  // Queue: `projects/<project>/locations/<region>/queues/<queue>`.
+  CLOUD_TASKS_QUEUE: z.string().min(1).optional(),
+  // Dedicated queue for `lineup-notices.continue-sweep`, which must NOT share
+  // the search drain's (that one is pinned to one dispatch at a time for a
+  // search-only reason). Set by Terraform (infra/terraform/lineup-notice-sweep.tf).
+  // Unset = continuations fall back to CLOUD_TASKS_QUEUE, the behaviour they
+  // had before the queue existed. See createLineupSweepContinuation.
+  CLOUD_TASKS_LINEUP_SWEEP_QUEUE: z.string().min(1).optional(),
+  // Dedicated queue for `tax.fill-location-rate` (background venue tax-rate
+  // fills queued by listings). Its own, NOT the search drain's: a provider
+  // outage would otherwise park hundreds of slow failing lookups ahead of
+  // every drain on that single-dispatch queue. Set by Terraform
+  // (infra/terraform/tax-rate-fill.tf). Unset = NO fallback: nothing is
+  // queued, cards say "See details" until a checkout, an event-page quote or
+  // the nightly reindex fills the venue. See createTaxRateFillScheduler.
+  CLOUD_TASKS_TAX_FILL_QUEUE: z.string().min(1).optional(),
+  // Service account whose OIDC token the tasks carry to the jobs service.
+  // Shared by every queue.
+  CLOUD_TASKS_INVOKER_SA: z.string().email().optional(),
+  // Earliest drain after an edit / slot width edits share one drain in.
+  // Floor 30s: at 0 a rescheduling drain would compute its OWN slot, a task
+  // name Cloud Tasks refuses while that task runs.
+  SEARCH_REINDEX_DRAIN_DELAY_S: z.coerce.number().int().min(30).max(3600).optional(),
+  SEARCH_REINDEX_DRAIN_WINDOW_S: z.coerce.number().int().min(1).max(3600).optional(),
 
   // Volunteer scanner: HMAC secret for the human+event-scoped volunteer QR
   // tokens. Distinct from the ticket QR secret so we can rotate
@@ -378,6 +469,38 @@ const schema = z.object({
     .default(300),
   SUPPORT_REPLY_MAX: z.coerce.number().int().positive().default(60),
   SUPPORT_REPLY_WINDOW_S: z.coerce.number().int().positive().default(60),
+
+  // In-process read caches that let production Neon suspend between uptime
+  // checks (see `ttl-read-through-cache.ts` / `with-cached-platform-settings.ts`).
+  // Both are tagged with a shared Redis generation, bumped by every actor
+  // mutation (failed ones too), every committed search-index write (API and
+  // jobs) and every e2e reset/seed. A change that went through one of those
+  // reaches another instance within that cache's *_GENERATION_MEMO_S; the
+  // writing instance at once. The TTL only bounds what nothing bumps for:
+  // the clock (an event starting, a price tier flipping), direct DB scripts,
+  // and a failed INCR (reported). Redis unreachable → no caching at all.
+  // PUBLIC_DISCOVERY: the anonymous home-page lists (`events.countryEvents`,
+  // `search.featuredEvents`). 0 disables the cache.
+  // PLATFORM_SETTINGS: the feature-gate snapshot. Point reads stay at 60s.
+  // *_GENERATION_MEMO_S: cross-instance staleness after a write, AND the cap
+  // on Redis GETs (one per window per instance) — the Upstash budget knob,
+  // see docs/ops/resource-burn.md RB-0003.
+  PUBLIC_DISCOVERY_CACHE_TTL_S: z.coerce.number().int().nonnegative().default(900),
+  PUBLIC_DISCOVERY_GENERATION_MEMO_S: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(30),
+  PLATFORM_SETTINGS_GENERATION_MEMO_S: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(60),
+  PLATFORM_SETTINGS_CACHE_TTL_S: z.coerce
+    .number()
+    .int()
+    .nonnegative()
+    .default(900),
 
   // Dev/test: when "true", settlements are scheduled for immediate payout
   // so the batch runner picks them up on the next cycle. Never enable in production.

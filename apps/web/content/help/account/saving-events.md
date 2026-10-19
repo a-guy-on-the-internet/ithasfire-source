@@ -1,14 +1,14 @@
 ---
 title: "Saving events"
-description: "Keep events for later with a private watchlist — hearts on cards, a Save button, and your /saved page."
+description: "Keep events for later with a private watchlist — hearts on cards, a Save button, and a Saved section on your My Tickets page."
 category: "account"
 order: 4
 tags: ["saves", "watchlist", "discovery", "bookmarks"]
-related: ["account/following-organisers-and-venues", "getting-started/find-events", "buying-tickets/how-to-buy"]
+related: ["account/following-organisers-and-places", "getting-started/find-events", "buying-tickets/how-to-buy"]
 specs: ["2026-07-01/completed/saved-events-watchlist"]
 ---
 
-Found an event you're not ready to book yet? Save it. Saved events live in your private watchlist at [/saved](/saved) so you can come back when you've made up your mind.
+Found an event you're not ready to book yet? Save it. Saved events live in a private watchlist on your My Tickets page ([/my-tickets](/my-tickets)), so you can come back when you've made up your mind.
 
 ## Before you start
 
@@ -27,7 +27,7 @@ Saving is not a ticket, a reservation, or an RSVP — it just keeps the event wh
 
 ## Your saved list
 
-Open [/saved](/saved) — it's the **Saved** tab in the bottom bar on mobile, or the heart button in the top navigation on desktop. Your list is split into two tabs:
+Tap the heart in the top bar, or open the account menu and choose **My Tickets**. Saved events have their own section on that page. On a narrow phone screen the top bar drops the heart to save room, so use the account menu. Your list is split into two tabs:
 
 - **Upcoming** — saved events that haven't happened yet
 - **Past** — saved events whose date has passed
@@ -47,4 +47,4 @@ Nobody. Saves are completely private: organisers can't see who saved their event
 - **The heart didn't stick** — if the save fails (for example, you lost connection), the heart flips back. Tap it again.
 - **A saved event disappeared from your list** — events that are taken down or unpublished by the organiser no longer appear. Cancelled events remain, badged.
 
-Looking for updates from a venue or organiser rather than a single event? [Follow them](/help/account/following-organisers-and-venues) instead — follows notify you about new events, while saves track events you've already found.
+Looking for updates from a place or organiser rather than a single event? [Follow them](/help/account/following-organisers-and-places) instead — follows notify you about new events, while saves track events you've already found.

@@ -1,0 +1,7 @@
+DROP TABLE IF EXISTS "SearchDocument";
+DROP FUNCTION IF EXISTS search_join_text_array(text[]);
+DROP FUNCTION IF EXISTS search_unaccent(text);
+DROP EXTENSION IF EXISTS earthdistance;
+DROP EXTENSION IF EXISTS cube;
+DROP EXTENSION IF EXISTS unaccent;
+DROP EXTENSION IF EXISTS pg_trgm;

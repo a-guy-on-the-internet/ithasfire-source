@@ -1,0 +1,311 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   THE VOLUNTEER'S OWN CHECK-IN CODE — document-specific styles
+   ═══════════════════════════════════════════════════════════════════════════
+
+   Fourth document on the print layer, and the counterpart to the volunteer
+   BADGE sheet. Layers on top of `src/app/_print/print.css`, which owns the
+   `--print-*` palette, the paper wrapper and the shared primitives.
+
+   ── THIS IS NOT A BADGE, AND IT MUST NOT LOOK LIKE ONE ────────────────────
+
+   The badge sheet is venue-issued credential stock: a dashed cut frame, a
+   "VOLUNTEER" designation in accent, an "Issued by …" line, six to a sheet.
+   Every one of those signals authorization, and every one of them is
+   deliberately ABSENT here.
+
+   This document is one person's "scan me in", for the volunteer whose phone is
+   dead. It gets: a plain masthead, the code, the facts, and a sentence saying
+   it admits nobody by itself. No cut lines (you don't cut it out — it is the
+   sheet), no lanyard proportions, no designation styled as a credential, and
+   no issuer, because the volunteer issued it to themselves. If a future change
+   makes this read like stock somebody could present at a door, it is wrong.
+
+   EVERY RULE IS CLASS-SCOPED — a correctness requirement, not a style. Next
+   does not unload a route's stylesheet on client-side navigation (citation at
+   the top of `print.css`), so a bare-element or `@page` rule here would follow
+   the volunteer onto the next page they print. Document-lifetime rules live in
+   `PaperSheet`'s un-hoisted <style>; there are none in this file.
+
+   No colour literals: every value is a `--print-*` custom property, which is
+   what keeps the sheet a FIXED LIGHT artefact whatever theme the account is
+   on. A printed dark-mode QR is an unscannable QR.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Masthead ──────────────────────────────────────────────────────────────── */
+
+.th-qr-sheet__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 4mm;
+  padding-bottom: 3mm;
+  /* Never orphan the masthead at the foot of a page. */
+  break-after: avoid;
+  page-break-after: avoid;
+}
+
+/* Replaced content always prints, even with Chrome's "Background graphics"
+   default of off — the same reason the other three sheets use an <img>. */
+.th-qr-sheet__wordmark {
+  display: block;
+  width: 34mm;
+  height: auto;
+}
+
+.th-qr-sheet__stamp {
+  margin: 0;
+  font-size: 7pt;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--print-muted);
+  text-align: right;
+}
+
+/* ── Title + name ──────────────────────────────────────────────────────────── */
+
+/*
+ * "Volunteer check-in code" — a DESCRIPTION of what the paper is, in the
+ * document ink. Not the badge's accent-coloured "VOLUNTEER" kicker, which is a
+ * designation and reads as authorization. The distinction is the whole point
+ * of the two documents existing separately.
+ */
+.th-qr-sheet__title {
+  margin: 5mm 0 0;
+  font-size: 12pt;
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+  break-after: avoid;
+  page-break-after: avoid;
+}
+
+.th-qr-sheet__name {
+  margin: 2mm 0 0;
+  font-size: 20pt;
+  font-weight: 700;
+  line-height: 1.05;
+  letter-spacing: -0.4px;
+  overflow-wrap: anywhere;
+  break-after: avoid;
+  page-break-after: avoid;
+}
+
+/* ── The code ──────────────────────────────────────────────────────────────── */
+
+/*
+ * The scan block, centred, and the reason this document exists. Unlike the
+ * badge — which fits six to a page and fights for every millimetre — this
+ * sheet holds ONE code and can afford to be generous.
+ *
+ * `print-color-adjust: exact` because Chrome's print dialog ships with
+ * "Background graphics" OFF, which drops backgrounds: without it the white
+ * quiet zone disappears on tinted stock or under a forced-background setting,
+ * and a QR without a light quiet zone is a QR a scanner refuses.
+ * `--print-paper` is pure white, declared for exactly this in `PaperSheet`.
+ */
+.th-qr-sheet__scan {
+  display: flex;
+  justify-content: center;
+  margin-top: 6mm;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.th-qr-code {
+  padding: 5mm;
+  background-color: var(--print-paper);
+  border: 1px solid var(--print-rule);
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+  line-height: 0;
+}
+
+/*
+ * 70mm — and the contrast with the badge is the point.
+ *
+ *   artefact       payload             modules  EC level  printed  mm/module
+ *   ticket stub    ticket CODE (~12ch)    29      H (30%)   32mm      1.10
+ *   volunteer BADGE signed JWT (382 B)    77      M (15%)   36mm      0.47
+ *   THIS sheet     signed JWT (382 B)     77      M (15%)   70mm      0.91
+ *
+ * Identical payload to the badge, nearly double the module size, because the
+ * constraint that squeezed the badge — six of them on one page — does not
+ * exist here. This sheet is one code on one page, so it takes the scan margin
+ * the badge could not afford, and lands within reach of the ticket stub.
+ *
+ * The 5mm quiet zone is ~5.5 modules, comfortably past the 4 the spec asks
+ * for. Error level stays M for the reason spelled out on the badge: raising it
+ * ADDS modules and would shrink the module size back down.
+ *
+ * `QRCodeSVG` emits a viewBox and no intrinsic size, so CSS alone scales it.
+ */
+.th-qr-code__svg {
+  display: block;
+  width: 70mm;
+  height: 70mm;
+}
+
+/* ── Facts ─────────────────────────────────────────────────────────────────── */
+
+/*
+ * Role / when / where, in a grid because the labels align across the row —
+ * that is the design system's grid test, not decoration. `minmax(0, …)` so a
+ * long venue string wraps inside its column instead of blowing the track out.
+ *
+ * ASYMMETRIC on purpose (v2 §5: "explicit asymmetric fr … never 50/50 unless
+ * truly equal"). Equal thirds shipped first and broke the column that matters
+ * most: "Sat, Aug 15 · 4:00 PM – 8:00 PM CDT" wrapped its zone onto a second
+ * line, so the sheet read as though the shift ended "CDT". The when column is
+ * the longest string on the row by some way and gets the widest track; a role
+ * name is two words.
+ */
+.th-qr-sheet__facts {
+  display: grid;
+  grid-template-columns:
+    minmax(0, 3fr)
+    minmax(0, 5fr)
+    minmax(0, 4fr);
+  gap: 4mm 6mm;
+  margin: 7mm 0 0;
+  padding-top: 3mm;
+  border-top: 1px solid var(--print-rule);
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.th-qr-field {
+  min-width: 0;
+}
+
+/* <dd> carries a 40px UA indent. */
+.th-qr-field dd {
+  margin: 1mm 0 0;
+}
+
+.th-qr-field__value {
+  margin: 0;
+  font-size: 10pt;
+  font-weight: 600;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.th-qr-field__sub {
+  display: block;
+  margin-top: 0.8mm;
+  font-size: 8.5pt;
+  font-weight: 500;
+  color: var(--print-muted);
+}
+
+/* A volunteer working two shifts at one event gets both under one code. */
+.th-qr-shift + .th-qr-shift {
+  margin-top: 2mm;
+}
+
+/* The event spans the full width beneath the three-up row: it is the one fact
+   most likely to be long, and it has no column partner to align with. */
+.th-qr-sheet__event {
+  grid-column: 1 / -1;
+}
+
+/* ── Footer ────────────────────────────────────────────────────────────────── */
+
+/*
+ * The sentence that keeps this from being a badge. Body-sized, not fine print:
+ * "this admits nobody on its own" is the most important thing on the page
+ * after the code itself, and setting it at 7pt would be a way of not saying
+ * it.
+ */
+.th-qr-sheet__note {
+  margin: 6mm 0 0;
+  padding-top: 3mm;
+  border-top: 1px solid var(--print-rule);
+  font-size: 9pt;
+  line-height: 1.5;
+  max-width: 90ch;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.th-qr-sheet__footer {
+  margin: 4mm 0 0;
+  font-size: 7.5pt;
+  line-height: 1.45;
+  color: var(--print-muted);
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+/* Screen-only note pointing at the browser's own Save-as-PDF. */
+.th-qr-sheet__hint {
+  margin: 5mm 0 0;
+  font-size: 8pt;
+  line-height: 1.45;
+  color: var(--print-muted);
+  max-width: 80ch;
+}
+
+/* ── Screen-only states ────────────────────────────────────────────────────── */
+
+.th-qr-sheet__notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 24px 0;
+}
+
+.th-qr-sheet__notice-title {
+  margin: 0;
+  font-size: 13pt;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+.th-qr-sheet__notice-body {
+  margin: 0;
+  font-size: 10pt;
+  line-height: 1.45;
+  color: var(--print-muted);
+  max-width: 62ch;
+}
+
+/* ── Narrow screens ──────────────────────────────────────────────────────────
+   A three-up fact row is a PAPER layout. Below the width at which the paper
+   preview itself gives up (`print.css`), it re-declares to one column.
+
+   NOTHING IS HIDDEN — grids collapse by re-declaring `grid-template-columns`,
+   never by dropping content, and every fact on the printed sheet is still
+   here. `@media screen` only, so paper is untouched.
+
+   The code itself also has to shrink: 70mm is 265px, which overflows a 320px
+   viewport once the sheet's 16px padding is counted. `max-width: 100%` with
+   `height: auto` keeps it square and inside the column. */
+
+@media screen and (max-width: 820px) {
+  .th-qr-sheet__facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .th-qr-sheet__stamp {
+    text-align: left;
+  }
+
+  .th-qr-code {
+    padding: 4mm;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+
+  .th-qr-code__svg {
+    width: 100%;
+    max-width: 70mm;
+    height: auto;
+    aspect-ratio: 1;
+  }
+}

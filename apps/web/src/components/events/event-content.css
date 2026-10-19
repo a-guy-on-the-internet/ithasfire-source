@@ -1,0 +1,1504 @@
+/**
+ * Event Preview Styles
+ * 
+ * These styles are applied to rendered ProseMirror content in preview modes.
+ * Supports desktop, mobile, and email viewport variants.
+ */
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Entrance animation — staggered reveal on page load
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+@keyframes eventContentReveal {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.event-content-hero {
+  animation: eventContentReveal 0.5s ease-out both;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * The poster frame — width is the column, height follows the file
+ *
+ * What this replaces: a fixed 16/9 box with the poster `object-fit: contain`ed
+ * inside it, backed by a blurred, veiled copy of ITSELF whose only job was to
+ * disguise the letterbox bars. A 2:3 gig flyer — the common shape — rendered
+ * ~240px wide in a 768px column, the other ~520px being a blur of the thing you
+ * were trying to look at.
+ *
+ * The rule now: the frame stops dictating shape. Width is the column; height
+ * follows the file, up to a ceiling. At or under the ceiling nothing is added
+ * and nothing is cropped; only a file TALLER than the ceiling is cropped, and
+ * it crops from the bottom.
+ *
+ * The rule is written so it never NEEDS the image's intrinsic dimensions:
+ * older uploads have none recorded, and `media.aspectRatio` is dead
+ * end-to-end. Container query units state it without them:
+ *   `height: auto`        → natural height, whatever the file turns out to be
+ *   `max-height: N cqw`   → a ceiling expressed as a RATIO of the frame's own
+ *                           width, which is the only measurement we have
+ *   `object-fit: cover`   → the clamped case crops instead of letterboxing
+ *   `object-position: top`→ and crops from the BOTTOM, because flyers are
+ *                           top-weighted: the headliner's name survives.
+ * Under `cover` + auto height the two collapse into one behaviour — below the
+ * ceiling the box already matches the file's ratio, so `cover` crops nothing.
+ *
+ * Where `cqw` is unsupported the max-height simply does not apply and the
+ * poster renders at natural height: uncropped, occasionally tall. A graceful
+ * degradation, not a broken layout.
+ *
+ * Reserving the box before the bytes arrive: `height: auto` alone cannot, and
+ * on a cold load at 320px the sheet below jumped ~460px when the poster
+ * decoded (CLS 0.48). So `finalize-event-image-upload.ts` reads the file's
+ * pixel size from its header (EXIF rotation applied) into `event_images.width`
+ * /`height`, and the poster `<img>` carries them as `width`/`height`
+ * attributes (`posterSizeAttrs`). With `width: 100%; height: auto` here, those
+ * attributes only feed the UA's `aspect-ratio: auto w / h`: the box takes the
+ * file's ratio up front, the `max-height` ceiling still clamps it, and once
+ * the image loads its own ratio takes over. The final shape is the same as
+ * without them.
+ *
+ * Where the size is unknown (an upload whose header could not be read, or a
+ * row the backfill has not reached) no attributes are set and the poster
+ * renders as before, layout shift included. Still not papered over with a
+ * guessed min-height: that would fight the rule it is meant to serve.
+ * ───────────────────────────────────────────────────────────────────────────── */
+.event-hero-poster-frame {
+  container-type: inline-size;
+}
+
+.event-hero-poster-img {
+  display: block;
+  width: 100%;
+  height: auto;
+  /* 150cqw = 1.5 x the frame's width = the 2:3 ceiling. 16:9, 1:1, 4:5 and 2:3
+     itself all land under it and render untouched; a 9:16 story graphic is the
+     only common shape that gets clamped. */
+  max-height: 150cqw;
+  object-fit: cover;
+  object-position: 50% 0%;
+}
+
+/* The compact frame (embeds, and the builder's mobile preview) keeps the hero
+   inside a SQUARE. An embed is a widget in someone else's page: at a 380px
+   width a 2:3 poster is 570px tall and pushes the ticket list and its CTA out
+   of the iframe entirely. 100cqw still roughly doubles what the old 220px cap
+   allowed a portrait flyer, and a 16:9 poster — which lands at ~0.56cqw — is
+   unaffected either way. */
+.event-hero-poster-img--compact {
+  max-height: 100cqw;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * The poster-first page — ONE grid, two left edges
+ *
+ * MEASURED at 1440 with a 2:3 flyer before this: the poster's left edge at
+ * 200px, the h1 at 672px, and everything below the hero at 360px — a 720px
+ * block centred on the page, aligned with nothing. Three left edges. The
+ * canvas (Event Page Poster-First Redesign, "Desktop — top of page") puts the
+ * numbered sections IN the right column, beside the rail. So the rail, the
+ * meta block, the buy band, ContentStack and the sections after it are
+ * SIBLINGS of one grid: the rail in column 1, everything else in column 2.
+ * That is also what lets the rail actually travel — it used to be the tallest
+ * thing in its own row, so `sticky` had nowhere to go — and what fills the
+ * ~300px of dead space that sat under the CTA past 1200px.
+ *
+ * WHO GETS IT: a poster event on the real page (`isPosterFirstLayout` in
+ * EventContent.tsx — never the embed, the builder preview, the community
+ * layout or the posterless Date Stub). The media query gates the width; both
+ * have to agree, so a real phone stays on the block-flow layout below.
+ *
+ * THE TWO TREATMENTS (canvas boards "A — Full bleed" and "Desktop"):
+ *
+ *   NARROW  the poster full-bleed at the top, a cream paper sheet riding up
+ *           24px over its bottom edge under a 2px ink rule, everything on
+ *           that paper in ink, back/save/share as 40px squares over the
+ *           poster (the only dark chrome left), and the price + CTA docked in
+ *           an ink bar at the bottom of the screen (`.event-sticky-bar`).
+ *   WIDE    a dark band across the TOP of the page only — the blurred
+ *           parallax backdrop under a scrim, fading into cream — with the
+ *           back link, the h1 and the badges on it in on-dark ink; the rail
+ *           overhanging that boundary onto the paper; Save / Share / Calendar
+ *           as three equal buttons under the poster; the buy band a paper
+ *           card straddling the boundary; the sections on cream.
+ *
+ * THE SCRIM, RE-DERIVED. Light-on-dark text needs a >=0.62 black floor to
+ * clear AA over an arbitrary poster (worst case a pure-white backdrop pixel
+ * under 0.62 black composites to #616161: `$onStructure` 5.94:1, the 85%
+ * muted rung 4.83:1). The old scrim spanned the whole hero zone and faded in
+ * a reserved strip. Now the text it backs is rows 1-2 of the grid (back link,
+ * meta block), so the band is a grid item under exactly those rows at
+ * 0.62 → 0.70, and the FADE to cream is a second item that only ever
+ * occupies the top of row 3 — below the sheet's own 24px bottom padding,
+ * below the last line of light text, behind the buy band. Nothing light
+ * ever sits on the fade. Narrow, the text is ink on paper and there is no
+ * band at all; the colours flip with the same media query, through the
+ * `--hero-*` custom properties below.
+ *
+ * THE THRESHOLD IS 768px, AND THAT NUMBER IS NOT FREE. The page's max-width
+ * is an inline style (EventPageBody, 68rem) and cannot carry a media query:
+ * from the first pixel past 48rem the poster frame is wider, and a portrait
+ * poster that is wider is TALLER. So the columns must be on by the first
+ * pixel the page can exceed 48rem, and 48rem is 768px. MEASURED when the two
+ * disagreed: at an 880px viewport a 2:3 flyer rendered 768x1152 and the h1
+ * sat 1325px down. `EventContent.test.tsx` pins the pair.
+ *
+ * WIDTHS. The page is 68rem (1088px); the rail climbs in three steps, every
+ * column below being (page − 48px inset − 56px gutter − rail):
+ *
+ *   >= 768   rail 300  ->  column 364 at 768, 496 at 899
+ *   >= 900   rail 360  ->  column 436 at 900, 624 at 1087
+ *   >= 1200  rail 440  ->  column 544 (the page is capped at 1088 by here)
+ *
+ * 56px is the canvas gutter; the rail gave up 20px at the two lower steps to
+ * pay for it, so the decision column never drops under the 364px the h1 and
+ * badges are already hardened for (they survive a 320px viewport). 544px is
+ * ~65 characters of 16px Montserrat — the prose measure the design system
+ * asks for, and why the sections no longer need a cap of their own.
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+.event-page-split {
+  /* The hero palette. Narrow: ink on paper. Flipped wide, in the immersive
+     block below. Consumed by inline styles in EventContent.tsx, because an
+     inline style cannot carry a media query and this is one JSX tree. */
+  --hero-ink: var(--color, #211C16);
+  --hero-ink-muted: var(--colorMuted, #5C544A);
+  --hero-rule: var(--borderColor, #211C16);
+  /* The shell's own top padding at each of ITS steps (AppShell MainContent:
+     $4 / $5 at >640 / $6 at >900). The poster (narrow) and the band (wide)
+     climb back over it so the page starts under the navbar, as drawn. */
+  --shell-top: 16px;
+  position: relative;
+  /* Narrow: FULL BLEED. The whole page escapes the shell's side gutter —
+     the poster wants the screen edges, and the sheet then carries its own
+     16px inset so the text lands where the sections' $4 padding already
+     lands it. `50% - 50vw` is the column's distance to the viewport edge;
+     any scrollbar surplus is clipped by `body { overflow-x: clip }`. */
+  margin-inline: calc(50% - 50vw);
+  background: var(--background, #F6F0E4);
+  /* A grid on the phone too, because DOM order and paint order part ways:
+     the sheet (title) comes FIRST in the DOM so a screen reader meets the
+     h1 before the poster's chrome, and the grid puts the poster above it.
+     One column, five rows: poster, sheet, facts, sections, after. */
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto auto auto auto auto;
+  row-gap: 0;
+}
+
+/* The rail column dissolves narrow — its two children place themselves. */
+.event-page-split__aside {
+  display: contents;
+}
+
+@media (min-width: 641px) {
+  .event-page-split {
+    --shell-top: 24px;
+  }
+}
+
+@media (min-width: 901px) {
+  .event-page-split {
+    --shell-top: 32px;
+  }
+}
+
+/* Room under the last section before the footer. */
+.event-page-split {
+  padding-bottom: 48px;
+}
+
+
+/* A status / sellability notice sits above the hero (EventDetail renders
+   them before this component). Then nothing climbs back over the shell's top
+   padding: the band or the poster would paint over the notice's bottom edge. */
+.event-page-split--after-notice {
+  --shell-top: 0px;
+}
+
+/* ── The docked bar and the audio mini-player share the bottom edge ──
+   The player docks at `--consumer-bottom-nav-height` too, and at z 9000 it
+   would cover the bottom 48px of this 84px bar — the price and half the CTA.
+   While the bar is on screen (narrow, something to buy) its height is
+   published for the player to add. CSS, not an effect: `:has()` is right on
+   first paint and follows the media query that shows the bar. */
+@media (max-width: 767px) {
+  html:has(.event-page-split--bar) {
+    --event-price-bar-height: 84px;
+  }
+
+  /* The bar floats over whatever ends the DOCUMENT, and that is the site
+     footer, not this page: clearance inside the page left the footer's last
+     rows (Terms, Acceptable Use) under the bar at the end of the scroll. The
+     shell's own bottom-nav clearance is an inline style, so the extra room is
+     a spacer after it. */
+  body:has(.event-page-split--bar)::after {
+    content: "";
+    display: block;
+    height: var(--event-price-bar-height, 84px);
+  }
+
+  /* Narrow, the paper covers everything from the poster down, so the fixed
+     backdrop is never seen — except through the transparent site footer,
+     where it rendered as a muddy blur of the poster. Off. The class stays in
+     the DOM, so `body:has(.hero-backdrop)` (the frosted navbar) still holds. */
+  html:has(.event-page-split) .hero-backdrop {
+    display: none;
+  }
+}
+
+/* Wide-only furniture, off until the columns turn on. */
+.event-page-split__band,
+.event-page-split__fade,
+.event-page-split__back,
+.event-buy-band {
+  display: none;
+}
+
+/* ── The rail: row 1 on the phone, the poster at the top ── */
+.event-page-split__rail {
+  grid-row: 1;
+  position: relative;
+  margin-top: calc(-1 * var(--shell-top));
+}
+
+/* ── The paper sheet, riding up over the poster's bottom edge ──
+   Row 2, after the rail — though it is BEFORE the rail in the DOM. */
+.event-page-split__sheet {
+  grid-row: 2;
+  position: relative;
+  /* ABOVE the poster frame (inline z-index 1), which now comes LATER in the
+     DOM and would otherwise win the tie and paint over the rule and the 24px
+     overlap (review caught exactly that). Level with the poster's chrome
+     (z 2, later still), so a Share menu opening down a short 16:9 poster
+     still paints over the sheet. */
+  z-index: 2;
+  margin-top: -24px;
+  border-top: 2px solid var(--borderColor, #211C16);
+  background: var(--background, #F6F0E4);
+  padding: 22px 16px 0;
+}
+
+/* ── The facts (Schedule, Location, the map): row 3, under the sheet ── */
+.event-page-split__facts {
+  grid-row: 3;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 24px 16px 0;
+}
+
+/* The numbered sections, on the same paper. */
+.event-page-split__content {
+  grid-row: 4;
+  padding: 24px 16px 0;
+}
+
+.event-page-split__after {
+  grid-row: 5;
+}
+
+/* ── Chrome over the poster: back / save / share as 40px squares ──
+   A FIXED dark surface over a photograph, so both halves of the pair are the
+   scrim tokens (`scrim` / `onScrim`), never the themed ink — the DS's
+   "migrate a fill and its foreground as a unit" rule. */
+.event-poster-chrome {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  right: 16px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.event-poster-chrome__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+
+.event-poster-action-anchor {
+  position: relative;
+}
+
+/* The calendar export has no place over the poster; it joins the row wide. */
+.event-poster-action-anchor--calendar {
+  display: none;
+}
+
+.event-poster-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  box-sizing: border-box;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  flex-shrink: 0;
+  border: 2px solid color-mix(in srgb, var(--onScrim, #FDFAF3) 55%, transparent);
+  border-radius: 0;
+  background: color-mix(in srgb, var(--scrim, #211C16) 55%, transparent);
+  color: var(--onScrim, #FDFAF3);
+  cursor: pointer;
+  text-decoration: none;
+  font-family: Montserrat, sans-serif;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1.8px;
+  line-height: 1;
+  text-transform: uppercase;
+  white-space: nowrap;
+  transition: background-color 150ms ease-out, border-color 150ms ease-out,
+    color 150ms ease-out;
+}
+
+.event-poster-action:hover,
+.event-poster-action[aria-expanded="true"] {
+  background: var(--scrim, #211C16);
+  border-color: var(--onScrim, #FDFAF3);
+}
+
+.event-poster-action:focus-visible {
+  outline: 2px solid var(--onScrim, #FDFAF3);
+  outline-offset: 2px;
+}
+
+.event-poster-action svg {
+  flex-shrink: 0;
+}
+
+/* Icon-only narrow: the label stays in the accessibility tree. */
+.event-poster-action__label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ── The price, as a LABEL over a figure ("FROM" / "$18.00") ──
+   The label is the mono `xs` rung (10px / 2.5px — field labels, table heads);
+   the figure is display Montserrat, because a starting price is the largest
+   number on the page and Plex Mono stops at 700. */
+.event-price-label {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 2.5px;
+  line-height: 1.2;
+  text-transform: uppercase;
+  color: var(--colorMuted, #5C544A);
+}
+
+.event-price-label--on-ink {
+  color: var(--colorMutedInverted, #BDB4A6);
+}
+
+/* ── The docked price bar (narrow) ──
+   Portaled to <body>; docks ABOVE the shell's bottom nav, whose live height
+   the nav publishes on <html>. `EventDetail` stands the nav's centre action
+   down while this bar is on screen. An INVERTED panel, so both halves are the
+   inverted pair (`backgroundInverted` / `colorInverted`). */
+.event-sticky-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: var(--consumer-bottom-nav-height, 0px);
+  z-index: 1200;
+  box-sizing: border-box;
+  height: 84px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 0 16px;
+  background: var(--backgroundInverted, #211C16);
+}
+
+.event-sticky-bar__price {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.event-sticky-bar__figure {
+  font-family: Montserrat, sans-serif;
+  font-size: 22px;
+  font-weight: 900;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  color: var(--colorInverted, #FDFAF3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* "incl. $2.12 fees + $3.55 tax" under the figure: the muted foreground of
+   the inverted pair. Wraps rather than truncates: a clipped amount is a
+   wrong amount. At 1.2 three lines still sit inside the 84px bar (label 12 +
+   figure 24.2 + 3 × 14.4 + gaps = 83.4); past that `DockedBarPriceCaption`
+   steps the line aside (visually hidden, still read aloud — see `.sr-only`
+   below) rather than spill. */
+.event-sticky-bar__caption {
+  font-size: 12px;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  color: var(--colorMutedInverted, #BDB4A6);
+}
+
+.event-sticky-bar__cta {
+  flex: 1 1 auto;
+  max-width: 214px;
+}
+
+/* The price must never ellipsize: a clipped amount reads as a wrong amount.
+   On narrow phones the button sits at its content width (label + 32px a
+   side), so the price only gets what the gap and the button leave over.
+   Measured (Montserrat 900): "1.234,56 US$" is 158.5px at 22px and 144.1 at
+   20px. With a 14px gap the es column is 158.3 at 360 and 124.3 at 320. */
+@media (max-width: 374px) {
+  .event-sticky-bar {
+    gap: 8px;
+  }
+}
+
+/* Below 360px a smaller figure and a slimmer button (still 54px tall)
+   leave the es column ~156px, room for a four-digit price at 20px.
+   !important is required: the Button's padding (`--t-space-6`) is an INLINE
+   style, which no selector can outrank. */
+@media (max-width: 359px) {
+  .event-sticky-bar__figure {
+    font-size: 20px;
+  }
+
+  .event-sticky-bar .event-sticky-bar__cta [data-testid="event-sticky-get-tickets-btn"] {
+    padding-left: 16px !important;
+    padding-right: 16px !important;
+  }
+}
+
+@media (min-width: 768px) {
+  .event-sticky-bar {
+    display: none;
+  }
+
+  .event-page-split {
+    /* Two columns that align across five rows — with EXPLICIT tracks rather
+       than an fr split. The rail column is not claiming a share of whatever
+       is going; it exists to give a portrait file a KNOWN width, because the
+       ceiling in `.event-hero-poster-img` is written in `cqw` and the rail
+       is what that percentage is a percentage of. Explicit ROWS too, so the
+       rail column can span `2 / -1`. */
+    grid-template-columns: minmax(0, 300px) minmax(0, 1fr);
+    /* The LAST row is flexible. The rail column spans rows 2-5 and, with the
+       facts under the poster, is routinely taller than the decision column;
+       a spanning item's excess is otherwise split equally across the auto
+       rows it spans — MEASURED at 1440: 38px of empty band between the meta
+       row and the buy card. With an fr track at the end, the slack lands
+       below the last section instead. */
+    grid-template-rows: auto auto auto auto minmax(0, 1fr);
+    column-gap: 56px;
+    align-items: start;
+    /* Back inside the column: the band and the fade do their own full-bleed
+       escape below, and the paper is the page's, via ::before. */
+    margin-inline: 0;
+    padding-inline: 24px;
+    padding-bottom: 80px;
+    background: transparent;
+  }
+
+  /* The paper. Full-bleed and behind everything in the page column — which
+     is still ABOVE the fixed HeroBackdrop, because the column is its own
+     stacking context (EventPageBody: position relative, z-index 1) and this
+     lives inside it. Without it, the gutters beside the column and the rail
+     column below the poster would show the raw blurred backdrop.
+
+     It starts where the fade ENDS — a grid item on rows 3 to the end, 120px
+     down (the fade's height) — never at the top of the grid. It used to be
+     `inset: 0`, which put cream UNDER the band: 0.62-0.70 black over cream is
+     flat grey, and the parallax backdrop the band exists to scrim was hidden
+     everywhere except the 32px strip above the grid. The bottom padding is
+     inside the last row's extent, so the paper still runs to the footer. */
+  .event-page-split::before {
+    content: "";
+    position: relative;
+    z-index: -1;
+    grid-column: 1 / -1;
+    grid-row: 3 / -1;
+    align-self: stretch;
+    margin-top: 120px;
+    margin-bottom: -80px;
+    margin-inline: calc(50% - 50vw);
+    background: var(--background, #F6F0E4);
+  }
+
+  /* The band and the fade are this page's scrim; the backdrop's own veil
+     (built for the old full-hero layout) stacked another 0.3-0.6 black on
+     top and crushed the poster's colour to near-black. */
+  html:has(.event-page-split--immersive) .hero-backdrop__veil {
+    display: none;
+  }
+
+  /* Wide, the hero text sits on the band: the on-dark rungs. */
+  .event-page-split--immersive {
+    --hero-ink: var(--onStructure, #FDFAF3);
+    --hero-ink-muted: color-mix(
+      in srgb,
+      var(--onStructure, #FDFAF3) 85%,
+      transparent
+    );
+    --hero-rule: color-mix(in srgb, var(--onStructure, #FDFAF3) 35%, transparent);
+  }
+
+  /* ── The band: rows 1-2, full-bleed, up under the navbar ── */
+  .event-page-split__band {
+    display: block;
+    grid-column: 1 / -1;
+    grid-row: 1 / 3;
+    align-self: stretch;
+    position: relative;
+    z-index: 0;
+    pointer-events: none;
+    margin-inline: calc(50% - 50vw);
+    margin-top: calc(-1 * var(--shell-top));
+    /* The floor. 0.62 at the top under the back link, 0.70 by the meta
+       block — the same numbers the zone-wide scrim used, minus its fade. */
+    background: linear-gradient(
+      to bottom,
+      rgba(0, 0, 0, 0.62) 0,
+      rgba(0, 0, 0, 0.7) 100%
+    );
+  }
+
+  /* ── The fade: the top of row 3 only. Behind the buy band, below the last
+     light glyph (the sheet pads 24px above this edge). When there is no buy
+     band the row is exactly this tall, so the sections start on cream. ── */
+  .event-page-split__fade {
+    display: block;
+    grid-column: 1 / -1;
+    grid-row: 3;
+    align-self: start;
+    position: relative;
+    z-index: 0;
+    pointer-events: none;
+    height: 120px;
+    margin-inline: calc(50% - 50vw);
+    background: linear-gradient(
+      to bottom,
+      rgba(0, 0, 0, 0.7) 0,
+      rgba(0, 0, 0, 0.42) 40%,
+      var(--background, #F6F0E4) 100%
+    );
+  }
+
+  .event-page-split__back {
+    display: block;
+    grid-column: 1 / -1;
+    grid-row: 1;
+    position: relative;
+    z-index: 1;
+    padding: 12px 0;
+    /* The link carries 12px of its own left padding for its hit area; pull
+       it back so the arrow sits on the rail's left edge. */
+    margin-left: -12px;
+  }
+
+  /* ── The rail column: column 1, every row, ONE sticky unit ── */
+  .event-page-split__aside {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+    grid-column: 1;
+    grid-row: 2 / -1;
+    align-self: start;
+    /* The containing block is the grid AREA, which spans every row to the
+       right, so the column pins at the top and the decision column scrolls
+       past it — WHILE IT FITS the viewport. Taller than that (a 2:3 poster
+       plus the facts is ~1200px) sticky simply never engages, which is the
+       honest behaviour: there is nothing to pin without covering the facts.
+       Sticky is on the unit, never on the poster alone — a pinned poster
+       with the facts scrolling underneath it would hide them. Deliberately
+       NO overflow anywhere in here: the Share and Calendar menus open from
+       the rail. */
+    position: sticky;
+    /* Under the navbar (its visible height, published on the grid by
+       EventContent), plus the same 24px `.community-body__rail` keeps. */
+    top: calc(var(--navbar-visible, 0px) + 24px);
+    z-index: 1;
+  }
+
+  /* The facts carry the "Getting there" list (arrival areas), which makes the
+     unit too tall to pin without hiding lower rows that hold keyboard focus
+     (WCAG 2.4.11). It stops pinning while the list is in it. */
+  .event-page-split__rail:has([data-arrival-areas-list]) {
+    position: static;
+  }
+
+  .event-page-split__rail {
+    grid-row: auto;
+    margin-top: 0;
+  }
+
+  /* The facts, under the actions: the same section rhythm the column has. */
+  .event-page-split__facts {
+    grid-row: auto;
+    padding: 0;
+  }
+
+  /* A photograph is a plate here, not the page: the same 2px ink frame the
+     page's other content blocks carry. `cqw` measures the container's
+     content box, so the frame does not move the 2:3 ceiling. */
+  .event-page-split .event-hero-poster-frame {
+    border: 2px solid var(--borderColor, #211C16);
+  }
+
+  /* Save / Share / Calendar: three equal buttons directly under the poster. */
+  .event-poster-chrome {
+    position: static;
+    display: block;
+    margin-top: 16px;
+  }
+
+  .event-poster-chrome__back {
+    display: none;
+  }
+
+  .event-poster-chrome__actions {
+    margin-left: 0;
+  }
+
+  .event-poster-action-anchor {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+
+  .event-poster-action-anchor--calendar {
+    display: block;
+  }
+
+  .event-poster-action {
+    flex: 1 1 0;
+    min-width: 0;
+    width: 100%;
+    height: 44px;
+    /* "CALENDAR" at the 360px rail: 8 glyphs at ~8.9px, the icon, the gap
+       and this padding come to ~101px in a 108px button. */
+    padding: 0 4px;
+    gap: 6px;
+    letter-spacing: 1.5px;
+    border-color: var(--borderColor, #211C16);
+    background: var(--surface, #FDFAF3);
+    color: var(--color, #211C16);
+  }
+
+  /* Decisive: a colour inversion, the DS's content hover. */
+  .event-poster-action:hover,
+  .event-poster-action[aria-expanded="true"] {
+    background: var(--structure, #211C16);
+    border-color: var(--structure, #211C16);
+    color: var(--onStructure, #FDFAF3);
+  }
+
+  .event-poster-action:focus-visible {
+    outline-color: var(--structure, #211C16);
+  }
+
+  .event-poster-action__label {
+    position: static;
+    width: auto;
+    height: auto;
+    margin: 0;
+    overflow: visible;
+    clip: auto;
+  }
+
+  /* ── The decision column ── */
+  .event-page-split__sheet {
+    grid-column: 2;
+    grid-row: 2;
+    z-index: 1;
+    margin-top: 0;
+    border-top: 0;
+    background: transparent;
+    /* 24px of solid band below the last line of light text, before the
+       fade begins in row 3. This is the number the contrast argument above
+       rests on. */
+    padding: 0 0 24px;
+  }
+
+  .event-page-split .event-title-row h1 {
+    /* The title takes the whole column — Save/Share left this row for the
+       rail, and the column runs 364px at its narrowest, where sharing the
+       line would leave the h1 under 200px at the 42px display scale. */
+    flex-basis: 100% !important;
+  }
+
+  /* ── The buy band: a paper card straddling the band → cream boundary ── */
+  .event-buy-band {
+    grid-column: 2;
+    grid-row: 3;
+    align-self: start;
+    position: relative;
+    z-index: 1;
+    display: flex;
+    /* The column is 300px at 768 and the price + CTA need ~350 on one line:
+       the CTA drops under the figure there, right-aligned, rather than
+       covering it. */
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px 20px;
+    box-sizing: border-box;
+    border: 2px solid var(--borderColor, #211C16);
+    background: var(--surface, #FDFAF3);
+    padding: 18px 20px;
+  }
+
+  .event-buy-band__price {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+
+  .event-buy-band__figure {
+    font-family: Montserrat, sans-serif;
+    font-size: 32px;
+    font-weight: 900;
+    letter-spacing: -1px;
+    line-height: 1.1;
+    font-variant-numeric: tabular-nums;
+    color: var(--color, #211C16);
+  }
+
+  .event-buy-band__remaining {
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--colorMuted, #5C544A);
+  }
+
+  .event-buy-band__cta {
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+
+  .event-page-split__content {
+    grid-column: 2;
+    grid-row: 4;
+    padding: 32px 0 0;
+  }
+
+  .event-page-split__after {
+    grid-column: 2;
+    grid-row: 5;
+  }
+
+  /* The rail carries "Add to calendar" from here up. */
+  .event-page-split .event-schedule-calendar {
+    display: none;
+  }
+}
+
+/* Between the columns turning on and the first rail step the rail is 300px,
+   so each of its three buttons is ~93px: "SAVE" fits, "CALENDAR" does not.
+   Icon-only there — every one of them carries an aria-label — and labelled
+   from the 360px rail up. */
+@media (min-width: 768px) and (max-width: 899px) {
+  /* The decision column is 300px here. "WILLIAMSBURG" at the 42px display
+     scale is ~330px and broke mid-word (MEASURED); 32px is ~250px. The
+     inline clamp() is viewport-based and cannot know the column, hence the
+     !important. */
+  .event-page-split .event-title-row h1 {
+    font-size: 32px !important;
+  }
+
+  .event-poster-action__label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+  }
+}
+
+@media (min-width: 900px) {
+  .event-page-split {
+    /* First step up. The column pays 60px for it at the boundary itself (496
+       at 899 -> 436 at 900) and earns it straight back as the page grows —
+       any step function has one such pixel, and 900 is the DS breakpoint to
+       spend it on. */
+    grid-template-columns: minmax(0, 360px) minmax(0, 1fr);
+  }
+}
+
+@media (min-width: 1200px) {
+  .event-page-split {
+    /* The full rail. 440px is where a 2:3 flyer lands at 660px: tall enough
+       to read a lineup off, short enough to clear a laptop viewport under
+       the navbar. The page stopped growing at 1088, so this last step is the
+       one that genuinely trades column width for poster size — 624px of
+       column down to 544px, still the ~65-character measure. */
+    grid-template-columns: minmax(0, 440px) minmax(0, 1fr);
+  }
+}
+
+.event-content-meta {
+  animation: eventContentReveal 0.5s ease-out 0.08s both;
+  /* The animation creates a stacking context; lift it so the share dropdown
+     (z-index: 9999 inside) renders above subsequent animated sections. */
+  position: relative;
+  z-index: 10;
+}
+
+/* Reveal order follows DOM order, so these two delays swapped when the prose
+   moved above the logistics: the body is now the third band down and the
+   logistics the fourth. Left as they were, the block sitting SECOND would have
+   animated in 80ms after the one below it. */
+.event-content-logistics {
+  animation: eventContentReveal 0.5s ease-out 0.24s both;
+}
+
+/* Below the h1's desktop-scale breakpoint the title takes the full row and
+   the SAVE/share actions wrap onto their own line — sharing the line squeezed
+   the h1 to ~156px on phones, forcing mid-word breaks at any font size.
+   !important is required: the h1 carries an inline `flex: 1` (inline
+   flex-basis: 0% beats any non-important class rule), and with a 0 basis +
+   min-width: 0 the item shrinks forever instead of triggering flex-wrap. */
+@media (max-width: 559px) {
+  .event-title-row h1 {
+    flex-basis: 100% !important;
+  }
+}
+
+/* Also the COMMUNITY layout's description wrapper, where it already led with
+   no `.event-content-logistics` sibling rendered — this tightens that stagger
+   by 80ms rather than reordering it. That layout consequently runs
+   0.08 → 0.16 → 0.32 with nothing at 0.24; the gap is deliberate, because the
+   alternative is a second set of delays keyed to a layout the rest of this
+   file does not know about. */
+.event-content-body-section {
+  animation: eventContentReveal 0.5s ease-out 0.16s both;
+}
+
+.event-content-tickets-section {
+  animation: eventContentReveal 0.5s ease-out 0.32s both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .event-content-hero,
+  .event-content-meta,
+  .event-content-logistics,
+  .event-content-body-section,
+  .event-content-tickets-section {
+    animation: none;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Fee tooltip (ticket rows on event detail)
+ * Shows on hover (desktop) AND focus-within (touch / keyboard)
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+.fee-tooltip-anchor {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.fee-tooltip-content {
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 8px);
+  right: 0;
+  z-index: 20;
+  min-width: 280px;
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--foreground, #211C16) 95%, transparent);
+  color: var(--background, #F6F0E4);
+  border-radius: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.fee-tooltip-content::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  right: 12px;
+  border: 5px solid transparent;
+  border-top-color: color-mix(in srgb, var(--foreground, #211C16) 95%, transparent);
+}
+
+.fee-tooltip-anchor:hover .fee-tooltip-content,
+.fee-tooltip-anchor:focus-within .fee-tooltip-content {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.fee-tooltip-row {
+  display: block;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Share dropdown
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+.share-dropdown-anchor {
+  position: relative;
+}
+
+.share-dropdown-menu {
+  display: none;
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 9999;
+  min-width: 180px;
+  padding: 6px 0;
+  background: color-mix(in srgb, var(--foreground, #211C16) 95%, transparent);
+  border-radius: 0;
+  border: 1px solid color-mix(in srgb, var(--background, #F6F0E4) 15%, transparent);
+  overflow: hidden;
+}
+
+.share-dropdown-anchor[data-open="true"] .share-dropdown-menu {
+  display: block;
+}
+
+.share-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 14px;
+  background: none;
+  border: none;
+  color: var(--background, #F6F0E4);
+  font-size: 14px;
+  font-family: inherit;
+  cursor: pointer;
+  text-align: left;
+  text-decoration: none;
+  transition: background 0.15s ease;
+}
+
+.share-dropdown-item:hover {
+  background: color-mix(in srgb, var(--background, #F6F0E4) 15%, transparent);
+}
+
+.share-dropdown-item svg {
+  flex-shrink: 0;
+}
+
+/* The description typography (`.event-content-body` and its --mobile /
+   --email variants) lives in event-body-typography.css, shared with the
+   description editor. EventContent.tsx imports it. */
+
+/* ── Accessibility utilities ─────────────────────────────── */
+/* The docked bar's breakdown steps aside VISUALLY when it can't fit the 84px
+   bar (`DockedBarPriceCaption`), but stays in the accessibility tree. It
+   rides this rule rather than `display`, so a later `display:` on the
+   caption can never un-hide it. */
+.event-sticky-bar__caption[data-overflow="true"],
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Focus ring for custom interactive elements */
+.fee-tooltip-anchor [tabindex]:focus-visible {
+  outline: var(--focus-width) solid var(--focus-color);
+  outline-offset: var(--focus-offset);
+  border-radius: 0;
+}
+
+.copy-address-btn:focus-visible {
+  outline: var(--focus-width) solid var(--focus-color);
+  outline-offset: var(--focus-offset);
+  border-radius: 0;
+}
+
+/* Travel-time buttons use `all: unset`, which strips the UA focus ring —
+   restore a visible one. */
+.travel-time-btn:focus-visible {
+  outline: var(--focus-width) solid var(--focus-color);
+  outline-offset: var(--focus-offset);
+  border-radius: 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Lineup "Listen" chip (lineup-listen-embeds)
+ * Quiet secondary affordance on the lineup row — the act's name/role stays
+ * the primary content. Strict Swiss: radius 0, visible hairline border,
+ * decisive ink inversion on hover and while the player panel is expanded.
+ * Below-fold themed tokens only (reads on both Stub and Ember).
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+.lineup-listen-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto; /* pin to the row end so chips align across rows */
+  min-height: 36px;
+  padding: 4px 12px;
+  background: transparent;
+  border: 1px solid var(--borderColor, #211C16);
+  border-radius: 0;
+  color: var(--color, #211C16);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.lineup-listen-chip svg {
+  flex-shrink: 0;
+}
+
+.lineup-listen-chip:hover,
+.lineup-listen-chip[aria-expanded="true"] {
+  background: var(--color, #211C16);
+  color: var(--colorInverted, #FDFAF3);
+}
+
+.lineup-listen-chip:focus-visible {
+  outline: var(--focus-width) solid var(--focus-color);
+  outline-offset: var(--focus-offset);
+  border-radius: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lineup-listen-chip {
+    transition: none;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Calendar dropdown (mirrors share-dropdown pattern)
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+.calendar-dropdown-anchor {
+  position: relative;
+}
+
+.calendar-dropdown-menu {
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 25;
+  min-width: 200px;
+  padding: 6px 0;
+  background: color-mix(in srgb, var(--foreground, #211C16) 95%, transparent);
+  border-radius: 0;
+  border: 1px solid color-mix(in srgb, var(--background, #F6F0E4) 15%, transparent);
+  overflow: hidden;
+}
+
+.calendar-dropdown-anchor[data-open="true"] .calendar-dropdown-menu {
+  display: block;
+}
+
+/* Under the poster rail the trigger sits at the TOP of the page, so the menu
+   opens downward and hangs off the right edge (the rail is as narrow as 300px
+   and the menu 200px, so a left-anchored menu would cross into the column). */
+.calendar-dropdown-menu--below {
+  top: calc(100% + 6px);
+  bottom: auto;
+  left: auto;
+  right: 0;
+}
+
+.calendar-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 14px;
+  background: none;
+  border: none;
+  color: var(--background, #F6F0E4);
+  font-size: 14px;
+  font-family: inherit;
+  cursor: pointer;
+  text-align: left;
+  text-decoration: none;
+  transition: background 0.15s ease;
+}
+
+.calendar-dropdown-item:hover {
+  background: color-mix(in srgb, var(--background, #F6F0E4) 15%, transparent);
+}
+
+.calendar-dropdown-item svg {
+  flex-shrink: 0;
+}
+
+/* Ensure fee tooltip doesn't overflow on narrow viewports */
+@media (max-width: 480px) {
+  .fee-tooltip-content {
+    right: auto;
+    left: 50%;
+    transform: translateX(-50%);
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Responsive logistics block: side-by-side on desktop, stacked on mobile
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+.logistics-row {
+  flex-direction: column !important;
+  gap: 0 !important;
+}
+
+@media (min-width: 768px) {
+  .logistics-row {
+    flex-direction: row !important;
+    gap: 28px !important;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Ticket type rows: wrap price / capacity below name on narrow screens
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+@media (max-width: 480px) {
+  .ticket-type-row {
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    gap: 6px;
+  }
+
+  .ticket-type-row__right {
+    flex-wrap: wrap;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Community listing layout (COMMUNITY stewardship, RSVP attendance)
+ *
+ * Only the public community branch uses these. The ticketed (OWNED) page never
+ * carries these classes, so nothing here can reach it.
+ *
+ * Written as plain CSS on plain elements rather than as Tamagui props for one
+ * reason: both blocks REFLOW at a breakpoint (the head's date panel goes from
+ * a band above the title to a column beside it; the body goes from one column
+ * to two tracks). A Tamagui `flexDirection` prop compiles to an atomic class of
+ * the same specificity as a stylesheet rule, so overriding it from here would
+ * need `!important` at every reflow site.
+ *
+ * Colours are `var(--token, <stub hex>)`: the injector sets `--<key>` at
+ * runtime and the fallback is what SSR / first paint renders.
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/* ── The head: the Date Stub promoted from decoration to the page head ────── */
+
+.community-head {
+  display: flex;
+  /* Narrow first: the date is a band ABOVE the title. Beside it, the title
+     would be wrapping inside ~148px at a 320px viewport. */
+  flex-direction: column;
+  align-items: stretch;
+  border: 2px solid var(--borderColor, #211C16);
+  background: var(--surface, #FDFAF3);
+  /* No `eventContentReveal` here. The head renders inside
+     `.event-content-meta`, which already runs that animation at a 0.08s
+     delay; running it again at 0s compounded the 36px translate and
+     multiplied the opacity, so the head slid further and finished 80ms
+     before the block it sits in. */
+}
+
+.community-head__date {
+  display: flex;
+  flex-shrink: 0;
+  width: 100%;
+  /* Enough for the `lg` ramp's stacked group (weekday 15 + numeral 56 +
+     month 15 = 86px) plus air. */
+  height: 112px;
+}
+
+.community-head__body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+  padding: 16px 16px 18px;
+}
+
+.community-head__time {
+  /* The mono label idiom, `sm` rung — size and tracking travel together. */
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--fs-mono-sm, 11px);
+  letter-spacing: var(--tr-mono-sm, 2px);
+  line-height: 14px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--colorMuted, #5C544A);
+}
+
+/* STARTS 8:30 PM — key muted, value in ink, the fact block's key/value
+   relationship on one line. Inline, not flex: the space between the two is a
+   real text node, so it is both what a screen reader speaks and where a narrow
+   column breaks. Some ICU builds join "8:30" and "PM" with a no-break space;
+   others (Node 24.8, measured) use an ordinary one, so `nowrap` is what keeps
+   "PM" from stranding. */
+.community-head__time-value {
+  color: var(--color, #211C16);
+  white-space: nowrap;
+}
+
+.community-head__title {
+  font-family: "Montserrat", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, sans-serif;
+  /* Ramps with the viewport rather than sitting at a fixed display size: the
+     head's body column is narrower than the old full-width h1's line box, and
+     a fixed 42px shattered long titles letter-by-letter at 390px. */
+  font-size: clamp(21px, 5.6vw, 34px);
+  font-weight: 900;
+  line-height: 1.08;
+  letter-spacing: -0.8px;
+  text-transform: uppercase;
+  margin: 0;
+  color: var(--color, #211C16);
+  /* Word boundaries only — `break-word` never splits a word that fits on its
+     own line and does not inflate the flex item's min-content width. */
+  overflow-wrap: break-word;
+  hyphens: auto;
+  -webkit-hyphens: auto;
+  min-width: 0;
+}
+
+.community-head__venue {
+  font-family: "Montserrat", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+  font-weight: 500;
+  margin: 0;
+  color: var(--colorMuted, #5C544A);
+}
+
+/* "Confirmed by venue" — the mono overline idiom, hairline-separated, the
+   same treatment it had inside the hero's venue badge. */
+.community-head__confirmed {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding-left: 8px;
+  border-left: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--fs-mono-xs, 10px);
+  letter-spacing: var(--tr-mono-xs, 2.5px);
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--colorMuted, #5C544A);
+  white-space: nowrap;
+}
+
+.community-head__venue-link {
+  color: var(--accentText, #A8300F);
+  text-decoration: none;
+}
+
+.community-head__venue-link:hover,
+.community-head__venue-link:focus-visible {
+  text-decoration: underline;
+}
+
+@media (min-width: 560px) {
+  .community-head {
+    flex-direction: row;
+  }
+
+  .community-head__date {
+    width: 30%;
+    /* Beyond this the torn column stops reading as a stub half and starts
+       reading as a coloured panel with a small number in it. */
+    max-width: 176px;
+    height: auto;
+    min-height: 168px;
+  }
+
+  .community-head__body {
+    padding: 22px 24px;
+  }
+}
+
+/* ── The body: one column on a phone, two tracks with a sticky rail wide ──── */
+
+.community-body {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+/*
+ * Reading order IS DOM order here — there is not one `order` rule in this
+ * layout, and that is deliberate.
+ *
+ * The first version interleaved two tracks with `order: 1..5` so the fact
+ * block could paint above the date list on a phone. But the fact block holds
+ * the address link, "View venue page", copy-address and "Suggest an edit", so
+ * a keyboard user tabbed off the description, skipped the facts entirely,
+ * landed in the RSVP toggles several hundred pixels below, and the NEXT tab
+ * jumped back UP to the address link. WCAG 1.3.2 and 2.4.3, both Level A.
+ *
+ * Three wrappers instead. On a phone all three dissolve and their children
+ * fall into one column in source order: description, facts, lineup, dates,
+ * map. Wide, the grid places them — the rail spans both rows in column two
+ * and sticks, without a single item being reordered.
+ */
+.community-body__track {
+  display: contents;
+}
+
+@media (min-width: 768px) {
+  .community-body {
+    /* Columns align across rows, so this is a grid — and an explicit
+       asymmetric fr, never 50/50. */
+    display: grid;
+    grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+    gap: 32px;
+    align-items: start;
+  }
+
+  .community-body__track {
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+    min-width: 0;
+  }
+
+  .community-body__lead {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .community-body__rest {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  /* The rail is what fixes the measured desktop failure: the right column
+     used to hold a ~300px map and then ~500px of dead space while the left
+     column ran on. Spanning both rows lets it stay in view for the length of
+     the whole left track. Sticky works on a row-spanning grid item — the
+     containing block is the grid area.
+
+     It carries the fact block ONLY. With the map and the calendar dropdown in
+     here too the pinned box ran ~690px, so on a 13" laptop the last control
+     sat off-screen the entire time it was stuck; and a scroll container is not
+     the fix, because CalendarDropdown's menu opens upward out of its own box
+     (`bottom: calc(100% + 6px)`, below) and the listing-notice popover renders
+     inline — both would be clipped. */
+  .community-body__rail {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+    position: sticky;
+    top: 24px;
+  }
+
+  /* A "Getting there" list (arrival areas) outgrows a laptop viewport, and a
+     pinned rail that tall hides its lower rows while they hold keyboard focus
+     (WCAG 2.4.11). The rail stops pinning while it carries the list; still no
+     scroll container, for the reason above. */
+  .community-body__rail:has([data-arrival-areas-list]) {
+    position: static;
+  }
+}
+
+/* ── The fact block — WHERE / WHEN / LISTED BY ────────────────────────────── */
+
+.community-facts {
+  display: flex;
+  flex-direction: column;
+  border: 2px solid var(--borderColor, #211C16);
+  background: var(--surface, #FDFAF3);
+}
+
+.community-facts__row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+}
+
+.community-facts__row + .community-facts__row {
+  border-top: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+.community-facts__key {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--fs-mono-xs, 10px);
+  letter-spacing: var(--tr-mono-xs, 2.5px);
+  line-height: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--colorMuted, #5C544A);
+}
+
+.community-facts__value {
+  font-family: "Montserrat", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--color, #211C16);
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+
+/* When the address IS a maps link it has to look like one — the same
+   accent-as-text token the location section already uses, which is the AA-safe
+   rung (`accent` itself is a graphic value and cannot carry small text). */
+a.community-facts__value {
+  color: var(--accentText, #A8300F);
+  text-decoration: none;
+}
+
+a.community-facts__value:hover,
+a.community-facts__value:focus-visible {
+  text-decoration: underline;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .community-head {
+    animation: none;
+  }
+}

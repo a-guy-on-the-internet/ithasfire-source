@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   force-unlock:
@@ -26,29 +27,30 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v4
+        uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.6
 
       # Forgejo Actions doesn't inject GitHub OIDC tokens — match the
       # working `terraform-apply.yml` pattern and use the SA key.
       - name: Auth to Google Cloud
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
         id: setup_gcloud
         # Retried below — see the note at the first occurrence in deploy-dev.yml.
         continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Setup gcloud (retry)
         if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version

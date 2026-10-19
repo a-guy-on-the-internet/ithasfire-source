@@ -1,5 +1,6 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
+  AccessibilityInfo,
   ActivityIndicator,
   KeyboardAvoidingView,
   Modal,
@@ -11,8 +12,7 @@ import {
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { TRPCClientError } from "@trpc/client";
-import { AlertTriangle, X } from "lucide-react-native";
+import { AlertTriangle, ShieldCheck, X } from "lucide-react-native";
 
 import {
   SquarePrimaryButton,
@@ -22,29 +22,19 @@ import {
   type NativePalette,
 } from "@th/ui-native";
 
-import { trpc } from "@/lib/trpc";
-
-const getPasswordErrorMessage = (err: unknown): string => {
-  if (err instanceof TRPCClientError) {
-    const code = (err.data as { code?: string } | undefined)?.code;
-    if (code === "TOO_MANY_REQUESTS") {
-      return "Too many attempts. Wait a minute and try again.";
-    }
-    if (code === "BAD_REQUEST") {
-      return "That password didn't work. Check it and try again.";
-    }
-  }
-  return "Couldn't verify the password. Try again.";
-};
+import { PASSWORD_COPY } from "./event-password-challenge";
+import { useEventPasswordSubmit } from "./use-event-password-submit";
 
 /**
  * Bottom-sheet password prompt for password-gated events (FR-011).
  *
- * Calls `events.validatePassword`; the server persists the unlock for
- * signed-in viewers, so on success we invalidate the gate state (plus the
- * detail queries it gates) and the screen re-renders unlocked. Wrong
- * passwords keep the sheet open with an inline error. The password is never
- * logged or persisted client-side.
+ * Calls `events.validatePassword` through `useEventPasswordSubmit`; the
+ * server persists the unlock for signed-in viewers, so on success the hook
+ * invalidates the gate state (plus the detail queries it gates) and the
+ * screen re-renders unlocked. Wrong passwords keep the sheet open with an
+ * inline error. When the server asks for a Turnstile check, the hook runs it
+ * in the system browser and resubmits once. The password is never logged or
+ * persisted client-side.
  */
 export const EventPasswordSheet = ({
   eventId,
@@ -55,56 +45,50 @@ export const EventPasswordSheet = ({
   visible: boolean;
   onClose: () => void;
 }) => {
-  const utils = trpc.useUtils();
   const insets = useSafeAreaInsets();
   const colors = useColors();
   const shared = useStyles();
   const styles = useThemedSheet(makeSheet);
   const [password, setPassword] = useState("");
   const [focused, setFocused] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  const mutation = trpc.events.validatePassword.useMutation({
-    // Never auto-retry: a wrong password would be re-submitted and burn the
-    // 5/min/event rate-limit budget.
-    retry: false,
-    onSuccess: async (data) => {
-      if (!data.unlocked) {
-        setErrorMessage("That password didn't work. Check it and try again.");
-        return;
-      }
-      setPassword("");
-      setErrorMessage(null);
-      // Gate state flips passwordRequired → false, which re-enables the
-      // gated detail queries (SEO, body, ticket types, waiver).
-      await Promise.all([
-        utils.events.getGateState.invalidate({ eventId }),
-        utils.events.getEventSeo.invalidate(),
-        utils.events.getPublicEventBody.invalidate(),
-        utils.events.listEventTicketTypes.invalidate({ eventId }),
-        utils.waivers.getEventWaiver.invalidate({ eventId }),
-      ]);
-      onClose();
-    },
-    onError: (err) => {
-      setErrorMessage(getPasswordErrorMessage(err));
-    },
+  const handleUnlocked = useCallback(() => {
+    setPassword("");
+    onClose();
+  }, [onClose]);
+
+  const { submit, isBusy, notice, clearNotice } = useEventPasswordSubmit({
+    eventId,
+    onUnlocked: handleUnlocked,
   });
 
-  const canSubmit = password.trim().length > 0 && !mutation.isPending;
+  // iOS: `accessibilityRole="alert"` doesn't announce a view as it mounts,
+  // and the notice usually mounts as the browser sheet closes, when VoiceOver
+  // is re-focusing the app. `queue: true` waits for that speech instead of
+  // being cut off by it. Keyed on the object, so the same message after a
+  // retry is announced again. Android uses the banner's
+  // `accessibilityLiveRegion` instead (its announce API is deprecated at
+  // API 36), so neither platform reads it twice.
+  useEffect(() => {
+    if (!notice || Platform.OS !== "ios") return;
+    AccessibilityInfo.announceForAccessibilityWithOptions(notice.text, {
+      queue: true,
+    });
+  }, [notice]);
+
+  const canSubmit = password.trim().length > 0 && !isBusy;
 
   const handleSubmit = useCallback(() => {
     if (!canSubmit) return;
-    setErrorMessage(null);
-    mutation.mutate({ eventId, password: password.trim() });
-  }, [canSubmit, eventId, mutation, password]);
+    void submit(password.trim());
+  }, [canSubmit, password, submit]);
 
   const handleClose = useCallback(() => {
-    if (mutation.isPending) return;
+    if (isBusy) return;
     setPassword("");
-    setErrorMessage(null);
+    clearNotice();
     onClose();
-  }, [mutation.isPending, onClose]);
+  }, [clearNotice, isBusy, onClose]);
 
   return (
     <Modal
@@ -150,18 +134,48 @@ export const EventPasswordSheet = ({
               see details and get tickets.
             </Text>
 
-            {errorMessage ? (
-              <View style={styles.errorBanner} accessibilityRole="alert">
-                <AlertTriangle color={colors.dangerSoft} size={18} />
-                <Text style={styles.errorText}>{errorMessage}</Text>
-              </View>
-            ) : null}
+            {/* Always mounted so a notice is a content change INSIDE an existing
+                Android live region; TalkBack often skips a node that mounts
+                with the region already set. Empty, it is taken out of flow so
+                the sheet's `gap` doesn't add space for it. `collapsable={false}`
+                keeps Fabric from flattening the empty view away. */}
+            <View
+              accessibilityLiveRegion="polite"
+              collapsable={false}
+              style={notice ? null : styles.liveRegionEmpty}
+            >
+              {notice ? (
+                <View
+                  style={
+                    notice.tone === "info" ? styles.infoBanner : styles.errorBanner
+                  }
+                  // Danger only: the info notice is guidance, not an alert.
+                  accessibilityRole={
+                    notice.tone === "danger" ? "alert" : undefined
+                  }
+                  testID="event-password-notice"
+                >
+                  {notice.tone === "info" ? (
+                    <ShieldCheck color={colors.color} size={18} />
+                  ) : (
+                    <AlertTriangle color={colors.dangerSoft} size={18} />
+                  )}
+                  <Text
+                    style={
+                      notice.tone === "info" ? styles.infoText : styles.errorText
+                    }
+                  >
+                    {notice.text}
+                  </Text>
+                </View>
+              ) : null}
+            </View>
 
             <TextInput
               value={password}
               onChangeText={(value) => {
                 setPassword(value);
-                setErrorMessage(null);
+                clearNotice();
               }}
               placeholder="Event password"
               placeholderTextColor={colors.placeholder}
@@ -171,7 +185,7 @@ export const EventPasswordSheet = ({
               secureTextEntry
               returnKeyType="go"
               enterKeyHint="go"
-              editable={!mutation.isPending}
+              editable={!isBusy}
               onFocus={() => setFocused(true)}
               onBlur={() => setFocused(false)}
               onSubmitEditing={handleSubmit}
@@ -182,13 +196,13 @@ export const EventPasswordSheet = ({
 
             <View style={styles.ctaWrapper}>
               <SquarePrimaryButton
-                label={mutation.isPending ? "Checking..." : "Unlock event"}
+                label={isBusy ? "Checking..." : PASSWORD_COPY.unlockCta}
                 onPress={handleSubmit}
                 disabled={!canSubmit}
                 accessibilityHint="Submits the event password to unlock details and tickets."
                 testID="event-password-submit"
               />
-              {mutation.isPending ? (
+              {isBusy ? (
                 <View style={styles.spinnerOverlay} pointerEvents="none">
                   {/* Sits ON the primary button's `ctaFill`. */}
                   <ActivityIndicator color={colors.onCta} />
@@ -261,6 +275,28 @@ const makeSheet = (c: NativePalette) =>
     errorText: {
       flex: 1,
       color: c.dangerSoft,
+      fontFamily: "Montserrat",
+      fontSize: 14,
+      lineHeight: 19,
+    },
+    // Out of flow while empty: an in-flow 0-height child still gets the
+    // sheet's 14px `gap` on each side; an absolute one gets none.
+    liveRegionEmpty: { position: "absolute" },
+    // Guidance, not a failure (the security-check step): structural ink on
+    // the border + label, same geometry as the error banner.
+    infoBanner: {
+      minHeight: 44,
+      borderWidth: 2,
+      borderColor: c.borderColorStrong,
+      backgroundColor: c.surface,
+      padding: 12,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 10,
+    },
+    infoText: {
+      flex: 1,
+      color: c.color,
       fontFamily: "Montserrat",
       fontSize: 14,
       lineHeight: 19,

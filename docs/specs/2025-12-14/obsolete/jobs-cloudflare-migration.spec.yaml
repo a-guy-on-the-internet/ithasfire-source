@@ -1,0 +1,63 @@
+# Spec: Jobs Cloudflare Workers Migration Exploration
+meta:
+  owner: platform-rnd
+  status: draft
+  reviewers:
+    - platform-eng
+    - security
+summary: |
+  Explore the feasibility of running selected jobs (HTTP-triggered or lightweight queue
+  consumers) on Cloudflare Workers/Pages Functions instead of Kubernetes.
+scope:
+  included:
+    - Candidate job identification and selection criteria.
+    - Architecture comparison: Workers vs. current BullMQ/KEDA.
+    - Deployment + secret management approach in Cloudflare.
+    - Observability and rollback plan.
+  excluded:
+    - Immediate production migration (requires follow-up RFC).
+requirements:
+  candidates:
+    selection_criteria:
+      - CPU < 10ms, no heavy filesystem usage.
+      - Requires HTTP integrations or Cloudflare R2 proximity.
+      - Can tolerate Workers execution limits (50ms CPU per invocation, 128MB memory).
+    shortlist:
+      - sitemap shard publish webhook
+      - notifications webhook fan-out (Resend/Slack)
+      - lightweight cache warmer triggers
+  architecture:
+    data_flow:
+      - trigger: Cloudflare Cron Triggers or Queues (beta)
+      - storage: Cloudflare R2 + KV for idempotency tokens
+      - fallback: enqueue to BullMQ if Workers unavailable
+    deployment:
+      - repository: packages/adapters-cloudflare (new)
+      - bundler: Wrangler with `wrangler.toml` per worker
+      - secrets: Cloudflare Secrets Manager (mirrored from @th/config via Terraform)
+    interop:
+      - expose HTTP endpoints consumed by Fastify for hybrid flows
+      - use Ports layer to abstract Cloudflare vs. Node runtime implementations
+  observability:
+    metrics:
+      - Workers traces exported to Datadog via Cloudflare Logs
+      - Custom metrics: execution_count, queue_depth (Cloudflare Queues)
+    logging:
+      - ensure PII scrubbing per security guidelines
+      - ship logs to R2 + Datadog using Logpush
+  rollout:
+    phases:
+      1. Proof-of-concept in dev: migrate sitemap shard publisher only.
+      2. Run parallel execution alongside KEDA job; compare outputs.
+      3. Document performance, cost, and reliability findings.
+      4. Draft RFC for production migration if benefits realized.
+risk_mitigation:
+  - Maintain fallback path to existing Kubernetes workers.
+  - Limit initial rollout to non-critical jobs.
+  - Validate cost implications vs. current infrastructure.
+  - Ensure secrets rotation is automated in Terraform.
+acceptance_criteria:
+  - Candidate list agreed with product + SRE stakeholders.
+  - POC plan documented including infrastructure requirements.
+  - Observability + rollback strategies defined to SRE satisfaction.
+  - Decision framework established for future migration go/no-go.

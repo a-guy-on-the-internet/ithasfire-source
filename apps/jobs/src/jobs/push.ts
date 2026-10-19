@@ -17,7 +17,7 @@ import {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // push.drain-receipts
-// Every 15 minutes: poll Expo receipts for due tickets, disable dead devices,
+// Every 30 minutes: poll Expo receipts for due tickets, disable dead devices,
 // delete resolved/expired rows (the outbox drains to empty).
 // ─────────────────────────────────────────────────────────────────────────────
 

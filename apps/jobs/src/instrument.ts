@@ -8,6 +8,7 @@
  * integrations the API carries are unnecessary here.
  */
 import * as Sentry from "@sentry/node";
+import { scrubLocationFromErrorEvent } from "@th/errors";
 
 const dsn = process.env.SENTRY_DSN;
 
@@ -57,6 +58,17 @@ if (dsn) {
     // despite the 0.1 config. Re-verify with that same known-rate comparison
     // before relying on it; see `docs/ops/resource-burn.md`.
     tracesSampleRate: resolveTracesSampleRate(),
+
+    // No local variables and no default PII here, but `reportError(err,
+    // { extra })` and captured contexts/breadcrumbs can still carry a Place
+    // or Event row — i.e. the true address of a venue that withholds it.
+    // Same scrub as the API (`@th/errors`); never throws.
+    beforeSend(event) {
+      return scrubLocationFromErrorEvent(event);
+    },
+    beforeSendTransaction(event) {
+      return scrubLocationFromErrorEvent(event);
+    },
   });
 }
 

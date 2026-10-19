@@ -1,0 +1,156 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Org — Organizations, memberships, invitations, delegation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Organization {
+  id            String    @id @default(uuid())
+  name          String
+  // URL-safe slug for discoverability. Derived from name by default, disambiguated on collision.
+  slug          String    @unique
+  status        OrgStatus @default(ACTIVE)
+  defaultLocale String?   @map("default_locale")
+  /// Public contact email for the org. When set, used as Reply-To on org-originated emails (announcements, approvals, invitations).
+  contactEmail  String?   @map("contact_email")
+
+  /// Physical mailing address for CAN-SPAM compliance. Included in the footer
+  /// of all announcement emails sent on behalf of this org. When null the
+  /// platform-level fallback (SENDER_PHYSICAL_ADDRESS env) is used instead.
+  physicalAddress String? @map("physical_address")
+
+  // ── Default payout terms ──────────────────────────────────────────
+  // Direct FKs to the org-level default PayoutTerms.
+  // When an event is created under this org without an explicit agreement,
+  // these are copied to Event.payoutTermsId / Event.resalePayoutTermsId.
+  defaultPrimaryPayoutTermsId String? @map("default_primary_payout_terms_id")
+  defaultResalePayoutTermsId  String? @map("default_resale_payout_terms_id")
+
+  defaultPrimaryPayoutTerms PayoutTerms? @relation("OrgDefaultPrimaryPayoutTerms", fields: [defaultPrimaryPayoutTermsId], references: [id], onDelete: SetNull)
+  defaultResalePayoutTerms  PayoutTerms? @relation("OrgDefaultResalePayoutTerms", fields: [defaultResalePayoutTermsId], references: [id], onDelete: SetNull)
+
+  members     OrgMember[]
+  events      Event[]
+  eventInviteOptOuts EventInviteOptOut[]
+  eventInviteComplaints EventInviteComplaint[]
+  eventInvitePauses  EventInvitePause[]
+  invitations OrgInvitation[]
+  digestLogs  NotificationDigestLog[]
+  slugHistory OrgSlugHistory[]
+  verificationRequests PlaceVerificationRequest[]
+  announcements Announcement[]
+  volunteerRoleTemplates VolunteerRoleTemplate[]
+  waiverTemplates        WaiverTemplate[]
+  posReaders             PosReader[]
+  // ORG-subject API keys and key requests (scoped-api-keys spec); CASCADE.
+  apiKeys                ApiKey[]        @relation("ApiKeyOrg")
+  apiKeyRequests         ApiKeyRequest[] @relation("ApiKeyRequestOrg")
+  disputes               Dispute[] @relation("OrganizationDisputes")
+  membershipTiers        MembershipTier[] @relation("OrganizationMembershipTiers")
+  membershipStanding     MembershipStanding? @relation("OrganizationMembershipStanding")
+  stats                  OrgStats?
+  // Outbound organizer→performer booking requests (TO_PERFORMER direction).
+  organizerBookingRequests BookingRequest[] @relation("BookingRequestOrganizerOrg")
+  // Venue-internal booking-request labels (booking-holds FR-017).
+  bookingTags              BookingTag[]     @relation("BookingTagOrg")
+  // Lineup rows that ARE this group (lineup v3 FR-015).
+  eventHumans              EventHuman[]     @relation("EventHumanOrg")
+  applicationsAsOrg        EventApplicationSubmission[] @relation("ApplicationSubmissionApplyingAsOrg")
+  // Booking grants given to this org, and the holds it holds (as booker, or
+  // as a place hold's named party). holds-without-a-request FR-001 / FR-002.
+  bookingGrantsReceived    PlaceBookingGrant[] @relation("PlaceBookingGrantGranteeOrg")
+  bookingHoldsHeld         BookingHold[]       @relation("BookingHoldHolderOrg")
+
+  // ── Trust / Reputation ────────────────────────────────────────────
+  /// Computed or overridden trust tier. NEW by default.
+  trustTier       OrgTrustTier @default(NEW) @map("trust_tier")
+  /// Free-text badge label for CUSTOM tier (e.g. "Official Partner").
+  trustBadgeLabel String?      @map("trust_badge_label")
+  /// Optional icon key (lucide icon name) for CUSTOM badge.
+  trustBadgeIcon  String?      @map("trust_badge_icon")
+
+  chargebackTermsVersion           String?
+  chargebackTermsAcceptedAt        DateTime?
+  chargebackTermsAcceptedByHumanId String?
+  chargebackTermsAcceptedBy        Human?    @relation("OrganizationChargebackTermsAcceptedBy", fields: [chargebackTermsAcceptedByHumanId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([slug])
+  @@index([chargebackTermsAcceptedByHumanId])
+}
+
+model OrgSlugHistory {
+  id         String   @id @default(uuid())
+  orgId      String
+  slug       String   @unique
+  recordedAt DateTime @default(now())
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([orgId, recordedAt])
+}
+
+model OrgMember {
+  id      String  @id @default(uuid())
+  orgId   String
+  humanId String
+  role    OrgRole
+
+  org   Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  human Human        @relation(fields: [humanId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([orgId, humanId])
+  @@index([humanId])
+  @@index([orgId])
+}
+
+/// Email invitation to join an organization. Created when the invitee does not
+/// yet have a Ithas Fire account (or to provide a formal invitation flow for
+/// existing users). The token is single-use and time-limited.
+model OrgInvitation {
+  id                String              @id @default(uuid())
+  orgId             String
+  email             String
+  role              OrgRole
+  invitedByHumanId  String
+  token             String              @unique
+  status            OrgInvitationStatus @default(PENDING)
+  expiresAt         DateTime
+  acceptedAt        DateTime?
+  acceptedByHumanId String?
+
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  invitedBy Human        @relation("OrgInvitationInviter", fields: [invitedByHumanId], references: [id], onDelete: Cascade)
+  acceptedBy Human?      @relation("OrgInvitationAcceptor", fields: [acceptedByHumanId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([orgId, email])
+  @@index([token])
+  @@index([orgId, status])
+  @@index([email])
+}
+
+/// Allows a human (principal) to grant another human (delegate) scoped access
+/// to manage their personal events, places, etc. — without requiring an org.
+/// Think "artist hires an assistant".
+model HumanDelegate {
+  id          String  @id @default(uuid())
+  principalId String
+  delegateId  String
+  role        OrgRole // reuses the org role enum (OWNER excluded at app level)
+
+  principal Human @relation("DelegatesOf", fields: [principalId], references: [id], onDelete: Cascade)
+  delegate  Human @relation("DelegatingFor", fields: [delegateId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([principalId, delegateId])
+  @@index([delegateId])
+  @@index([principalId])
+}

@@ -1,0 +1,3 @@
+# Example vars for tileserver module
+tileserver_image = "gcr.io/<PROJECT_ID>/ticket-tileserver:latest"
+tiles_bucket = "my-tiles-bucket"

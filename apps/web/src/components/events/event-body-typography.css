@@ -1,0 +1,406 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Event description typography — ONE source for every surface that shows it
+ * ─────────────────────────────────────────────────────────────────────────────
+ * `.event-content-body` is the description's typography on the public event
+ * page and in the builder's Preview (EventContent.tsx). The description
+ * EDITOR puts the same class on its ProseMirror root (ProseEditor.tsx), so
+ * what an organiser types looks like what the page will show: same heading
+ * sizes and weights, same list markers, blockquote and rule.
+ *
+ * Moved verbatim out of event-content.css so the editor can load these rules
+ * without the page layout around them. The `--mobile` and `--email` variants
+ * stay in this file, AFTER the base rules: they override at equal
+ * specificity, so they have to come later in the same file. Splitting them
+ * across two files would leave the winner to CSS chunk order. */
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Base Preview Content Styles
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+.event-content-body {
+  font-family: "Montserrat", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 16px;
+  line-height: 1.7;
+  color: var(--color, #211C16);
+}
+
+.event-content-body p {
+  margin: 0 0 16px 0;
+}
+
+.event-content-body p:last-child {
+  margin-bottom: 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Headings
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+.event-content-body h1,
+.event-content-body h2,
+.event-content-body h3 {
+  font-family: "Montserrat", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-weight: 700;
+  color: var(--color, #211C16);
+  margin: 32px 0 16px 0;
+  line-height: 1.3;
+}
+
+.event-content-body h1:first-child,
+.event-content-body h2:first-child,
+.event-content-body h3:first-child {
+  margin-top: 0;
+}
+
+.event-content-body h1 {
+  font-size: 32px;
+  padding-bottom: 12px;
+  border-bottom: 2px solid var(--color, #211C16);
+}
+
+.event-content-body h2 {
+  font-size: 24px;
+  position: relative;
+  padding-left: 16px;
+}
+
+.event-content-body h2::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  background: linear-gradient(180deg, var(--color, #211C16) 0%, var(--colorMuted, #5C544A) 100%);
+  border-radius: 0;
+}
+
+.event-content-body h3 {
+  font-size: 20px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Blockquotes - Stylized quote blocks
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+.event-content-body blockquote {
+  margin: 24px 0;
+  padding: 24px 32px;
+  background: linear-gradient(135deg, var(--surfaceMuted, #EFE7D6) 0%, var(--surfaceMuted, #EFE7D6) 100%);
+  border-left: 4px solid var(--color, #211C16);
+  border-radius: 0;
+  position: relative;
+  font-style: italic;
+  color: var(--colorMuted, #5C544A);
+}
+
+.event-content-body blockquote::before {
+  content: "\201C";
+  position: absolute;
+  top: -8px;
+  left: 16px;
+  font-size: 64px;
+  font-family: Georgia, serif;
+  color: var(--colorMuted, #5C544A);
+  line-height: 1;
+}
+
+.event-content-body blockquote p {
+  margin: 0;
+  position: relative;
+  z-index: 1;
+}
+
+.event-content-body blockquote p:not(:last-child) {
+  margin-bottom: 12px;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Lists
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+.event-content-body ul,
+.event-content-body ol {
+  margin: 16px 0;
+  padding-left: 0;
+  list-style: none;
+}
+
+.event-content-body ul li,
+.event-content-body ol li {
+  position: relative;
+  padding-left: 28px;
+  margin-bottom: 8px;
+}
+
+.event-content-body ul li::before {
+  content: "";
+  position: absolute;
+  left: 8px;
+  top: 10px;
+  width: 8px;
+  height: 8px;
+  background: var(--color, #211C16);
+  border-radius: 50%;
+}
+
+.event-content-body ol {
+  counter-reset: ol-counter;
+}
+
+.event-content-body ol li {
+  counter-increment: ol-counter;
+}
+
+.event-content-body ol li::before {
+  content: counter(ol-counter);
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 24px;
+  height: 24px;
+  background: var(--color, #211C16);
+  color: var(--colorInverted, #FDFAF3);
+  font-size: 12px;
+  font-weight: 700;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Nested lists */
+.event-content-body ul ul,
+.event-content-body ol ol,
+.event-content-body ul ol,
+.event-content-body ol ul {
+  margin: 8px 0;
+}
+
+.event-content-body ul ul li::before {
+  background: transparent;
+  border: 2px solid var(--color, #211C16);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Links
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+.event-content-body a {
+  color: var(--color, #211C16);
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 2px;
+  transition: all 0.15s ease;
+}
+
+.event-content-body a:hover {
+  background-color: var(--color, #211C16);
+  color: var(--colorInverted, #FDFAF3);
+  text-decoration: none;
+  padding: 0 4px;
+  margin: 0 -4px;
+  border-radius: 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Horizontal Rules
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+.event-content-body hr {
+  border: none;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--color, #211C16), transparent);
+  margin: 32px 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Images
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+.event-content-body figure {
+  margin: 24px 0;
+}
+
+.event-content-body figure[style*="float: left"] {
+  margin: 0 16px 8px 0;
+}
+
+.event-content-body figure[style*="float: right"] {
+  margin: 0 0 8px 16px;
+}
+
+.event-content-body img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 0;
+}
+
+.event-content-body figcaption {
+  margin-top: 8px;
+  font-size: 14px;
+  color: var(--colorMuted, #5C544A);
+  text-align: center;
+  font-style: italic;
+}
+
+/* The image's optional one-line caption. It sits inside the figure, so it
+   spans the image's width and stays with a floated image instead of
+   dropping under the wrapping text; left edge on the image's left edge.
+   Scoped to image blocks: the audio block's title is a figcaption too. */
+.event-content-body figure[data-type="image-block"] figcaption {
+  line-height: 1.5;
+  text-align: left;
+  font-style: normal;
+  overflow-wrap: anywhere;
+}
+
+/* Clearfix: ensure floated images don't collapse the body container */
+.event-content-body::after {
+  content: "";
+  display: table;
+  clear: both;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Text Formatting
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+.event-content-body strong {
+  font-weight: 700;
+  color: var(--color, #211C16);
+}
+
+.event-content-body em {
+  font-style: italic;
+}
+
+.event-content-body s {
+  text-decoration: line-through;
+  color: var(--colorMuted, #5C544A);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Mobile Viewport Adjustments
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+.event-content-body--mobile {
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+.event-content-body--mobile h1 {
+  font-size: 26px;
+}
+
+.event-content-body--mobile h2 {
+  font-size: 20px;
+}
+
+.event-content-body--mobile h3 {
+  font-size: 17px;
+}
+
+.event-content-body--mobile blockquote {
+  padding: 16px 20px;
+  margin: 16px 0;
+}
+
+.event-content-body--mobile blockquote::before {
+  font-size: 48px;
+  left: 12px;
+}
+
+.event-content-body--mobile figure[data-type="image-block"] figcaption {
+  font-size: 13px;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Email Viewport Adjustments
+ * Email rendering must be more conservative for email client compatibility
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/* ds-color-ok-start: this is the EMAIL viewport of the event-content preview (EventPreview.tsx,
+   `viewport === "email"`) — a fidelity simulation of how the body renders in a mail client. Mail
+   clients strip CSS custom properties, so a `var()` here would paint the preview in colours the
+   real email can never have, i.e. the preview would lie. A fixed, theme-independent palette is the
+   point. Same class as the theme-editor's literal swatches in eslint-white-permanents.mjs.
+
+   NOTE (pre-existing, not this gate's business): these literals don't match the real email tokens
+   either (`packages/ui-email/src/theme/tokens.ts` = text #181818, border #D4D4D4, muted #F8FAFC),
+   so the simulation is already approximate. ui-email is still on the pre-v2 steel-blue/navy brand
+   and has no colour gate at all — see the handoff backlog. Re-theming the two together is the fix;
+   tokenizing this block to APP theme vars is not. */
+.event-content-body--email {
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+.event-content-body--email h1,
+.event-content-body--email h2,
+.event-content-body--email h3 {
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+.event-content-body--email h1 {
+  font-size: 28px;
+  border-bottom: 2px solid #000;
+  padding-bottom: 8px;
+}
+
+.event-content-body--email h2 {
+  font-size: 22px;
+  padding-left: 12px;
+  border-left: 4px solid #000;
+}
+
+.event-content-body--email h2::before {
+  display: none;
+}
+
+.event-content-body--email h3 {
+  font-size: 18px;
+}
+
+.event-content-body--email blockquote {
+  background: #f5f5f5;
+  border-left: 4px solid #333;
+  border-radius: 0;
+  padding: 16px 20px;
+  margin: 16px 0;
+}
+
+.event-content-body--email blockquote::before {
+  display: none;
+}
+
+.event-content-body--email ul li::before {
+  background: #333;
+}
+
+.event-content-body--email ol li::before {
+  background: #333;
+}
+
+.event-content-body--email a {
+  color: #0066cc;
+  text-decoration: underline;
+}
+
+.event-content-body--email a:hover {
+  background: transparent;
+  color: #0066cc;
+}
+
+.event-content-body--email hr {
+  background: #ddd;
+}
+
+.event-content-body--email img {
+  border-radius: 0;
+  box-shadow: none;
+}
+/* ds-color-ok-end */

@@ -18,10 +18,40 @@ import type { TimezoneLookupPort } from "@th/ports/timezone-lookup";
 import type { PaymentProcessorPort } from "@th/ports/payment-processor-port";
 import type { Repos } from "@th/ports/repos";
 import { safeReporter, type ReporterPort } from "@th/ports/reporter";
+import { configureLocationObfuscation } from "@th/core/lib/location/obfuscation-key";
+import { deriveOpenCallStatusTokenSecret } from "@th/core/lib/security/open-call-status-token-key";
+import {
+  LOCATION_OBFUSCATION_CANARY_EVENT,
+  LOCATION_OBFUSCATION_CANARY_PLACE,
+  canaryPoint,
+  verifyLocationObfuscationLive,
+} from "@th/core/lib/location/obfuscation-self-test";
+import { projectPublicEventLocation } from "@th/core/lib/location/project-public-event-location";
+import { redactPlaceLocation } from "@th/core/lib/location/redact-place-location";
+import { adaptersLocationObfuscationCanary } from "@th/adapters/geo/obfuscation";
 import type { SearchIndexPort } from "@th/ports/search";
 import type { MultiSearchPort } from "@th/ports/search/multi-index.port";
 
 import { createPrismaRepos } from "@th/adapters/db/prisma-repos";
+import { withOutboxDrainTriggers } from "@th/adapters/decorators/with-outbox-drain-triggers";
+import { withSearchReindexDrainScheduling } from "@th/adapters/decorators/with-search-reindex-drain-scheduling";
+import { withTaxRateFillQueue } from "@th/adapters/decorators/with-tax-rate-fill-queue";
+import { createTaxRateFillQueue } from "@th/core/use-cases/tax/tax-rate-fill-queue";
+import {
+  createCacheGeneration,
+  createRedisCacheGenerationStore,
+} from "@th/adapters/decorators/cache-generation";
+import {
+  withPublicReadBumpOnIndexWrites,
+  withPublicReadBumpOnSearchDocumentWrites,
+} from "@th/adapters/decorators/with-public-read-bump-on-search-writes";
+import { createThrottledReporter } from "@th/core/lib/throttled-reporter";
+import {
+  createLineupSweepContinuation,
+  createSearchReindexDrainTrigger,
+  createTaxRateFillScheduler,
+} from "@th/adapters/queue/cloud-tasks-scheduler";
+import { createJobTrigger } from "@th/adapters/queue/job-trigger";
 import { createPrismaEmailDeliverabilityAdapter } from "@th/adapters/db/prisma-email-deliverability-adapter";
 import {
   createAzureContentSafetyModerationAdapter,
@@ -34,11 +64,14 @@ import { createPinoLoggerAdapter } from "@th/adapters/infra/logger";
 import { createSystemClock } from "@th/adapters/infra/clock";
 import { PrismaIdempotencyAdapter } from "@th/adapters/idempotency/prisma-adapter";
 import { RedisIdempotency } from "@th/adapters/idempotency/redis-adapter";
+import { RedisRateLimitAdapter } from "@th/adapters/rate-limit/redis-rate-limit-adapter";
+import { resolveRedisConnection } from "@th/adapters/redis/connection-config";
 import {
   createMailerFromConfig,
   createFooterDefaultsCache,
 } from "@th/adapters/comms/mail";
 import { SnsSmsAdapter } from "@th/adapters/comms/sns-sms";
+import { snsSmsConfig } from "@th/adapters/comms/sns-sms-config";
 // Statically imported on purpose (unlike Stripe/Meilisearch/S3):
 // `expo-server-sdk` is a lightweight HTTP client and the adapter needs no
 // credentials, so there is no env-gate to lazy-load behind.
@@ -55,8 +88,14 @@ import { RedisJobDiagnosticsAdapter } from "@th/adapters/job-diagnostics/redis-d
 // envs configured to skip the load entirely on boot.
 
 import { Sentry } from "../instrument";
+import { warmPool } from "./warm-pool";
 
 import type { JobContext } from "./define-job";
+import {
+  resolveModerationProvider,
+  type ModerationProviderMode,
+} from "./moderation-config";
+import { createDlqRerunJob } from "./dlq-rerun";
 import { createJobRunTracker, type JobRunTracker } from "./job-run-tracker";
 import { PostgresJobRunTracker } from "./postgres-job-run-tracker";
 import { env, forceConnectCapabilities } from "./env";
@@ -94,11 +133,14 @@ class MissingStripePaymentProcessor implements PaymentProcessorPort {
   getProcessingFeeForPaymentIntent = () =>
     this.fail("getProcessingFeeForPaymentIntent");
   getChargeIdForPaymentIntent = () => this.fail("getChargeIdForPaymentIntent");
+  getPlatformBalance = () => this.fail("getPlatformBalance");
   createTransfer = () => this.fail("createTransfer");
   reverseTransfer = () => this.fail("reverseTransfer");
   getTransfer = () => this.fail("getTransfer");
   listTransferReversals = () => this.fail("listTransferReversals");
   retrievePaymentIntent = () => this.fail("retrievePaymentIntent");
+  retrievePaymentIntentWithClientSecret = () =>
+    this.fail("retrievePaymentIntentWithClientSecret");
   createConnectAccount = () => this.fail("createConnectAccount");
   createAccountOnboardingLink = () => this.fail("createAccountOnboardingLink");
   createConnectLoginLink = () => this.fail("createConnectLoginLink");
@@ -116,6 +158,9 @@ class MissingStripePaymentProcessor implements PaymentProcessorPort {
   processPaymentIntentOnReader = () =>
     this.fail("processPaymentIntentOnReader");
   cancelReaderAction = () => this.fail("cancelReaderAction");
+  retrieveDispute = () => this.fail("retrieveDispute");
+  updateDisputeEvidence = () => this.fail("updateDisputeEvidence");
+  uploadDisputeEvidenceFile = () => this.fail("uploadDisputeEvidenceFile");
 }
 
 class MissingSearchIndexPort implements SearchIndexPort {
@@ -145,6 +190,14 @@ export interface JobsContainer extends Omit<JobContext, "runId"> {
    * hatch out of the ports layer.
    */
   prisma: PrismaClient;
+  /**
+   * Which image-moderation adapter `moderation` actually is. Recorded at the
+   * point of selection so `GET /moderation/config` reports the running
+   * process's choice instead of re-reading env and guessing at it. Jobs do not
+   * need this (they hold the port itself), which is why it lives on
+   * `JobsContainer` and not on `JobContext`.
+   */
+  moderationProvider: ModerationProviderMode;
   runTracker: JobRunTracker;
   diagnostics: RedisJobDiagnosticsAdapter | null;
   close: () => Promise<void>;
@@ -174,18 +227,155 @@ export async function buildContainer(): Promise<JobsContainer> {
   await prisma.$connect();
 
   const logger = createPinoLoggerAdapter();
-  const repos: Repos = createPrismaRepos(prisma);
+  // Outbox drain wake-ups. Jobs writes outbox rows too (the daily recurring
+  // refresh queues "that night is off" notices; the hourly degraded requeue
+  // revives moderation rows), and a drain that stops on its time budget wakes
+  // itself again from app.ts. Null locally unless JOB_TRIGGER_BACKEND=http.
+  const jobTrigger = createJobTrigger(
+    {
+      JOB_TRIGGER_TOPIC_PREFIX: env.JOB_TRIGGER_TOPIC_PREFIX,
+      JOB_TRIGGER_BACKEND: env.JOB_TRIGGER_BACKEND,
+      JOBS_SERVICE_URL: env.JOBS_SELF_URL ?? `http://localhost:${env.PORT}`,
+      JOBS_API_KEY: env.JOBS_API_KEY,
+      // The local-only http backend is refused on Cloud Run / in production.
+      NODE_ENV: env.NODE_ENV,
+      K_SERVICE: process.env.K_SERVICE,
+    },
+    logger,
+    safeReporter(Sentry.captureException),
+  );
+  // Search index writes (drains, full reindex, price flips) bump the shared
+  // public-read generation after they commit, so the API's in-process caches
+  // of anonymous reads (the home page's featured list reads the index) drop
+  // the old document within their memo window. Bump-only here: jobs serves no
+  // cached reads. The store closes over `redis`, constructed below; it is only
+  // called once a job runs. See with-public-read-bump-on-search-writes.ts.
+  const publicReadGeneration = createCacheGeneration({
+    store: createRedisCacheGenerationStore({
+      eval: (script, numKeys, ...args) => redis.eval(script, numKeys, ...args),
+    }),
+    reportError: createThrottledReporter(
+      safeReporter(Sentry.captureException),
+      15 * 60 * 1000,
+    ),
+    logger,
+  });
+  const baseRepos: Repos = withPublicReadBumpOnSearchDocumentWrites(
+    createPrismaRepos(prisma),
+    publicReadGeneration,
+  );
+  const reposWithDrainTriggers: Repos = jobTrigger
+    ? withOutboxDrainTriggers(baseRepos, {
+        trigger: jobTrigger,
+        logger,
+        reportError: safeReporter(Sentry.captureException),
+      })
+    : baseRepos;
+  // Edit-triggered search reindex: jobs marks too (the recurring refresh
+  // re-pins listings), and `search.drain-reindex-pending` reschedules itself
+  // through the same trigger while rows remain. Null without a Cloud Tasks
+  // queue — see with-search-reindex-drain-scheduling.ts.
+  const searchReindexDrain = createSearchReindexDrainTrigger({
+    CLOUD_TASKS_QUEUE: env.CLOUD_TASKS_QUEUE,
+    CLOUD_TASKS_INVOKER_SA: env.CLOUD_TASKS_INVOKER_SA,
+    // NOT JOBS_SELF_URL (the DLQ rerun base); see SEARCH_DRAIN_TARGET_URL.
+    JOBS_SERVICE_URL: env.SEARCH_DRAIN_TARGET_URL,
+    SEARCH_REINDEX_DRAIN_DELAY_S: env.SEARCH_REINDEX_DRAIN_DELAY_S,
+    SEARCH_REINDEX_DRAIN_WINDOW_S: env.SEARCH_REINDEX_DRAIN_WINDOW_S,
+  });
+  // Hops 2..LINEUP_SWEEP_MAX_CONTINUATIONS of a lineup-notice sweep chain are
+  // enqueued HERE (the API enqueues the first), and they go on the dedicated
+  // lineup-sweep queue rather than the search drain's — which is pinned to
+  // `max_concurrent_dispatches = 1` because overlapping search DRAINS would
+  // read the same marks, a reason that never applied to sweeps (each row is
+  // claimed in the OWED/SENT ledger) but whose head-of-line blocking did.
+  //
+  // Fallback, deliberate: no dedicated queue in the env — every revision
+  // between this commit and the terraform apply that creates it — means the
+  // search-drain scheduler, i.e. the behaviour this already had. Null only
+  // when no Cloud Tasks is configured at all, and then an unfinished sweep is
+  // reported and its rows wait for a future publish.
+  const lineupSweepContinuation = createLineupSweepContinuation(
+    {
+      CLOUD_TASKS_LINEUP_SWEEP_QUEUE: env.CLOUD_TASKS_LINEUP_SWEEP_QUEUE,
+      CLOUD_TASKS_INVOKER_SA: env.CLOUD_TASKS_INVOKER_SA,
+      // NOT JOBS_SELF_URL, for the same reason as the drain above.
+      JOBS_SERVICE_URL: env.SEARCH_DRAIN_TARGET_URL,
+    },
+    searchReindexDrain?.scheduler ?? null,
+  );
+  const reposWithDrainScheduling: Repos = searchReindexDrain
+    ? withSearchReindexDrainScheduling(reposWithDrainTriggers, {
+        trigger: searchReindexDrain,
+        clock: createSystemClock(),
+        logger,
+        reportError: safeReporter(Sentry.captureException),
+      })
+    : reposWithDrainTriggers;
+  // Background venue tax-rate fills queued by listings — here the search
+  // reindex's own listing loader. Own queue, no fallback to the search
+  // drain's; same reasoning as the API root (apps/api/src/lib/dep.ts).
+  // OUTERMOST.
+  const taxRateFillScheduler = createTaxRateFillScheduler({
+    CLOUD_TASKS_TAX_FILL_QUEUE: env.CLOUD_TASKS_TAX_FILL_QUEUE,
+    CLOUD_TASKS_INVOKER_SA: env.CLOUD_TASKS_INVOKER_SA,
+    // NOT JOBS_SELF_URL, for the same reason as the drain above.
+    JOBS_SERVICE_URL: env.SEARCH_DRAIN_TARGET_URL,
+  });
+  if (!taxRateFillScheduler) {
+    logger.info("tax_rate_fill_queue_not_configured", {
+      hint: "Set CLOUD_TASKS_TAX_FILL_QUEUE (with CLOUD_TASKS_INVOKER_SA and SEARCH_DRAIN_TARGET_URL) to queue background venue tax-rate fills.",
+    });
+  }
+  const repos: Repos = withTaxRateFillQueue(
+    reposWithDrainScheduling,
+    taxRateFillScheduler
+      ? createTaxRateFillQueue({
+          scheduler: taxRateFillScheduler,
+          clock: createSystemClock(),
+        })
+      : null,
+  );
   const clock: ClockPort = createSystemClock();
 
   // Redis
-  const redisUrl = env.REDIS_URL ?? "redis://localhost:6379";
-  const redis = new Redis(redisUrl);
+  //
+  // Bounds and guards come from the shared resolver so jobs matches the API:
+  // it throws when REDIS_URL is missing in production, throws when it points
+  // at a loopback host in production, and caps retries/command time so an
+  // unreachable Redis fails fast. Before 2026-09-12 this had none of that —
+  // an unbounded client dialling `redis://127.0.0.1:6379` reconnected every
+  // ~2s for eleven days while every job hard-failed.
+  const redisConnection = resolveRedisConnection({
+    url: env.REDIS_URL,
+    namespace: env.REDIS_NAMESPACE,
+    nodeEnv: process.env.NODE_ENV,
+  });
+  const redis = new Redis(redisConnection.url, {
+    ...(redisConnection.keyPrefix
+      ? { keyPrefix: redisConnection.keyPrefix }
+      : {}),
+    commandTimeout: redisConnection.commandTimeout,
+    maxRetriesPerRequest: redisConnection.maxRetriesPerRequest,
+  });
   redis.on("error", (err) => logger.error("redis_error", { err }));
 
   const idempotency: IdempotencyPort =
     env.IDEMPOTENCY_BACKEND === "postgres"
       ? new PrismaIdempotencyAdapter(prisma, "jobs", logger)
       : new RedisIdempotency(redis, "jobs", logger);
+  // The lineup notices' OWED/SENT ledger is written by the API under ITS
+  // namespace ("api", apps/api/src/lib/dep.ts); `lineup-notices.continue-sweep`
+  // has to read and claim the same keys, so it gets a port on that namespace.
+  // Same backend switch as above: api and jobs set IDEMPOTENCY_BACKEND
+  // together (prod.tfvars sets both to postgres; dev leaves both on redis).
+  const lineupNoticeLedger: IdempotencyPort =
+    env.IDEMPOTENCY_BACKEND === "postgres"
+      ? new PrismaIdempotencyAdapter(prisma, "api", logger)
+      : new RedisIdempotency(redis, "api", logger);
+  // Same keys as the API's limiter (shared Redis + REDIS_NAMESPACE prefix),
+  // so the lineup notices' per-recipient daily caps count both services.
+  const rateLimit = new RedisRateLimitAdapter(redis);
 
   // Payments
   const payments: PaymentProcessorPort = env.STRIPE_SECRET_KEY
@@ -197,6 +387,11 @@ export async function buildContainer(): Promise<JobsContainer> {
         baseUrl: env.STRIPE_BASE_URL,
       })
     : new MissingStripePaymentProcessor(logger);
+
+  // `payments` is NEVER null — without a key it is a stub that throws on every
+  // call. Jobs whose contract distinguishes "no processor" from "processor
+  // failed" must branch on this rather than on `payments` being falsy.
+  const paymentsConfigured = Boolean(env.STRIPE_SECRET_KEY);
 
   // Recurring membership billing (Stripe Billing). Null when Stripe is not
   // configured. The tax-jurisdiction refresh job REQUIRES it — a rate change
@@ -247,7 +442,7 @@ export async function buildContainer(): Promise<JobsContainer> {
       hint: "Set MEILISEARCH_HOST and MEILISEARCH_API_KEY to enable search indexing. Run: cd infra/docker && docker compose up meilisearch -d",
     });
   }
-  const { searchIndex, multiSearch } = await (async (): Promise<{
+  const { searchIndex, multiSearch: rawMultiSearch } = await (async (): Promise<{
     searchIndex: SearchIndexPort;
     multiSearch: MultiSearchPort | null;
   }> => {
@@ -292,6 +487,9 @@ export async function buildContainer(): Promise<JobsContainer> {
       }),
     };
   })();
+  const multiSearch = rawMultiSearch
+    ? withPublicReadBumpOnIndexWrites(rawMultiSearch, publicReadGeneration)
+    : null;
 
   // Platform-level email footer defaults (CAN-SPAM). The jobs process never
   // writes settings, so it relies solely on the TTL backstop to self-heal.
@@ -334,28 +532,28 @@ export async function buildContainer(): Promise<JobsContainer> {
     });
   }
 
-  // SMS (optional — AWS SNS). Only wired when AWS creds are configured.
-  // The SnsSmsAdapter respects `Transactional` type by default so we
-  // don't accidentally drop volunteer reminders to spam category.
+  // SMS (optional — AWS SNS). Wired only when `snsSmsConfig` says so: AWS
+  // creds AND at least one origination number, the same predicate the API's
+  // `sms` capability uses. The SnsSmsAdapter respects `Transactional` type
+  // by default so we don't accidentally drop volunteer reminders to spam
+  // category.
   let sms: SMSPort | null = null;
-  if (env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY) {
+  const smsConfig = snsSmsConfig(env);
+  if (smsConfig) {
     const { SNSClient } = await import("@aws-sdk/client-sns");
     const snsClient = new SNSClient({
       region: env.AWS_REGION,
-      credentials: {
-        accessKeyId: env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
-      },
+      credentials: smsConfig.credentials,
     });
     sms = new SnsSmsAdapter({
       client: snsClient,
       logger,
       defaultSmsType: "Transactional",
-      defaultSenderId: env.AWS_SNS_SENDER_ID,
+      originationNumbers: smsConfig.originationNumbers,
     });
   } else {
     logger.warn("sms_not_configured", {
-      hint: "Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (and optionally AWS_SNS_SENDER_ID) to enable SMS dispatch from jobs.",
+      hint: "Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (and AWS_SMS_ORIGINATION_NOTIFICATIONS / AWS_SMS_ORIGINATION_OTP) to enable SMS dispatch from jobs.",
     });
   }
 
@@ -380,6 +578,44 @@ export async function buildContainer(): Promise<JobsContainer> {
   // the job it was only meant to observe.
   const reportError: ReporterPort = safeReporter(Sentry.captureException);
 
+  // Location obfuscation key — MUST be the API's key: the search index built
+  // here and the event/venue pages served there draw the same circles, and
+  // two different circles for one radius are two samples of the true point.
+  // Same source as apps/api/src/lib/dep.ts (UNSUBSCRIBE_SECRET, HKDF'd).
+  // Missing → circles fail closed to "fully hidden", reported once at boot.
+  configureLocationObfuscation({
+    secret: env.UNSUBSCRIBE_SECRET,
+    logger,
+    reportError,
+  });
+  // Boot self-test — the same canaries as apps/api/src/lib/dep.ts: a circle
+  // drawn through the specifiers the search indexer and the adapters import.
+  // A keyless copy of the module would index every obscured event and venue
+  // fully hidden. Production refuses to boot; elsewhere, error + report.
+  verifyLocationObfuscationLive({
+    failHard: env.NODE_ENV === "production",
+    logger,
+    reportError,
+    canaries: [
+      {
+        source: "@th/core/lib/location/project-public-event-location",
+        draw: () =>
+          canaryPoint(
+            projectPublicEventLocation(LOCATION_OBFUSCATION_CANARY_EVENT),
+          ),
+      },
+      {
+        source: "@th/core/lib/location/redact-place-location",
+        draw: () =>
+          canaryPoint(redactPlaceLocation(LOCATION_OBFUSCATION_CANARY_PLACE)),
+      },
+      {
+        source: "@th/adapters/geo/obfuscation",
+        draw: adaptersLocationObfuscationCanary,
+      },
+    ],
+  });
+
   // Timezone lookup (lat/lng → IANA zone; venue-hierarchy FR-004). Local
   // pure-JS adapter — always wired (no credentials, no network). Mirrors
   // apps/api/src/lib/dep.ts.
@@ -389,7 +625,13 @@ export async function buildContainer(): Promise<JobsContainer> {
   // refresh job then SKIPS rather than treating an absent provider as
   // "every rate is now zero", which would archive live rates wholesale.
   const taxRateLookup: TaxRateLookupPort | null = env.ZIPTAX_API_KEY
-    ? createZiptaxAdapter(env.ZIPTAX_API_KEY)
+    ? createZiptaxAdapter(env.ZIPTAX_API_KEY, {
+        // An address lookup that failed while the postal fallback answered.
+        reportError: createThrottledReporter(
+          safeReporter(Sentry.captureException),
+          10 * 60_000,
+        ),
+      })
     : null;
   if (!taxRateLookup) {
     logger.warn("ziptax_not_configured", {
@@ -403,23 +645,27 @@ export async function buildContainer(): Promise<JobsContainer> {
   // human review — never auto-approve un-analyzed content), while non-prod uses
   // a deterministic stub that auto-approves so local/dev and CI flows aren't
   // blocked. Composition-root selection per the spec.
-  const azureConfigured = !!(
-    env.AZURE_CONTENT_SAFETY_ENDPOINT && env.AZURE_CONTENT_SAFETY_KEY
-  );
+  //
+  // The SELECTION CONDITION lives in `./moderation-config` so the
+  // `GET /moderation/config` endpoint reports the provider this process
+  // actually chose rather than re-deriving the same two branches from env a
+  // second time (the reliable way to build a dashboard that lies).
+  const moderationProvider = resolveModerationProvider(env);
   const isProduction = env.NODE_ENV === "production";
-  const moderation: ModerationPort = azureConfigured
-    ? createAzureContentSafetyModerationAdapter({
-        endpoint: env.AZURE_CONTENT_SAFETY_ENDPOINT!,
-        apiKey: env.AZURE_CONTENT_SAFETY_KEY!,
-        reportError,
-        logger,
-      })
-    : isProduction
-      ? createFailClosedModerationAdapter()
-      : createStubModerationAdapter();
-  if (!azureConfigured) {
+  const moderation: ModerationPort =
+    moderationProvider === "azure"
+      ? createAzureContentSafetyModerationAdapter({
+          endpoint: env.AZURE_CONTENT_SAFETY_ENDPOINT!,
+          apiKey: env.AZURE_CONTENT_SAFETY_KEY!,
+          reportError,
+          logger,
+        })
+      : moderationProvider === "fail-closed"
+        ? createFailClosedModerationAdapter()
+        : createStubModerationAdapter();
+  if (moderationProvider !== "azure") {
     logger.warn("image_moderation_unconfigured", {
-      mode: isProduction ? "fail-closed" : "stub",
+      mode: moderationProvider,
       hint: isProduction
         ? "AZURE_CONTENT_SAFETY_ENDPOINT + AZURE_CONTENT_SAFETY_KEY are not both set — image moderation is FAILING CLOSED (every image is held FLAGGED for human review). Set both to enable real Azure AI Content Safety scanning."
         : "AZURE_CONTENT_SAFETY_ENDPOINT + AZURE_CONTENT_SAFETY_KEY are not both set — image moderation runs in STUB mode (auto-approves every image). Set both to enable real Azure AI Content Safety scanning.",
@@ -472,16 +718,22 @@ export async function buildContainer(): Promise<JobsContainer> {
       ? new PostgresJobRunTracker(prisma)
       : createJobRunTracker(redis);
 
-  // DLQ Diagnostics (Redis-backed, rerun via self-enqueue)
+  // DLQ Diagnostics (Redis-backed). A rerun POSTs the payload back to the run
+  // route and reads what the run did; see lib/dlq-rerun.ts.
   const diagnostics: RedisJobDiagnosticsAdapter =
     new RedisJobDiagnosticsAdapter({
       redis,
-      rerunJob: async (queue, payload) => {
-        await enqueue(queue, payload);
-        const { randomUUID } = await import("node:crypto");
-        return randomUUID();
-      },
+      rerunJob: createDlqRerunJob({ selfUrl, apiKey: env.JOBS_API_KEY }),
+      // For the adapter's swallows: the entry could not be deleted after a
+      // confirmed rerun, a rerun claim could not be released, or a stored
+      // member was unreadable and skipped.
+      reportError,
+      logger,
     });
+
+  // Before app.ts listens: a cold instance's first tick otherwise opens every
+  // connection at once and the slowest pass the 10s connect timeout.
+  await warmPool(pool, POOL_TUNING.max, { logger, reportError });
 
   const close = async () => {
     await prisma
@@ -506,14 +758,20 @@ export async function buildContainer(): Promise<JobsContainer> {
     logger,
     clock,
     idempotency,
+    lineupNoticeLedger,
+    rateLimit,
     payments,
+    paymentsConfigured,
     fileStorage,
     searchIndex,
     multiSearch,
+    searchReindexDrain,
+    lineupSweepContinuation,
     mailer,
     sms,
     push,
     moderation,
+    moderationProvider,
     taxRateLookup,
     timezoneLookup,
     membershipBilling,
@@ -540,8 +798,11 @@ export async function buildContainer(): Promise<JobsContainer> {
     forceConnectCapabilities,
     appBaseUrl,
     unsubscribeSecret: env.UNSUBSCRIBE_SECRET ?? null,
+    // Same derivation as apps/api/src/lib/dep.ts (see define-job.ts).
+    openCallStatusTokenSecret: deriveOpenCallStatusTokenSecret(env.UNSUBSCRIBE_SECRET),
     renderEmailTemplate,
     enqueue,
+    jobTrigger,
     runTracker,
     diagnostics,
     close,

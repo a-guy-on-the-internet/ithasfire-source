@@ -1,0 +1,44 @@
+-- Per-ticket-type sales windows, Phase 2a (docs/specs/2026-08-04/
+-- ticket-type-packs.spec.yaml FR-014, adopted verbatim by
+-- docs/specs/2026-08-10/time-based-ticket-pricing.spec.yaml FR-009).
+--
+--   salesOpenAt  — the absolute UTC instant this tier BECOMES purchasable.
+--                  NULL = no lower bound (today's behaviour). INCLUSIVE: at
+--                  exactly this instant the tier IS on sale, mirroring the
+--                  scheduled-price flip, which is live at exactly
+--                  scheduledPriceAt.
+--   salesCloseAt — the absolute UTC instant this tier STOPS being purchasable.
+--                  NULL = no upper bound. EXCLUSIVE: at exactly this instant
+--                  the tier is CLOSED. A 12:00→18:00 window therefore sells at
+--                  17:59:59.999 and refuses at 18:00:00.000, so two
+--                  back-to-back tiers (close A = open B) neither overlap nor
+--                  leave a gap.
+--
+-- INVARIANT when both are set: salesOpenAt < salesCloseAt (equal is rejected
+-- too — such a window can never sell anything). Enforced at the WRITE BOUNDARY
+-- in core (upsertTicketType / updateTicketType reject with
+-- TICKET_TYPE_SALES_WINDOW_INVALID), NOT by a CHECK constraint — identical
+-- reasoning to the scheduled-price migration one file back: a 23514 surfaces
+-- through Prisma as an opaque driver error with no AppErrorCode the UI can
+-- translate. The runtime predicate (assertTicketTypeOnSale in
+-- packages/core/src/lib/orders/door-pricing.ts) is defensive regardless: an
+-- inverted window that somehow reaches it simply refuses every purchase, which
+-- fails closed.
+--
+-- ENFORCEMENT SHIPS WITH THESE COLUMNS, not after them (FR-014: "a stored
+-- window with no checkout guard is UI theatre"). All five money sites —
+-- createCheckout, updateOrderItems, claimFreeTickets, startPosSale,
+-- recordCashSale — refuse an out-of-window purchase against the injected
+-- clock. The per-type window COMPOSES with the pre-existing event-level sales
+-- close (now >= endsAt ?? startsAt); the stricter of the two wins and the
+-- per-type window never widens the event-level one.
+--
+-- TIMESTAMP(3) to match every other DateTime in this schema.
+--
+-- Additive only, no backfill: every existing row gets NULL / NULL, i.e. "no
+-- bound", which is exactly today's behaviour by construction (NFR-001).
+-- Instant on this table (ADD COLUMN with a NULL default does not rewrite on
+-- PG 11+). Reversible by dropping both columns; no index or constraint is
+-- touched.
+ALTER TABLE "TicketType" ADD COLUMN "salesOpenAt" TIMESTAMP(3),
+ADD COLUMN "salesCloseAt" TIMESTAMP(3);

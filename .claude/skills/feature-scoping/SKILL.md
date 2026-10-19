@@ -1,6 +1,6 @@
 ---
 name: feature-scoping
-description: "Scope a feature from a vague idea into a structured spec. Use when the user has a feature request, product idea, or business requirement that needs to be broken down before implementation. Outputs a spec YAML in the project's docs/specs/ format. Use when asked to 'scope this', 'write a spec', 'plan this feature', 'what would it take to build X', or before any multi-layer feature implementation."
+description: "Scope a vague feature idea into a spec under docs/specs/<date>/, opening with a grilling interview. Use when asked to scope or spec a feature, or what it would take to build something, and before any multi-layer build."
 ---
 
 # Feature Scoping
@@ -17,6 +17,8 @@ Turn a vague idea into a structured, actionable spec before any code is written.
 ## Workflow
 
 ### Phase 1: Grill
+
+Read `docs/pro-social.md` first: when an axis comes down to a close product call, recommend the option that helps people see and connect, and name the principle that decided it.
 
 Before writing anything, invoke the **`grilling`** skill (Skill tool) and run its frontier-rounds interview to a shared understanding. Do not assume context, and do not draft the spec while any branch of the design tree is still open.
 
@@ -41,12 +43,13 @@ Before drafting, gather codebase context:
 3. **Schema**: Check current Prisma models for relevant entities
 4. **Ports**: Identify which ports are needed (existing vs. new)
 5. **Patterns**: Look at how analogous features were built (follow the existing pattern)
+6. **Interview evidence**: if the feature touches venues, bookings, reviews or artist profiles, read [`INTERVIEW-SOURCES.md`](INTERVIEW-SOURCES.md) and the insights doc it names.
 
 ### Phase 3: Draft the Spec
 
 Output a `.spec.yaml` file following the project conventions.
 
-**File location**: `docs/specs/<today's date>/<feature-name>.spec.yaml`
+**File location**: `docs/specs/<today's date>/<feature-name>.spec.yaml`. Drafts sit at the dated folder's root; a spec moves to `completed/` once implemented.
 
 **Spec structure**:
 
@@ -57,6 +60,11 @@ Output a `.spec.yaml` file following the project conventions.
 
 version: "1.0"
 updated: "<YYYY-MM-DD>"
+
+# ── Rulings (<who>, <YYYY-MM-DD>; full text in memory <file>.md) ─────────────
+# R1  "<the owner's words, verbatim>" — what it decides.
+# R2  ...
+# Earlier rulings that still bind: <memory file or decision record>.
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 
@@ -148,7 +156,11 @@ acceptance_criteria:
   - <Testable statement 2>
 ```
 
-### Phase 4: Review with User
+### Phase 4: Design board (UI features only)
+
+When the feature has a visible surface, publish the design options as an artifact (built from the real components, never invented UI) and get the owner's pick before the spec is final. Record the pick as a ruling.
+
+### Phase 5: Review with User
 
 Present the spec and ask:
 1. "Does this match what you're thinking?"
@@ -164,5 +176,8 @@ Present the spec and ask:
 - Flag auth requirements. Every use case must state who is authorized.
 - Identify what's out of scope. Prevent scope creep by being explicit about what this spec does NOT cover.
 - Use the project's spec format. Output to `docs/specs/<date>/` with the correct suffix (`.spec.yaml` for features, `.component.yaml` for UI specs, `.flow.yaml` for user journeys).
-- Reference existing patterns. If a similar feature exists, say "mirrors the pattern in create-checkout.ts" rather than inventing a new approach.- **Check for overlapping specs.** Before creating a new spec, search `docs/specs/` for existing specs that cover similar ground. Don't duplicate.
-- **Update the index.** After creating a spec, update `docs/README.md` to include the new file in the appropriate table (per project documentation conventions).- Keep it short. A spec should be scannable in under 2 minutes. If it's longer, split it.
+- Reference existing patterns. If a similar feature exists, say "mirrors the pattern in create-checkout.ts" rather than inventing a new approach.
+- **Rulings go in as they are given**: the owner's exact words, who gave them, and the date, in the Rulings block. A ruling that lives only in chat is lost at the next compaction.
+- **Check for overlapping specs.** Before creating a new spec, search `docs/specs/` for existing specs that cover similar ground. Don't duplicate.
+- **Follow the spec conventions.** Name, date and place the spec per `docs/specs/README.md`. Specs get no row in `docs/README.md`; that index lists living docs only.
+- Keep it short. A spec should be scannable in under 2 minutes. If it's longer, split it.

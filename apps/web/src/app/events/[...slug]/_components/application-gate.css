@@ -1,0 +1,263 @@
+/* ── Application gate page frame (direction D, 2026-09-30) ─────────────────
+   The gate body (intro, step band, one question at a time, status timeline)
+   is `@th/ui` EventApplicationGate. This file is the PAGE around it: a poster
+   rail beside the content column on wide screens, a compact thumbnail header
+   on phones, and the phone-only pinned Back/Next bar.
+
+   The wide frame copies the event page's split steps (event-content.css
+   `.event-page-split`: 300px rail from 768, 360 from 900, 440 from 1200,
+   56px gutter, 68rem column) so that when an approved applicant presses
+   "View event" the poster is already where the event page puts it. */
+
+.th-appgate {
+  /* The shell's own side gutter at each of its steps (AppShell MainContent):
+     16px on phones, 24px from 641. The pinned bar escapes it to full bleed. */
+  --appgate-gutter: 16px;
+  position: relative;
+  width: 100%;
+  max-width: 68rem;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  padding-bottom: 48px;
+  box-sizing: border-box;
+}
+
+.th-appgate--posterless {
+  max-width: 44rem;
+}
+
+.th-appgate__rail {
+  display: none;
+}
+
+.th-appgate__poster {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  overflow: hidden;
+  border: 2px solid var(--borderColor, #211C16);
+  box-sizing: border-box;
+}
+
+.th-appgate__main {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  min-width: 0;
+}
+
+.th-appgate__head {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+  min-width: 0;
+}
+
+.th-appgate__thumb {
+  position: relative;
+  flex: none;
+  width: 56px;
+  height: 84px;
+  overflow: hidden;
+  border: 2px solid var(--borderColor, #211C16);
+  box-sizing: border-box;
+}
+
+.th-appgate__head-text {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* Same treatment as the event page's <h1> (EventContent): Montserrat 900,
+   uppercase, tight tracking, word-boundary wrapping only. Stepped sizes
+   rather than a viewport ramp. */
+.th-appgate__title {
+  margin: 0;
+  font-family: var(--font-heading);
+  font-weight: 900;
+  font-size: 22px;
+  line-height: 1.05;
+  letter-spacing: -0.5px;
+  text-transform: uppercase;
+  color: var(--color, #211C16);
+  overflow-wrap: break-word;
+  hyphens: auto;
+  -webkit-hyphens: auto;
+  min-width: 0;
+}
+
+.th-appgate__note {
+  margin: 0;
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--colorMuted, #5C544A);
+}
+
+.th-appgate__link {
+  color: var(--color, #211C16);
+  font-weight: 600;
+  text-decoration: underline;
+  text-decoration-color: var(--accent, #E2481D);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+}
+
+.th-appgate__link:hover {
+  color: var(--accentText, #A8300F);
+}
+
+@media (min-width: 641px) {
+  .th-appgate {
+    --appgate-gutter: 24px;
+  }
+}
+
+/* ── Phones: the primary action is pinned to the bottom (DS Task page) ── */
+@media (max-width: 767px) {
+  /* First-paint stand-in for the phone bottom nav's height, which only lands
+     (as `--consumer-bottom-nav-height`) after hydration. Without it the pinned
+     bar painted at the screen's bottom edge and jumped up 85px once the nav
+     mounted. Same measurement and reasoning as `--th-door-bottom-nav` in
+     password-door.css; this whole block is under the nav's 960 breakpoint. */
+  .th-appgate {
+    --appgate-bottom-nav: calc(
+      73px + max(12px, env(safe-area-inset-bottom, 0px))
+    );
+  }
+
+  .th-appgate .th-appgate-nav {
+    position: sticky;
+    bottom: var(--consumer-bottom-nav-height, var(--appgate-bottom-nav));
+    z-index: 5;
+    margin-inline: calc(-1 * var(--appgate-gutter));
+    padding: 12px var(--appgate-gutter)
+      calc(12px + env(safe-area-inset-bottom, 0px));
+    background-color: var(--background, #F6F0E4);
+    border-top: 2px solid var(--borderColor, #211C16);
+  }
+
+  /* WCAG 2.4.11: the pinned bar (~80px, taller with a safe-area inset) sits
+     over the scrolling page, so a focused control must scroll to ABOVE it
+     rather than stop beneath it. Margin on the controls, not scroll-padding,
+     because the scroller is the shell's, not ours. */
+  .th-appgate
+    :is(input, textarea, select, button, a[href], [role="radio"], [role="checkbox"], [tabindex]):not(
+      .th-appgate-nav *
+    ) {
+    scroll-margin-bottom: calc(
+      var(--consumer-bottom-nav-height, var(--appgate-bottom-nav)) + 112px +
+        env(safe-area-inset-bottom, 0px)
+    );
+  }
+
+  /* Back sizes to its label; the primary (always last) takes the rest, so a
+     lone Next spans the bar. `!important` because the Button atom's flex and
+     inset are painted as INLINE styles at runtime (measured: `flex: 1 0
+     auto`, 24px padding, with plain rules present and losing), and nothing
+     else outranks inline. */
+  .th-appgate .th-appgate-nav__row > * {
+    flex: 0 0 auto !important;
+    margin-left: 0 !important;
+  }
+
+  .th-appgate .th-appgate-nav__row > :last-child {
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+  }
+}
+
+/* MEASURED at 320: "BACK" (94) + gap + "SEND APPLICATION" (201, its
+   min-content with the atom's 24px inset) needed 323px of a 320px bar. A
+   14px inset brings the pair to 299. Wider phones keep the atom's inset. */
+@media (max-width: 374px) {
+  .th-appgate .th-appgate-nav__row > * {
+    padding-inline: 14px !important;
+  }
+}
+
+/* ── Wide: poster rail beside the content column ── */
+@media (min-width: 768px) {
+  .th-appgate:not(.th-appgate--posterless) {
+    grid-template-columns: minmax(0, 300px) minmax(0, 1fr);
+    column-gap: 56px;
+    align-items: start;
+    padding-inline: 24px;
+  }
+
+  .th-appgate:not(.th-appgate--posterless) .th-appgate__rail {
+    display: block;
+  }
+
+  .th-appgate:not(.th-appgate--posterless) .th-appgate__thumb {
+    display: none;
+  }
+
+  .th-appgate__title {
+    font-size: 32px;
+    letter-spacing: -1px;
+  }
+}
+
+@media (min-width: 900px) {
+  .th-appgate:not(.th-appgate--posterless) {
+    grid-template-columns: minmax(0, 360px) minmax(0, 1fr);
+  }
+
+  .th-appgate__title {
+    font-size: 42px;
+  }
+}
+
+@media (min-width: 1200px) {
+  .th-appgate:not(.th-appgate--posterless) {
+    grid-template-columns: minmax(0, 440px) minmax(0, 1fr);
+  }
+}
+
+/* `scrollIntoView` after a send lands the page top below the sticky navbar,
+   not under it. */
+.th-appgate {
+  scroll-margin-top: 96px;
+}
+
+/* The status headline takes focus after a send (programmatic, tabindex -1);
+   it is not a control, so no ring. */
+.th-appgate [data-testid="application-status"] h2:focus {
+  outline: none;
+}
+
+/* A one-line answer looks like the long-answer box beside it: paper fill, ink
+   border (the DS boxed field). globals.css repaints every native <input> to
+   the page background with a 30% border at (0,6,1), which beats the Tamagui
+   atoms; the <textarea> rule there is (0,0,1) and loses, so the two shapes
+   drifted apart. The fill holds in every state (the textarea's does); only
+   the RESTING border is ours, so focus and invalid keep the global accent /
+   error border. */
+.th-appgate
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not(
+    [type="file"]
+  ):not([type="hidden"]):not([type="color"]) {
+  background: var(--surface, #FDFAF3);
+}
+
+.th-appgate
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not(
+    [type="file"]
+  ):not([type="hidden"]):not([type="color"]):not(:focus):not(
+    [aria-invalid="true"]
+  ) {
+  border-color: var(--borderColor, #211C16);
+}
+
+.th-appgate
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not(
+    [type="file"]
+  ):not([type="hidden"]):not([type="color"]):not(:focus):not(
+    [aria-invalid="true"]
+  ):hover {
+  border-color: var(--borderColorStrong, #000000);
+}

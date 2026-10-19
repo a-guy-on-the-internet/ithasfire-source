@@ -1,0 +1,59 @@
+title: use-case | comms.send-announcement-now
+owner: comms
+file: packages/core/src/use-cases/comms/send-announcement-now.ts
+goal: >
+  Immediately send a DRAFT or SCHEDULED announcement now, changing status to SENT (or FAILED),
+  by expanding audience to recipient list and enqueuing per-channel jobs (batch fan-out).
+
+ports:
+  - Repos (announcements, recipients, authz)
+  - JobQueue (enqueue batched jobs: "comms.deliverEmail", "comms.deliverInApp")
+  - Logger
+  - Clock
+  - Idempotency
+  - Metrics (optional)
+
+invariants:
+  - Announcement must be DRAFT or SCHEDULED.
+  - If SCHEDULED for future, override to "send now" and clear scheduledAt.
+  - Content valid; channels non-empty.
+  - Resolve recipients from audience snapshot at send time.
+
+input_schema:
+  actorHumanId: uuid
+  announcementId: uuid
+  force?: boolean # if already SENT, only allow re-send when force=true and create new version
+  clientKey: string(min:8)
+
+output_schema:
+  announcementId: uuid
+  status: enum[SENT,PARTIAL,FAILED] # overall batch state
+  enqueuedJobs: int
+
+side_effects:
+  - DB: create a SendAttempt row; announcement status -> SENT/FAILED/ PARTIAL (optimistic SENT after enqueue ok)
+  - Queue: enqueue delivery jobs by channel in batches (e.g., 1k per job)
+  - Audit: comms.announcement.sent_request
+
+idempotency:
+  key: comms:sendNow:${announcementId}:${clientKey}
+  ttl_sec: 120
+  behavior: replay same job counts if identical; conflict on mismatch; safe to re-enqueue idempotently.
+
+errors:
+  - invalid_input(422): empty content, no channels, audience empty
+  - forbidden(403): actor lacks rights
+  - not_found(404): announcement missing
+  - conflict(409): already SENT and force != true
+  - dependency_failed(424): recipient expansion or queue failures
+  - transient(503): idem contention
+
+notes:
+  - Recipient expansion lives in repos (e.g., fans/followers, ticket holders).
+  - Don’t actually deliver here; just fan out jobs with announcementId + recipient batch cursor.
+  - Store snapshot count for analytics.
+tests:
+  - happy path with 2 channels
+  - already SENT → conflict vs force=true
+  - empty recipient set → invalid_input
+  - queue partial failure → dependency_failed

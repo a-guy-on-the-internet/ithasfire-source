@@ -1,0 +1,28 @@
+-- SavedLocation gains an address-derived IANA timezone.
+--
+-- Closes the freeform-address half of the event-timezone gap (venue-hierarchy
+-- FR-004). A LINKED-VENUE event inherits `Place.timezone`, which is derived
+-- from the venue's coordinates at place upsert. A FREEFORM-ADDRESS event
+-- normalizes into a `SavedLocation`, which carried `lat`/`lng` but no zone —
+-- so there was nothing to inherit and the event fell through to the
+-- organiser's browser zone or the platform default. A New York show created by
+-- a Nashville organiser rendered every time — door time, address reveal,
+-- scheduled price flips, sales windows — on the Central clock.
+--
+-- This column is the freeform mirror of `Place.timezone`: derived once from
+-- the coordinates when the address is first normalized into a SavedLocation,
+-- then reused by every later event at the same saved address. Same
+-- derive-and-cache lifecycle as the `admission_tax_rate_bps` cache already on
+-- this table.
+--
+-- Additive and NULLABLE with NO backfill, deliberately:
+--   * Existing SavedLocation rows keep `NULL`. `NULL` means "no derived
+--     answer", which is exactly the state they are in, and the resolution
+--     chain already treats it as "fall through" rather than "trust the null".
+--   * Existing EVENTS are untouched. `Event.timezone` is already stamped and
+--     the save chain ranks the event's own zone ABOVE any derived source, so
+--     nothing here can move a published door time.
+--   * No index: the column is only ever read by primary key alongside the rest
+--     of the row.
+ALTER TABLE "SavedLocation"
+  ADD COLUMN "timezone" TEXT;

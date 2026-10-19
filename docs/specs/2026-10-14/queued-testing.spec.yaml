@@ -1,0 +1,109 @@
+# queued-testing.spec.yaml
+#
+# Machine-wide queue for tests, e2e, builds and typecheck, so ~20 agent
+# sessions sharing one arm64 Mac cannot overload it.
+
+version: "1.0"
+updated: "2026-10-14"
+
+# ── Rulings (owner, 2026-10-14; plan memory/session_queued_testing.plan.md) ──
+# R0  "We overload this machine often is most of the issue. I do wish we could
+#     have queued testing in such a way that multiple agents wouldn't blow this
+#     thing up." — the problem statement.
+# R1  "Do them all" (answer to round 1, Q1–Q8, all recommendations taken):
+#   Q1 test containers use the native arm64 image imresamu/postgis:16-3.4.
+#   Q2 the dev DB moves to arm64 too, as its own step AFTER the Mon 10-19 demo,
+#      dump taken first; the owner picks the time.
+#   Q3 one shared long-lived test postgres per machine; each test file gets its
+#      own database on it; test-utils starts it on first use.
+#   Q4 everything queues: unit vitest (light); container boot, playwright,
+#      Next builds, typecheck (heavy).
+#   Q5 slot budget: 1 heavy + 3 light.
+#   Q6 enforced inside vitest config / playwright globalSetup / test-utils, so
+#      every launch path waits; GATE_LOCK=0 and CI bypass; one CLAUDE.md line.
+#   Q7 apps/web vitest capped at 4 workers locally, CI uncapped.
+#   Q8 `pnpm gate:status` shows holders and queue; stale slots taken over.
+
+summary:
+  problem: >
+    Parallel sessions stack vitest, testcontainers (emulated amd64 postgis,
+    ~3.3x the CPU of native), playwright and tsc. On 2026-10-14 the Docker VM hit
+    load ~60 on 12 CPUs and the shared dev Postgres crash-looped for hours.
+  solution: >
+    A counting-semaphore "gate" (1 heavy + 3 light slots) that every test, e2e,
+    build and typecheck run acquires from inside its own config, plus a native
+    arm64 postgis image and one shared reused test server instead of a container
+    boot per run.
+  users:
+    - Claude sessions and subagents on the owner's Mac
+    - the owner (status command)
+  surfaces:
+    - dev tooling only (scripts/dev, vitest/playwright configs, test-utils)
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        A slot is held by a live PID; when that PID is gone, or the holder is
+        older than the max age, the next waiter takes it over and says so.
+    - id: FR-002
+      description: >
+        A waiter prints "gate: queued (<weight>) behind …" at once and every ~30 s,
+        then "gate: acquired after Ns". Exit codes and argv pass through unchanged.
+    - id: FR-003
+      description: >
+        Re-entrant: a process whose ancestor holds a slot runs without taking
+        another (GATE_LOCK_HELD), so nested gates cannot deadlock.
+    - id: FR-004
+      description: >
+        Every `vitest run` (any package, any launch path) waits for a light slot;
+        watch mode does not take one. Every playwright run and Next build waits
+        for a heavy slot; typecheck scripts take heavy.
+    - id: FR-005
+      description: >
+        test-utils, when no REUSE URL is set and not in CI, uses one shared
+        container `th-test-pg` (imresamu/postgis:16-3.4, 127.0.0.1 fixed port),
+        starting it if absent (`docker run --name` is the atomic claim; a native
+        boot is ~7 s, so no gate slot); concurrent sessions creating
+        the migrated template database cannot corrupt each other.
+    - id: FR-006
+      description: >
+        `pnpm gate:status` lists each slot's holder (pid, age, command, cwd) and
+        the waiters.
+    - id: FR-007
+      description: apps/web vitest uses at most 4 workers when CI is unset.
+  non_functional:
+    - id: NFR-001
+      description: >
+        Planting a failing test or a type error under the gate still exits
+        non-zero; a bogus flag still reaches the tool.
+    - id: NFR-002
+      description: CI=true/1 or GATE_LOCK=0 skips the gate entirely.
+
+architecture:
+  note: >
+    No product code. Lives in scripts/dev (gate library + CLI), the vitest and
+    playwright configs, and packages/test-utils/src/testcontainers.
+
+risks:
+  - risk: A long full suite holds a light slot for ~15 min.
+    severity: LOW
+    mitigation: 3 light slots; targeted file runs stay the norm.
+  - risk: Shared test server becomes a single point of failure for every session.
+    severity: MEDIUM
+    mitigation: >
+      Health check on use; if unhealthy, recreate under the heavy slot only when
+      no live session holds a test database (never pattern-kill).
+  - risk: Moving the dev DB to arm64 changes glibc collation.
+    severity: HIGH
+    mitigation: Dump/restore, after the 10-19 demo, at a time the owner picks.
+
+out_of_scope:
+  - CI runners (amd64, unaffected).
+  - Scheduling across machines.
+
+acceptance_criteria:
+  - Five concurrent `vitest run` invocations show at most 3 running; the rest print "queued".
+  - A planted failing test under the gate exits non-zero.
+  - Two sessions running adapter integration tests at once share one th-test-pg and both pass.
+  - `pnpm gate:status` shows the holders during the above.

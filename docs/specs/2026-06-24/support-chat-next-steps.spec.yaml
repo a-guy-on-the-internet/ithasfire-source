@@ -1,0 +1,156 @@
+# support-chat-next-steps.spec.yaml
+#
+# Roadmap for the support chat after the v1 widget shipped. Captures the
+# concrete next steps so they don't rot: notify-on-reply email, plugging the
+# AI clerk in as the first responder, and operator-side experience. The AI
+# clerk's own internals are specced separately — this is the integration +
+# follow-on surface for the CHAT specifically.
+
+version: "1.0"
+updated: "2026-06-24"
+
+# ── What already shipped (v1, on main) ───────────────────────────────────────
+
+shipped:
+  - Sign-in-only bottom-right chat widget; polling (open+visible fast, collapsed slow, hidden off) to preserve scale-to-zero.
+  - Postgres SupportThread / SupportMessage; authorType USER | HUMAN_AGENT | AI_CLERK | SYSTEM (AI-ready).
+  - tRPC: support.sendMessage, getMessages, getMyActiveThread, markThreadRead, listThreads (staff), replyToThread (staff), setThreadStatus.
+  - /platform/support operator inbox (AWAITING_HUMAN first); in-page sign-in overlay; expand/compress animation.
+  - Best-effort Discord alert on new thread + AWAITING_HUMAN escalation via dedicated DISCORD_SUPPORT_WEBHOOK (terraform + CI wired; dev/prod secrets set + dev verified live 2026-06-24).
+  - Help article content/help/troubleshooting/contacting-support.md.
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The widget captures and answers live questions while the user is on the
+    page, and pings us on Discord. But a reply is invisible to a user who has
+    closed the tab (no email), every thread still lands on a human (no
+    deflection), and operators have no read-state of their own. These are the
+    gaps that make the chat feel half-finished.
+  solution: >
+    Three phased follow-ons: (A) order-aware notify-on-reply email so users come
+    back when we answer; (B) wire the AI clerk in as the Tier-0 first responder
+    that deflects the easy questions and escalates the rest into the same thread;
+    (C) operator-side read/needs-reply state and quality-of-life.
+  users:
+    - attendee (signed-in)
+    - platform support operator / admin
+  surfaces:
+    - web
+    - api
+    - jobs   # email send
+
+# ── Next steps (phased) ──────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    # ── Phase A: notify-on-reply email (closes the long-pending gap) ──────────
+    - id: NS-A1
+      description: >
+        When a HUMAN_AGENT or AI_CLERK message is appended to a thread AND the
+        owner is not actively connected (no recent getMessages poll within a
+        short window), enqueue ONE order-aware email to the thread owner: "we
+        replied to your support request", with thread/event/order context and a
+        deep link back to the widget/thread. Debounced so a burst of operator
+        replies sends at most one email per quiet period. Closes the
+        "order-aware email follow-up pending" gap on the /support hub.
+    - id: NS-A2
+      description: >
+        Respect the user's notification/email preferences and the existing
+        email suppression + test-domain rules (reuse the comms/email path; never
+        send to suppressed or reserved test domains).
+
+    # ── Phase B: AI clerk as Tier-0 first responder in the widget ─────────────
+    - id: NS-B1
+      description: >
+        On a new user message in a thread, the AI clerk (see
+        ai-clerk-and-tool-registry.spec.yaml) attempts a Tier-0 (read-only)
+        answer — find events, fetch the user's own tickets/orders, answer policy
+        — posting as authorType AI_CLERK in the SAME thread. No new data model:
+        the thread already supports AI_CLERK.
+    - id: NS-B2
+      description: >
+        Escalation handoff: when the clerk can't resolve (low confidence, out of
+        scope, repeated failure, or the user asks for a human), it sets the
+        thread to AWAITING_HUMAN — which already fires the Discord ping — and
+        tells the user a human will follow up. A human reply seamlessly continues
+        the same thread.
+    - id: NS-B3
+      description: >
+        Tier-2 actions (buy / refund) are explicitly DEFERRED to the AI clerk
+        spec's own rollout (confirm-before-act, server-decided eligibility). This
+        phase ships read-only deflection only.
+
+    # ── Phase C: operator experience ──────────────────────────────────────────
+    - id: NS-C1
+      description: >
+        Operator-side read/needs-reply state: the inbox distinguishes threads
+        with an unread USER message (needs operator attention) from ones already
+        answered, independent of the attendee's own readAt. (markThreadRead today
+        is attendee-side only.)
+    - id: NS-C2
+      description: >
+        Operator quality-of-life: optional reply notification to the operator,
+        canned/quick replies, and thread search/filter by event/order/human in
+        the inbox.
+
+  non_functional:
+    - id: NS-N1
+      description: >
+        Notify-on-reply must not double-send or spam: debounce per thread, and
+        skip the email if the user is currently connected (their next poll will
+        show the reply). Best-effort — an email failure never blocks the reply.
+    - id: NS-N2
+      description: >
+        AI clerk turns stay cheap (Haiku 4.5) and never autonomously mutate; the
+        deflection layer is read-only and the escalation path is the existing
+        AWAITING_HUMAN status + Discord ping.
+
+# ── Dependencies & links ─────────────────────────────────────────────────────
+
+dependencies:
+  - "AI clerk internals (tool registry, agent loop, RBAC, confirm-before-act): docs/specs/2026-06-23/ai-clerk-and-tool-registry.spec.yaml"
+  - "Shipped widget + thread model: docs/specs/2026-06-23/completed/support-chat-widget.spec.yaml"
+  - "Email/comms path + suppression + test-domain rules: existing comms use-cases"
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Notify-on-reply emails feel spammy or fire while the user is still online.
+    severity: MEDIUM
+    mitigation: >
+      Gate on "not recently polling" + per-thread debounce (NS-N1); respect prefs
+      and suppression (NS-A2).
+  - risk: >
+      AI clerk posts a wrong/low-confidence answer instead of escalating.
+    severity: MEDIUM
+    mitigation: >
+      Conservative escalation thresholds; "talk to a human" always available;
+      read-only only in this phase (NS-B3); answers grounded in tool results, not
+      model assertion.
+
+open_questions:
+  - "How is 'user actively connected' detected — last getMessages poll timestamp on the thread, or a lightweight presence ping? (Spec assumes last-poll timestamp.)"
+    Answer: We don't check. We just assume silence is them not there. We will however have a little notification on the chat window when we have replied back and vice versa on the platform side.
+  - "Dev vs prod support Discord channels are separate (done). Do operators also want an email/Slack on escalation, or is Discord enough? (Assume Discord enough for now.)"
+    Answer: Discord is enough for now. We can add email/Slack later if needed.
+  - "Does notify-on-reply reuse the /support hub deep link or link straight to the widget thread? (Assume widget thread deep link.)"
+    Answer: Widget thread deep link. The email will have a link that opens the chat widget and takes them to the right thread.
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - AI clerk Tier-2 buy/refund actions (owned by ai-clerk-and-tool-registry.spec.yaml).
+  - Anonymous/signed-out chat (widget remains sign-in only).
+  - SSE/WebSocket push (polling stays; SSE is a later upgrade if 3-5s lags).
+  - Attachments/images, typing indicators, mobile push notifications.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A user who closes the tab after asking a question receives one order-aware email when an operator or the clerk replies, linking back to the thread; a user still polling gets no email.
+  - A new user question is answered by the AI clerk (authorType AI_CLERK) in-thread for Tier-0 cases, with no human involvement.
+  - When the clerk can't help (or the user asks for a human), the thread flips to AWAITING_HUMAN, Discord pings, and a human continues the same thread.
+  - The operator inbox surfaces threads needing a reply distinctly from answered ones, independent of the attendee's readAt.
+  - No notify-on-reply double-sends; email failures never block a reply; no sends to suppressed/test domains.

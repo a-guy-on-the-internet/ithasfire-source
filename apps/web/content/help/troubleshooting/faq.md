@@ -14,7 +14,7 @@ If your question isn't answered here, email [support@ithasfire.com](mailto:suppo
 ### I didn't receive my confirmation email
 
 1. Check your spam / promotions folder.
-2. Sign in and open [/my-tickets](/my-tickets) — your tickets are always there, even if email delivery failed.
+2. Sign in and open [/my-tickets](/my-tickets) — your tickets are there even if email delivery failed. If the page asks you to verify your email, do that first. If the code doesn't arrive either, skip to step 4.
 3. From the order detail page, click **Resend confirmation**.
 4. Still nothing? The email on file might be wrong — contact support with your order ID.
 
@@ -56,9 +56,9 @@ When you buy through a ticket widget embedded on an organiser's own website, che
 
 Ticket widgets only work on the website their organiser registered. If you see _"This widget isn't available on this domain"_, the page embedding the widget isn't the organiser's registered site — buy from the event's page on Ithas Fire or from the organiser's official website instead. If you **are** the organiser, check your [embed settings](/help/organising-events/embed-widgets).
 
-### How do I follow a venue or organiser?
+### How do I follow a place or organiser?
 
-Open any venue, artist, or organiser page and click **Follow**. You'll get notifications when they publish new events. Tune channels and the distance filter under [Settings → Notifications](/account/settings/notifications). See [following organisers and venues](/help/account/following-organisers-and-venues).
+Open any place, artist, or organiser page and click **Follow**. You'll get notifications when they publish new events. Tune channels and the distance filter under [Settings → Notifications](/account/settings/notifications). See [following organisers and places](/help/account/following-organisers-and-places).
 
 ### What is the resale marketplace?
 
@@ -79,6 +79,18 @@ If an event is recruiting, a **Volunteer** button appears on its page. Pick a ro
 ### Someone asked me to coordinate a volunteer group — what can I do?
 
 An organiser can hand you one group to run without giving you admin access. From the console link in your invite email you review, check in, and pull helpers into **your** group, and broadcast to it — but nothing outside it. See [coordinate a volunteer group](/help/getting-started/coordinate-a-volunteer-group).
+
+### How do I stop getting event invites from an organiser?
+
+Every event invite email ends with a **Stop invites from** link naming the organiser. Follow it and confirm, and that organiser can't send you invites any more. Other organisers can still invite you, and invites you already have keep working. To stop invites from every organiser on Ithas Fire at once, choose **stop invites from every organiser** on the same page. No account is needed. To turn them back on, [contact us](/contact).
+
+### Why did my invite emails stop sending?
+
+When 3 or more people, or more than 1 in 100 of the people you invited in the last 30 days, mark your invites as spam, we pause your invite emails. Guests you already invited keep their links, and your shared invite link still works. Ask for a review from the notice in **Invited guests**. See [when your invite emails are paused](/help/organising-events/when-invites-are-paused).
+
+### My invite link stopped working
+
+The organiser may have revoked or reset it, or the event may have ended. The event page tells you the link no longer works; ask whoever sent it for a new one, or enter the password (or apply) as usual. See [what guests see](/help/organising-events/restrict-event-access#what-your-guests-see).
 
 ### My QR code is rejected at the door
 
@@ -108,29 +120,29 @@ Open [Settings → Delete account](/account/settings/danger), click **Delete acc
 Deleting your account does not automatically cancel upcoming tickets or pending organiser payouts. Resolve those first, or contact support.
 :::
 
-### How do I get booked to play at a venue?
+### How do I get booked to play at a place?
 
-Turn on **Performer mode** under [Settings → Performer](/account/settings/performer), then click **Request to book** — at the top of the page or in the action bar — on any verified venue that accepts booking requests. Track or withdraw sent requests under [Settings → Booking requests](/account/settings/booking-requests). See [performer mode and booking requests](/help/account/performer-mode-and-booking-requests).
+Click **Play here** on any verified place that accepts booking requests, write your pitch and pick your dates. You can list the other acts on the night under **The bill**. To put your own act on the bill, turn on **Performer mode** under [Settings → Performer](/account/settings/performer), or use the button in the form. Track or withdraw sent requests under [Settings → Booking requests](/account/settings/booking-requests). See [performer mode and booking requests](/help/account/performer-mode-and-booking-requests).
 
-### A venue accepted my booking and emailed me a claim link — what is it?
+### Can I use a place's space for something that isn't a gig?
 
-You requested the booking through the venue's own website without logging in. The link signs you in (or creates your account), lets you choose who you're performing as, and creates the draft agreement with the venue. It's single-use and lasts 30 days — the venue can resend it if it expires. See [performer mode and booking requests](/help/account/performer-mode-and-booking-requests).
+Often, yes. If a place has opened one of its calendars to it, its page shows **Rent or use a space** beside **Play here**. You pick the calendar, the day and the times, say what it's for, and the place decides — including which room you get. You don't need performer mode. Most rentals and uses end up as your own event, in your own admin, once the place confirms. See [Rent or use a space](/help/account/performer-mode-and-booking-requests#rent-or-use-a-space).
+
+### A place accepted my booking and emailed me a claim link — what is it?
+
+You requested the booking through the place's own website without logging in. The link signs you in (or creates your account), lets you choose who you're performing as, and creates the draft agreement with the place. It's single-use and lasts 30 days — the place can resend it if it expires. See [performer mode and booking requests](/help/account/performer-mode-and-booking-requests).
 
 ### I applied to an event — can I change or withdraw my application?
 
 While your application is still pending you can withdraw it from the event page. If the organiser's application window is still open, you're free to apply again afterwards. Once the organiser has decided, withdrawing is no longer available — contact them directly if something has changed. You don't need an account to apply: signed-out applicants get their decision by email, and the approval email carries the link that unlocks the event.
 
-### How do I control which notifications I get — and can I get texts?
+### How do I control which notifications I get?
 
-Open [Settings → Notifications](/account/settings/notifications). Each category (order confirmations, event announcements, promotions, organiser updates) has per-channel switches for in-app, email, push, and SMS. SMS is off by default and unlocks after you verify a phone number under [Settings → Security](/account/settings/security). See [notification settings](/help/account/notification-settings).
+Open [Settings → Notifications](/account/settings/notifications). Each category (order confirmations, event announcements, promotions, organiser updates) has per-channel switches for in-app, email and push, plus SMS for order confirmations when texts are offered (US numbers only). See [notification settings](/help/account/notification-settings).
 
 ### Can I download a list of all my past orders?
 
 Not yet — on the roadmap. For now, open each order from [/my-tickets](/my-tickets) and download its receipt individually.
-
-### Can I move the floating action bar, or use it from the keyboard?
-
-Yes to both, on a desktop browser. Drag it by the flame square at its left end and it snaps to one of seven resting places — five along the bottom, plus the two top corners — and stays there next time. Each button in the bar also answers to a number key, running left to right from **1**; hover a button to see its number. See [the action bar](/help/getting-started/the-action-bar).
 
 ---
 
@@ -142,7 +154,7 @@ Most fields, yes. Constraints:
 
 - Capacity can only go **up**, never below the number already sold
 - Reducing a ticket price triggers partial refunds for buyers who paid more
-- Changing date or venue notifies all buyers automatically
+- Changing date or place notifies all buyers automatically
 
 ### Can people download the audio I add to my event?
 
@@ -154,11 +166,15 @@ Refunds are buyer-initiated through [/my-tickets](/my-tickets). If a buyer needs
 
 ### When will I get paid?
 
-Depends on the payout schedule you picked. See the table in [payouts and settlements](/help/organising-events/payouts-and-settlements). The earliest option, `ASAP`, transfers funds about 2 days after each sale.
+Depends on the payout schedule you picked. See the table in [payouts and settlements](/help/organising-events/payouts-and-settlements). The earliest option, **As soon as possible**, pays out the day after the event ends, or once each sale's funds clear (two business days), whichever is later.
+
+### A buyer disputed a charge — what happens to my payout?
+
+The disputed amount is held out of your payable balance while the card network reviews it; the rest keeps paying out. Ithas Fire is the merchant of record and responds to the dispute for you. If it's lost, the amount comes off your upcoming payouts (the network's fee isn't passed on for ticket sales); if it's won, the hold is released. Details in [Payouts and settlements](/help/organising-events/payouts-and-settlements#refunds-and-chargebacks).
 
 ### Why isn't the cash I took at the door in my payout?
 
-It never will be — you already have that money. Payouts only move funds Stripe collected, and cash handed over at your own door was never Stripe's to move. The same applies to comps, which are recorded at $0.
+You already have that money, and payouts only move funds Stripe collected. What a cash sale does change is your balance: the tax the buyer paid in cash is owed to Ithas Fire, which remits it to the state, so it comes off your next payout. A cash sale carries no platform fee. Comps are recorded at $0 and owe nothing. Details in [payouts and settlements](/help/organising-events/payouts-and-settlements#cash-you-took-at-the-door).
 
 To see what the door took in cash, open **Sell** under **Door & crew** and expand **Cash taken tonight**. See [sell tickets at the door](/help/organising-events/selling-at-the-door).
 
@@ -170,21 +186,25 @@ Three common reasons:
 - Start time has passed — `COMPLETED` events are filtered out of search by default
 - You set location visibility to **Obscured** — map and location searches use the fuzzed public point inside your circle, not the real address; with the map fully hidden the event has no map point at all, so it only surfaces through text search and direct links
 
-### How do I take ownership of my venue's page?
+### How do I take ownership of my place's page?
 
-If your venue already has a page but you don't control it, open that page and use **Claim this venue**. Prove you operate it with an account email at the venue's domain, an emailed code, or an uploaded document; most claims are then reviewed by our team before the venue verifies. Track the status in your account settings under **Venue claims**. If the venue already has a verified owner, you'll see an **Owned by … · Request transfer** row naming that owner instead. See [claim your venue](/help/organising-events/claim-your-venue).
+If your place already has a page but you don't control it, open that page and use **Claim this place**. Prove you operate it with an account email at the place's domain, an emailed code, or an uploaded document; most claims are then reviewed by our team before the place verifies. Track the status in your account settings under **Place claims**. If the place already has a verified owner, you'll see an **Owned by … · Request transfer** row naming that owner instead. See [Claim your place](/help/organising-events/claim-your-place).
 
-### How do performers send my venue booking requests?
+### How do performers send my place booking requests?
 
-Verify your venue (open its **Verification** page from the admin sidebar — it sits in the **Venue** group) and switch on **Accept booking requests** in the venue's page settings — a **Request to book** button then appears on your venue page automatically. Requests arrive in the venue's **Bookings** inbox and expire after 14 days if you don't respond. See [receive booking requests from performers](/help/organising-events/booking-requests).
+Verify your place (open its **Settings** page from the admin sidebar — the first item in the **Place** group — and use the **Verification** section) and switch on **Accept booking requests** on the place's **Bookings** page — a **Request to book** button then appears on your place page automatically. Requests arrive in the place's **Bookings** inbox and expire after 14 days if you don't respond. See [receive booking requests from performers](/help/organising-events/booking-requests).
 
 ### Can bands request to book through my own website?
 
-Yes — the **Booking button for your website** section in your venue's page settings (beneath the **Accept booking requests** switch) gives you a paste-in snippet for a **Request to book** button. Bands don't need an Ithas Fire account to send a request, and you're notified of every new one. See [embed your events on your own site](/help/organising-events/embed-widgets).
+Yes — the **Booking button for your website** section on your place's **Bookings** page (beneath the **Accept booking requests** switch) gives you a paste-in snippet for a **Request to book** button. Bands don't need an Ithas Fire account to send a request, and you're notified of every new one. See [embed your events on your own site](/help/organising-events/embed-widgets).
+
+### Can I rent out or lend my spaces?
+
+Yes, per calendar. On the place's **Calendars** page, each calendar has switches for what it accepts — performances, rentals, use of a space — and an optional flat rate for rentals that you can show publicly. Once a calendar accepts rentals or use — and has an active space to offer — your page gains a **Rent or use a space** button, and those requests arrive in your Bookings inbox alongside performer pitches. When you confirm one you choose who owns the event. Ithas Fire doesn't collect the rental fee — that's between you and the requester. See [Requests to rent or use a space](/help/organising-events/booking-requests#requests-to-rent-or-use-a-space) and [spaces and calendars](/help/organising-events/spaces-and-calendars).
 
 ### How do I recruit volunteers for my event?
 
-Open your event's **Volunteers** page (under **Manage** in the event side rail), switch on **Accept volunteers**, then add roles and shifts. Review applications, check volunteers in, and export hours from the same page. See [recruit and manage volunteers](/help/organising-events/manage-volunteers).
+Open your event's **Volunteers** page (under **Manage** in the event side rail), switch on **Accept volunteers**, then add roles and shifts. Review applications, check volunteers in, and export hours on the **Signups** page listed under it. See [recruit and manage volunteers](/help/organising-events/manage-volunteers).
 
 ### Where did the Ithas Fire volunteer role go?
 
@@ -196,11 +216,11 @@ Yes. Post a **volunteer ask** for your organisation, a place you manage, or your
 
 ### Can I give volunteers a free ticket?
 
-Attach a **comp reward** to an event's volunteering: a free ticket issued automatically when a volunteer is approved or checked in, with an optional budget cap and an audit ledger. Configuring rewards needs a finance role. See [comp rewards for volunteers](/help/organising-events/volunteer-comp-rewards).
+Attach a **comp reward** to an event's volunteering: a free ticket issued automatically when a volunteer is approved or checked in, with an optional budget cap and an audit ledger. Only owners and admins can configure rewards. See [comp rewards for volunteers](/help/organising-events/volunteer-comp-rewards).
 
 ### Can I run a private / invite-only event?
 
-Yes. Set the event's **Visibility** to **Private** so only people with the direct link can reach it, and add an **Access gate** — a password or an application to approve — when the link alone shouldn't be enough to get in. See [restrict who can see and attend your event](/help/organising-events/restrict-event-access). To also keep the venue secret, set location visibility to **Obscured** with the map fully hidden, which keeps it off public maps and location-based search (it can still be found by title) and reveals the exact address only to ticket holders — see [obscured locations](/help/organising-events/hidden-venues-and-address-reveal).
+Yes. Set the event's **Visibility** to **Private** so only people with the direct link can reach it, and add an **Access gate** — a password or an application to approve — when the link alone shouldn't be enough to get in. See [restrict who can see and attend your event](/help/organising-events/restrict-event-access). To let specific people past the gate without the password or an application, send them an invite link from the same section; new organisers can send 50 invites a day, rising to 1,000 once 10 paid-ticket holders have been scanned in at their events or they've had a payout. To also keep the place secret, set location visibility to **Obscured** with the map fully hidden, which keeps it off public maps and location-based search (it can still be found by title) and reveals the exact address only to ticket holders — see [obscured locations](/help/organising-events/hidden-places-and-address-reveal).
 
 ### Can I take a discount code at the door?
 

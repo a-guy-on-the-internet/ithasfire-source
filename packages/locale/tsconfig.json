@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "../config/tsconfig/base.json",
+  "compilerOptions": {
+    "composite": true,
+    "incremental": true,
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": true,
+    "declarationMap": true,
+    "noEmit": false,
+    "jsx": "react-jsx",
+    "types": ["react"]
+  },
+  "include": ["src", "messages"],
+  "exclude": ["dist", "node_modules"]
+}

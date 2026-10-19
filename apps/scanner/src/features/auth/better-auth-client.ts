@@ -40,8 +40,13 @@ export const authClient = createAuthClient({
       // session cookie. We carry the session token ourselves (stashed in
       // SecureStore by setSessionToken) and present it as a Bearer token —
       // the API's `bearer()` plugin authenticates these requests.
+      //
+      // An Authorization header the caller set explicitly wins: sign-out
+      // revokes the DEPARTING operator's session with the token it captured
+      // before the local teardown, and by the time that request goes out the
+      // next operator's token may already be the local one.
       const token = getSessionTokenSync();
-      if (token) {
+      if (token && !ctx.headers.has("Authorization")) {
         ctx.headers.set("Authorization", `Bearer ${token}`);
       }
       // Resolved fresh per request so a Settings → Developer preset

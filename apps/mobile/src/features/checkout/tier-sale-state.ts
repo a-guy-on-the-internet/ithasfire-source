@@ -1,6 +1,6 @@
 /**
  * Per-tier sale-window copy for the mobile checkout picker
- * (docs/specs/2026-08-10/time-based-ticket-pricing.spec.yaml FR-010).
+ * (docs/specs/2026-08-10/completed/time-based-ticket-pricing.spec.yaml FR-010).
  *
  * WHY THIS EXISTS. `TicketTypePicker` gated its stepper on `maxQty === 0`
  * alone, so a tier that opens on Friday rendered with a live +/- and a working

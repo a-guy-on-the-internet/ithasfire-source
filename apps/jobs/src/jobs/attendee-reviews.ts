@@ -7,6 +7,7 @@
 import { z } from "zod";
 import { defineScheduledTask } from "../lib/define-job";
 import { getSchedule } from "../lib/manifest";
+import { reportNotConfiguredOnce } from "../lib/report-not-configured";
 import { recomputeReviewAggregates } from "@th/core/use-cases/attendee-reviews/recompute-review-aggregates";
 import {
   sendAttendeeReviewDigests,
@@ -71,12 +72,23 @@ export const sendAttendeeReviewDigestsJob = defineScheduledTask({
       ctx.logger.warn(
         "attendee-review-digests.send.skipped_mailer_unconfigured",
       );
+      // A warn does not reach Sentry (CLAUDE.md), and app.ts answers 200 for
+      // this return: without the report a cleared mailer config means the
+      // digest silently never goes out. Once per process.
+      reportNotConfiguredOnce(ctx, {
+        job: "attendee-review-digests.send",
+        reason: "mailer_unconfigured",
+      });
       return { skipped: "mailer_unconfigured" as const };
     }
     if (!ctx.unsubscribeSecret) {
       ctx.logger.warn(
         "attendee-review-digests.send.skipped_unsubscribe_secret_unconfigured",
       );
+      reportNotConfiguredOnce(ctx, {
+        job: "attendee-review-digests.send",
+        reason: "unsubscribe_secret_unconfigured",
+      });
       return { skipped: "unsubscribe_secret_unconfigured" as const };
     }
 

@@ -1,0 +1,38 @@
+{
+  "name": "@th/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "dependencies": {
+    "@th/errors": "workspace:^",
+    "@th/ports": "workspace:^",
+    "@th/schema": "workspace:^",
+    "@th/types": "workspace:^",
+    "entities": "^4.5.0",
+    "escape-html": "^1.0.3",
+    "luxon": "^3.7.2",
+    "ngeohash": "0.6.3",
+    "rrule": "^2.7.2",
+    "sanitize-html": "^2.17.3",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@th/tsconfig": "workspace:^",
+    "@types/escape-html": "^1.0.4",
+    "@types/luxon": "^3.3.3",
+    "@types/ngeohash": "^0.6.1",
+    "@types/rrule": "^2.2.9",
+    "@types/sanitize-html": "^2.16.1",
+    "vitest": "^1.6.1"
+  }
+}

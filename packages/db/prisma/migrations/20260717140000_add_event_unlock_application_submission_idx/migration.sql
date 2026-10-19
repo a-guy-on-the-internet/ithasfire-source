@@ -1,0 +1,23 @@
+-- Submission-keyed index backing `eventUnlocks.revokeBySubmission`
+-- (packages/adapters/src/db/prisma/event-unlocks.ts) — the rescind path's
+-- `updateMany({ where: { applicationSubmissionId, revokedAt: null } })` that
+-- revokes EVERY grant minted from a rescinded application submission
+-- (the redeemer / forwarded-link clicker may differ from the original
+-- applicant, so we revoke by submission id, not humanId). The existing
+-- `@@unique([eventId, humanId])`, `@@index([humanId])` and
+-- `@@index([eventId, revokedAt])` none lead with applicationSubmissionId, so
+-- without this index a rescind forces a sequential scan of EventUnlock.
+--
+-- Built `CONCURRENTLY` so a production deploy doesn't take a SHARE lock that
+-- blocks EventUnlock writes (password/application/magic-link unlocks) for the
+-- duration of the build, matching this repo's other index-only migrations
+-- (PlaceOwnership_ownerType_ownerId_idx, AuditLog_at_idx). `CONCURRENTLY`
+-- cannot run inside a transaction; this file is intentionally a single
+-- statement so Prisma migrate executes it without an implicit BEGIN/COMMIT.
+--
+-- NOTE: this repo's dev DB is db-push-managed, not migrate-deploy-managed.
+-- This migration file was written but NOT applied — apply via
+-- `pnpm -F @th/db prisma db push` (dev) or the normal migrate-deploy path
+-- (prod) as a manual follow-up step.
+-- CreateIndex
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "EventUnlock_applicationSubmissionId_idx" ON "EventUnlock"("applicationSubmissionId");

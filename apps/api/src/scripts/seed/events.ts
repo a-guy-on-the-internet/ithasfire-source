@@ -1,5 +1,7 @@
 import type { PrismaClient } from "@prisma/client";
+import { mintApplicationFormPublicId } from "@th/core/lib/application-form-public-id";
 import { createPrismaRepos } from "@th/adapters/db/prisma";
+import { createDbAuthZAdapter } from "@th/adapters/authz/db-authz-adapter";
 import { createSystemClock } from "@th/adapters/infra/clock";
 import {
   saveEventForOrg,
@@ -14,12 +16,24 @@ import { DEMO_IDS } from "./ids.js";
 import { ensureSeedPrimaryPayoutLine } from "./finance.js";
 import {
   slugify,
-  buildStartDate,
+  buildStartDateInZone,
+  timezoneForRegionCode,
   seededCoordsForFixture,
   createInMemoryIdempotency,
 } from "./utils.js";
-import { buildSeedEventBody, DEMO_EVENT_IMAGES } from "./fixtures.js";
+import { buildSeedEventBody, DEMO_EVENT_IMAGES, PLACES } from "./fixtures.js";
 import type { EventSeedFixture, HumanEventFixture } from "./fixtures.js";
+
+/**
+ * The event's own IANA zone: the linked place's zone when it has one (what
+ * `saveEvent` would inherit anyway), else the zone of its seed region.
+ */
+export const fixtureTimezone = (
+  fixture: Pick<EventSeedFixture, "regionCode"> & { placeId?: string },
+): string =>
+  (fixture.placeId
+    ? PLACES.find((p) => p.id === fixture.placeId)?.timezone
+    : undefined) ?? timezoneForRegionCode(fixture.regionCode);
 
 // Realistic US admission/amusement tax rates (basis points) for seed regions.
 // These approximate the combined state + local entertainment tax.
@@ -53,7 +67,12 @@ export const upsertEventWithTickets = async (
   const orgPayee = options.orgPayeeMap[orgId];
   if (!orgPayee) throw new Error(`No payee/agreement found for org ${orgId}`);
 
-  const startsAt = buildStartDate(fixture.daysFromNow, fixture.startHour);
+  const timezone = fixtureTimezone(fixture);
+  const startsAt = buildStartDateInZone(
+    fixture.daysFromNow,
+    fixture.startHour,
+    timezone,
+  );
   const endsAt = new Date(
     startsAt.getTime() + fixture.durationHours * 60 * 60 * 1000,
   );
@@ -62,7 +81,10 @@ export const upsertEventWithTickets = async (
   const repos = createPrismaRepos(prisma);
   const clock = createSystemClock();
   const idempotency = createInMemoryIdempotency();
-  const deps = { repos, clock, idempotency };
+  // `canManagePlace` for the save / publish (W1 venue stamp, N2 guard) —
+  // the real rule, the same adapter the API wires.
+  const authz = createDbAuthZAdapter({ repos });
+  const deps = { repos, clock, idempotency, authz };
 
   // De-dupe by slug: if it already exists, update that event via use-case.
   const existing = await prisma.event.findUnique({
@@ -83,6 +105,7 @@ export const upsertEventWithTickets = async (
     actorHumanId,
     title: fixture.title,
     startsAt: startsAt.toISOString(),
+    timezone,
     endsAt: endsAt.toISOString(),
     location: fixture.placeId
       ? { placeId: fixture.placeId }
@@ -146,6 +169,9 @@ export const upsertEventWithTickets = async (
       name: ticket.name,
       priceCents: ticket.priceCents,
       capacity: ticket.capacity,
+      pricingMode: ticket.pricingMode,
+      minimumCents: ticket.minimumCents,
+      suggestedCents: ticket.suggestedCents,
       clientKey: `seed-tt:${fixture.slug}:${slugify(ticket.name)}`,
     });
   }
@@ -203,14 +229,18 @@ export const upsertEventWithTickets = async (
     fixture.gateType === "APPLICATION" &&
     fixture.applicationQuestions?.length
   ) {
-    const existingForm = await prisma.eventApplicationForm.findFirst({
-      where: { eventId: draft.eventId },
+    const existingForm = await prisma.eventApplicationForm.findUnique({
+      where: {
+        eventId_purpose: { eventId: draft.eventId, purpose: "ATTEND" },
+      },
     });
 
     if (!existingForm) {
       const form = await prisma.eventApplicationForm.create({
         data: {
           eventId: draft.eventId,
+          purpose: "ATTEND",
+          publicId: mintApplicationFormPublicId(),
         },
       });
 
@@ -276,6 +306,8 @@ export const ensureEventImage = async (
         publicUrl: imageData.url,
         attached: true,
         attachedAt: new Date(),
+        // See the note on the create branch below.
+        uploadedAt: new Date(),
       },
     });
     imageId = existing.id;
@@ -290,6 +322,25 @@ export const ensureEventImage = async (
         contentType: "image/jpeg",
         attached: true,
         attachedAt: new Date(),
+        /**
+         * Required, or this image is invisible to every search-backed surface.
+         *
+         * `getPrimaryImageRefs` — which is what the search indexer resolves an
+         * event's hero through — filters `heroImage.uploadedAt: { not: null }`
+         * to exclude uploads that were requested but never finalised
+         * (`requestEventImageUpload` creates the row with `publicUrl: ""`).
+         * A seeded image is fully formed and already hosted, so it has to say
+         * so; without this it looked like an abandoned upload, the indexer
+         * resolved no hero, and `SearchDocument.image_url` came out NULL for
+         * every seeded event. Search-backed cards then rendered with no
+         * artwork at all while the DB-backed ones beside them had photos.
+         *
+         * This is the second half of a swap that was only half made: that
+         * filter used to be `attached: true`, a field NOTHING but this script
+         * sets. It was flipped to match real uploads; the seed was never
+         * flipped to match back.
+         */
+        uploadedAt: new Date(),
         createdByHumanId: DEMO_IDS.human,
       },
     });
@@ -314,7 +365,12 @@ export const upsertHumanEventWithTickets = async (
     fixtureIndex: number;
   },
 ) => {
-  const startsAt = buildStartDate(fixture.daysFromNow, fixture.startHour);
+  const timezone = fixtureTimezone(fixture);
+  const startsAt = buildStartDateInZone(
+    fixture.daysFromNow,
+    fixture.startHour,
+    timezone,
+  );
   const endsAt = new Date(
     startsAt.getTime() + fixture.durationHours * 60 * 60 * 1000,
   );
@@ -323,7 +379,10 @@ export const upsertHumanEventWithTickets = async (
   const repos = createPrismaRepos(prisma);
   const clock = createSystemClock();
   const idempotency = createInMemoryIdempotency();
-  const deps = { repos, clock, idempotency };
+  // `canManagePlace` for the save / publish (W1 venue stamp, N2 guard) —
+  // the real rule, the same adapter the API wires.
+  const authz = createDbAuthZAdapter({ repos });
+  const deps = { repos, clock, idempotency, authz };
 
   const existing = await prisma.event.findUnique({
     where: { slug: fixture.slug },
@@ -340,6 +399,7 @@ export const upsertHumanEventWithTickets = async (
     actorHumanId: options.actorHumanId,
     title: fixture.title,
     startsAt: startsAt.toISOString(),
+    timezone,
     endsAt: endsAt.toISOString(),
     location: {
       addressText: fixture.addressText,
@@ -393,6 +453,9 @@ export const upsertHumanEventWithTickets = async (
       name: ticket.name,
       priceCents: ticket.priceCents,
       capacity: ticket.capacity,
+      pricingMode: ticket.pricingMode,
+      minimumCents: ticket.minimumCents,
+      suggestedCents: ticket.suggestedCents,
       clientKey: `seed-htt:${fixture.slug}:${slugify(ticket.name)}`,
     });
   }

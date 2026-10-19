@@ -2,6 +2,11 @@
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
     "strict": true,
+    // Incremental so a re-run that follows no source change is near-instant.
+    // The build info lives in node_modules/.cache (already gitignored) instead
+    // of beside the tsconfig, so it never shows up as untracked.
+    "incremental": true,
+    "tsBuildInfoFile": "../../node_modules/.cache/tsc-daemon/apps-scanner.tsbuildinfo",
     "baseUrl": ".",
     "paths": {
       "@/*": ["./src/*"],

@@ -14,129 +14,119 @@ Two capture paths exist; use them deliberately:
 
 Reviewers: flag new catch-and-fallback branches lacking `reportError` as `[BLOCKING]`.
 
+## Model Lifecycle Convention
+
+A new persisted model ships with its whole lifecycle decided, not just the create-and-list half a demo needs.
+
+- **The spec records the lifecycle.** For each of create, read (single and list), update and remove, the model's spec says built, or not built and why. Append-only is a valid decision: orders, tickets, audit rows and refunds take no update or delete use case (REFUNDED and INVALID are terminal). The defect is the unrecorded gap, found during an incident.
+- **Remove is decided when the model is introduced**: soft or hard, and what happens to dependents. Read the FK graph first; most of ours CASCADE.
+- **`/platform` gets full CRUD by default** (owner, 2026-10-11: "often times I will want CRUD for things on platform"). A model a platform admin manages gets create, edit and remove on its platform page along with the list, and a page that can remove a row can also create one. A model with no platform page says so in its spec. The standing example: a category can be deleted on `/platform` but is created only by approving a category request.
+- **A use case is the supported way to change a row.** Raw SQL skips the audit row and the `reindexAfterMutation` / `markForSearchReindex` calls; two listings were removed from production that way on 2026-10-06. When hand-written SQL is the only way to make a change, build the use case and its surface.
+
+Reviewers: flag as `[BLOCKING]` a new model that lands create without update and remove unless its spec records that part as not built (append-only included), and a platform page that can remove a row but cannot create one.
+
 ## Local Dev
 
 Dev login credentials and seeded users/orgs (including the `dev-login` admin slug) live in `apps/api/src/scripts/seed/ids.ts` (imported by `seed-data.ts`). Check there for the email/password to sign in locally.
 
-### Testing passkeys
+**Passkeys** (web sign-in or scanner cross-device, AASA/assetlinks, keystore fingerprint) → read `docs/runbooks/passkey-testing.md` before testing or touching them.
 
-The `/sign-in` flow is passkey-first via Better Auth's WebAuthn plugin. To test in local dev without a real device:
+## Sessions: hand off or compact
 
-1. Open Chrome DevTools → ⋮ menu → **More tools → WebAuthn**.
-2. Toggle **"Enable virtual authenticator environment"** on.
-3. Click **"Add"** → leave defaults (`internal`, `ctap2`, `resident-key: yes`, `user-verification: yes`).
-4. On `/account/settings`, expand **Security** and click **"Add a passkey"** to enroll one against the virtual authenticator.
-5. Sign out, hit `/sign-in`, click **"Continue with Passkey"** — DevTools logs the assertion and signs you in.
+A session is one task. Every turn re-reads the whole context, and quality drops as it fills, so a fresh session that starts from a written handoff beats a long one carried by summaries. Auto-compact (set to fire at 400K) is the backstop, not the plan.
 
-The "Use password instead" expander still works for accounts without an enrolled passkey.
+**Hand off** (end this session, the next one starts fresh) when:
+- the task is done and the user moves to a different task: new feature, new bug, new area of the code;
+- a long investigation has ended in a decision and building starts;
+- the session is drifting: repeated mistakes, the same files re-read, user corrections piling up.
 
-### Testing scanner passkeys
+At a hand-off point, say so in one line and invoke the `handoff` skill: it writes the handoff, starts the next session and opens it in a VS Code tab, and you close out this side (HISTORY.md entry, memory). When the user's message *is* the new task, that task goes into the handoff rather than being started here. A question answerable in a turn or two stays in this session.
 
-Scanner passkeys piggyback on the same `passkey()` server plugin. Cross-device credential sharing relies on:
+**Compact** (stay in this session) when the next step continues the same task and needs what is already in context: after a plan is agreed and before building it, or between implementation steps of one feature. Suggest `/compact focus on <next step>` at that boundary instead of waiting for auto-compact.
 
-- `apps/web/public/.well-known/apple-app-site-association` claims `FJG7F43395.com.ithasfire.scan` for `webcredentials` AND `FJG7F43395.com.ithasfire.app` (consumer) for both `webcredentials` and `applinks` (`/events/*`, `/event/*`, `/orgs/*`, `/places/*`, `/p/*`, `/my-tickets*`, `/tickets/qr/*`) on `ithasfire.com`. (Team `FJG7F43395` = business account; the old `5J9DRDR2TB.com.ithasfire(.scanner)` bundle IDs were burned in App Store Connect and re-registered as `com.ithasfire.app` / `com.ithasfire.scan`.)
-- `apps/web/public/.well-known/assetlinks.json` claims `com.ithasfire.scan` for Credential Manager. The Android SHA-256 fingerprint is the EAS-managed production keystore. To re-verify, run `cd apps/scanner && eas credentials -p android` and compare the Production keystore's SHA-256 against `assetlinks.json`. Update both whenever the keystore is rotated. **TODO before consumer mobile launch:** add a second entry for `com.ithasfire` (Android consumer package) with its EAS production SHA-256 (omit until real; invalid fingerprints break App Links auto-verification for the whole file).
-- `apps/scanner/app.config.ts` — `ios.associatedDomains` + `android.intentFilters` reference `ithasfire.com`.
+**Before either:** a ruling, correction or preference the user gives in chat goes to memory or the active plan/spec file when it is given. Rules that live only in the conversation are what compaction loses.
 
-Local + dev limitations: the iOS Simulator and Android emulator don't honour AASA / assetlinks the same way real devices do. To smoke-test cross-device passkey sign-in, build via `eas build --profile preview` and install on a physical device. Locally you can still test the **CTA wiring** by running the scanner against an API host that's reachable over HTTPS.
+## Compact Instructions
 
-Server side requires no extra setup — `passkey()` is mounted in `better-auth.ts` and Better Auth derives the relying party from `PUBLIC_WEB_URL`.
+When summarizing this conversation for compaction, keep verbatim:
+- every ruling, correction and preference the user stated, with who decided it;
+- the files this session changed versus files belonging to peer sessions, and each commit made with whether it is pushed;
+- open questions waiting on the user, and the agreed next step;
+- whether each load-bearing claim is `[VERIFIED]` or `[REASONED]`.
+
+Name the active plan, spec, handoff and memory files by path. Drop tool output and file contents (they are re-read from disk), and dead ends unless the reason they failed matters.
+
+## Product principle
+
+**Pro-social is the tiebreaker.** Read `docs/pro-social.md` before recommending any product, UX or design option (grilling, scoping, specs, UI review), and name the principle that decided the recommendation.
+
+**No enshittification is a veto** (owner, 2026-10-12). Its definition and examples are in `docs/pro-social.md`. An option that moves toward it is off the table, not a lost tiebreak; when a change might qualify, ask the owner before building. Reviewers: flag it as `[BLOCKING]`.
 
 ## Prose & Vocabulary
 
 - **All prose follows the `unslop` skill's avoid-list** — chat replies to the user included, not just artifacts. Load it before writing any substantial human-facing text.
-- **`CONTEXT.md` (repo root) is the canonical glossary** once it exists: use its terms — and honour its `_Avoid_` lists — in code, delegation prompts, and copy. When terminology is being debated or a term is fuzzy, load the `domain-modeling` skill and resolve it into `CONTEXT.md` right there.
+- **`CONTEXT.md` (repo root) is the canonical glossary**: use its terms — and honour its `_Avoid_` lists — in code, delegation prompts, and copy. When terminology is being debated or a term is fuzzy, load the `domain-modeling` skill and resolve it into `CONTEXT.md` right there.
 - **Editing any agent-consumed doc** (a skill, this file, `.claude/agents/*`) → load the `writing-for-agents` skill first.
 
 ## Dev Orchestrator
 
-For any implementation task, use the **dev loop**: plan → route → build → review → fix → approve. Invoke `[skill:dev]` to run the full loop.
-
-### Specialist Skills
-
-| Skill                         | When to use                                                                        |
-| ----------------------------- | ---------------------------------------------------------------------------------- |
-| `[skill:coder]`               | Backend: use cases, adapters, transports, tests, bug fixes                         |
-| `[skill:reviewer]`            | Code review after implementation (always runs in the dev loop)                     |
-| `[skill:ui]`                  | UI pages, components, layouts, styling, design system                              |
-| `[skill:mobile]`              | Expo / React Native work in `apps/mobile`, `apps/scanner`, `apps/audio-transcoder` |
-| `[skill:infra]`               | Terraform, Docker, CI/CD, Cloud Run, DNS, secrets                                  |
-| `[skill:refactor]`            | Code cleanup, module reorganization, dead code removal                             |
-| `[skill:context-map]`         | Understand unfamiliar areas before changing them                                   |
-| `[skill:security-review]`     | Security audit (run on-demand, not scheduled)                                      |
-| `[skill:implementation-plan]` | Break a feature into a layer-ordered build plan                                    |
-| `[skill:feature-scoping]`     | Turn a vague idea into a structured spec                                           |
-| `[skill:sentry-triage]`       | Investigate unresolved Sentry errors, map to code, diagnose root cause             |
-| `[skill:codex-delegate]`      | Delegate to Codex (GPT) for a cross-model second-opinion review, mechanical offload, or screenshot UI verification |
-
 ### Model Selection (be deliberate, not default-everything)
 
-Subagents inherit the session model unless overridden. Use that lever:
+An agent's frontmatter sets its default model; `model` on the `Agent` call overrides it for that call.
 
-- **Downgrade to `haiku`** for cheap, mechanical, low-judgment work — recon
-  greps, single-file fixes with a fully-specified diff, boilerplate test/fixture
-  additions, fleets of near-identical small tasks. Pass `model: "haiku"` on the
-  `Task`/`Agent` call.
-- **Keep review at full strength.** Never downgrade the `reviewer` /
-  `security-reviewer` pass — this codebase's best catches (a TOCTOU race, a
-  Turbopack prod bug, an incomplete auth allowlist) came from strong review
-  reasoning a weak model waves through. Bump the hardest adversarial re-review
-  to `opus` when the diff is high-stakes (money, auth, migrations, concurrency).
-- **Omit the override** (inherit) for everything in between — usually correct.
+| Agent | Default | Override |
+| --- | --- | --- |
+| `reviewer`, `security-reviewer` | `opus`, pinned | never lower. This codebase's best catches (a TOCTOU race, a Turbopack prod bug, an incomplete auth allowlist) came from review reasoning a weaker model waves through. |
+| `coder`, `refactor` | `sonnet` | pass `model: "opus"` for the **hard** cases below |
+| `ui`, `mobile`, `infra` | inherit | — |
+| `browser-driver` | `sonnet`, pinned | never `haiku`: a haiku driver ran `pnpm seed:dev` on its own (2026-09-29) |
+| `Explore`, boilerplate, fleets of near-identical tasks | — | pass `model: "haiku"` |
 
-**Cross-model diversity (Codex / GPT).** For high-stakes diffs, run a Codex
-second-opinion review *alongside* the Claude `reviewer` and reconcile both —
-a different model lineage catches different classes of bug. Use `[skill:codex-delegate]`
-(wraps `scripts/codex-headless.sh`), which enforces a hang/crash watchdog
-(default 600s hard cap = "10-minute check", plus stall detection), killing by
-PID/PGID — never a pattern kill. Codex is **additive**, not a replacement:
-Claude subagents stay the primary path (structured schemas, harness-tracked,
-shared context). The watchdog **investigates, doesn't reflexively kill** — on
-cap/stall it diagnoses and leaves the run alive (exit 125) since a reasoning
-model legitimately goes quiet; `--kill-on-cap` opts into a hard kill.
-**Prefer gpt-5.6 for cheap/mechanical/computer-use work** to save Claude tokens
-(user's standing preference). Codex handles **computer-use** (`--computer-use` —
-drives live Mac apps; the dangerous-bypass it needs is user-authorized, don't
-re-ask; keep prompts scoped since it drops the sandbox) and mechanical checks.
-Model defaults to `gpt-5.6-terra` (balanced; `gpt-5.6-luna` for fast/cheap bulk).
-Runs on the user's subscription (external cost) — scoped.
-**TASTE STAYS WITH CLAUDE (hard rule):** never delegate UI/design/visual/
-product-taste judgment to Codex/GPT-5.5 — Claude leads all UI work and owns the
-verdict. When unsure if something is "taste," treat it as taste.
+**Hard** — send `coder`/`refactor` on `opus` when the step:
+- touches money, auth/authz, migrations, concurrency or locking;
+- spans layers (core + adapter + transport) or more than ~3 files with new behaviour;
+- starts from an ambiguous spec, or is a bug whose cause is not yet known;
+- is a fix round after a `sonnet` build drew a `[BLOCKING]` finding. Escalate on the first one; don't send `sonnet` back twice.
 
-**Visual-defect critique → Antigravity/Gemini (`[skill:visual-critique]`).** The
-one UI job that goes to another model: an *objective* visual-defect pass over
-rendered screenshots (truncation, overflow, misalignment, contrast/a11y,
-safe-area collisions, broken responsive states) via `scripts/agy-headless.sh`
-(Gemini, multimodal, free Antigravity tier). Gemini *judges*; Claude still owns
-generation/taste and **triages the findings** — verify each against the
-screenshot (Gemini can hallucinate defects) before acting. Never ask it "does
-this look good" — objective defects only.
+Everything else (a fully specified diff, tests and fixtures, applying `[WARNING]`/`[NIT]` fixes, a single-area change with a clear pattern to copy) stays on `sonnet`. Name the model you chose in the plan step (or in your message to the user), so the routing is visible.
 
-### When to Use `spawn_session` vs Inline Skills
+### Tool output budget (every agent, every Bash call)
 
-**Use inline skills (default)** when:
+Everything a tool returns is re-read on every later turn, so a 50KB log at turn
+10 is paid for again at turns 11 through 200. Return the **signal**, not the dump:
 
-- The task is sequential — each step depends on the previous one
-- You need to carry context between build and review phases
-- It's the standard dev loop (plan → build → review → fix)
-- The task is a single feature or bug fix
+- Tests, typecheck, lint, build: pipe through `2>&1 | tail -40`, or `grep` for
+  `FAIL|error|✗` plus a summary line. Use vitest `--reporter=dot` for full suites.
+- Test, e2e, build and typecheck runs queue machine-wide (1 heavy + 3 light slots), so ~20
+  sessions never stack them. `vitest run` and playwright queue from their own configs;
+  typecheck and builds queue only through the scripts: `pnpm typecheck` (packages),
+  `pnpm typecheck:<api|web|jobs|mobile|scanner>`, `pnpm -F web build`; any other heavy
+  command goes through `node scripts/dev/gate/run.mjs --weight heavy -- <cmd>` (a hook
+  refuses bare `tsc` and `next build`). Under memory pressure the gate runs one job at a
+  time. A queued run prints `gate: queued (<weight>) …` with the reason and can wait tens
+  of minutes: give it a long timeout or `run_in_background`. `pnpm gate:status` shows
+  holders, waiters, memory and ungated runs.
+  Container-backed tests share one native `th-test-pg` server that test-utils starts itself.
+- Read files by range (`offset`/`limit`, `sed -n`); `grep -n` first to find the range.
+- Cap broad searches with `| head -50`.
+- When the full output is needed later, write it to the scratchpad and report the path.
 
-**Use `spawn_session`** when:
-
-- Work is genuinely parallel and independent (e.g., backend + frontend with no shared state yet)
-- You need isolation — one subtask shouldn't pollute context for another
-- Long-running tasks where you want to report partial progress
-- Running a review or security scan while continuing other work
-
-Rule of thumb: if the tasks share files or need each other's output, keep them inline. If they're independent workstreams, spawn.
+**Cross-model work.** `[skill:codex-delegate]` runs Codex/GPT for a second-opinion
+review on high-stakes diffs (additive to `reviewer`, never a replacement), for
+mechanical offload, and for computer-use. **Prefer GPT for cheap/mechanical/
+computer-use work** to save Claude tokens (user's standing preference); the
+wrapper always runs the newest GPT model (owner, 10-07).
+`[skill:visual-critique]` runs Gemini for an objective visual-defect pass over
+screenshots; Claude triages every finding. **TASTE STAYS WITH CLAUDE (hard
+rule):** UI/design/visual/product-taste judgment is Claude's verdict, never
+another model's. When unsure if something is "taste," treat it as taste.
 
 ## Dev Loop (Default Posture)
 
 For **any** implementation task — even without an explicit `/dev` invocation — act as the **development orchestrator**: analyze the task, route it to the right specialist subagent, then run it through code review before declaring it done. Produce reviewed, production-ready code. `/dev <task>` runs this same loop explicitly; this section makes it the default.
 
 ### Delegation
-Delegate to specialists with the **Task tool**, setting `subagent_type` to the specialist's name (`coder`, `reviewer`, `ui`, `infra`, `refactor`, `mobile` — defined in `.claude/agents/`). Delegations are **stateless**: each subagent starts fresh, so every prompt must be detailed and self-contained — what to implement, which files/packages, the constraints/patterns to follow, which docs to read, and exactly what to report back. Pass full context every time; when relaying review feedback, restate the original intent plus the findings verbatim.
+Delegate to specialists with the **Agent tool**, setting `subagent_type` to the specialist's name (`coder`, `reviewer`, `ui`, `infra`, `refactor`, `mobile` — defined in `.claude/agents/`). Delegations are **stateless**: each subagent starts fresh, so every prompt must be detailed and self-contained — what to implement, which files/packages, the constraints/patterns to follow, which docs to read, and exactly what to report back. Pass full context every time; when relaying review feedback, restate the original intent plus the findings verbatim.
 
 ### Agent Roster & Routing
 | Agent | When to use |
@@ -146,24 +136,24 @@ Delegate to specialists with the **Task tool**, setting `subagent_type` to the s
 | `ui` | Web/shared UI pages, components, layouts, styling, design system, accessibility, responsive design |
 | `infra` | Terraform, Docker, CI/CD, Cloud Run, DNS, secrets, deployment, env config |
 | `refactor` | Code cleanup, deduplication, module reorganization, dead code removal, barrel exports |
-| `mobile` | Expo / React Native in `apps/mobile`, `apps/scanner`, `apps/audio-transcoder` |
+| `mobile` | Expo / React Native in `apps/mobile`, `apps/scanner` |
 
 Classify before delegating:
-- **Expo / React Native app** (`apps/mobile`, `apps/scanner`, `apps/audio-transcoder`) → load the `ui` skill for visible screens, then route to `mobile` (mobile UI stays with `mobile`; `ui` runs the design-review pass after the mobile engineering review).
+- **Expo / React Native app** (`apps/mobile`, `apps/scanner`) → load the `ui` skill for visible screens, then route to `mobile` (mobile UI stays with `mobile`; `ui` runs the design-review pass after the mobile engineering review).
 - **Non-mobile UI** (web pages, components, styling, tokens) → load the `ui` skill, then route to `ui`.
 - **Infra** (Terraform, Docker, CI, Cloud Run, env vars, secrets) → `infra`.
 - **Pure cleanup** (no new behavior) → `refactor`.
-- **Everything else** (use cases, adapters, transports, tests, bug fixes) → `coder`.
+- **Everything else** (use cases, adapters, transports, tests, bug fixes, the fastify `apps/audio-transcoder` and `apps/mcp`) → `coder`.
 - **Cross-cutting** → split into steps and route each (run sequentially: e.g. `coder` → `reviewer` → `ui` → `reviewer`).
 
 ### Orchestrator Skills Toolkit
-Before building: `feature-scoping` (vague idea → spec; opens by running the `grilling` interview to an empty frontier) → `implementation-plan` (spec → ordered steps) → `context-map` (before any multi-file change). For UI work, load the `ui` skill first. `grilling` also stands alone for stress-testing any plan or decision outside scoping. After building: `help-center-authoring` (if user-facing) and `release-notes`. Use `doc-coauthoring` for substantial written artifacts, `domain-modeling` when a session shifts the domain language (update `CONTEXT.md` / `docs/decisions/`), and `/handoff` to compact a session for the next agent to continue.
+Before building: `feature-scoping` (vague idea → spec; opens by running the `grilling` interview to an empty frontier) → `implementation-plan` (spec → ordered steps in a `memory/session_*.plan.md`). For UI work, load the `ui` skill first. `grilling` also stands alone for stress-testing any plan or decision outside scoping. After building: `help-center-authoring` (if user-facing). Every new living doc in `docs/` or `docs/runbooks/` gets a row in the matching table of `docs/README.md` (`pnpm docs:check` fails without it); one in a folder with its own README (`decisions/`, `design/`) gets a row there; specs and dated records get none. Use `domain-modeling` when a session shifts the domain language (update `CONTEXT.md` / `docs/decisions/`), and `/handoff` to end a session into a fresh one (see "Sessions: hand off or compact").
 
 ### The 9-Step Loop
 ```
-1. PLAN    → Break down the task, classify each step, set up todos (TodoWrite)
+1. PLAN    → Break down the task, classify each step, write the steps to the plan file
 2. ROUTE   → Pick the right specialist for each step
-3. BUILD   → Delegate to the specialist (Task tool)
+3. BUILD   → Delegate to the specialist (Agent tool)
 4. REVIEW  → Delegate to `reviewer` to audit the output
 5. FIX     → If CHANGES_REQUESTED, send findings back to the SAME specialist
 6. REPEAT  → Steps 4–5 until APPROVED (max 3 rounds per step)
@@ -177,7 +167,7 @@ Before building: `feature-scoping` (vague idea → spec; opens by running the `g
 - **Max 3 review rounds per step.** If unresolved after 3, stop and escalate to the user.
 - **One feature/fix per loop.** Don't combine unrelated changes in one iteration.
 - **Pass full context between agents** — delegations are stateless; restate intent and findings each time.
-- **Track progress with TodoWrite.**
+- **Track progress in the plan file's `## Status`** (commit hash, pushed or not) as each step lands; a one-step task reports its commit in the final report instead.
 - **Run final validation yourself** (typecheck, tests) after approval, as a sanity check.
 - **Run the app yourself** for anything user-facing. Green tests are not evidence that a page works.
 
@@ -208,7 +198,7 @@ Subagent reports are evidence only where they are backed by a command. In every 
 
 The orchestrator **re-runs the load-bearing `[VERIFIED]` claims** and treats `[REASONED]` claims about runtime behaviour as unproven until measured. Real examples from one session: "the 320px cluster wraps" was `[REASONED]` and wrong; "`\p{...}` may crash on Hermes" was `[REASONED]` and disproved by actually running Hermes; "DOM output is byte-identical for existing callers" was true but had to be checked by grepping every call site.
 
-Note `reviewer` and `security-reviewer` have **no Bash** — they physically cannot execute anything, so everything they report is `[REASONED]`. Their findings are leads to verify, not verdicts.
+Note `reviewer` has **no Bash**: it physically cannot execute anything, so everything it reports is `[REASONED]`. `security-reviewer` has Bash for read-only probing (grep, `git diff`, `git show`); its runtime claims count only where tagged `[VERIFIED]`. Their findings are leads to verify, not verdicts.
 
 ### Gates That Look Real And Are Not
 
@@ -217,7 +207,7 @@ Verify a gate actually fails before trusting it. Each of these was confirmed by 
 | Command | Reality |
 | --- | --- |
 | `pnpm exec tsc --noEmit` **at repo root** | **No-op.** Picks up the root solution `tsconfig.json` (`files: []`), so `--noEmit` walks nothing and exits 0 even with a planted type error. Use **`pnpm typecheck`** (`-p tsconfig.base.json`), which does catch it. From inside `apps/web` the bare form is real — so the same command is a gate or a lie depending on cwd. |
-| **`pnpm typecheck` alone** | **Covers `packages/**` only.** `tsconfig.base.json` ends its `exclude` with `"apps/**"`, so a type error in `apps/api`, `apps/jobs`, `apps/mobile` or `apps/scanner` exits 0. A verified miss: `dispatchStripeEvent(event, stripe, {replay: true})` against a 2-arg signature passed `pnpm typecheck` and failed `pnpm -F api exec tsc -p tsconfig.json --noEmit` with TS2554. Typechecking is **two commands minimum** — `pnpm typecheck` for packages, plus the app's own `tsc -p tsconfig.json --noEmit` for every app you touched. Note `**/*.test.ts` is excluded everywhere, so no test file is typechecked by any of them. |
+| **`pnpm typecheck` alone** | **Covers `packages/**` only and skips every test file.** An app type error exits 0: a 3-arg call against a 2-arg signature in `apps/api` passed it and failed the app's own tsc with TS2554. Typechecking is two commands minimum: `pnpm typecheck` plus `pnpm typecheck:<app>` for every app touched (mcp and audio-transcoder have no script: `bash scripts/dev/with-gate-lock.sh pnpm -F <app> exec tsc -p tsconfig.json --noEmit`). The app command checks the tests in its `include` (web, mobile, scanner, jobs), the only gate that catches a fixture asserting a shape the product cannot emit; **`apps/api/test/**` is typechecked by nothing, so vitest is its only gate.** |
 | `pnpm run <script> -- <flags>` | The `--` and everything after it lands in the underlying tool's argv and is silently dropped. A bogus flag runs green. `deploy-dev.yml`'s web step passes `--retry=1` this way, so its documented flake-retry has never applied. |
 | `pnpm -F <name> exec …` with a typo'd filter | Prints "No projects matched the filters" and exits **0** — a permanently-green step that looks like coverage. |
 | `vitest --run` in a package with no tests | Exits **non-zero** on zero matched files. Never add a CI step for a package that has no tests. |
@@ -226,7 +216,7 @@ Verify a gate actually fails before trusting it. Each of these was confirmed by 
 A package's tests running locally does **not** mean CI runs them. `@th/types` had 161 tests in zero jobs; check the workflow before claiming coverage.
 
 ### Verdict Handling
-The `reviewer` returns `APPROVED | CHANGES_REQUESTED` with findings tagged `[BLOCKING] / [WARNING] / [NIT]`. Any `[BLOCKING]` → `CHANGES_REQUESTED`. On `CHANGES_REQUESTED`, extract the `[BLOCKING]` and `[WARNING]` findings and send them back to the specialist that wrote the code, then re-review.
+The `reviewer` returns `APPROVED | CHANGES_REQUESTED` with findings tagged `[BLOCKING] / [WARNING] / [NIT]`. Any `[BLOCKING]` → `CHANGES_REQUESTED`. On `CHANGES_REQUESTED`, extract the `[BLOCKING]` and `[WARNING]` findings and send them back to the specialist that wrote the code, then re-review. A Coverage line marked UNASSESSED needs evidence, not a code change: give the reviewer the files or command output it names and re-review. On `APPROVED` with warnings, fix, accept or defer each one, and say which in the final report.
 
 ### Final Report
 ```
@@ -246,6 +236,3 @@ The `reviewer` returns `APPROVED | CHANGES_REQUESTED` with findings tagged `[BLO
 
 ### Review Rounds: <N>
 ```
-
-### Discord Narration (optional)
-If `DISCORD_AGENTS_WEBHOOK` is set, POST a status embed after each major step via `curl` (colors: planning=3447003, coding=16776960, reviewing=15105570, approved=3066993, changes_requested=15158332). Only attempt if the env var exists; **never fail the loop because Discord is unavailable.**

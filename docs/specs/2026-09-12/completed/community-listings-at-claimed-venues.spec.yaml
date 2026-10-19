@@ -1,0 +1,171 @@
+# community-listings-at-claimed-venues.spec.yaml
+#
+# Let a venue owner accept ownerless community listings at their place, once,
+# at claim time — resolving a deadlock where neither side of the confirmation
+# relationship has an owner.
+
+version: "1.0"
+updated: "2026-09-12"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Venue confirmation requires an authority on both sides: a venue that stamps,
+    or an event owner who is a verified owner of the place. A COMMUNITY listing
+    is ownerless by database constraint (`event_community_ownerless_rsvp_check`),
+    so the owner arm can never hold. The venue arm needs a claimed venue. Measured
+    on the dev database: 508 places, 14 with any ownership (2.8%), 0 claim
+    requests ever filed, 0 events ever confirmed. Both sides are ownerless, so
+    confirmation can never be established, and every community listing renders
+    address-only forever while its venue's page stays empty. 19 of 19 published
+    community listings carry no `placeId` at all; 17 of them name a venue that
+    already exists in the directory.
+  solution: >
+    A place-level owner decision — `Place.acceptsCommunityListings` — offered when
+    an owner claims the place and editable afterwards. Listings stay ownerless;
+    the venue consents once, for the venue, rather than per event. Confirmation
+    stays derived: a third arm on `isVenueConfirmed`, so flipping the flag
+    retroactively lights up existing listings and flipping it off retracts them,
+    with no stamp backfill and no stored derived state.
+  non_goals:
+    - Giving community listings an owner. They stay ownerless; that is the point.
+    - A per-listing accept flow. The venue accepts the venue, not each event.
+    - Auto-enabling on claim. Consent is explicit.
+    - Backfilling `placeId`. That is a separate script and a prerequisite, not
+      part of this spec.
+
+# ── Rulings (decided, do not relitigate) ─────────────────────────────────────
+
+rulings:
+  blocking_is_intended: >
+    Confirmation also drives availability and conflict detection
+    (`get-place-booking-availability.ts` uses the same predicate). An accepted
+    weekly open mic therefore BLOCKS that slot for booking requests. This is
+    correct and deliberate — the room genuinely is busy. Do not scope the new
+    arm to display-only.
+  revocation_reverts_to_address_only: >
+    If ownership is revoked the listing reverts to plain address and stays in
+    the community. It is not deleted, not unlinked, and not orphaned — it simply
+    stops being confirmed. Unowned consent is the exact state the model exists
+    to prevent, so the flag must not survive as a live `true` on an unowned place.
+  predicate_stays_derived: >
+    `isVenueConfirmed` remains the only place the rule lives. The new arm is
+    added there. No stored `isConfirmed` flag, ever.
+  unconfirmed_link_shows_the_name: >
+    Owner, 2026-10-06 (picked option B). A community listing linked to a place
+    (`placeId` set) that is NOT venue-confirmed shows the place's name as plain
+    text: no link to the venue page, not listed on the venue page, no search
+    `venueId`, and no availability block. Confirmation, consent and blocking are
+    unchanged and still need the claimed owner's yes. Nobody grants consent for
+    an unowned place, platform staff included. The community form gets a place
+    picker so `placeId` is recorded at create time, ahead of consent.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  - id: FR-001
+    title: Place-level acceptance flag
+    detail: >
+      Add `Place.acceptsCommunityListings Boolean @default(false)`. Mirror the
+      existing `Place.acceptsBookingRequests` in every respect — column shape,
+      snake_case map, the admin toggle component, and the cache-revalidate route
+      that already exists for that flag. Default false: consent is explicit.
+
+  - id: FR-002
+    title: Third arm on the confirmation derivation
+    detail: >
+      In `packages/core/src/lib/venue-confirmation.ts`, extend `isVenueConfirmed`:
+
+        isVenueConfirmed =
+             (venueConfirmedAt != null AND venueConfirmationWithdrawnAt == null
+              AND venueConfirmedPlaceId == placeId)
+          OR (the event's owner is a verified, unrevoked owner of the place)
+          OR (event.stewardship == COMMUNITY
+              AND place.acceptsCommunityListings
+              AND event.placeId == place.id)
+
+      Retroactive by construction: no stamps are written, so toggling the flag
+      changes the verdict for existing and future listings alike.
+
+  - id: FR-003
+    title: Withdrawal is absolute
+    detail: >
+      `venueConfirmationWithdrawnAt` currently negates the stamp arm only. It must
+      negate ALL arms, including the new one, so an owner who accepts listings
+      broadly can still reject a single bad one without switching the venue-wide
+      flag off.
+
+  - id: FR-004
+    title: The SQL twin must not drift
+    detail: >
+      The predicate is expressed twice — `isVenueConfirmed` in TS over loaded
+      records, and a hand-written SQL fragment in
+      `packages/adapters/src/db/prisma/events.ts` (~:498) fed by
+      `venueConfirmedFilterFor`. They cannot be collapsed into one function: one
+      runs in JS, the other must push into SQL. `venueConfirmedFilterFor` is only
+      a thin accessor returning `{ orgIds, humanIds }`; the real duplication is
+      the SQL fragment.
+
+      Mitigation is a PARITY TEST, not a refactor: one fixture corpus of
+      (event, place) pairs covering every arm and every negation, asserted to
+      produce identical verdicts through both paths. Add the new arm to both,
+      and add the parity test in the same change. The SQL side needs the flag,
+      so `venueConfirmedFilterFor` grows a field and the repo read needs the
+      place row (or a join).
+
+  - id: FR-005
+    title: Prompt at claim, editable after
+    detail: >
+      When an owner completes a place claim, ask whether to accept community
+      listings, stating plainly that accepted listings appear on the venue page
+      AND occupy that time for booking availability. It must also be reachable
+      later from the place's admin settings alongside the booking toggle — an
+      owner who declines at claim time must be able to change their mind.
+
+  - id: FR-006
+    title: Revocation resets the flag
+    detail: >
+      When place ownership is revoked, set `acceptsCommunityListings = false` in
+      the same transaction as the revocation. Per the ruling, listings then
+      render address-only and remain in the community.
+
+  - id: FR-007
+    title: Show the venue what it is accepting
+    detail: >
+      `getVenueCalendar` already reads without the confirmation filter, so a venue
+      can see unconfirmed listings claiming its room. Surface the count of
+      community listings currently attached to the place at the point of decision,
+      so the toggle is an informed one rather than abstract.
+
+# ── Consequences to verify ───────────────────────────────────────────────────
+
+verify:
+  - >
+    Availability: an accepted recurring listing blocks its slot in
+    `get-place-booking-availability`. Assert this positively — it is the ruling,
+    not a side effect to be suppressed.
+  - >
+    Stats: `recalculate-place-stats` uses the same filter, so accepted listings
+    begin counting toward the venue's event history. Expected, worth a test.
+  - >
+    Search: `build-search-index` writes `venueId`/`venueName` gated on
+    confirmation. Accepted listings gain both — which means a REINDEX is required
+    before the change is visible in search. Say so in the runbook.
+  - >
+    Public event page: `get-event-seo` gates `placeSlug` on the same predicate, so
+    accepted listings gain the "At {venue}" link. Note this depends on the venue's
+    EntityPage slug being routable — 493 of 509 place pages currently carry
+    multi-segment slugs that 404. Tracked separately; do not fix here.
+
+# ── Open ─────────────────────────────────────────────────────────────────────
+
+open_questions:
+  - >
+    Should accepting be offered for places with zero attached community listings?
+    Today `placeId` is null on all of them, so the count is zero everywhere until
+    the link backfill runs. Sequencing the backfill first makes FR-007 meaningful.
+  - >
+    Does a venue want notifying when a NEW community listing attaches to a place
+    that already accepts them? Blanket consent plus silent additions is the shape
+    most likely to surprise an owner later.

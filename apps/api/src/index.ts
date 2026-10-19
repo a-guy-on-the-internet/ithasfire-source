@@ -77,11 +77,29 @@ async function bootstrap() {
       // NOTE: Use override:true for API local env so it takes precedence over
       // empty/stale shell env vars (e.g. STRIPE_WEBHOOK_SECRET="" from global shell config).
       // This is safe because the file is local-only and explicitly overrides shell env.
+      // DEV_ENV_PINS (comma-separated var names, set by scripts/human-dev.cjs)
+      // marks values the parent process injected on purpose — e.g. the
+      // STRIPE_WEBHOOK_SECRET of the `stripe listen` it started on the API's
+      // own Stripe account. Snapshot them here so the override:true load of
+      // apps/api/.env.local below cannot silently replace them.
+      const pinnedNames = (process.env.DEV_ENV_PINS ?? "")
+        .split(",")
+        .map((name) => name.trim())
+        .filter(Boolean);
+      // Truthy, not just defined: an empty-string shell export (e.g.
+      // STRIPE_WEBHOOK_SECRET="" from global shell config) must not pin
+      // itself over the file value.
+      const pinned = Object.fromEntries(
+        pinnedNames
+          .filter((name) => Boolean(process.env[name]))
+          .map((name) => [name, process.env[name] as string]),
+      );
       dotenv.config({ path: ".env.local", override: true });
       dotenv.config({
         path: "../../.env.local",
         override: !process.env.DATABASE_URL,
       });
+      Object.assign(process.env, pinned);
     } catch {
       // Optional dependency for local development; ignore if unavailable.
     }

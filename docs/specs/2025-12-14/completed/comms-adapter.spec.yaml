@@ -1,0 +1,103 @@
+status: complete
+task: Implement comms adapters for Mail (SES), SMS, and In-App (DB+JobQueue) using the defined ports
+repo_root: packages/adapters/src/comms
+goal: Production-ready adapters with retries, metrics, logging, idempotency usage, and health checks.
+
+adapters:
+  - mailer: ses-mailer.ts
+  - sms: sns-sms.ts
+  - inapp: inapp-db-queue.ts
+
+dependencies:
+  - Use the Port interfaces & zod schemas from `packages/ports`.
+  - Use existing LoggerPort, MetricsPort, IdempotencyPort from `packages/ports` (compose via constructor).
+  - For In-App, use Repos (notifications repo) + JobQueuePort to fan-out async delivery.
+  - No business logic here—just mapping, validation, retries, and error normalization.
+
+environment:
+  ses-mailer:
+    - AWS_REGION
+    - AWS_ACCESS_KEY_ID
+    - AWS_SECRET_ACCESS_KEY
+    - MAIL_FROM_DEFAULT
+  sns-sms:
+    - AWS_REGION
+    - (optional) AWS_ACCESS_KEY_ID (local only)
+    - (optional) AWS_SECRET_ACCESS_KEY (local only)
+    - (optional) SNS_DEFAULT_SMS_TYPE
+    - (optional) SNS_DEFAULT_SENDER_ID
+  inapp-db-queue:
+    - no vendor env; requires repos + queue injected
+
+behavior:
+  logging:
+    - Log with child logger context: { adapter: "ses" | "sns" | "inapp", op, messageId?, idem? }
+  metrics:
+    - Counters: `comms.mail.sent`, `comms.mail.error`, `comms.sms.sent`, `comms.sms.error`, `comms.inapp.published`, `comms.inapp.error`
+    - Timers: `comms.mail.latency`, `comms.sms.latency`, `comms.inapp.latency`
+    - Tags: channel, templateKey?, errorCode?
+  idempotency:
+    - Respect `idempotencyKey` if present:
+      - get(key) → replay result
+      - begin(key, ttl=120s) → proceed or return transient
+      - commit(key, { vendorMessageId, normalizedResult })
+      - fail(key) on error
+  retries:
+    - Use exponential backoff for retryable HTTP/5xx and vendor “rate limited” responses.
+    - Max 3 attempts; jitter; surface `transient` on exhaustion.
+  normalization:
+    - Map vendor errors → port error codes (rate_limited, dependency_failed, invalid_input, unauthorized).
+    - Always return { success, id, idempotentReplay? }.
+
+health():
+  - Make lightweight API call or token check.
+  - Return HealthStatus { ok, vendor, latencyMs, message? }.
+  - Do not throw; degraded health sets ok=false.
+
+mapping specifics:
+  ses-mailer:
+    - Support `text|html` and `template` w/ variables.
+    - Attachments → SES Raw with base64.
+    - Use `from` override or fallback to MAIL_FROM_DEFAULT.
+    - Batch: chunk to SES limits; report partial successes.
+
+  sns-sms:
+    - Single recipient per publish. Batch fan-out uses bounded concurrency.
+    - Enforce 1600 char safeguard (truncate with ellipsis).
+    - Normalize E164. Reject invalid with `invalid_input`.
+    - Default SMSType Transactional; optional SenderID.
+
+  inapp-db-queue:
+    - Persist notification record via repos: { humanId, title, body, kind, metadata, tags, expiresAt }
+    - Enqueue a job `deliver.inapp` per recipient (JobQueuePort).
+    - Return a synthesized id (db id or composed).
+    - Health: check repos + queue `health()`.
+
+errors:
+  - Throw `CommsPortError` with one of:
+    - invalid_input, unauthorized, rate_limited, dependency_failed, transient, not_found, conflict
+  - Include `details` with minimally: vendorStatus?, vendorBody?, requestId?
+
+testing:
+  locations:
+    - packages/adapters/test/comms/ses-mailer.test.ts
+    - packages/adapters/src/comms/__tests__/sns-sms.test.ts
+    - packages/adapters/test/comms/inapp-db-queue.test.ts
+  coverage:
+    - happy path (single + batch)
+    - idempotency replay
+    - rate limit → retry → success
+    - dependency failed → mapped error
+    - invalid input (bad email/phone/template)
+    - health ok/degraded
+  use fakes:
+    - Fake IdempotencyPort, MetricsPort, LoggerPort, Repos, JobQueuePort.
+
+documentation:
+  - JSDoc at adapter class top explaining env vars, limits, and example usage.
+  - README snippet under packages/adapters/src/comms/README.md with wiring notes.
+
+deliverables:
+  - Three adapter classes implementing the corresponding Port interfaces.
+  - Full error normalization and metrics/logging hooks.
+  - Batch operations with partial success accounting.

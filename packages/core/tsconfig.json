@@ -1,0 +1,22 @@
+{
+  "extends": "../config/tsconfig/base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "types": ["vitest"],
+    "baseUrl": ".",
+    "paths": {
+      "@th/core/*": ["./src/*"],
+      "@th/adapters": ["../adapters/src/index.ts"],
+      "@th/adapters/*": ["../adapters/src/*"],
+      "@th/ports": ["../ports/src/index.ts"],
+      "@th/ports/*": ["../ports/src/*"],
+      "@th/schema": ["../schema/src/index.ts"],
+      "@th/types": ["../types/src/index.ts"],
+      "@th/types/*": ["../types/src/*"],
+      "@th/test-utils": ["../test-utils/src/index.ts"],
+      "@th/test-utils/*": ["../test-utils/src/*"]
+    }
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
+}

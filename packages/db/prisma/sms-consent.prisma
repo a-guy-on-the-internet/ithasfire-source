@@ -1,0 +1,49 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// SMS consent ledger — app-owned record of phone-level SMS opt-out / opt-in
+// state, keyed by normalized E.164 number. AWS SNS suppresses STOP'd numbers at
+// the provider level, but that never updates Ithas Fire state on its own; this
+// ledger plus provider reconciliation is the source of truth for whether a
+// reminder/announcement SMS may be sent.
+// See docs/specs/2026-05-18/completed/sms-opt-out-sns.spec.yaml.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model SmsConsent {
+  id                String           @id @default(uuid())
+  // Normalized E.164 (e.g. +15555550123). One current state per number.
+  phoneE164         String           @unique
+  status            SmsConsentStatus
+  // Free-form origin tag (e.g. "provider_reconciliation", "support_manual",
+  // "inbound_stop", "user_settings"). Kept as String, not an enum, so new
+  // sources don't require a migration.
+  source            String
+  // The STOP-family keyword that triggered an opt-out, when known.
+  reasonKeyword     String?
+  // Provider message id associated with the triggering event, when available.
+  providerMessageId String?
+  // Human who recorded a manual support action, when applicable.
+  actorHumanId      String?
+  metadata          Json             @default("{}")
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+  optedOutAt        DateTime?
+  optedInAt         DateTime?
+
+  @@index([status, updatedAt])
+}
+
+// Append-only audit trail of every consent-affecting signal. The current
+// `SmsConsent` row is derived from these; events are never mutated.
+model SmsConsentEvent {
+  id                String   @id @default(uuid())
+  phoneE164         String
+  // e.g. "opt_out", "opt_in", "provider_opted_out", "support_opt_out".
+  eventType         String
+  source            String
+  providerMessageId String?
+  // SHA-256 of the raw provider payload, when one exists, for replay dedupe
+  // without storing PII-bearing bodies.
+  payloadHash       String?
+  createdAt         DateTime @default(now())
+
+  @@index([phoneE164, createdAt])
+}

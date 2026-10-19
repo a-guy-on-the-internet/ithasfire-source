@@ -65,7 +65,6 @@ const seedVenueCellCreate: FastifyPluginAsync = async (app) => {
       const place = await prisma.place.create({
         data: {
           name: "E2E Cell Create Venue",
-          slug: `e2e-cell-venue-${stamp}`,
           address: "22 Room St, Test City, TS 00001",
           city: "Test City",
           region: "TS",
@@ -95,10 +94,18 @@ const seedVenueCellCreate: FastifyPluginAsync = async (app) => {
           slug: "e2e-social-club",
           isDefault: true,
           defaultStartTime: CALENDAR_DEFAULT_START_TIME,
+          // Every Calendar names a PRIMARY space, FK-pinned to an ACTIVE one
+          // (migration 20260924120000_calendar_primary_space) that must ALSO be
+          // one of its own CalendarSpace joins (migration
+          // 20260924160000_calendar_primary_space_joined). The second FK is
+          // DEFERRABLE INITIALLY DEFERRED, and "deferred" means "checked at the
+          // end of the enclosing transaction" — in autocommit that is the end of
+          // THIS statement. So the join is a NESTED write, not a follow-up
+          // `calendarSpace.create`: a Prisma nested write is one transaction,
+          // and the separate statement it replaces would have failed outright.
+          primarySpaceId: space.id,
+          calendarSpaces: { create: [{ spaceId: space.id }] },
         },
-      });
-      await prisma.calendarSpace.create({
-        data: { calendarId: calendar.id, spaceId: space.id },
       });
 
       return reply.status(200).send({
@@ -108,7 +115,6 @@ const seedVenueCellCreate: FastifyPluginAsync = async (app) => {
           orgId: org.id,
           orgSlug: org.slug,
           placeId: place.id,
-          placeSlug: place.slug,
           placeName: place.name,
           spaceId: space.id,
           calendarId: calendar.id,

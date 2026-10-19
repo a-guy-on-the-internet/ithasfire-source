@@ -2,9 +2,30 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # pre-push hook — mirrors CI checks locally so we don't burn GH Actions minutes.
 #
-# Runs: lockfile sync → prisma validate → build → lint → core tests → adapter tests
+# Runs, per pushed commit: lockfile sync → prisma validate → prisma generate →
+# build → lint → core tests → adapter tests → web i18n guard
 #
-# Skip with: git push --no-verify
+# ── It checks the COMMIT being pushed, in a clean checkout ────────────────────
+# Each pushed sha is checked out into a throwaway `git worktree` under $TMPDIR,
+# and every step runs there. Uncommitted edits in the tree you push from (this
+# checkout is shared by many concurrent sessions, each with half-finished work)
+# cannot fail the hook, and cannot make it pass either. What is tested is
+# exactly what lands on the remote.
+#
+# Consequences worth knowing:
+#   - Pushing `git push origin <sha>:refs/heads/main` checks <sha>, not HEAD.
+#   - The worktree starts with no node_modules, no Prisma client and no built
+#     dist, so the hook installs (from the pnpm store, offline-first) and
+#     generates them. That costs a minute or two; the turbo cache is shared
+#     with the main checkout ($MAIN_ROOT/.turbo/cache), so unchanged packages
+#     replay instead of rebuilding.
+#   - Gitignored files (apps/web/.env.local, .env.sentry-build-plugin, …) do NOT
+#     exist in the worktree. That mirrors CI's steps, which build with no env
+#     files. (A turbo cache hit can still replay a build made in the main
+#     tree, whose output may have read those files.)
+#   - The worktree is removed on exit, success, failure or Ctrl-C. A run that
+#     was SIGKILLed cannot clean up; the next run reaps its worktree instead
+#     (see reap_orphan_worktrees).
 #
 # ── The summary tells the truth ───────────────────────────────────────────────
 # This hook used to print "All pre-push checks passed" unconditionally — even
@@ -21,16 +42,16 @@
 #             run is not evidence of a problem.
 #   passed  — ran clean.
 #
-# Escape hatches, in order of preference:
-#   PREPUSH_SOFT=1 git push   — downgrade FAILED to WARNED. Use when the tree is
-#                               dirty with someone else's in-flight work and the
-#                               failure is not in what you are pushing (this repo
-#                               routinely carries concurrent uncommitted work).
-#   git push --no-verify      — skip the hook entirely.
+# Escape hatch:
+#   PREPUSH_SOFT=1 git push   — downgrade FAILED to WARNED (lint and the test
+#                               steps). Use when the failure is already on
+#                               origin/main or is a known flake, i.e. not
+#                               introduced by the commits you are pushing.
+#   (`git push --no-verify` is ruled out by the owner, 10-05. Don't; use
+#   PREPUSH_SOFT.)
 #
-# NOTE: every step here tests the WORKING TREE, not the commits being pushed. A
-# dirty tree can therefore fail you for code you are not pushing — which is
-# exactly what PREPUSH_SOFT is for.
+# Bash 3.2 (macOS /bin/bash) safe: no empty-array expansion under `set -u`, no
+# `timeout`, no `mapfile`.
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -40,8 +61,9 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No colour
 
-step() { printf "\n${YELLOW}▸ %s${NC}\n" "$1"; }
-pass() { printf "${GREEN}  ✓ %s${NC}\n" "$1"; }
+STEP_START=0
+step() { STEP_START=$SECONDS; printf "\n${YELLOW}▸ %s${NC}\n" "$1"; }
+pass() { printf "${GREEN}  ✓ %s${NC} (%ss)\n" "$1" "$((SECONDS - STEP_START))"; }
 fail() { printf "${RED}  ✗ %s${NC}\n" "$1"; exit 1; }
 
 # Outcome accumulators. Deliberately newline-delimited STRINGS rather than
@@ -51,93 +73,250 @@ fail() { printf "${RED}  ✗ %s${NC}\n" "$1"; exit 1; }
 # not depend on that.
 FAILED_STEPS=""
 WARNED_STEPS=""
-record_fail() { FAILED_STEPS="${FAILED_STEPS}  • $1\n"; }
-record_warn() { WARNED_STEPS="${WARNED_STEPS}  • $1\n"; }
+record_fail() { FAILED_STEPS="${FAILED_STEPS}  • ${LABEL_PREFIX}$1\n"; }
+record_warn() { WARNED_STEPS="${WARNED_STEPS}  • ${LABEL_PREFIX}$1\n"; }
+LABEL_PREFIX=""
 
+ZERO_SHA="0000000000000000000000000000000000000000"
+is_zero_sha() { [ -n "$1" ] && [ -z "${1//0/}" ]; }
+
+# ── Locate the repository BEFORE touching git's environment ────────────────
+# REPO_ROOT is the tree `git push` ran in (the main checkout or a linked
+# worktree). MAIN_ROOT is the main checkout, which owns the shared turbo cache.
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-cd "$REPO_ROOT"
-
-# ── Skip on non-code pushes (tags, etc.) ────────────────────────────────────
-# The hook receives lines on stdin: <local ref> <local sha> <remote ref> <remote sha>
-# If no refs are provided (e.g. deleting a remote branch), skip.
-if ! read -r _ _ _ _; then
-  exit 0
+GIT_COMMON_DIR_ABS="$(cd "$REPO_ROOT" && cd "$(git rev-parse --git-common-dir)" && pwd -P)"
+if [ "$(basename "$GIT_COMMON_DIR_ABS")" = ".git" ]; then
+  MAIN_ROOT="$(dirname "$GIT_COMMON_DIR_ABS")"
+else
+  MAIN_ROOT="$REPO_ROOT"
 fi
+REMOTE_NAME="${1:-origin}"
 
-# ── Check if only docs/infra changed (mirror CI paths-ignore) ──────────────
-# Compare what's being pushed vs what remote already has.
-REMOTE_REF=$(git rev-parse --abbrev-ref @{upstream} 2>/dev/null || echo "origin/main")
-CHANGED_FILES=$(git diff --name-only "$REMOTE_REF"...HEAD 2>/dev/null || echo "")
+# ── Drop every repo-local git variable ──────────────────────────────────────
+# Sessions here commit through an exported temp index. An inherited
+# GIT_INDEX_FILE makes `git worktree add` leave a STALE checkout, and an
+# inherited GIT_DIR / GIT_WORK_TREE would point turbo's file hashing (and
+# pnpm's `prepare` script) at the main tree instead of the worktree.
+# `git rev-parse --local-env-vars` is git's own list of those variables.
+for _v in $(git rev-parse --local-env-vars); do
+  unset "$_v"
+done
+unset _v
+cd "$REPO_ROOT"
+# Never let git-lfs (or anything else) block on a credential prompt.
+export GIT_TERMINAL_PROMPT=0
 
-if [ -n "$CHANGED_FILES" ]; then
-  # Filter out docs, markdown, and terraform-only changes
-  CODE_CHANGES=$(echo "$CHANGED_FILES" | grep -vE '^(docs/|infra/terraform/|\.github/workflows/(infra-validation|terraform-))|\.md$' || true)
-  if [ -z "$CODE_CHANGES" ]; then
-    printf "${GREEN}▸ Only docs/infra changes — skipping pre-push checks${NC}\n"
-    exit 0
+# ── Reap worktrees left by a SIGKILLed run ──────────────────────────────────
+# SIGKILL (e.g. a tool timeout) runs no trap, so that run's worktree, with a
+# full node_modules, stays behind. Remove those here, under strict limits:
+#   - only registered worktrees at <dir>/th-prepush.XXXXXX/th-prepush.XXXXXX,
+#     the exact shape check_commit creates; nothing else is ever touched;
+#   - only when the run that made it is gone: its .owner-pid process is dead,
+#     or is now some unrelated process (pid reuse). A live peer hook is left
+#     alone;
+#   - with no .owner-pid (or an unreadable one), only when the dir is older
+#     than 60 minutes.
+reap_orphan_worktrees() {
+  local list line path parent leaf owner owner_cmd kerr reaped=0
+  list=$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null) || return 0
+  [ -n "$list" ] || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) path="${line#worktree }" ;;
+      *) continue ;;
+    esac
+    [ -n "$path" ] || continue
+    case "$path" in */th-prepush.*/th-prepush.*) ;; *) continue ;; esac
+    parent=$(dirname "$path")
+    leaf=$(basename "$path")
+    # Both levels must be the same th-prepush.XXXXXX name, as created below.
+    case "$leaf" in th-prepush.??????) ;; *) continue ;; esac
+    [ "$(basename "$parent")" = "$leaf" ] || continue
+    [ -n "$parent" ] && [ "$parent" != "/" ] || continue
+
+    owner=""
+    if [ -f "$parent/.owner-pid" ]; then
+      owner=$(head -n 1 "$parent/.owner-pid" 2>/dev/null || true)
+      case "$owner" in ''|*[!0-9]*) owner="" ;; esac
+    fi
+    if [ -n "$owner" ]; then
+      if kerr=$(kill -0 "$owner" 2>&1); then
+        # Alive. Leave it if it is a hook, or if ps can't say (empty): only a
+        # pid provably reused by something else is reaped at once.
+        owner_cmd=$(ps -ww -p "$owner" -o command= 2>/dev/null || true)
+        case "$owner_cmd" in ''|*pre-push*) continue ;; esac
+      else
+        # Dead only on ESRCH. EPERM (e.g. a sandboxed caller) is "can't tell":
+        # fall back to the age rule below rather than reap a live peer.
+        case "$kerr" in *"No such process"*) ;; *) owner="" ;; esac
+      fi
+    fi
+    if [ -z "$owner" ]; then
+      # No usable owner: only reap once it is clearly stale.
+      if [ -d "$parent" ] && [ -z "$(find "$parent" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
+        continue
+      fi
+    fi
+
+    printf "${YELLOW}▸ Removing orphaned pre-push worktree %s (owner pid %s is not a running hook)${NC}\n" \
+      "$path" "${owner:-unknown}"
+    git -C "$REPO_ROOT" worktree remove -f -f "$path" > /dev/null 2>&1 || true
+    rm -rf "$parent" 2>/dev/null || true
+    reaped=1
+  done <<EOF
+$list
+EOF
+  if [ "$reaped" -eq 1 ]; then
+    git -C "$REPO_ROOT" worktree prune > /dev/null 2>&1 || true
   fi
+  return 0
+}
+reap_orphan_worktrees
+
+# ── Collect the refs being pushed ───────────────────────────────────────────
+# stdin: <local ref> <local sha> <remote ref> <remote sha>, one line per ref.
+# Deletions (local sha all zeros) push no code and are skipped. A sha pushed
+# under several refs is checked once.
+upstream_base_ref() {
+  if git rev-parse --verify --quiet "refs/remotes/$REMOTE_NAME/main" > /dev/null; then
+    echo "refs/remotes/$REMOTE_NAME/main"
+  elif git rev-parse --verify --quiet "refs/remotes/origin/main" > /dev/null; then
+    echo "refs/remotes/origin/main"
+  fi
+}
+
+# Docs/infra-only filter, mirroring CI paths-ignore. Callers must list files
+# with `--no-renames`: rename detection prints only the NEW path, so a commit
+# that `git mv`s code into docs/ would otherwise read as docs-only.
+code_changes_in() {
+  echo "$1" | grep -vE '^(docs/|infra/terraform/|\.github/workflows/(infra-validation|terraform-))|\.md$' | grep -v '^$' || true
+}
+
+SHAS_TO_CHECK=""   # newline-delimited "<sha> <local ref>"
+SEEN_SHAS=" "
+SAW_REF=0
+while read -r local_ref local_sha _remote_ref remote_sha; do
+  [ -n "${local_sha:-}" ] || continue
+  SAW_REF=1
+  is_zero_sha "$local_sha" && continue
+
+  # Peel tags to the commit they point at.
+  commit_sha=$(git rev-parse --verify --quiet "${local_sha}^{commit}" || true)
+  if [ -z "$commit_sha" ]; then
+    # Not a commit (e.g. a tag on a tree or blob). Nothing to build.
+    continue
+  fi
+  # Already queued under another ref: check it once. A sha is only marked
+  # seen once it is QUEUED, so a ref whose diff is docs-only never hides the
+  # same sha pushed under another ref whose diff has code.
+  case "$SEEN_SHAS" in *" $commit_sha "*) continue ;; esac
+
+  # What does this ref add on top of what the remote already has?
+  base=""
+  if ! is_zero_sha "${remote_sha:-$ZERO_SHA}" \
+     && git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+    base="$remote_sha"
+  else
+    # New branch, or a remote sha we have not fetched: diff against the
+    # merge-base with <remote>/main.
+    up=$(upstream_base_ref)
+    if [ -n "$up" ]; then
+      base=$(git merge-base "$commit_sha" "$up" 2>/dev/null || true)
+    fi
+  fi
+
+  if [ -n "$base" ] && CHANGED_FILES=$(git diff --no-renames --name-only "$base"..."$commit_sha" 2>/dev/null); then
+    if [ -z "$CHANGED_FILES" ]; then
+      # The remote already has every change in this commit.
+      continue
+    fi
+    if [ -z "$(code_changes_in "$CHANGED_FILES")" ]; then
+      printf "${GREEN}▸ %s (%s): only docs or infra changes — skipping its checks${NC}\n" \
+        "$(git rev-parse --short "$commit_sha")" "$local_ref"
+      continue
+    fi
+  fi
+  # Base unknown or diff failed: check it rather than guess.
+  SHAS_TO_CHECK="${SHAS_TO_CHECK}${commit_sha} ${local_ref}
+"
+  SEEN_SHAS="${SEEN_SHAS}${commit_sha} "
+done
+
+if [ "$SAW_REF" -eq 0 ] || [ -z "$SHAS_TO_CHECK" ]; then
+  # No refs, deletions only, or nothing but docs or infra / already-pushed commits.
+  exit 0
 fi
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  pre-push checks (mirrors CI — skip with --no-verify)"
+echo "  pre-push checks on the pushed commit(s), in a clean worktree"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# ── 1. Lockfile sync ────────────────────────────────────────────────────────
-# Catches the case where a `pnpm add` / hand-edit updated package.json (or
-# pnpm-lock.yaml) without the matching counterpart making it into the
-# commit. CI runs `pnpm install --frozen-lockfile` and bombs the gate
-# 14+ minutes in; doing the same check here fails locally in ~3 seconds.
-# Auto-recovery hint included so the next person doesn't have to think.
-step "Lockfile sync"
-LOCK_OUT=$(mktemp)
-if pnpm install --frozen-lockfile --prefer-offline > "$LOCK_OUT" 2>&1; then
-  pass "package.json + pnpm-lock.yaml in sync"
-else
-  printf "${RED}  ✗ Lockfile is out of sync with package.json${NC}\n"
-  grep -E 'ERR_PNPM|specifiers in the lockfile|dependencies were|dependencies are mismatched|dependencies were removed|^\* ' "$LOCK_OUT" | head -20
-  printf "${YELLOW}  Recover: ${NC}pnpm install --no-frozen-lockfile && git add package.json pnpm-lock.yaml apps/*/package.json packages/*/package.json\n"
-  rm -f "$LOCK_OUT"
-  exit 1
-fi
-rm -f "$LOCK_OUT"
+# ── Throwaway worktree lifecycle ────────────────────────────────────────────
+# Each run gets its own mktemp dir, so two sessions pushing at once never share
+# a checkout. The EXIT trap removes it on every path out; INT/TERM/HUP are
+# turned into exits so the EXIT trap runs once, after the foreground step dies.
+# SIGKILL runs no trap at all; reap_orphan_worktrees covers that case.
+WT_PARENT=""
+WT=""
+BOUNDED_PID=""
+GATED_PID=""
 
-# ── 2. Prisma validate ──────────────────────────────────────────────────────
-step "Prisma validate"
-pnpm db:validate > /dev/null 2>&1 && pass "Schema valid" || fail "Prisma schema validation failed"
+remove_worktree() {
+  if [ -n "$GATED_PID" ]; then
+    # GATED_PID is the gate itself (gate_cmd execs it): a plain background
+    # child, which a non-interactive bash starts with SIGINT ignored, so Ctrl-C
+    # alone would leave it running. TERM reaches the gate, which forwards it to
+    # the build/test it runs and releases its slot.
+    kill -TERM "$GATED_PID" 2>/dev/null || true
+    wait "$GATED_PID" 2>/dev/null || true
+    GATED_PID=""
+  fi
+  if [ -n "$BOUNDED_PID" ]; then
+    # run_bounded starts its job in its own process group, so Ctrl-C does not
+    # reach it. Kill the group, or vitest keeps running in a deleted tree.
+    kill -9 -"$BOUNDED_PID" 2>/dev/null || kill -9 "$BOUNDED_PID" 2>/dev/null || true
+    wait "$BOUNDED_PID" 2>/dev/null || true
+    BOUNDED_PID=""
+  fi
+  if [ -n "$WT" ]; then
+    git -C "$REPO_ROOT" worktree remove -f -f "$WT" > /dev/null 2>&1 || true
+    WT=""
+  fi
+  if [ -n "$WT_PARENT" ]; then
+    rm -rf "$WT_PARENT" 2>/dev/null || true
+    WT_PARENT=""
+  fi
+  git -C "$REPO_ROOT" worktree prune > /dev/null 2>&1 || true
+}
 
-# ── 2. Build ────────────────────────────────────────────────────────────────
-step "Build (turbo)"
-BUILD_OUT=$(mktemp)
-if pnpm build > "$BUILD_OUT" 2>&1; then
-  pass "Build succeeded"
-else
-  printf "${RED}  ✗ Build failed${NC}\n"
-  # Show only error lines — strip noise, keep TS errors + build failures
-  grep -E 'error TS|Type error|SyntaxError|Cannot find|⨯|ELIFECYCLE|ERR_|\bfailed\b' "$BUILD_OUT" | head -40 || tail -30 "$BUILD_OUT"
-  rm -f "$BUILD_OUT"
-  exit 1
-fi
-rm -f "$BUILD_OUT"
+# Step logs live in $WT_PARENT and vanish with it. On a failure, copy the log
+# somewhere that survives so the full output can be read afterwards.
+keep_log() {
+  # keep_log <log file> <name>
+  local kept
+  kept=$(mktemp "${TMPDIR:-/tmp}/th-prepush-$2.XXXXXX") || return 0
+  cp "$1" "$kept" 2>/dev/null && printf "  Full log: %s\n" "$kept"
+  return 0
+}
 
-# ── 2b. Prune turbo cache ───────────────────────────────────────────────────
-# The build above writes a new artifact to .turbo/cache per task-hash; turbo
-# never prunes it, so the dir grows unbounded. Cap it (default 5 GB, oldest-first).
-step "Prune turbo cache"
-"$REPO_ROOT/scripts/prune-turbo-cache.sh" && pass "Cache within size cap"
+trap remove_worktree EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
-# ── 3. Lint ─────────────────────────────────────────────────────────────────
-# `pnpm lint` exits non-zero only on ERRORS; warnings alone leave it at 0. So a
-# non-zero here is a real, blocking problem, not style noise.
-step "Lint"
-if pnpm lint > /dev/null 2>&1; then
-  pass "Lint passed"
-else
-  printf "${RED}  ✗ Lint failed — run 'pnpm lint' to review${NC}\n"
-  record_fail "Lint (pnpm lint)"
-fi
+# ── Shared turbo cache ──────────────────────────────────────────────────────
+# Point the worktree's turbo at the main checkout's cache so unchanged
+# packages replay. UNVERIFIED by test, read from turbo's docs and source: turbo 2.x
+# already redirects a linked worktree's cache to the main worktree's
+# .turbo/cache (set explicitly here in case that changes), and turbo 2.9.12
+# writes entries to a pid-unique temp file and renames them into place, which
+# is what lets concurrent hook runs share the dir.
+export TURBO_CACHE_DIR="$MAIN_ROOT/.turbo/cache"
+# `turbo run` ignores the daemon in 2.x; keep it that way if that changes.
+export TURBO_DAEMON=false
 
-# ── 4. Core + adapter unit tests ───────────────────────────────────────────
+# ── Test bounds (see run_bounded) ───────────────────────────────────────────
 # These steps are BOUNDED by wall clock, which is why the outcome is graded
 # rather than boolean. Hitting the cap tells you nothing about the code, so it
 # warns; a suite that RAN and failed is real evidence, so it blocks.
@@ -179,13 +358,107 @@ VITEST_BOUNDS="--testTimeout=30000 --hookTimeout=30000"
 # machine while still bounding a pathological hang.
 STEP_CAP_SECONDS="${PREPUSH_TEST_CAP:-420}"
 
+# ── Machine-wide gate (scripts/dev/gate) ────────────────────────────────────
+# Builds and tests queue for a slot shared by every session on this machine
+# (1 heavy + 3 light). The MAIN tree's working copy of the gate runs, as with
+# the prune script below: the pushed commit may predate it. Absent → ungated.
+# Waiting is announced at once (after ~2s) and every ~30s, because each step's
+# own output goes to a log file and a silent queue looks like a hang.
+GATE_RUN="$MAIN_ROOT/scripts/dev/gate/run.mjs"
+GATE_NOTE_SECS="${PREPUSH_GATE_NOTE_SECS:-30}"
+case "$GATE_NOTE_SECS" in '' | *[!0-9]*) GATE_NOTE_SECS=30 ;; esac
+GATE_NOTE_SECS=$((10#$GATE_NOTE_SECS)) # "08" would otherwise be bad octal in $((…))
+[ "$GATE_NOTE_SECS" -ge 1 ] || GATE_NOTE_SECS=1
+
+# gate_cmd <weight> <label> <ready-file> -- <cmd...>: the command, gated.
+# <ready-file> appears once the slot is held (or the gate is bypassed), just
+# before <cmd> starts. Callers run it as `gate_cmd … &`, which forks a subshell;
+# `exec` replaces that subshell, so $! is the gate (or <cmd>) itself and a TERM
+# to it reaches the process holding the slot, never just a wrapper shell.
+gate_cmd() {
+  local weight="$1" label="$2" ready="$3"; shift 4
+  if [ -f "$GATE_RUN" ]; then
+    exec node "$GATE_RUN" --weight "$weight" --label "pre-push: $label" --ready-file "$ready" -- "$@"
+  else
+    : > "$ready"
+    exec "$@"
+  fi
+}
+
+# gate_wait <pid> <ready-file> <weight> <label>: block while <pid> is queued.
+# Sets GATE_STARTED=1 if the command started, 0 if <pid> exited first (the
+# gate itself failed: bad slot dir, permissions, a killed waiter).
+GATE_STARTED=0
+gate_wait() {
+  local pid="$1" ready="$2" weight="$3" label="$4" q=0
+  GATE_STARTED=0
+  while [ ! -e "$ready" ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 1
+    q=$((q + 1))
+    if [ "$q" -eq 2 ] || { [ "$q" -gt 2 ] && [ $(((q - 2) % GATE_NOTE_SECS)) -eq 0 ]; }; then
+      printf "${YELLOW}  … %s: queued for a %s gate slot (%ss so far; pnpm gate:status shows the queue)${NC}\n" \
+        "$label" "$weight" "$q"
+    fi
+  done
+  if [ -e "$ready" ]; then
+    GATE_STARTED=1
+    if [ "$q" -ge 2 ]; then
+      printf "  … %s: got a %s slot after %ss\n" "$label" "$weight" "$q"
+    fi
+  fi
+}
+
+# gate_failed <label> <rc>: the gate exited before running the command. Fails
+# closed (a gate error is not a passing step) but says what actually broke.
+gate_failed() {
+  printf "${RED}  ✗ %s: the gate failed before the command started (exit %s) — see 'pnpm gate:status'${NC}\n" "$1" "$2"
+}
+
+# run_gated <weight> <label> <log> -- <cmd...>: run <cmd> under the gate with
+# output to <log>, announcing any queue wait; returns <cmd>'s exit code.
+run_gated() {
+  local weight="$1" label="$2" log="$3"; shift 4
+  local ready="$WT_PARENT/gate-ready.$$.$RANDOM"
+  rm -f "$ready"
+  gate_cmd "$weight" "$label" "$ready" -- "$@" > "$log" 2>&1 &
+  GATED_PID=$!
+  gate_wait "$GATED_PID" "$ready" "$weight" "$label"
+  local rc=0
+  wait "$GATED_PID" || rc=$?
+  GATED_PID=""
+  rm -f "$ready"
+  if [ "$GATE_STARTED" = "0" ]; then
+    gate_failed "$label" "$rc"
+    [ "$rc" -ne 0 ] || rc=70
+  fi
+  return "$rc"
+}
+
 run_bounded() {
   # run_bounded <label> <review-cmd> -- <cmd...>
   local label="$1" review="$2"; shift 3
+  local ready="$WT_PARENT/gate-ready.$$.$RANDOM"
+  rm -f "$ready"
   set -m
-  "$@" > /dev/null 2>&1 &
+  # The job holds a LIGHT gate slot for the run; the vitest it starts sees
+  # GATE_LOCK_HELD and runs re-entrantly instead of queuing again.
+  gate_cmd light "$label" "$ready" -- "$@" > /dev/null 2>&1 &
   local pid=$!
+  BOUNDED_PID=$pid
   set +m
+  # The cap EXCLUDES queue time: its clock starts only once the slot is held.
+  # Counting the wait would let a busy machine kill a suite before it ran and
+  # file it as "inconclusive" (a warning), so failing tests would push.
+  gate_wait "$pid" "$ready" light "$label"
+  rm -f "$ready"
+  if [ "$GATE_STARTED" = "0" ]; then
+    local grc=0
+    wait "$pid" 2>/dev/null || grc=$?
+    BOUNDED_PID=""
+    gate_failed "$label" "$grc"
+    record_fail "$label (gate failed before the run; see 'pnpm gate:status')"
+    return 0
+  fi
   local waited=0
   while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$STEP_CAP_SECONDS" ]; do
     sleep 1
@@ -197,6 +470,7 @@ run_bounded() {
     # SIGKILLed job makes `wait` exit 137, which would abort the whole hook —
     # turning a soft warning into a failed push. (It did exactly that.)
     wait "$pid" 2>/dev/null || true
+    BOUNDED_PID=""
     # INCONCLUSIVE, not failed: the suite was stopped mid-flight, so it is not
     # evidence of anything. Warn, never block.
     printf "${YELLOW}  ⚠ %s exceeded %ss and was stopped — run '%s' to review${NC}\n" \
@@ -205,8 +479,10 @@ run_bounded() {
     return 0
   fi
   if wait "$pid" 2>/dev/null; then
+    BOUNDED_PID=""
     pass "$label passed"
   else
+    BOUNDED_PID=""
     # Ran to completion and failed. This is the case that used to be swallowed.
     printf "${RED}  ✗ Some %s failed — run '%s' to review${NC}\n" "$label" "$review"
     record_fail "$label (run '$review')"
@@ -214,51 +490,181 @@ run_bounded() {
   return 0
 }
 
-step "Core unit tests"
-run_bounded "Core tests" "pnpm -F @th/core exec vitest --run" -- \
-  pnpm -F @th/core exec vitest --run $VITEST_BOUNDS
+# ── The checks, run inside the worktree for one commit ─────────────────────
+check_commit() {
+  local sha="$1" ref="$2" short
+  short=$(git rev-parse --short "$sha")
 
-# ── 5. Adapter unit tests ──────────────────────────────────────────────────
-# Skipped unless TESTCONTAINERS_REUSE_DATABASE_URL is set, and that is a
-# deliberate call rather than laziness. Seven files in this package call
-# startPostgresContainer, vitest.config.ts pins maxForks: 1, and vitest runs
-# files serially — so the FIRST container test blocks every file behind it.
-# Without the env var the step cannot get past that file, so it would burn the
-# entire cap to produce a warning while testing almost nothing. Skipping states
-# that honestly and instantly instead of pretending to check.
-#
-# CI always sets the var (ci.yml, deploy-dev.yml), so adapter coverage is never
-# actually lost — it runs there on every push.
-step "Adapter unit tests"
-if [ -n "${TESTCONTAINERS_REUSE_DATABASE_URL:-}" ]; then
-  run_bounded "Adapter tests" "pnpm -F @th/adapters exec vitest --run" -- \
-    pnpm -F @th/adapters exec vitest --run $VITEST_BOUNDS
-else
-  printf "${YELLOW}  ⚠ Skipped — needs TESTCONTAINERS_REUSE_DATABASE_URL (7 tests start postgis containers, serially, and would stall).${NC}\n"
-  printf "${YELLOW}    Point it at a THROWAWAY LOCAL Postgres — the helper runs CREATE/DROP DATABASE, and local dev points at a cloud DB.${NC}\n"
-  printf "${YELLOW}    CI runs this suite regardless.${NC}\n"
-  record_warn "Adapter tests (skipped — no TESTCONTAINERS_REUSE_DATABASE_URL)"
-fi
+  step "Checkout $short ($ref) into a clean worktree"
+  WT_PARENT=$(mktemp -d "${TMPDIR:-/tmp}/th-prepush.XXXXXX")
+  # Written BEFORE `worktree add`, so a registered hook worktree always has
+  # an owner the reaper can test.
+  echo "$$" > "$WT_PARENT/.owner-pid"
+  # The leaf name becomes the worktree's admin dir (.git/worktrees/<leaf>), so
+  # make it unique too; two concurrent pushes then never race for one name.
+  WT="$WT_PARENT/$(basename "$WT_PARENT")"
+  local WT_OUT="$WT_PARENT/worktree-add.log"
+  if git worktree add --detach "$WT" "$sha" > "$WT_OUT" 2>&1; then
+    pass "Checked out $short at $WT"
+  else
+    tail -20 "$WT_OUT"
+    fail "git worktree add failed for $short"
+  fi
+  cd "$WT"
 
-# ── 6. Web i18n copy guard ──────────────────────────────────────────────────
-# Fast, deterministic guard: error-code↔catalog parity + no catch-all-phrase
-# regression in user-facing error copy. Hard-fails (unlike the soft test steps
-# above) — it runs in ~1s and the whole point is to BLOCK copy rot from shipping.
-step "Web i18n copy guard"
-I18N_OUT=$(mktemp)
-if pnpm -F web exec vitest --run src/i18n > "$I18N_OUT" 2>&1; then
-  pass "i18n parity + catch-all guard passed"
-else
-  printf "${RED}  ✗ i18n copy guard failed${NC}\n"
-  grep -E 'FAIL|✗|expected|offenders|AssertionError|Error:' "$I18N_OUT" | head -30 || tail -30 "$I18N_OUT"
-  rm -f "$I18N_OUT"
-  exit 1
-fi
-rm -f "$I18N_OUT"
+  # ── 1. Lockfile sync + install ────────────────────────────────────────────
+  # Catches the case where a `pnpm add` / hand-edit updated package.json (or
+  # pnpm-lock.yaml) without the matching counterpart making it into the
+  # commit. CI runs `pnpm install --frozen-lockfile` and bombs the gate
+  # 14+ minutes in; doing the same check here fails locally in seconds.
+  # In the fresh worktree this is also THE install: it populates node_modules
+  # from the pnpm store. Auto-recovery hint included so the next person
+  # doesn't have to think.
+  step "Lockfile sync + install"
+  local LOCK_OUT="$WT_PARENT/install.log"
+  if pnpm install --frozen-lockfile --prefer-offline > "$LOCK_OUT" 2>&1; then
+    pass "package.json + pnpm-lock.yaml in sync; dependencies installed"
+  else
+    printf "${RED}  ✗ Lockfile is out of sync with package.json (or install failed)${NC}\n"
+    grep -E 'ERR_PNPM|specifiers in the lockfile|dependencies were|dependencies are mismatched|dependencies were removed|^\* ' "$LOCK_OUT" | head -20 || tail -20 "$LOCK_OUT"
+    printf "${YELLOW}  Recover: ${NC}pnpm install --no-frozen-lockfile && git add package.json pnpm-lock.yaml apps/*/package.json packages/*/package.json\n"
+    keep_log "$LOCK_OUT" install
+    exit 1
+  fi
+
+  # ── 2. Prisma validate ──────────────────────────────────────────────────
+  step "Prisma validate"
+  pnpm db:validate > /dev/null 2>&1 && pass "Schema valid" || fail "Prisma schema validation failed"
+
+  # ── 3. Prisma generate ──────────────────────────────────────────────────
+  # A fresh worktree has no generated client, and pnpm does not run
+  # @prisma/client's postinstall here (onlyBuiltDependencies). @th/db's build
+  # and everything that imports it need it. Only ever via the db script: a
+  # bare `prisma generate` writes an empty shared client.
+  step "Prisma generate"
+  local GEN_OUT="$WT_PARENT/generate.log"
+  if pnpm -F @th/db run generate > "$GEN_OUT" 2>&1; then
+    pass "Prisma client generated"
+  else
+    tail -20 "$GEN_OUT"
+    keep_log "$GEN_OUT" generate
+    fail "Prisma generate failed"
+  fi
+
+  # ── 4. Build ────────────────────────────────────────────────────────────
+  # `turbo build` builds every workspace package with a build script,
+  # including @th/ui-email's dist (which api/jobs/web resolve through).
+  step "Build (turbo)"
+  local BUILD_OUT="$WT_PARENT/build.log"
+  # Heavy slot for the whole turbo build; the gated web `next build` inside it
+  # re-enters (turbo.json passes GATE_* through).
+  if run_gated heavy "Build" "$BUILD_OUT" -- pnpm build; then
+    pass "Build succeeded"
+  else
+    printf "${RED}  ✗ Build failed${NC}\n"
+    # Show only error lines — strip noise, keep TS errors + build failures.
+    # `<file>.ts:<line>:<col>` is the line Next prints ABOVE its "Type error".
+    # `panicked at` / `[Error`: Turbopack can panic while printing a resolve
+    # error (seen when a commit moved a module away), leaving only those lines.
+    grep -E 'error TS|Type error|SyntaxError|Cannot find|⨯|ELIFECYCLE|ERR_|\bfailed\b|\.(ts|tsx|js|mjs):[0-9]+:[0-9]+|Module not found|Build error occurred|panicked at|\[Error' "$BUILD_OUT" | head -40 || tail -30 "$BUILD_OUT"
+    keep_log "$BUILD_OUT" build
+    exit 1
+  fi
+
+  # ── 4b. Prune turbo cache ───────────────────────────────────────────────
+  # The build above writes a new artifact to the shared cache per task-hash;
+  # turbo never prunes it, so the dir grows unbounded. Cap it (default 5 GB,
+  # oldest-first). The script prunes the cache next to its own location, so
+  # this runs the MAIN tree's WORKING COPY of the script (not the pushed
+  # commit's): the worktree's copy would prune nothing. It is housekeeping,
+  # not a check, so a failure here warns and never blocks.
+  step "Prune turbo cache"
+  if [ -x "$MAIN_ROOT/scripts/prune-turbo-cache.sh" ]; then
+    if "$MAIN_ROOT/scripts/prune-turbo-cache.sh"; then
+      pass "Cache within size cap"
+    else
+      printf "${YELLOW}  ⚠ Cache prune failed (non-blocking)${NC}\n"
+    fi
+  else
+    printf "${YELLOW}  ⚠ No prune script in %s — skipped${NC}\n" "$MAIN_ROOT"
+  fi
+
+  # ── 5. Lint ─────────────────────────────────────────────────────────────
+  # `pnpm lint` exits non-zero only on ERRORS; warnings alone leave it at 0. So
+  # a non-zero here is a real, blocking problem, not style noise.
+  step "Lint"
+  if pnpm lint > /dev/null 2>&1; then
+    pass "Lint passed"
+  else
+    printf "${RED}  ✗ Lint failed — run 'pnpm lint' to review${NC}\n"
+    record_fail "Lint (pnpm lint)"
+  fi
+
+  # ── 6. Core unit tests ──────────────────────────────────────────────────
+  step "Core unit tests"
+  run_bounded "Core tests" "pnpm -F @th/core exec vitest --run" -- \
+    pnpm -F @th/core exec vitest --run $VITEST_BOUNDS
+
+  # ── 7. Adapter unit tests ───────────────────────────────────────────────
+  # Skipped unless TESTCONTAINERS_REUSE_DATABASE_URL is set, and that is a
+  # deliberate call rather than laziness. Seven files in this package call
+  # startPostgresContainer, vitest.config.ts pins maxForks: 1, and vitest runs
+  # files serially — so the FIRST container test blocks every file behind it.
+  # Without the env var the step cannot get past that file, so it would burn
+  # the entire cap to produce a warning while testing almost nothing. Skipping
+  # states that honestly and instantly instead of pretending to check.
+  #
+  # CI always sets the var (ci.yml, deploy-dev.yml), so adapter coverage is
+  # never actually lost — it runs there on every push.
+  step "Adapter unit tests"
+  if [ -n "${TESTCONTAINERS_REUSE_DATABASE_URL:-}" ]; then
+    run_bounded "Adapter tests" "pnpm -F @th/adapters exec vitest --run" -- \
+      pnpm -F @th/adapters exec vitest --run $VITEST_BOUNDS
+  else
+    printf "${YELLOW}  ⚠ Skipped — needs TESTCONTAINERS_REUSE_DATABASE_URL (7 tests start postgis containers, serially, and would stall).${NC}\n"
+    printf "${YELLOW}    Point it at a THROWAWAY LOCAL Postgres — the helper runs CREATE/DROP DATABASE, and local dev points at a cloud DB.${NC}\n"
+    printf "${YELLOW}    CI runs this suite regardless.${NC}\n"
+    record_warn "Adapter tests (skipped — no TESTCONTAINERS_REUSE_DATABASE_URL)"
+  fi
+
+  # ── 8. Web i18n copy guard ──────────────────────────────────────────────
+  # Fast, deterministic guard: error-code↔catalog parity + no catch-all-phrase
+  # regression in user-facing error copy. Hard-fails (unlike the soft test
+  # steps above) — it runs in ~1s and the whole point is to BLOCK copy rot
+  # from shipping.
+  step "Web i18n copy guard"
+  local I18N_OUT="$WT_PARENT/i18n.log"
+  if run_gated light "i18n copy guard" "$I18N_OUT" -- pnpm -F web exec vitest --run src/i18n; then
+    pass "i18n parity + catch-all guard passed"
+  else
+    printf "${RED}  ✗ i18n copy guard failed${NC}\n"
+    grep -E 'FAIL|✗|expected|offenders|AssertionError|Error:' "$I18N_OUT" | head -30 || tail -30 "$I18N_OUT"
+    keep_log "$I18N_OUT" i18n
+    exit 1
+  fi
+
+  cd "$REPO_ROOT"
+  remove_worktree
+}
+
+N_SHAS=$(printf "%s" "$SHAS_TO_CHECK" | grep -c . || true)
+while read -r _sha _ref; do
+  [ -n "$_sha" ] || continue
+  if [ "$N_SHAS" -gt 1 ]; then
+    LABEL_PREFIX="$(git rev-parse --short "$_sha"): "
+  fi
+  # </dev/null: nothing in the checks may read (and so swallow) the list of
+  # shas this loop is iterating over.
+  check_commit "$_sha" "$_ref" < /dev/null
+done <<EOF
+$SHAS_TO_CHECK
+EOF
+LABEL_PREFIX=""
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 # The banner reports the WORST outcome recorded, never a fixed string.
 echo ""
+printf "  (checked %s commit(s) in %ss)\n" "$N_SHAS" "$SECONDS"
 if [ -n "$FAILED_STEPS" ]; then
   if [ -n "${PREPUSH_SOFT:-}" ]; then
     printf "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
@@ -278,10 +684,11 @@ if [ -n "$FAILED_STEPS" ]; then
     printf "%b" "$WARNED_STEPS"
   fi
   printf "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
-  printf "  Fix the above, or:\n"
-  printf "    ${YELLOW}PREPUSH_SOFT=1 git push${NC}   if the failure is in someone else's\n"
-  printf "                              uncommitted work and not in your commits\n"
-  printf "    ${YELLOW}git push --no-verify${NC}      to skip these checks entirely\n"
+  printf "  These ran against the pushed commit in a clean checkout, so the\n"
+  printf "  failure is most likely in committed code. Fix it, or:\n"
+  printf "    ${YELLOW}PREPUSH_SOFT=1 git push${NC}   if it is already on origin/main or a known\n"
+  printf "                              flake, not something your commits introduced\n"
+  printf "  (owner rule: never --no-verify; use PREPUSH_SOFT)\n"
   echo ""
   exit 1
 fi

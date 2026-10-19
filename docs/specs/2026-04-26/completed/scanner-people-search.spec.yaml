@@ -1,0 +1,388 @@
+# scanner-people-search.spec.yaml
+#
+# Make the scanner's manual-search fallback work offline by extending the
+# event manifest to include attendee + volunteer display name and email,
+# and indexing them locally for fast prefix search.
+
+version: "1.0"
+updated: "2026-04-26"
+related:
+  - docs/specs/2026-04-25/completed/unified-scan-resolver.spec.yaml
+  - docs/specs/2026-04-24/scanner-foundation.spec.yaml
+  - docs/specs/2026-04-24/volunteer-scanner-check-in.spec.yaml
+
+scope_note: >
+  Adds a new "people" arm to the existing scanner manifest pipeline. Does
+  NOT change the scan resolver, the QR formats, or the write paths
+  (`scanTicket`, `checkInVolunteer`). Read-only enrichment + a new local
+  index. Manual-search UI keeps its existing online-tRPC behavior; this
+  spec adds the offline fallback layer underneath it and switches the UI
+  to a local-first / network-augment query pattern.
+
+dependencies:
+  hard:
+    - existing `getScannerEventManifest` use case
+      (packages/core/src/use-cases/scanner/get-scanner-event-manifest.ts)
+    - existing volunteering repo: `listSignups(eventId, …)`
+    - existing tickets repo: `listAll({ eventId, limit, offset })`
+    - existing humans/people lookup (whatever surfaces displayName + email
+      for a humanId today — see Open Questions)
+    - SQLite scanner local DB
+      (apps/scanner/src/lib/local-db.ts)
+  soft:
+    - SQLite FTS5 extension (default-bundled with expo-sqlite ≥ 14)
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The scanner's local SQLite cache stores tickets keyed by `ticket_code`
+    only. The "owner" column is an opaque humanId — no name, no email —
+    and volunteer signups aren't cached at all. Manual search
+    (apps/scanner/src/screens/unified-search-screen.tsx) calls tRPC
+    directly, so when the gate's network drops the operator loses the
+    fallback flow they reach for *because* QR scanning failed (dead phone,
+    damaged wallet pass, "I think my code is in my email"). At a venue
+    door, that's the worst time for a search box to stop working.
+  solution: >
+    1. Extend the event manifest to include attendee (ticket-holder) and
+       volunteer rows with `humanId`, `displayName`, `email`, and `kind`.
+    2. Add a `people` table to the scanner SQLite schema indexed by event,
+       backed by an FTS5 virtual table for prefix / token search on name
+       and email.
+    3. Switch `unified-search-screen` to query the local index first, then
+       merge with network results when online (online wins on conflict).
+    4. Wipe people data aggressively: on sign-out, on event closure, on
+       end_at + 24h, on staleness threshold.
+  users:
+    - Scanner operators with `ORG_SCAN_ROLES` (door staff, gate)
+    - Operators with `ORG_EDIT_ROLES` (volunteer check-in writes)
+  surfaces:
+    - scanner
+    - api (extended manifest endpoint)
+    - core (extended manifest use case)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        `getScannerEventManifest` MUST return a `people` array alongside
+        `tickets`. Each entry: `{ humanId, displayName, email | null, kind:
+        "attendee" | "volunteer", signupStatus?: string }`. A human who is
+        BOTH a ticket-holder AND a volunteer for the event appears twice
+        (once per kind) so the UI can show both contexts in search results.
+
+    - id: FR-002
+      description: >
+        Volunteer rows include all signups regardless of status (CONFIRMED,
+        PENDING, etc.), with `signupStatus` populated. The UI is
+        responsible for visually distinguishing pending vs confirmed.
+        Rationale: gate operators sometimes need to look up a volunteer
+        whose signup hasn't been approved yet.
+
+    - id: FR-003
+      description: >
+        The manifest endpoint MUST enforce `ORG_SCAN_ROLES` on the event's
+        org (already does for tickets — extend to people). No PII leaves
+        the API to anyone without that role.
+
+    - id: FR-004
+      description: >
+        The scanner local DB schema gains a `people` table:
+          (human_id, event_id, display_name, email, kind, signup_status,
+           synced_at)
+        with PRIMARY KEY `(human_id, event_id, kind)` so attendee +
+        volunteer rows for the same human coexist. An FTS5 virtual table
+        `people_fts` mirrors `display_name` and `email` for prefix search.
+
+    - id: FR-005
+      description: >
+        `useLocalSync` MUST upsert people rows on every manifest fetch and
+        keep `people_fts` in sync via triggers (or explicit re-indexing on
+        write — pick the simpler one).
+
+    - id: FR-006
+      description: >
+        `unified-search-screen` MUST execute a local FTS query for each
+        keystroke (debounced 150ms, min 2 chars), render results
+        immediately, and fire the existing tRPC search in parallel. When
+        the network result arrives, merge by `humanId + kind`, network
+        wins on field conflicts. If offline, suppress the network call and
+        show an inline "Offline — local results only" affordance using the
+        existing NetworkBanner color tokens.
+
+    - id: FR-007
+      description: >
+        Search results display `displayName`, `email` (truncated), kind
+        badge ("Ticket" / "Volunteer"), and event name. Tapping a result
+        invokes the existing UnifiedResultView — no behavior change to the
+        admit / check-in path.
+
+    - id: FR-008
+      description: >
+        Local people data MUST be wiped:
+          a. On sign-out (extend `clearAll` in local-db.ts).
+          b. When an event's status flips to ENDED / CLOSED (detected via
+             manifest sync — if event missing or status terminal, drop its
+             people rows).
+          c. After `end_at + 24h` (background sweep on app foreground).
+          d. When `synced_at` is older than 24h AND the event is no longer
+             in `accessibleEvents` (operator removed from org / role).
+
+    - id: FR-009
+      description: >
+        Manifest fetch frequency for people data MUST match the existing
+        ticket manifest cadence (5min interval; on-foreground refresh).
+        Bandwidth cap: a single event with 10k attendees + 200 volunteers
+        ≈ 10.2k rows × ~120 bytes JSON each ≈ ~1.2MB uncompressed. tRPC
+        gzips by default; payload should land under 250KB on the wire.
+        If a single event is projected to exceed 50k people, fall back to
+        paginated fetches (out-of-scope for this spec — flag as follow-up).
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Local FTS query MUST return results in < 50ms p95 for events up to
+        10k people on a mid-tier 2022 Android device. (Validate in QA;
+        SQLite FTS5 on indexed columns easily clears this.)
+
+    - id: NFR-002
+      description: >
+        PII handling: people data is treated as session-scoped operator
+        data. Encrypted-at-rest is NOT required (the device is operator-
+        owned, the app's SecureStore is reserved for credentials), but the
+        wipe rules in FR-008 are mandatory. Add a one-line note to
+        `docs/auth.md` or a new `docs/scanner-pii.md` documenting the
+        retention model so this isn't surprising on audit.
+
+    - id: NFR-003
+      description: >
+        Manifest endpoint MUST log `ticketCount + peopleCount` to the
+        scanner audit trail (already logs the actor; extend payload).
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: getScannerEventManifest (extended)
+        description: >
+          Existing use case grows a `people` field. Adds two repo calls:
+          one to enrich ticket-holders with displayName + email, one to
+          list volunteer signups with the same fields. Output shape
+          documented in FR-001. Idempotent read; no money.
+        input: { eventId, actorHumanId }
+        output: { eventId, tickets, people, syncedAt }
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - Repos.tickets.listAll (already used for tickets)
+      - Repos.volunteering.listSignups (existing — confirm signature
+        returns displayName + email, otherwise widen the DTO)
+      - Repos.humans (or whatever surfaces displayName + email by
+        humanId — see Open Questions)
+      - Repos.events.getById
+      - rbac.requireOrgMembership
+
+  adapters:
+    new: []
+    existing:
+      - PrismaRepos.tickets.listAll — already returns `ownerName` +
+        `ownerEmail` via the `owner` + `authUser` joins. No change.
+      - PrismaRepos.volunteering.listSignups — already returns
+        `contactName` + `contactEmail` on `VolunteerSignupRecord`. No
+        change.
+      - Net result: zero adapter / port changes. Use case just maps
+        existing fields into the manifest's `people` array.
+
+  transport:
+    trpc_procedures:
+      - scanner.getEventManifest — output schema grows `people`. No new
+        procedure; consumers gracefully ignore unknown fields, but the
+        scanner client is updated to consume them.
+    webhooks: []
+
+  ui:
+    pages:
+      - apps/scanner/src/screens/unified-search-screen.tsx (modified —
+        local-first query, offline indicator, dual ticket/volunteer
+        rendering)
+    components:
+      - new: apps/scanner/src/lib/use-people-search.ts — small hook
+        wrapping the local FTS query + network merge. ~80 LoC.
+      - apps/scanner/src/lib/local-db.ts — schema migration v2 adds
+        `people` + `people_fts` tables; new functions `upsertPeople`,
+        `searchPeople(eventId, query, limit)`, `dropPeopleForEvent`,
+        `dropStalePeople`.
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []           # No Prisma changes.
+  modified_models: []
+  migrations_needed: false # Backend.
+
+  scanner_local_schema:
+    new_tables:
+      - people (regular table)
+      - people_fts (FTS5 virtual table)
+    migration_strategy: >
+      Bump `local-db.ts` migration to v2. Run `CREATE TABLE IF NOT
+      EXISTS` + `CREATE VIRTUAL TABLE IF NOT EXISTS USING fts5(...)` on
+      every `db()` open. No destructive operation; existing v1 data
+      (events, tickets, scan_queue, recent_scans) is preserved.
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      PII on the device. A lost / stolen scanner device with people data
+      cached for an active event is a privacy incident waiting to happen.
+    severity: HIGH
+    mitigation: >
+      Aggressive wipe rules (FR-008). Document retention model
+      (NFR-002). Future: tie wipe to OS lock-screen events or remote
+      kill-switch (out-of-scope, flag as follow-up).
+
+  - risk: >
+      Manifest payload bloat for huge events.
+    severity: MEDIUM
+    mitigation: >
+      Bandwidth budget documented (FR-009). Add a `peopleCount` in the
+      response so the client can detect when paginated fetches will be
+      needed; that pagination is a follow-up spec.
+
+  - risk: >
+      Stale data leads to operator confusion (e.g., volunteer
+      cancellation not reflected for 5 minutes).
+    severity: MEDIUM
+    mitigation: >
+      Sync interval matches existing ticket manifest (5min). Show
+      `synced_at` timestamp in search results when older than 10
+      minutes. Online merge in FR-006 means active network sessions
+      get fresh data automatically.
+
+  - risk: >
+      FTS5 not available on some old Android devices / older
+      expo-sqlite versions.
+    severity: LOW
+    mitigation: >
+      Verify expo-sqlite ≥14 in `apps/scanner/package.json` (FTS5 has
+      been default-built in SQLite for years; expo-sqlite uses system
+      SQLite which on iOS 16+ and Android 10+ all ship FTS5). If not
+      available at runtime, fall back to a `LIKE '%term%' COLLATE NOCASE`
+      query — slower but functional.
+
+  - risk: >
+      Display-name + email fields don't currently flow through
+      `volunteering.listSignups` or `tickets.listAll`. Widening the DTO
+      could ripple into other use cases.
+    severity: MEDIUM
+    mitigation: >
+      Audit callsites of those repo methods first. If the field set is
+      used in many places, prefer adding a sibling
+      `listSignupsForScanner` method that returns the wider DTO rather
+      than expanding the existing one. Decide in implementation phase.
+
+open_questions: []   # all resolved during scoping; see resolved_questions below.
+
+resolved_questions:
+  - q: How to fetch displayName + email by humanId?
+    a: >
+      Already available. `tickets.listAll` returns `ownerName` +
+      `ownerEmail` (from the owner.authUser join). `listSignups` returns
+      `contactName` + `contactEmail` directly on the signup row.
+      No new repo methods, no DTO widening, no Prisma schema changes.
+  - q: Email casing in the local FTS index?
+    a: >
+      Store `lower(email)` in the FTS column for consistent prefix
+      matching. Keep the original-case email in the regular `people`
+      table for display. One sentence in the retention doc covers it.
+  - q: Per-event opt-out for offline people data?
+    a: >
+      In scope conceptually, deferred indefinitely. The wipe rules in
+      FR-008 cover the realistic privacy-incident surface. A per-event
+      opt-out toggle is overkill for current product needs. Flagged in
+      `out_of_scope` so it's discoverable if a future high-privacy
+      event ever needs it.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Pagination for events with >50k people (separate spec if/when needed)
+  - Encrypted-at-rest storage of people data
+  - Phone number search (PII scope decision: name + email only)
+  - Order short-code search (separate UX, can be a follow-up)
+  - Remote kill-switch / device wipe
+  - Online-only manual search UI changes unrelated to offline behavior
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - >
+      `getScannerEventManifest` returns `people: { humanId, displayName,
+      email, kind, signupStatus? }[]` for an authorized scanner.
+  - >
+      A scanner operator with airplane mode on can search by attendee
+      first name and see results within 100ms (perceived).
+  - >
+      A scanner operator with airplane mode on can search by volunteer
+      email prefix and see results.
+  - >
+      Searching surfaces both an attendee AND a volunteer entry for the
+      same human, when applicable.
+  - >
+      After sign-out, the local people table is empty.
+  - >
+      After an event flips to ENDED, its people rows are dropped on the
+      next manifest sync cycle.
+  - >
+      Online + offline modes return identical UI shapes; the only
+      differences are the "offline" indicator and possibly stale data
+      with `synced_at` exposed.
+  - >
+      No regression on the unified scan resolver tests.
+  - >
+      No new tsc errors in `apps/scanner` or `packages/core`.
+
+# ── Implementation slices (suggested order) ──────────────────────────────────
+
+implementation_slices:
+  - slice: 1
+    title: Backend — extend manifest with people
+    layers: [core, adapter, transport]
+    description: >
+      Audit the volunteering / tickets repos for displayName + email
+      availability; widen DTO or add sibling method as needed. Extend
+      `getScannerEventManifest` use case + Zod output schema. Update
+      tests. No client changes yet.
+
+  - slice: 2
+    title: Scanner local DB — schema v2 + FTS index
+    layers: [scanner-app]
+    description: >
+      Migrate `local-db.ts` to v2 (people + people_fts). Add `upsertPeople`,
+      `searchPeople`, `dropPeopleForEvent`, `dropStalePeople`. Wire
+      `useLocalSync` to upsert from the new manifest field. Wire wipe
+      paths (sign-out, event-ended, end_at+24h, staleness).
+
+  - slice: 3
+    title: UI — local-first manual search
+    layers: [scanner-app]
+    description: >
+      Update `unified-search-screen` to query local FTS first, merge
+      with network. Add offline indicator. Render dual-kind rows. No
+      changes to result-view or write paths.
+
+  - slice: 4
+    title: Docs + retention note
+    layers: [docs]
+    description: >
+      One-line addition to `docs/auth.md` or a new `docs/scanner-pii.md`
+      documenting the retention model + wipe triggers. Update
+      `docs/README.md` index.

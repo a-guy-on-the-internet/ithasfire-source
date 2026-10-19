@@ -1,0 +1,26 @@
+-- Embed unified views (docs/specs/2026-08-04/embed-unified-views.spec.yaml,
+-- FR-001 / D-003).
+--
+-- "Tickets embed" and "calendar embed" were never separate rows: the Embed
+-- model has no type column, and the split lives entirely in which ROUTE a
+-- pasted snippet points at (/embed/[id] renders the grid, /embed/calendar/[id]
+-- renders the same row as a calendar). These two columns promote "view" to a
+-- first-class, per-embed property.
+--
+-- Additive only. NO backfill script, by design: there is no per-type row split
+-- to backfill FROM, so the column defaults alone reproduce today's behaviour
+-- for every existing row (including the wild embeds already pasted onto
+-- third-party sites and the fixed-id test-bench rows) —
+--   defaultView = 'list'  ⇒ a bare /embed/[id] still renders the grid
+--   viewToggle  = false   ⇒ no viewer-facing switcher is rendered
+--
+-- `defaultView` is TEXT rather than a Postgres enum, matching "subjectType"'s
+-- documented convention on this model: the write path
+-- (packages/core/src/use-cases/embeds/upsert-embed.ts, EMBED_VIEWS) is the
+-- authority on allowed values, so growing the vocabulary needs no migration.
+--
+-- Instant on this small table (ADD COLUMN with a non-volatile default does not
+-- rewrite on PG 11+). Reversible by dropping both columns; the unique key
+-- (subjectType, subjectId, domain) is untouched.
+ALTER TABLE "Embed" ADD COLUMN "defaultView" TEXT NOT NULL DEFAULT 'list';
+ALTER TABLE "Embed" ADD COLUMN "viewToggle" BOOLEAN NOT NULL DEFAULT false;

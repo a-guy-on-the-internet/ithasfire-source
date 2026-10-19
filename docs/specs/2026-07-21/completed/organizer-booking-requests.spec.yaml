@@ -1,0 +1,275 @@
+# organizer-booking-requests.spec.yaml
+#
+# Inverts the booking-request flow: organizers (orgs) send "we want you to
+# play" requests TO performers, and org admins get a Bookings hub that
+# consolidates every booking surface. Complements (does not replace) the
+# existing performer→venue flow and the deferred lineup/conversation specs
+# (docs/specs/2026-07-14/). User-confirmed decisions 2026-07-21: performers
+# OPT IN to receiving requests (consent-first, mirrors Place.acceptsBookingRequests);
+# requests carry free-form preferred dates + an OPTIONAL existing-event attach.
+
+version: "1.0"
+updated: "2026-07-21"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Booking requests only flow performer→venue. An organizer who KNOWS which
+    act they want has no way to initiate — the performer's public page offers
+    only passive contact info (email/phone scroll-button). Meanwhile the
+    org-admin side of booking is scattered: per-venue inboxes are nested under
+    places/[placeId], sent-as-performer requests live in personal account
+    settings, and org performer mode/defaults live in org settings.
+  solution: >
+    (a) Direction-aware BookingRequest: orgs send requests to performers who
+    have opted in via a new PerformerProfile.acceptsBookingRequests toggle;
+    the act responds; acceptance mints the same DRAFT Agreement (polymorphic
+    parties already support org proposer / performer counterparty).
+    (b) A top-level org-admin "Bookings" section aggregating: requests sent to
+    acts, per-venue inboxes, and links to performer mode/defaults.
+  users:
+    - Org admins/editors booking acts for their shows
+    - Performer-mode humans and org acts (bands) receiving requests
+  surfaces:
+    - web
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Data model: BookingRequest gains `direction` ("TO_VENUE" | "TO_PERFORMER",
+        default TO_VENUE, backfilled), nullable `placeId` (was required), and
+        `organizerOrgId String?` (sender org for TO_PERFORMER). SEMANTICS:
+        `performerOwnerType/performerOwnerId` ALWAYS identify the ACT in both
+        directions (sender in TO_VENUE, target in TO_PERFORMER) — no column
+        role-swapping. Migration adds a CHECK constraint: TO_VENUE ⇒ placeId
+        NOT NULL ∧ organizerOrgId NULL; TO_PERFORMER ⇒ placeId NULL ∧
+        organizerOrgId NOT NULL ∧ performerOwnerId NOT NULL. Optional
+        `attachedEventId String?` (TO_PERFORMER only) links an existing event.
+    - id: FR-002
+      description: >
+        Performer opt-in: `PerformerProfile.acceptsBookingRequests Boolean
+        @default(false)`. New use case setPerformerBookingAcceptance mirrors
+        set-place-booking-acceptance.ts (idempotent, audited); enabling
+        requires performer mode enabled (isPerformerEnabled). Toggle renders
+        in PerformerSection (human) and OrgSettingsView performer section
+        (org act), directly under PerformerModeToggle. Disabling performer
+        mode implicitly stops new requests (create gate checks both).
+    - id: FR-003
+      description: >
+        createOrganizerBookingRequest: actor needs ORG_EDIT_ROLES in the
+        sender org; target must be performer-enabled AND accepting (else
+        PERFORMER_NOT_ACCEPTING_REQUESTS). Pitch: message ≥10 chars,
+        1–3 preferredDates (reuse pitch-schema.ts primitives), optional offer
+        feeType/feeAmountCents/feeCurrency (same cross-field rules), optional
+        setLengthMinutes (preset list), optional attachedEventId — must be an
+        event the sender org owns; store id only, render title/date live.
+        One OPEN request per (organizerOrgId, performer owner) pair, mirroring
+        the per-venue rule. TTL: same BOOKING_REQUEST_TTL_DAYS (14).
+    - id: FR-004
+      description: >
+        Lifecycle reuse: same status enum + CAS updateStatus discipline.
+        markViewed/respond authz for TO_PERFORMER = performer side (human
+        target: actor is the human; org target: ORG_EDIT_ROLES; markViewed
+        membership-any, mirroring the venue inbox bar). withdraw authz =
+        sender org ORG_EDIT_ROLES. The existing daily auto-expire job covers
+        both directions unchanged. Existing venue-scoped use cases MUST
+        direction-guard (a TO_PERFORMER request never appears in a venue
+        inbox and vice versa) — enforced in the repo list scoping.
+    - id: FR-005
+      description: >
+        Accept mints the Agreement (reuse _shared/accept-agreement.ts,
+        direction-branched): type PERFORMANCE, status DRAFT, proposer =
+        organizer org, counterparty = performer owner, placeId = attached
+        event's venue if present else null, payout terms = bare PENDING
+        PRIMARY draft (no place defaults in this direction), title
+        "Booking — {act name}". Decline stores declineReason. Negotiation
+        happens in the existing agreement editor (prior decision).
+    - id: FR-006
+      description: >
+        Notifications (mirror notify-booking-request-received): on create,
+        notify the target performer (human directly; org act → members with
+        NOTIFY_ORG_ROLES) — idempotency key
+        organizer-booking-request-received:{id}:{humanId}, in-app+email+push,
+        deep link to their requests list. On respond (accept/decline), notify
+        the sender org's NOTIFY_ORG_ROLES members with a link to the
+        agreement (accept) or the hub (decline). Post-commit, best-effort,
+        reportError on swallow (Sentry convention).
+    - id: FR-007
+      description: >
+        Performer receiving surface: "Requests to you" list (mirror
+        SentBookingRequestsList) in PerformerSection (human) and
+        OrgSettingsView performer section (org act), via new list scope
+        "performer-inbox" (received TO_PERFORMER, newest first) — rows show
+        org name, attached event (if any), dates, offer, status; open rows
+        get Accept/Decline; ACCEPTED rows link to the agreement.
+    - id: FR-008
+      description: >
+        Org-admin Bookings hub: new top-level ADMIN_SECTIONS item
+        (id "bookings", rbac ORG_NON_SCANNER, route bookings) with:
+        (a) "Acts you've contacted" — new list scope "organizer" (outbound
+        TO_PERFORMER by organizerOrgId) with withdraw + agreement links and
+        the "Book an act" entry point; (b) "Venue inboxes" — one section/tab
+        per org-owned place reusing the existing scope:"venue" list +
+        BookingInbox composition (deep links to the nested page remain
+        valid); (c) links to org performer mode/defaults in settings.
+        Respond actions stay gated to ORG_EDIT_ROLES as today.
+    - id: FR-009
+      description: >
+        Public performer-page CTA: performer entity summaries (HUMAN and
+        ORGANIZATION) in get-public-page gain acceptsBookingRequests
+        (performer-enabled AND accepting). New gate helper
+        performerAcceptsBookingRequests(entity) (mirror
+        placeAcceptsBookingRequests, entity-pages.ts:156). When true,
+        HumanHero/OrgHero render a "Request to book" CTA (mirror
+        HeroBookingRequestButton: signed-out → sign-in redirect; signed-in →
+        dialog). The dialog's sender picker lists the viewer's ORG_EDIT_ROLES
+        orgs (listMySenders-style composition); a viewer with no eligible org
+        sees an explanatory empty state (link to create a group). The
+        existing scroll-to-contact "Booking" button remains for
+        contact-info-only pages; when the CTA renders, it replaces the
+        scroll button (one primary booking affordance).
+  non_functional:
+    - id: NFR-001
+      description: >
+        No cross-direction leakage: every existing TO_VENUE query/authz path
+        (venue inbox, respond, resendInvite, claim, embed) must be provably
+        unaffected — regression tests assert a TO_PERFORMER row never
+        surfaces in scope:"venue"/"performer" lists nor in the claim flow.
+    - id: NFR-002
+      description: >
+        Offer amounts are informational until an Agreement is finalized —
+        no money movement in this spec; integer cents only; same currency
+        conventions as booking defaults ("usd" lowercase).
+    - id: NFR-003
+      description: >
+        All new free-text (message, declineReason) uses the plainText*
+        sanitizer helpers at the schema boundary.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: set-performer-booking-acceptance
+        description: Opt-in toggle; mirrors set-place-booking-acceptance (audited, idempotent).
+        input: "ownerType, ownerId, actorHumanId, accepts"
+        output: "{ accepts }"
+        idempotent: true
+        money: false
+      - name: create-organizer-booking-request
+        description: Org → performer request; target opt-in gate; one open per pair; notify post-commit.
+        input: "organizerOrgId, actorHumanId, performerOwner, pitch (message, dates, offer?, setLength?, attachedEventId?)"
+        output: "{ bookingRequestId }"
+        idempotent: false
+        money: false
+      - name: modify:respond-to-booking-request (direction branch)
+        description: Performer-side accept/decline; accept mints org-proposer agreement (FR-005).
+        input: "existing + direction-aware authz"
+        output: "existing shape"
+        idempotent: true
+        money: false
+      - name: modify:list-booking-requests
+        description: "New scopes: organizer (outbound TO_PERFORMER), performer-inbox (received)."
+        input: "scope + owner ids"
+        output: "existing row shape + direction fields"
+        idempotent: true
+        money: false
+      - name: notify-organizer-booking-request-received / -responded
+        description: Mirror notify-booking-request-received; recipients per FR-006.
+        input: "bookingRequestId"
+        output: "void (best-effort)"
+        idempotent: true
+        money: false
+  ports:
+    new: []
+    existing:
+      - bookingRequests (repo — direction-aware create/list scoping)
+      - performerProfiles (repo — acceptsBookingRequests read/write)
+      - agreements, payoutTerms (accept path, existing)
+      - notify / notifyWithEmail, audit, authz, events (attach validation)
+  adapters:
+    new: []
+    existing:
+      - packages/adapters/src/db/prisma/booking-requests.ts, performer-profiles.ts
+  transport:
+    trpc_procedures:
+      - "performers.setBookingAcceptance"
+      - "bookingRequests.createToPerformer"
+      - "bookingRequests.list — new scopes (authz inside use case)"
+    webhooks: []
+  ui:
+    pages:
+      - "apps/web/src/app/admin/[slug]/bookings/page.tsx (hub, FR-008)"
+    components:
+      - "PerformerSection / OrgSettingsView — accepting toggle + Requests-to-you list"
+      - "HumanHero / OrgHero — Request-to-book CTA + OrganizerBookingDialog (new)"
+      - "Hub components: OrganizerSentList, venue-inbox aggregation (reuse BookingInbox)"
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models:
+    - "BookingRequest: + direction (default TO_VENUE), placeId → nullable, + organizerOrgId?, + attachedEventId?; CHECK constraint per FR-001; backfill direction=TO_VENUE"
+    - "PerformerProfile: + acceptsBookingRequests Boolean @default(false)"
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Nullable placeId ripples through every consumer that assumes a venue
+      (BookingInbox rows, notify recipient resolution, claim flow,
+      createEventFromAgreement's findByAgreementId prefill).
+    severity: HIGH
+    mitigation: >
+      DB CHECK constraint + repo-level direction scoping so venue paths can
+      never load a TO_PERFORMER row; createEventFromAgreement explicitly
+      rejects TO_PERFORMER-originated agreements in v1 (manual event
+      creation covers it); typed discriminated union in core for the two
+      directions.
+  - risk: >
+      PerformerProfile is documented as a content-free gate; adding a field
+      invites future content creep.
+    severity: LOW
+    mitigation: >
+      acceptsBookingRequests IS a gate (like enabledAt), not content —
+      extend the header comment to say exactly that and re-forbid content.
+  - risk: >
+      Unsolicited-contact abuse (org spamming acts) despite opt-in.
+    severity: MEDIUM
+    mitigation: >
+      Opt-in default-off + one-open-request-per-pair + 14-day expiry; decline
+      requires no reason; revisit rate-limiting per org if abused.
+
+open_questions:
+  - Should an attached event auto-populate the agreement's proposedDate on
+    accept (recommend yes — event startsAt wins over preferredDates[0])?
+  - Hub rbac — ORG_NON_SCANNER for view matches events/places; confirm
+    VIEWER should see (respond stays ORG_EDIT_ROLES regardless).
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - createEventFromAgreement support for TO_PERFORMER agreements (v1 guards it out; manual event creation + lineup covers)
+  - Human (non-org) organizers as senders — orgs only in v1
+  - Embed/anonymous variants of the inverse direction
+  - Lineup junction / multi-act requests (deferred spec 2026-07-14 stands)
+  - Verified-stats snapshots on TO_PERFORMER requests
+  - Message threads (deferred conversation spec stands)
+  - SMS notifications
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A performer who has NOT opted in cannot be requested (no public CTA; create rejects) — performer mode alone is not enough.
+  - An org editor can send a request to an opted-in act with dates + optional offer + optional own-event attach; a second open request to the same act is rejected.
+  - The act sees it under "Requests to you" (settings), gets notified, and can accept (→ DRAFT agreement, org proposer, performer counterparty, place null unless attached event had a venue) or decline.
+  - The organizer is notified of the response; accepted requests link to the agreement from the hub.
+  - The org-admin Bookings hub shows outbound act requests and every org venue's inbox in one place; existing nested inbox URLs still work.
+  - No TO_PERFORMER row ever appears in a venue inbox, performer sent-list, claim, or embed path (regression-tested).
+  - Requests auto-expire after 14 days via the existing job.

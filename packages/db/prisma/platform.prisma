@@ -1,0 +1,266 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Platform — Settings, audit logs, idempotency, analytics.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ---------------- Platform Settings (key-value singleton store) ----------------
+
+/// Stores platform-wide configuration as key-value pairs.
+/// Well-known keys: "supportEmail", "platformName".
+model PlatformSetting {
+  key       String   @id // unique key, e.g. "supportEmail"
+  value     String
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+}
+
+model AuditLog {
+  id       String   @id @default(uuid())
+  entity   String
+  entityId String?
+  action   String
+  data     Json     @default("{}")
+  at       DateTime @default(now())
+
+  @@index([entity, at])
+  // Backs the platform-wide /platform/audit-log viewer's default view: a
+  // cross-entity feed sorted by `at` descending with no `entity` filter
+  // applied (the existing [entity, at] composite index only helps once an
+  // `entity` filter narrows the scan).
+  @@index([at])
+  // Exact-match reads of one entity's rows by action, newest first
+  // (`AuditRepo.listForEntity`): the public PLACE page's community
+  // attribution reads the latest `entity_page.community_handover` and
+  // `entity_page.community_updated` row for its page on every render.
+  @@index([entity, entityId, action, at])
+}
+
+model Idempotency {
+  key        String    @id // e.g. "stripe_evt:evt_123" or "checkout:user:uuid:clientKey"
+  status     String    @default("in_progress") // "in_progress" | "succeeded" | "failed"
+  lockedAt   DateTime  @default(now())
+  expiresAt  DateTime? // optional TTL for in_progress
+  resultJson Json? // cached success result
+  errorText  String? // last error message
+  updatedAt  DateTime  @updatedAt
+
+  @@index([status, expiresAt])
+}
+
+model JobRun {
+  id            String   @id
+  jobName       String
+  startedAt     DateTime
+  finishedAt    DateTime
+  durationMs    Int
+  status        String
+  resultSummary String?
+  errorMessage  String?
+  errorCode     String?
+  createdAt     DateTime @default(now())
+
+  @@index([jobName, startedAt])
+  @@index([startedAt])
+}
+
+model JobState {
+  jobName   String   @id
+  enabled   Boolean  @default(true)
+  /// Opaque resume point for jobs that scan a table in pages across runs.
+  /// Null = start from the beginning. Used by
+  /// `storage.sweep-orphaned-uploads`, whose candidate set is dominated by
+  /// rows it deliberately KEEPS: without a cursor that survives the run, every
+  /// run rescans the same oldest N and anything past them is never examined.
+  cursor    Json?
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+}
+
+// ---------------- Analytics ----------------
+
+/// Pre-computed daily event metrics. Populated by nightly batch jobs
+/// (sell-through-rollup, event-daily-stats). Consumers: resale pricing,
+/// organizer dashboards, notification digests.
+model EventDailyStats {
+  id                  String   @id @default(uuid())
+  eventId             String
+  date                DateTime @db.Date
+
+  // Revenue
+  grossRevenueCents   Int      @default(0)
+  netRevenueCents     Int      @default(0)
+  refundedCents       Int      @default(0)
+
+  // Tickets
+  ticketsSold         Int      @default(0)
+  ticketsRefunded     Int      @default(0)
+  ticketsTransferred  Int      @default(0)
+  totalCapacity       Int      @default(0)
+
+  // Sell-through (0.0-1.0), computed as ticketsSold / totalCapacity
+  sellThroughRate     Float    @default(0)
+
+  // Orders
+  orderCount          Int      @default(0)
+  refundCount         Int      @default(0)
+
+  // Per-ticket-type breakdown stored as JSON array:
+  // [{ ticketTypeId, name, sold, refunded, capacity, sellThrough, revenueCents }]
+  ticketTypeStats     Json     @default("[]")
+
+  // Waitlist
+  waitlistCount       Int      @default(0)
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([eventId, date])
+  @@index([date])
+  @@index([eventId, date])
+}
+
+/// Nightly resale price suggestions per ticket type. Populated by the
+/// resale-price-snapshots job. Read by the estimate-resale-price use-case.
+model ResalePriceSnapshot {
+  id                  String   @id @default(uuid())
+  eventId             String
+  ticketTypeId        String
+  date                DateTime @db.Date
+
+  // Pricing
+  suggestedPriceCents Int
+  facePriceCents      Int
+  resaleCapCents      Int?     // copied from TicketType at snapshot time
+
+  // Demand
+  demandTier          String   // "low" | "medium" | "high"
+  sellThroughRate     Float
+  sampleSize          Int      @default(0) // number of resale txns used; 0 = heuristic
+
+  // Source
+  source              String   @default("heuristic") // "heuristic" | "data"
+
+  event      Event     @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  ticketType TicketType @relation(fields: [ticketTypeId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([eventId, ticketTypeId, date])
+  @@index([eventId, date])
+  @@index([ticketTypeId, date])
+}
+
+// ── Resource Quotas ─────────────────────────────────────────────────────────
+
+/// Platform-wide default limits keyed by resource kind.
+/// One row per ResourceLimitKind. Admins can change these via the platform UI.
+model DefaultResourceLimit {
+  kind         ResourceLimitKind @id
+  /// The numeric limit value. Interpretation depends on kind:
+  /// count for ORGS_OWNED / ORGS_JOINED / EVENTS_PER_ORG / MEMBERS_PER_ORG,
+  /// bytes for STORAGE_BYTES_ORG / STORAGE_BYTES_HUMAN.
+  limitValue   BigInt
+  updatedAt    DateTime          @updatedAt
+  createdAt    DateTime          @default(now())
+}
+
+/// Per-subject quota override. Created when an expansion request is approved
+/// or when a platform admin manually adjusts a specific human/org.
+/// If no row exists for a (subjectType, subjectId, kind) triple, the
+/// DefaultResourceLimit applies.
+model ResourceQuotaOverride {
+  id            String            @id @default(uuid())
+  subjectType   QuotaSubjectType
+  subjectId     String            // humanId or orgId
+  kind          ResourceLimitKind
+  limitValue    BigInt
+  /// Optional note from the reviewer explaining why the override was granted.
+  note          String?
+  grantedByHumanId String?
+  updatedAt     DateTime          @updatedAt
+  createdAt     DateTime          @default(now())
+
+  @@unique([subjectType, subjectId, kind])
+  @@index([subjectId])
+}
+
+/// Tracks cumulative usage for quota-limited resources.
+/// Updated transactionally whenever a counted resource is created/deleted.
+model ResourceUsage {
+  id            String            @id @default(uuid())
+  subjectType   QuotaSubjectType
+  subjectId     String            // humanId or orgId
+  kind          ResourceLimitKind
+  currentUsage  BigInt            @default(0)
+  updatedAt     DateTime          @updatedAt
+  createdAt     DateTime          @default(now())
+
+  @@unique([subjectType, subjectId, kind])
+  @@index([subjectId])
+}
+
+/// A user request to raise a quota limit. Platform staff review these.
+model ExpansionRequest {
+  id                  String                  @id @default(uuid())
+  subjectType         QuotaSubjectType
+  subjectId           String
+  kind                ResourceLimitKind
+  /// The limit value at the time of the request.
+  currentLimitValue   BigInt
+  /// The limit value the user is requesting.
+  requestedLimitValue BigInt
+  /// Freeform justification from the user.
+  reason              String
+  status              ExpansionRequestStatus  @default(PENDING)
+  /// The human who submitted the request.
+  requestedByHumanId  String
+  /// The platform staff member who reviewed the request.
+  reviewedByHumanId   String?
+  reviewedAt          DateTime?
+  /// Staff note explaining approval or rejection.
+  reviewNote          String?
+
+  createdAt           DateTime                @default(now())
+  updatedAt           DateTime                @updatedAt
+
+  @@index([status, createdAt])
+  @@index([subjectType, subjectId])
+  @@index([requestedByHumanId])
+}
+
+// ── Featured Items (polymorphic hero carousel) ──────────────────────────────
+
+/// Platform-curated featured items for the homepage hero carousel.
+/// Polymorphic: itemType + itemId reference the target entity.
+model FeaturedItem {
+  id               String           @id @default(uuid())
+  itemType         FeaturedItemType
+  itemId           String           @map("item_id")
+
+  /// Display overrides (used when the source entity name isn't ideal)
+  title            String?
+  subtitle         String?
+  heroImageUrl     String?          @map("hero_image_url")
+  ctaUrl           String?          @map("cta_url")
+  ctaLabel         String?          @map("cta_label")
+
+  sortOrder        Int              @default(0) @map("sort_order")
+  active           Boolean          @default(true)
+  curatedByHumanId String?          @map("curated_by_human_id")
+  curatedAt        DateTime         @default(now()) @map("curated_at")
+  curatedUntil     DateTime?        @map("curated_until")
+  notes            String?
+
+  curator Human? @relation("FeaturedItemCurator", fields: [curatedByHumanId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([itemType, itemId])
+  @@index([active, sortOrder])
+  @@index([curatedByHumanId])
+  @@index([curatedUntil])
+  @@map("featured_items")
+}

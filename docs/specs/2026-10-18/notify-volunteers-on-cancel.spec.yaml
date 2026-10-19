@@ -1,0 +1,199 @@
+# Confirmed 2026-10-18 (owner: "Go with your recommendations"). Not built yet.
+# notify-volunteers-on-cancel.spec.yaml
+#
+# Cancelling an event tells the people who signed up to volunteer at it.
+
+version: "1.0"
+updated: "2026-10-18"
+
+# ── Rulings (owner, 2026-10-18; plan memory/session_notify_volunteers_on_cancel.plan.md) ──
+# R1  "Yeah it should notify the volunteers that the event has been cancelled."
+#     — cancelling an event notifies its volunteers.
+# R2  "No notifications should go out for an event that isn't in a published
+#     state." — reminders stop for a cancelled event (9c4642efd); the
+#     cancellation notice itself is the exception, because it reports the
+#     state change.
+# R3  "Go with your recommendations" — round 1, Q1–Q9 all as recommended:
+#     Q1 APPROVED, PENDING and CHECKED_IN signups are told; REJECTED,
+#        WITHDRAWN and NO_SHOW are not. Shift and shiftless alike. One message
+#        per person per event per channel, naming every role.
+#     Q2 email always (shadow volunteers too); in-app for verified accounts;
+#        SMS for signups that opted in to texts, through the consent ledger,
+#        GSM-7. Lawyer question L18 logged.
+#     Q3 signup status is not changed and no status is added. "My
+#        volunteering" shows the row as "Event cancelled"; the volunteer
+#        calendar feed marks the entry cancelled.
+#     Q4 one cancelled night of a recurring community listing
+#        (`cancelEventDate`) is out of scope.
+#     Q5 the cancel dialog says how many volunteers will be told, when there
+#        are any (people, not signup rows).
+#     Q6 events cancelled before this ships are covered once: future events
+#        whose `cancelledFromStatus` is PUBLISHED.
+#     Q7 a volunteer who also bought, saved or RSVPed gets both notices.
+#     Q8 a volunteer signup on an event that is not PUBLISHED is refused.
+#     Q9 volunteer comp rewards are untouched; the notice does not mention them.
+# Earlier rulings that still bind: B2 verified-recipient rule (unverified
+# accounts get email only, `packages/core/src/lib/verified-recipients.ts`);
+# SMS consent ledger (`ensureSmsDeliverable`); GSM-7 texts.
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    `cancel-event.ts` has no volunteer code. Ticket buyers, savers and RSVPers
+    hear about a cancellation through the CANCELLED change-notice outbox, but
+    volunteers do not, their signups stay APPROVED, and since 9c4642efd their
+    shift reminders stop too. A volunteer hears nothing and may still turn up.
+    "My volunteering" and the volunteer calendar feed keep showing the shift
+    as on, and the signup API still accepts new signups on a cancelled event.
+  solution: >
+    A cron sweep, built like the shift reminders, finds signups on cancelled
+    events that have not been told and tells each person once per channel,
+    recorded on the volunteer notification ledger under a new kind
+    EVENT_CANCELLED. Volunteers without an account are reached by email.
+    Signup rows keep their status; the reads that show a commitment learn the
+    event is cancelled.
+  users:
+    - volunteer (with or without an account)
+    - organiser (cancels the event)
+  surfaces: [jobs, web, email, in-app, sms]
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        A signup is owed a cancellation notice when its event is CANCELLED,
+        the event's `cancelledFromStatus` is PUBLISHED, the event's start is
+        still in the future, and the signup's status is APPROVED, PENDING or
+        CHECKED_IN. Event signups are matched by `eventId`; signups on the
+        event's EVENT ask by `askId` as well. The rule covers events cancelled
+        before this ships (Q6) with no separate backfill.
+    - id: FR-002
+      description: >
+        A sweep job (every 5 minutes) sends what is owed. Email goes to the
+        signup's contactEmail, in-app to a verified account (`humanId` set),
+        SMS only when `smsOptIn` and `contactPhone` are set and
+        `ensureSmsDeliverable` passes, and only where an SMS port is wired.
+        One message per person per event per channel names every role they
+        signed up for (group by humanId, else lowercased contactEmail).
+    - id: FR-003
+      description: >
+        Each (signup, channel) send is recorded on `VolunteerShiftNotification`
+        with kind EVENT_CANCELLED before or atomically with the send, using
+        the reminder ledger's claim rules, so overlapping ticks never
+        double-send and a failed send is retried next tick.
+    - id: FR-004
+      description: >
+        The message says the event is cancelled and they don't need to come.
+        It names the event, its date in the event's timezone and the roles.
+        It links to "My volunteering" (accounts) or the signup page (shadow).
+        No reason text, no reward text. SMS copy is GSM-7 and carries the SMS
+        brand prefix.
+    - id: FR-005
+      description: >
+        `listMyVolunteerCommitments` rows carry `eventCancelled: boolean`. The
+        web row shows "Event cancelled" and drops the address line. The row
+        keeps its status.
+    - id: FR-006
+      description: >
+        The volunteer calendar feed emits a cancelled-event signup with
+        `STATUS:CANCELLED` (same UID), so subscribed calendars mark it off.
+    - id: FR-007
+      description: >
+        `submitVolunteerSignup` refuses a signup when the event is not
+        PUBLISHED, on the event path and on the EVENT-ask path, with the error
+        the page already gives an unpublished event. A signup that commits
+        concurrently with a cancel is still told by the sweep (FR-001 reads at
+        send time).
+    - id: FR-008
+      description: >
+        The single-event cancel confirmation (event builder and events list)
+        adds one line when the event has volunteers who will be told:
+        "{count, plural, one {# volunteer} other {# volunteers}} will be told
+        it's off." The count is distinct people with an owed status (FR-001
+        statuses). The series-scope options are unchanged.
+  non_functional:
+    - id: NFR-001
+      description: >
+        Swallowed failures (a send, a candidate read) call `reportError` with
+        phone numbers redacted (pattern 0f8103f28) and keep the log line.
+    - id: NFR-002
+      description: >
+        The candidate query is bounded (CANCELLED + future start) and indexed;
+        a tick processes at most a fixed batch and resumes next tick.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: sendVolunteerCancellationNotices
+        description: >
+          Sweep owed signups (FR-001), group per person per event, send per
+          channel through the reminder machinery in
+          send-volunteer-shift-reminders.ts (shared code extracted, not
+          copied, where it fits).
+        idempotent: true
+        money: false
+      - name: submitVolunteerSignup (modified)
+        description: PUBLISHED gate (FR-007).
+      - name: listMyVolunteerCommitments (modified)
+        description: eventCancelled flag (FR-005).
+      - name: cancel-dialog volunteer count (new read or field on an existing one)
+        description: Org-admin read, same access as cancelEvent.
+  ports:
+    existing: [MailerPort, SMSPort, VolunteeringRepo, ReporterPort]
+  adapters:
+    existing: [packages/adapters/src/db/prisma/volunteering.ts]
+  transport:
+    trpc_procedures: [volunteer count for the cancel dialog]
+  jobs: [schedule sendVolunteerCancellationNotices every 5 minutes]
+  ui:
+    components:
+      - My volunteering row (cancelled state)
+      - cancel confirmation in EventBuilder and EventsManager
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  modified_models:
+    - VolunteerReminderKind enum gains EVENT_CANCELLED (ledger kind).
+  new_models: []
+  migrations_needed: true
+  lifecycle: >
+    No new model. Ledger rows are append-only (as today) and cascade with the
+    signup.
+
+# ── Risks ────────────────────────────────────────────────────────────────────
+
+risks:
+  - risk: First deploy sends to every owed signup at once (Q6 cohort).
+    severity: LOW
+    mitigation: Cohort is cancelled-since-2026-10-17 future events only; batch cap per tick.
+  - risk: Up to 5 minutes between cancel and notice.
+    severity: LOW
+    mitigation: Same cadence as the 1h reminder; acceptable.
+  - risk: Peer sessions have uncommitted hunks in volunteer-signups.ts, enums.prisma, ports/types volunteering.ts, jobs container.ts.
+    severity: MEDIUM
+    mitigation: Commit by temp-index splice of our hunks only.
+
+# ── Out of scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - One cancelled night of a recurring community listing (Q4).
+  - Archiving a community listing (ARCHIVED, not CANCELLED).
+  - Volunteer comp rewards on a cancelled event (Q9).
+  - A volunteer count on the series-scope cancel options.
+
+# ── Acceptance criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - Cancelling a published future event with an APPROVED shadow volunteer, an APPROVED account volunteer with two roles and a PENDING volunteer sends three emails (the two-role person gets one naming both) and one in-app notice; a second tick sends nothing.
+  - A WITHDRAWN or REJECTED signup on the same event gets nothing.
+  - An opted-in signup gets one GSM-7 text when SMS is wired; a STOPped number gets none.
+  - My volunteering shows the cancelled row as "Event cancelled" with no address.
+  - The calendar feed carries STATUS:CANCELLED for it.
+  - A signup API call on a cancelled event is refused.
+  - The cancel dialog shows the volunteer line only when the count is above zero.

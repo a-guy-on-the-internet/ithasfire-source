@@ -1,0 +1,800 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Finance — Payees, fee policies, payout terms, settlements, payouts.
+//
+// Terminology vs Stripe:
+//   Our "Payout"     = a batch run that groups multiple transfers
+//   Our "PayoutItem" = a single Stripe Transfer (transfers.create) to a connected account
+//   Stripe "Payout"  = money from a Stripe account to an external bank (automatic, we don't control)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Payee {
+  id              String           @id @default(uuid())
+  subjectType     PayeeSubjectType
+  subjectId       String
+  stripeAccountId String?          @unique
+  status          PayeeStatus      @default(PENDING)
+  payoutsEnabled  Boolean          @default(false)
+  chargesEnabled  Boolean          @default(false)
+  defaultCurrency String           @default("usd")
+  requirements    Json             @default("{}")
+  /// When the capability state on this row was last observed at the source
+  /// (Stripe `event.created` for an `account.updated` webhook, or "now" for a
+  /// live `accounts.retrieve`). Ordering guard: `syncCapabilities` only applies
+  /// a write whose `observedAt` is >= this value, so a late-arriving retry of an
+  /// older Stripe event cannot clobber a newer one. NULL = never synced, so the
+  /// first write always applies (this is the correct backfill value for
+  /// pre-existing rows).
+  capabilitiesSyncedAt DateTime?
+  resaleNegativeBalanceCents         Int      @default(0)
+  resaleNegativeBalanceOpenedAt      DateTime?
+  resaleNegativeBalanceAgingStartsAt DateTime?
+  resalePayoutBlockReason            String?
+  resalePayoutBlockedAt              DateTime?
+
+  orderSplits    OrderSplit[]
+  settlements    Settlement[]
+  settlementLines SettlementLine[]
+  payoutItems     PayoutItem[]
+  payoutTermsLines PayoutTermsLine[]
+  ledgerEntries   PayeeLedgerEntry[] @relation("PayeeLedger")
+  ledgerBalances  PayeeLedgerBalance[]
+
+  // ── P4b (deal terms) ──
+  dealRemainderOf         PayoutTerms[]                      @relation("PayoutTermsRemainderPayee")
+  dealDeductionsCredited  PayoutTermsDeduction[]             @relation("PayoutTermsDeductionCredited")
+  sheetOffPlatformHeld    SettlementSheetOffPlatformAmount[] @relation("SheetOffPlatformHeldBy")
+  sheetOffPlatformOwned   SettlementSheetOffPlatformAmount[] @relation("SheetOffPlatformOwner")
+  sheetDirectPaymentsFrom SettlementSheetDirectPayment[]     @relation("SheetDirectPaymentFrom")
+  sheetDirectPaymentsTo   SettlementSheetDirectPayment[]     @relation("SheetDirectPaymentTo")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([subjectType, subjectId])
+  /// Serves the nightly reconcile sweep. A default btree is ASC NULLS LAST, so
+  /// `listForCapabilityReconcile` splits into an `IS NULL` lookup plus an
+  /// `ORDER BY ... ASC` over the non-null rows rather than asking for
+  /// `ASC NULLS FIRST`, which no scan direction of this index can produce.
+  ///
+  /// CORRECTION to the comment inside migration 20260806120000 (which cannot
+  /// be edited — its checksum is recorded on deployed databases): only the
+  /// ORDERED arm is the clean early-stopping Index Scan. The IS NULL arm is
+  /// index-served (Bitmap) only once NULLs are rare, and always carries
+  /// Prisma's implicit `ORDER BY id` — pkey walk under backlog, small Sort in
+  /// steady state. Measured cheap either way; see the adapter for the plans.
+  @@index([capabilitiesSyncedAt])
+}
+
+model Dispute {
+  id              String            @id @default(cuid())
+  stripeDisputeId String            @unique
+  stripeChargeId  String?
+  paymentIntentId String?
+  orderId         String?
+  order           Order?            @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  ownerSubjectType PayeeSubjectType?
+  ownerSubjectId  String?
+  ownerOrgId      String?
+  ownerOrg        Organization?     @relation("OrganizationDisputes", fields: [ownerOrgId], references: [id], onDelete: SetNull)
+  ownerHumanId    String?
+  ownerHuman      Human?            @relation("HumanDisputes", fields: [ownerHumanId], references: [id], onDelete: SetNull)
+  amountCents     Int
+  /// Stripe's dispute fee in cents (typically $15), summed across the
+  /// dispute's balance transactions. Summing rather than taking the first is
+  /// deliberate: a WON dispute gets a reversing balance transaction carrying a
+  /// negative fee, so the sum naturally returns to 0 without special-casing.
+  ///
+  /// Typically absent at `charge.dispute.created` and materialising at
+  /// `funds_withdrawn`, so the lifecycle must never overwrite a known fee
+  /// with 0.
+  feeCents        Int               @default(0)
+  /// Who absorbs {@link feeCents}. Ticketing disputes are platform-borne;
+  /// membership disputes are debited to the payee. Null until first observed.
+  feeBorneBy      DisputeFeeBearer?
+  currency        String            @db.VarChar(3)
+  reason          String
+  status          DisputeStatus
+  triageReason    String?
+  linkedAt        DateTime?
+  evidenceDueBy   DateTime?
+  /// Mirror of Stripe `evidence_details` (has_evidence / past_due /
+  /// submission_count), refreshed from every dispute webhook and after a
+  /// successful evidence submit. Null = never observed. `evidenceDueBy`
+  /// above is the fourth member of that hash and predates these.
+  evidenceHasEvidence Boolean?
+  evidencePastDue     Boolean?
+  evidenceSubmissionCount Int?
+  /// When WE last submitted evidence through the desk (not Stripe's clock).
+  evidenceSubmittedAt DateTime?
+  fundsWithdrawnAt DateTime?
+  closedAt        DateTime?
+  outcome         String?
+  metadata        Json?
+  ledgerEntries   PayeeLedgerEntry[]
+  evidence        DisputeEvidence?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  @@index([orderId])
+  @@index([stripeChargeId])
+  @@index([paymentIntentId])
+  @@index([ownerSubjectType, ownerSubjectId, status])
+  @@index([ownerOrgId, status])
+  @@index([ownerHumanId, status])
+  /// The desk's open-queue sort (evidenceDueBy ASC NULLS LAST) — keep.
+  @@index([status, evidenceDueBy])
+}
+
+/// The chargeback evidence package for ONE dispute (1:1). `fields` is the
+/// editable `DisputeEvidenceFields` object (ports/dispute-evidence — camelCase
+/// keys mapping 1:1 onto Stripe's evidence hash; text only in v1, file-id
+/// slots stay unset). `sources` is per-source provenance
+/// (`DisputeEvidenceSources` in @th/types) so the desk can show ops what was
+/// found, what was missing and what did not apply.
+///
+/// Human ids are plain strings, no FK (house style, mirrors EntityReport):
+/// the reviewer / submitter stamp must survive the staff account leaving.
+model DisputeEvidence {
+  id        String                @id @default(cuid())
+  disputeId String                @unique
+  dispute   Dispute               @relation(fields: [disputeId], references: [id], onDelete: Cascade)
+  status    DisputeEvidenceStatus @default(DRAFT)
+  fields    Json
+  sources   Json
+  assembledAt      DateTime
+  /// Bumped on every (re-)assembly; doubles as the immutable attempt id in
+  /// the processor idempotency key (`dispute-evidence:<disputeId>:<n>:update`).
+  assembledVersion Int      @default(1)
+  reviewedByHumanId  String?
+  reviewedAt         DateTime?
+  submittedByHumanId String?
+  submittedAt        DateTime?
+  /// Sanitised (no PII) processor failure message from the last submit attempt.
+  submitError        String?
+  /// Stripe `evidence_details.submission_count` observed on the submit response.
+  processorSubmissionCount Int?
+  /// True when the row was reconciled to SUBMITTED from the processor's own
+  /// state (an earlier submit crashed after Stripe accepted). `fields` then
+  /// holds what Stripe reports it received, `submittedByHumanId` is null.
+  reconciledFromProcessor  Boolean?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+}
+
+/// A Stripe Radar early fraud warning (EFW): the card issuer told Stripe a
+/// charge is probably fraudulent, usually DAYS before the chargeback itself
+/// arrives. Refunding inside that window means no dispute, no dispute fee and
+/// no hit to the dispute ratio — so the row exists to get ops to a refund
+/// button fast, and to explain a later dispute ("we were warned").
+///
+/// `actionable` mirrors Stripe: false once the charge is disputed or fully
+/// refunded. `resolvedAt`/`resolution` are OUR record of why it stopped
+/// mattering (auto-set from the dispute/refund webhooks; IGNORED is ops').
+/// Owner columns are denormalised the way Dispute's are — plain ids, no
+/// relation, so an org/human delete never cascades into a Stripe mirror.
+model EarlyFraudWarning {
+  id              String   @id @default(cuid())
+  stripeEfwId     String   @unique
+  stripeChargeId  String
+  paymentIntentId String?
+  orderId         String?
+  order           Order?   @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  ownerOrgId      String?
+  ownerHumanId    String?
+  /// Stripe `fraud_type` verbatim (card_never_received, made_with_stolen_card,
+  /// unauthorized_use_of_card, misc, ...). Free string on purpose: Stripe adds
+  /// values without notice and a rejected enum would drop the warning.
+  fraudType       String
+  actionable      Boolean
+  /// Stripe's `created` on the EFW object (not our receipt time).
+  stripeCreatedAt DateTime
+  resolvedAt      DateTime?
+  resolution      EarlyFraudWarningResolution?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([orderId])
+  @@index([stripeChargeId])
+  /// The ops queue: `actionable AND resolvedAt IS NULL`, newest Stripe
+  /// warning first — exactly the predicate + sort of `listActionable`.
+  @@index([actionable, resolvedAt, stripeCreatedAt])
+}
+
+// NOTE: a SQL-only CHECK constraint guards the maturity invariant:
+//   "PayeeLedgerEntry_settlement_credit_available_check"
+//     CHECK ("type" <> 'SETTLEMENT_CREDIT' OR "availableAt" IS NOT NULL)
+// Prisma can't express CHECK constraints (house precedent:
+// BookingRequest_direction_shape_check), so it lives as raw SQL in migration
+// 20260810190000_ledger_authoritative_foundation. Every SETTLEMENT_CREDIT
+// must carry a maturity date; a NULL there would silently read as
+// "never payable" in the payable query.
+model PayeeLedgerEntry {
+  id             String               @id @default(cuid())
+  idempotencyKey String               @unique
+  payeeId        String
+  payee          Payee                @relation("PayeeLedger", fields: [payeeId], references: [id])
+  type           PayeeLedgerEntryType
+  amountCents    Int
+  currency       String               @db.VarChar(3)
+  sourceKind     String
+  sourceId       String
+  orderId        String?
+  settlementId   String?
+  disputeId      String?
+  dispute        Dispute?             @relation(fields: [disputeId], references: [id])
+  relatedEntryId String?
+  relatedEntry   PayeeLedgerEntry?    @relation("PayeeLedgerEntryRelated", fields: [relatedEntryId], references: [id])
+  relatedEntries PayeeLedgerEntry[]   @relation("PayeeLedgerEntryRelated")
+  /// When this entry counts toward the PAYABLE balance. Null = immediately.
+  /// Only SETTLEMENT_CREDIT rows carry a value, stamped at write time as
+  /// max(schedule, Stripe availability floor): the schedule is
+  /// `computePayoutDate` for ticketing and the next-UTC-month bucket for
+  /// memberships, and the floor is 2 business days from the mint
+  /// (`applyAvailabilityFloor`) so a payout is never scheduled before the
+  /// money can be available in the platform balance. Debits, holds and payouts
+  /// are always effective. The asymmetry is the design, not an accident:
+  /// credits WAIT for maturity, debits NEVER do — a refund inside the window
+  /// reduces the payable balance the instant it is written (spec 2026-08-10,
+  /// ledger-authoritative-settlement §2). Backed by the SQL-only CHECK above.
+  availableAt DateTime?
+  /// Stamped on a SETTLEMENT_CREDIT when a PAYOUT entry consumes its net
+  /// contribution (FIFO by availableAt). ATTRIBUTION ONLY — it exists so
+  /// refunds know whether money already left (order-item `paidOutAt`
+  /// stamping) and so "which orders did this payout cover" stays answerable.
+  /// NEVER an input to amount computation: the payable sum is the sum,
+  /// consumed or not.
+  consumedByEntryId String?
+  description    String
+  metadata       Json?
+  createdAt      DateTime             @default(now())
+
+  @@index([payeeId, createdAt])
+  @@index([orderId])
+  @@index([disputeId])
+  @@index([payeeId, currency, availableAt])
+  @@index([consumedByEntryId])
+}
+
+model PayeeLedgerBalance {
+  payeeId                String
+  payee                  Payee    @relation(fields: [payeeId], references: [id])
+  currency               String   @db.VarChar(3)
+  ledgerBalanceCents     Int      @default(0)
+  ledgerPendingHoldCents Int      @default(0)
+  reserveBalanceCents    Int      @default(0)
+  updatedAt              DateTime @updatedAt
+
+  @@id([payeeId, currency])
+}
+
+model FeePolicy {
+  id            String             @id @default(uuid())
+  // Scope org and
+  scopeType     FeePolicyScopeType
+  scopeId       String? // null for GLOBAL
+  status        FeePolicyStatus    @default(DRAFT)
+  version       Int
+  effectiveFrom DateTime
+  effectiveTo   DateTime?
+
+  // pricing knobs for the platform
+  buyerFeePct         Decimal        @db.Decimal(5, 4) // e.g. 0.065
+  maxFeeCents         Int?                             // per-ticket fee cap in cents (null = no cap)
+  minFeeCents         Int            @default(0)       // minimum fee per ticket (e.g. 100 = $1.00)
+  maxPlatformFeeCents Int?                             // order-level cap on total platform fees (e.g. 500 = $5.00)
+  platformFixedCents  Int            @default(0)       // our own per-ticket fixed fee in cents
+  feeMode             PaymentFeeType @default(PASS_THROUGH) // ABSORB | PASS_THROUGH
+  // Payout payment processor fees (e.g. Stripe)
+  processsorFeePct    Decimal        @db.Decimal(5, 4) // e.g. 0.029
+  processorFixedCents Int // e.g. 30
+  payoutPct           Decimal        @db.Decimal(5, 4) // e.g. 0.0025
+  payoutFixedCents    Int // e.g. 25
+  monthlyPayoutCents  Int // e.g. 200
+  // Minimum accumulated balance (cents) before a payout transfer executes.
+  // Prevents death-by-$0.25 on small splits. Default $10.
+  payoutMinimumCents  Int            @default(1000)
+  /// Stripe's monthly ACTIVE-connected-account fee, in cents (200 = $2). Billed
+  /// to the PLATFORM once per Express account per calendar month in which that
+  /// account receives a payout; dormant accounts cost nothing.
+  ///
+  /// Deliberately NOT `monthlyPayoutCents`: that field lives in the per-ticket
+  /// PRICING block (it is threaded into `payoutTermsPolicySchema` alongside
+  /// `payoutPct` / `payoutFixedCents` and rendered on the platform fee form),
+  /// so it means "a monthly processor cost component of ticket pricing". This
+  /// is a different thing entirely — a withholding applied once per payee per
+  /// month at payout time, never at pricing time. Overloading one integer with
+  /// both meanings would make any future pricing edit silently change what we
+  /// withhold from payouts.
+  ///
+  /// Defaults to 0 = feature OFF. Recovery only switches on when the platform
+  /// sets this (200) on the GLOBAL policy, so migrating this column cannot
+  /// change a single existing payout amount.
+  connectAccountFeeCents Int         @default(0)
+
+  notes      String?
+  createdBy  String
+  approvedBy String? // require separate human
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  payoutTerms PayoutTerms[]
+
+  // NOTE: this does NOT enforce "one ACTIVE policy per scope". GLOBAL rows have
+  // `scopeId = NULL` and Postgres treats NULLs as distinct, so any number of
+  // (GLOBAL, NULL, ACTIVE, 8) rows satisfy it. See the partial index below.
+  @@unique([scopeType, scopeId, status, version])
+  @@index([scopeType, scopeId, status, effectiveFrom])
+  // NOTE: a PARTIAL UNIQUE INDEX enforces "at most one ACTIVE policy per scope"
+  //   "FeePolicy_one_active_per_scope_key"
+  //     UNIQUE ("scopeType", COALESCE("scopeId", '')) WHERE "status" = 'ACTIVE'
+  // Partial + expression indexes aren't expressible in Prisma's schema, so it
+  // lives as raw SQL in migration
+  // 20260812130000_fee_policy_one_active_per_scope. The COALESCE is what makes
+  // GLOBAL rows collide with each other despite the NULL `scopeId`; DRAFT and
+  // ARCHIVED are outside the predicate so version history and drafts are
+  // unbounded. `feePolicies.upsert` is archive-then-create and the reconciler
+  // serializes it with `lockScopeGuard` (pg_advisory_xact_lock), so this index
+  // is the backstop for a future caller that forgets the lock — its P2002
+  // (target `FeePolicy_one_active_per_scope_key`) is deliberately unmapped and
+  // should fail loudly.
+}
+
+model PayoutTerms {
+  id                 String            @id @default(uuid())
+  kind               PayoutTermsKind
+  version            Int               @default(1)
+  isDefault          Boolean           @default(false)
+  settlementCurrency String            @default("usd") @db.VarChar(3)
+  effectiveFrom      DateTime?
+  effectiveTo        DateTime?
+  status             PayoutTermsStatus @default(PENDING)
+  feeMode            PaymentFeeType?
+  feePolicyId        String?
+  payoutSchedule     PayoutSchedule    @default(TWO_WEEKS_AFTER)
+  resaleProcessingFeeConfigRef String?
+  resalePayoutReleaseDays     Int       @default(7)
+
+  // ── Resale share clause (organiser-resale-share FR-001) ──
+  // The share every resale of a ticket pays to the event side. Set on RESALE
+  // terms. Null type = not set: resale stays off until the clause is set
+  // (every row written before this migration reads null, FR-015). Shape (SQL
+  // CHECK "PayoutTerms_resale_share_shape_check"):
+  //   null    bps and cents both NULL
+  //   PERCENT bps 0..1000 (the 10% limit, FR-002); cents NULL
+  //   FLAT    cents > 0; bps NULL
+  // Replaced the markup split's `resaleSellerMarkupShareBps` (dropped by
+  // FR-014, migration 20261013180000_resale_markup_split_removed).
+  resaleShareType  ResaleShareType?
+  resaleShareBps   Int?
+  resaleShareCents Int?
+  /// Who pays the share: SELLER (taken from the ask) or BUYER (added on top).
+  resaleSharePayer ResaleSharePayer @default(SELLER)
+
+  lines PayoutTermsLine[]
+
+  // ── P4b (deal terms) ──
+  /// The party the leftover falls to — and so the party who owes any
+  /// shortfall (FR-002, M7). Null on every row written before P4b: the read
+  /// side derives one by the legacy rule (core `resolveDealRemainder`) and
+  /// says so; the first deal write stores an explicit one. Restrict: a payee
+  /// holding a deal's remainder cannot be deleted out from under it.
+  remainderPayeeId String?
+  remainderPayee   Payee?                 @relation("PayoutTermsRemainderPayee", fields: [remainderPayeeId], references: [id], onDelete: Restrict)
+  /// Costs off the top, in waterfall order.
+  deductions       PayoutTermsDeduction[]
+
+  feePolicy   FeePolicy?   @relation(fields: [feePolicyId], references: [id], onDelete: SetNull)
+  settlements Settlement[]
+
+  eventsPrimary Event[] @relation("EventPrimaryPayoutTerms")
+  eventsResale  Event[] @relation("EventResalePayoutTerms")
+  eventsMerch   Event[] @relation("EventMerchPayoutTerms")
+  agreements    Agreement[] @relation("AgreementPayoutTerms")
+
+  // Reverse relations for Organization / Place / Human default FK pointers
+  orgsDefaultPrimary    Organization[] @relation("OrgDefaultPrimaryPayoutTerms")
+  orgsDefaultResale     Organization[] @relation("OrgDefaultResalePayoutTerms")
+  placesDefaultPrimary  Place[]        @relation("PlaceDefaultPrimaryPayoutTerms")
+  placesDefaultResale   Place[]        @relation("PlaceDefaultResalePayoutTerms")
+  humansDefaultPrimary  Human[]        @relation("HumanDefaultPrimaryPayoutTerms")
+  humansDefaultResale   Human[]        @relation("HumanDefaultResalePayoutTerms")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([kind, isDefault, status])
+  @@index([remainderPayeeId])
+}
+
+model PayoutTermsLine {
+  id             String                  @id @default(uuid())
+  payoutTermsId  String
+  payeeId        String
+  /// Optional: scope this line to a specific ticket type.
+  /// Null = applies to all ticket types under these payout terms.
+  ticketTypeId   String?
+  /// Whole percent 0..100. NULL only on a FIXED clause (P4b) — SQL CHECK
+  /// "PayoutTermsLine_deal_clause_shape_check".
+  percent        Int?
+  /// DEPRECATED (P4b, deal-terms-and-settlement FR-001). Never honoured by
+  /// the split math (compute-order-splits.ts) and no longer surfaced by the
+  /// deal read or write; a guarantee is a FIXED clause. Kept so existing rows
+  /// and the legacy line editors keep working; drop in a later contract
+  /// migration once nothing reads it.
+  floorCents     Int                     @default(0)
+  capPercent     Int?
+  priority       Int                     @default(0)
+  rounding       PayoutTermsLineRounding @default(FLOOR)
+
+  /// True when this line's payee is someone other than the event/agreement
+  /// owner. Owner lines stay false (auto-acknowledged). Stamped at line
+  /// creation; not user-editable.
+  requiresConfirmation Boolean @default(false)
+
+  /// Acknowledgement lifecycle. Null when requiresConfirmation = false.
+  /// PENDING → invited but no decision; CONFIRMED → payee acknowledged share;
+  /// COUNTERED → payee proposed a different share (see counterPercentBps);
+  /// DECLINED → payee refused this line version (terminal until an economics
+  /// edit resets the line to PENDING).
+  confirmationStatus PayoutLineConfirmationStatus?
+
+  /// Stamped when payee confirms. Reset to null whenever percent / floor /
+  /// cap change after first confirmation, forcing re-confirm.
+  confirmedAt DateTime?
+
+  /// The payee's counter-share ask (basis points) while COUNTERED. An ask
+  /// only — never applied to `percent` directly; a party applies it via the
+  /// DRAFT line editor. Cleared on confirm/decline and on economics edits.
+  counterPercentBps Int?
+
+  /// Free-form counter-offer message shared with the agreement parties.
+  /// Required (≥10 chars) when countering; cleared with counterPercentBps.
+  counterNote String?
+
+  // ── P4b (deal terms) ──
+  // The clause columns (FR-001). Defaults make every pre-P4b row a PERCENT
+  // line on the GROSS basis — exactly what the per-order engine pays today.
+  // FR-005 FENCE: only PERCENT + GROSS rows are payout lines; the adapter's
+  // `listLines` / `listLinesByTermsIds` / `getLineById` / `replaceLines`
+  // never see or touch any other row, so the per-order engine cannot pay a
+  // FIXED, NET_POOL or FIXED_AND_PERCENT clause. Shape (SQL CHECK
+  // "PayoutTermsLine_deal_clause_shape_check", mirroring the calculator's
+  // `assertDealTermsShape`):
+  //   FIXED             amountCents > 0; percent and resolution NULL
+  //   PERCENT           percent 0..100; amountCents and resolution NULL
+  //   FIXED_AND_PERCENT amountCents > 0, percent 1..100, resolution set
+  amountType   DealClauseAmountType  @default(PERCENT)
+  amountCents  Int?
+  basis        DealBasisKind         @default(GROSS)
+  resolution   DealClauseResolution?
+  displayLabel String?               @db.VarChar(200)
+
+  payoutTerms PayoutTerms @relation(fields: [payoutTermsId], references: [id], onDelete: Cascade)
+  payee       Payee       @relation(fields: [payeeId], references: [id])
+  ticketType  TicketType? @relation(fields: [ticketTypeId], references: [id], onDelete: Cascade)
+
+  @@index([payoutTermsId])
+  @@index([payeeId])
+  @@index([ticketTypeId])
+  @@index([payoutTermsId, confirmationStatus])
+  @@index([payoutTermsId, amountType, basis])
+}
+
+/// How a resale share is stated (organiser-resale-share FR-001): a percentage
+/// of each sale's ask, or a flat amount per sale.
+enum ResaleShareType {
+  PERCENT
+  FLAT
+}
+
+/// Who pays a resale share (organiser-resale-share FR-001, FR-005): SELLER
+/// takes it out of the ask; BUYER pays it on top of the ask.
+enum ResaleSharePayer {
+  SELLER
+  BUYER
+}
+
+enum PayoutLineConfirmationStatus {
+  PENDING
+  CONFIRMED
+  COUNTERED
+  DECLINED
+}
+
+// OrderSplit represents a split of an Order's gross amount to a Payee.
+model OrderSplit {
+  id          String @id @default(uuid())
+  orderId     String
+  payeeId     String
+  amountCents Int
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  payee Payee @relation(fields: [payeeId], references: [id], onDelete: Restrict)
+
+  settlementLines SettlementLine[]
+
+  @@unique([orderId, payeeId])
+  @@index([payeeId])
+}
+
+model Settlement {
+  id                  String   @id @default(uuid())
+  payeeId             String
+  date                DateTime // Kept for backward compat
+  scheduledPayoutDate DateTime // When this settlement should be paid out (midnight CST)
+  amountCents         Int
+  currency            String   @default("usd") @db.VarChar(3)
+  fxRate              Decimal? @db.Decimal(18, 8)
+  stripeTransferId    String?
+  status              String   @default("pending") // "pending"|"transferred"|"failed"
+
+  payoutId       String?
+  // Link to the payout terms that govern payout timing
+  payoutTermsId  String?
+  // Link to the event this settlement relates to (for payout date calculation)
+  eventId        String?
+
+  payee       Payee        @relation(fields: [payeeId], references: [id], onDelete: Cascade)
+  payout      Payout?      @relation(fields: [payoutId], references: [id], onDelete: SetNull)
+  payoutTerms PayoutTerms? @relation(fields: [payoutTermsId], references: [id], onDelete: SetNull)
+  event       Event?       @relation(fields: [eventId], references: [id], onDelete: SetNull)
+
+  lines           SettlementLine[]
+  payoutItemLinks PayoutItemSettlement[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([payeeId, scheduledPayoutDate])
+  @@index([scheduledPayoutDate, status])
+  @@index([status])
+  @@index([stripeTransferId])
+}
+
+// SettlementLine materializes which order amounts contributed to a Settlement.
+// This makes "has this order been paid out?" queryable and auditable.
+model SettlementLine {
+  id          String @id @default(uuid())
+  settlementId String
+  orderId     String
+  orderSplitId String
+  payeeId     String
+  amountCents Int
+  currency    String @default("usd") @db.VarChar(3)
+
+  settlement Settlement @relation(fields: [settlementId], references: [id], onDelete: Cascade)
+  order      Order      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderSplit OrderSplit @relation(fields: [orderSplitId], references: [id], onDelete: Cascade)
+  payee      Payee      @relation(fields: [payeeId], references: [id], onDelete: Cascade)
+
+  orderItemLinks OrderItemSettlementLine[]
+
+  createdAt DateTime @default(now())
+
+  @@unique([settlementId, orderSplitId])
+  @@index([orderId])
+  @@index([payeeId])
+}
+
+// OrderItemSettlementLine links individual order items to their settlement lines.
+// This enables item-level payout tracking for partial refunds and resale scenarios.
+// Multiple items may contribute to a single settlement line (many-to-one relationship).
+model OrderItemSettlementLine {
+  id               String @id @default(uuid())
+  orderItemId      String
+  settlementLineId String
+  amountCents      Int    // This item's contribution to the settlement
+
+  orderItem      OrderItem      @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  settlementLine SettlementLine @relation(fields: [settlementLineId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([orderItemId, settlementLineId])
+  @@index([settlementLineId])
+}
+
+// Payout represents a scheduled batch run that groups many Settlement transfers.
+model Payout {
+  id String @id @default(uuid())
+
+  // When this payout is intended to run (scheduler picks it up at/after this time)
+  scheduledFor DateTime
+
+  // If set, payout is paused/canceled and should not execute.
+  canceledAt DateTime?
+
+  // When execution actually started/ended (for audit + retries)
+  startedAt  DateTime?
+  completedAt DateTime?
+
+  status String @default("scheduled") // "scheduled"|"running"|"completed"|"failed"|"canceled"
+
+  // Optional: sport an external processor batch id (if we add it later)
+  processorBatchId String?
+
+  settlements Settlement[]
+  items PayoutItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, scheduledFor])
+  @@index([scheduledFor])
+}
+
+// PayoutItem tracks an individual transfer attempt for a Payee within a Payout.
+// Pre-cutover it covered Settlement rows via the PayoutItemSettlement join;
+// post-cutover (spec 2026-08-10) it carries its own PLAN — the credit entries
+// it claims, the order items they attribute to, the exact net sent to Stripe,
+// and the ledger key its PAYOUT entry is written under. That plan is what makes
+// a crashed run healable WITHOUT re-deriving anything from a payable balance
+// that the crash may already have changed.
+model PayoutItem {
+  id String @id @default(uuid())
+  payoutId String
+  payeeId String
+  currency String @default("usd") @db.VarChar(3)
+  /// GROSS: always equals the sum of the linked Settlement.amountCents rows.
+  /// This invariant is load-bearing for reconciliation — do NOT net the Connect
+  /// fee out of it.
+  amountCents Int
+  /// Stripe's monthly active-account fee withheld from THIS transfer, in cents
+  /// (0 = nothing withheld). The amount actually sent to Stripe is
+  /// `amountCents - recoveredDebtCents - connectAccountFeeCents`; the withheld
+  /// cents stay on the platform balance, which is why there is no second
+  /// transfer or charge.
+  connectAccountFeeCents Int @default(0)
+  /// LEGACY, always 0 on rows written post-cutover (spec 2026-08-10 §7).
+  /// Dispute-debt withheld from this item's transfer under the pre-cutover
+  /// model. Debt is no longer a withholding step — it is a NEGATIVE payable
+  /// that pays nothing and is recouped by the next cycle's arithmetic — so
+  /// nothing writes this column any more. Kept: it is financial history on
+  /// existing rows.
+  recoveredDebtCents Int @default(0)
+  /// Rolling-reserve cents withheld from this item's transfer (0 = none).
+  /// Computed on the MEMBERSHIP portion of the payout only (spec 2026-08-05,
+  /// "Dispute policy": a reserve is DEFERRED payout, not revenue), after debt
+  /// recovery and before the Connect fee — deduction order is debt → reserve
+  /// → fee. Stamped at creation on the already-claimed settlement set and
+  /// never recomputed. A matching RESERVE_HOLD ledger entry
+  /// (`reserve-hold:<payoutItemId>`) carries the deferred cents on
+  /// `PayeeLedgerBalance.reserveBalanceCents` until they mature. Like debt,
+  /// the reserve MAY consume the entire remaining net (no Stripe transfer,
+  /// `stripeTransferId` null, status "transferred").
+  reserveHeldCents Int @default(0)
+  /// Matured reserve ADDED to this item's transfer (0 = none). The transfer
+  /// sent to Stripe is `amountCents - recoveredDebtCents - reserveHeldCents -
+  /// connectAccountFeeCents + reserveReleasedCents`. RESERVE_RELEASE ledger
+  /// entries (`reserve-release:<holdEntryId>`, sourceId = this item) record
+  /// which holds came back; the payout batch's crash sweep uses that linkage
+  /// to heal a transfer whose release writes were lost mid-run.
+  reserveReleasedCents Int @default(0)
+
+  /// THE DURABLE PLAN (spec 2026-08-10 §6). The SETTLEMENT_CREDIT entry ids
+  /// this item claims, frozen at mint time. Load-bearing for crash recovery:
+  /// if the process dies after Stripe accepts the transfer but before the
+  /// PAYOUT ledger entry lands, the payable still shows the money as owed and
+  /// the credits still look unconsumed — the next batch heals the ledger from
+  /// THIS list (a pure ledger write, no Stripe call) instead of re-deriving a
+  /// plan from a balance the crash already invalidated.
+  plannedCreditEntryIds String[] @default([])
+  /// Order-item ids the planned credits attribute revenue to (read from each
+  /// credit's `metadata.items` at mint time). Stamped `paidOutAt` on success,
+  /// and replayed by the heal sweep — without it a post-payout refund would
+  /// not know money already left and would skip the transfer reversal.
+  plannedOrderItemIds String[] @default([])
+  /// The exact cents handed to Stripe (`amountCents - reserveHeldCents -
+  /// connectAccountFeeCents + reserveReleasedCents`), frozen at mint time.
+  /// Recorded rather than recomputed because every withholding input drifts
+  /// after a transfer lands (the Connect fee sees the account go active; the
+  /// reserve sees its releases written), so a recomputed amount is NOT the
+  /// amount that was sent.
+  plannedNetCents Int @default(0)
+  /// `idempotencyKey` of the PAYOUT ledger entry this item's payable claim is
+  /// written under. Derived from the CREDIT SET, not from this row's id, so a
+  /// duplicate run planning the same credits replays the same key as a no-op
+  /// (the double-ledger-debit guard). Null only on pre-cutover rows.
+  payoutLedgerKey String?
+
+  stripeTransferId String? @unique
+  status String @default("pending") // "pending"|"transferred"|"failed"
+  failedAt DateTime?
+  failureReason String?
+  /// When this item's transfer actually EXECUTED (Stripe accepted the
+  /// transfer, or the fully-withheld debt-recovery path completed). Stripe
+  /// bills its monthly active-account fee for the month a payout LANDS, so
+  /// month attribution keys on this — `createdAt` is only the fallback for
+  /// rows predating the column. Null for pending/failed items.
+  transferredAt DateTime?
+
+  payout Payout @relation(fields: [payoutId], references: [id], onDelete: Cascade)
+  payee Payee @relation(fields: [payeeId], references: [id], onDelete: Cascade)
+  settlements PayoutItemSettlement[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([payoutId, payeeId, currency])
+  @@index([payeeId])
+}
+
+// Join table: which settlements are included in a given payout item.
+model PayoutItemSettlement {
+  payoutItemId String
+  settlementId String
+
+  payoutItem PayoutItem @relation(fields: [payoutItemId], references: [id], onDelete: Cascade)
+  settlement Settlement @relation(fields: [settlementId], references: [id], onDelete: Cascade)
+
+  @@id([payoutItemId, settlementId])
+  @@index([settlementId])
+}
+
+// ── Fee waivers ──────────────────────────────────────────────────────────────
+// A consumable allowance that zeroes the Ithas Fire platform fee on a fixed
+// number of tickets. Unlike FeePolicy — a declarative, time-versioned rate card
+// — a waiver is STATEFUL: it depletes as tickets sell.
+//
+// Only the platform fee is waived. The Stripe processing fee still passes
+// through to the buyer; we cannot waive a cost the processor charges us.
+model FeeWaiver {
+  id          String               @id @default(uuid())
+  subjectType FeeWaiverSubjectType
+  subjectId   String
+  side        FeeWaiverSide
+
+  /// Total tickets this allowance covers.
+  ticketsGranted Int
+  /// Tickets currently RESERVED or SETTLED against it. Never exceeds
+  /// ticketsGranted — enforced by the atomic reserve in the repo AND by a
+  /// CHECK constraint, so a bad write cannot oversell the allowance.
+  ticketsUsed    Int @default(0)
+
+  status        FeeWaiverStatus @default(ACTIVE)
+  effectiveFrom DateTime        @default(now())
+  effectiveTo   DateTime?
+
+  notes     String?
+  createdBy String
+  revokedBy String?
+  revokedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  redemptions FeeWaiverRedemption[]
+
+  @@index([subjectType, subjectId, side, status])
+  @@index([status, effectiveFrom])
+}
+
+// One row per (waiver, order) — the audit trail for what an allowance actually
+// paid for, and the unit of release when a checkout fails or an order refunds.
+model FeeWaiverRedemption {
+  id       String    @id @default(uuid())
+  waiverId String
+  waiver   FeeWaiver @relation(fields: [waiverId], references: [id], onDelete: Cascade)
+
+  orderId String
+
+  /// Tickets on this order that had their platform fee waived.
+  ticketsReserved Int
+  /// Platform fee (cents) forgone — what this redemption cost Ithas Fire.
+  feeWaivedCents  Int
+
+  status     FeeWaiverRedemptionStatus @default(RESERVED)
+  releasedAt DateTime?
+  settledAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // One redemption per order per waiver — makes reserve idempotent under
+  // checkout retries.
+  @@unique([waiverId, orderId])
+  @@index([orderId])
+  @@index([status])
+}

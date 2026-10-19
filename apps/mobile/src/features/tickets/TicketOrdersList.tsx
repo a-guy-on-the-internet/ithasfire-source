@@ -22,6 +22,13 @@ import {
 } from "@th/ui-native";
 
 import { trpc, type RouterOutputs } from "@/lib/trpc";
+import { EmailVerificationPrompt } from "@/features/auth/EmailVerificationPrompt";
+import { EmailVerificationScroll } from "@/features/auth/EmailVerificationScroll";
+import {
+  isEmailVerificationRequired,
+  retryUnlessVerificationRequired,
+} from "@/features/auth/email-verification-required";
+import { useEmailVerificationLatch } from "@/features/auth/use-email-verification-latch";
 import {
   formatTicketCode,
   formatTicketCount,
@@ -208,15 +215,21 @@ const TicketOrderCard = ({
         />
       </View>
 
-      <View style={styles.purchaseRow}>
-        <View style={styles.purchaseLabelRow}>
-          <Receipt size={15} color={colors.colorMuted} />
-          <Text style={styles.purchaseLabel}>Subtotal</Text>
+      {/* No amount on a transferred-in ticket: the viewer did not buy the
+          order (`listMyOrders` returns charges: null). */}
+      {order.charges ? (
+        <View style={styles.purchaseRow}>
+          <View style={styles.purchaseLabelRow}>
+            <Receipt size={15} color={colors.colorMuted} />
+            <Text style={styles.purchaseLabel}>Total paid</Text>
+          </View>
+          <Text style={styles.amountText}>
+            {/* Same figure as the order screen's Total paid (server-side
+                `charges`); gross alone left out fees and tax. */}
+            {formatTicketOrderCurrency(order.charges.totalCents, order.currency)}
+          </Text>
         </View>
-        <Text style={styles.amountText}>
-          {formatTicketOrderCurrency(order.amountGrossCents, order.currency)}
-        </Text>
-      </View>
+      ) : null}
 
       <View style={styles.ticketDetailsGroup}>
         <Text style={styles.ticketDetailsTitle}>Ticket codes</Text>
@@ -299,8 +312,12 @@ export const TicketOrdersList = ({
   const styles = useThemedSheet(makeSheet);
   const query = trpc.orders.listMyOrders.useQuery(
     { limit: 50 },
-    { staleTime: 30_000 },
+    { staleTime: 30_000, retry: retryUnlessVerificationRequired(1) },
   );
+  const verificationRequired = useEmailVerificationLatch({
+    gated: isEmailVerificationRequired(query.error),
+    answered: query.isSuccess || query.isError,
+  });
 
   const orders = (query.data?.items ?? []) as TicketOrder[];
   const ticketQueries = trpc.useQueries((t) =>
@@ -360,6 +377,25 @@ export const TicketOrdersList = ({
     }
     return <EmptyState title={emptyTitle} body={emptyBody} />;
   }, [emptyBody, emptyTitle, query]);
+
+  // Outside the FlatList on purpose: `ListEmptyComponent` is re-created every
+  // render (it closes over `query`), which would remount the prompt and drop
+  // a half-typed code. Pull to refresh picks up a verify done elsewhere.
+  if (verificationRequired) {
+    return (
+      <EmailVerificationScroll
+        testID={testID}
+        contentContainerStyle={styles.content}
+        refreshing={query.isFetching}
+        onRefresh={() => void query.refetch()}
+      >
+        {ListHeaderComponent}
+        <View style={styles.stateContainer} testID="ticket-orders-verify">
+          <EmailVerificationPrompt context="tickets" />
+        </View>
+      </EmailVerificationScroll>
+    );
+  }
 
   return (
     <FlatList<TicketOrder>

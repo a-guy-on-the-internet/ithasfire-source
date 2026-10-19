@@ -1,0 +1,582 @@
+# community-managed-event-listings.spec.yaml
+#
+# Wikipedia-style community-managed free event listings, added as two new axes
+# on the existing Event aggregate (Model A — same Event table, new flags).
+
+version: "1.0"
+updated: "2026-07-01"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Free, recurring, grassroots events (open mics, jams, markets, meetups) have
+    no home on the platform. Every Event today must be OWNED by a human or org and
+    is wired for the transactional path (tickets, checkout, tax, payouts). There
+    is no way to crowd-source a free listing that no single organizer maintains,
+    and no way for the community to correct stale details (moved venue, new time).
+  solution: >
+    Add two orthogonal axes to the existing Event aggregate. (1) Attendance mode:
+    TICKETED (today) vs RSVP (free — no ticket types, checkout, tax, or payout;
+    attendance is just a signed-in user saying "I'm going", a personal reminder
+    with no public count). (2) Stewardship: OWNED (today) vs COMMUNITY (ownerless —
+    neither humanId nor orgId). A community listing = RSVP + COMMUNITY. Edit
+    suggestions are UNIVERSAL: anyone (anonymous allowed) can propose a
+    whitelisted-field edit to ANY published public event; approval always routes
+    to "the owner's side" — COMMUNITY listings to the community-moderator queue,
+    org events to that org's editors, personal events to the human owner. An
+    APPROVE atomically applies the diff and writes an AuditLog row — the audit
+    trail doubles as version history. Suggestions never mutate an event directly,
+    so there is zero blast radius into ticketed or payout-bearing events. This
+    mirrors the existing EventCategoryRequest request -> PENDING -> review ->
+    atomic apply + audit pattern.
+  users:
+    - Attendee (anonymous or signed-in) submitting an edit suggestion on any event
+    - Community moderator (applied-for, verified) reviewing COMMUNITY suggestions & creating listings
+    - Org editors / personal-event owners reviewing suggestions on their own events
+    - Platform staff (ADMIN) reviewing moderator applications
+    - Discovery/search consumers (community listings surface alongside owned events)
+  surfaces:
+    - web
+    - api
+    - jobs # (optional) reminder notifications for RSVPs; not in v1 core
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Event gains two enum columns: attendanceMode (TICKETED | RSVP, default
+        TICKETED) and stewardship (OWNED | COMMUNITY, default OWNED). Existing rows
+        default to TICKETED + OWNED with no behavior change.
+    - id: FR-002
+      description: >
+        A COMMUNITY event has humanId = null AND orgId = null. Enforced by a DB
+        check constraint in the COMMUNITY direction ONLY: stewardship = 'OWNED'
+        OR (humanId IS NULL AND orgId IS NULL AND attendanceMode = 'RSVP').
+        The OWNED => has-owner direction stays a use-case-layer invariant
+        (creation paths), NOT a DB constraint: Event.humanId is onDelete SetNull,
+        so deleting a human already orphans their personal OWNED events today —
+        a bidirectional constraint would break admin-delete-human. (Wikipedia
+        analog: community content is ownerless by design; account removal never
+        cascades into content.) RSVP is required for COMMUNITY.
+    - id: FR-003
+      description: >
+        RSVP events have no ticketTypes, orders, tickets, payoutTerms, tax fields,
+        or currency. Creating a ticket type or checkout against an RSVP event is
+        rejected (fail EVENT_NOT_TICKETED). RSVP is only reachable via COMMUNITY
+        creation in v1 (no OWNED+RSVP surface); publishEvent fails fast on
+        attendanceMode=RSVP as defense-in-depth rather than branching its
+        currency/tax/attestation stamping.
+    - id: FR-004
+      description: >
+        A signed-in user can RSVP ("I'm going") to any PUBLISHED RSVP event,
+        recorded as an EventRsvp row. RSVP is idempotent per (eventId, humanId)
+        and reversible (un-RSVP). NO public going-count is exposed; only the user's
+        own "you're going" state and the list of events they RSVPed to
+        (rsvps.getForUser — attendance intent, distinct from the separate
+        saved/watchlist spec).
+    - id: FR-005
+      description: >
+        Creating the first version of a COMMUNITY listing is gated to a verified
+        community moderator (HumanRole COMMUNITY_MODERATOR). It is created directly
+        as PUBLISHED (no draft-owner workflow) with stewardship=COMMUNITY,
+        attendanceMode=RSVP. It does NOT route through publishEvent (which requires
+        an owner, ticket types, and payout terms); the use-case writes the PUBLISHED
+        row directly, generating slug/shortId + geohash inline. countryCode is
+        REQUIRED in the create input (slug generation depends on it). The slug is
+        immutable thereafter (regenerateEventSlug rejects ownerless events; an
+        approved title edit does not change the slug — stable URLs by design).
+    - id: FR-006
+      description: >
+        ANYONE — including anonymous (no account) — can submit an EventEditSuggestion
+        against ANY PUBLISHED, PUBLIC event: COMMUNITY listing, org-owned, or
+        personal. The suggestion stores a whitelisted field diff (proposed values
+        keyed by field) plus the base version it was drafted against. It never
+        mutates the Event; it is queued at status PENDING for the event's approver
+        side (FR-008).
+        Every proposed value is strictly validated at submit time AND re-validated
+        + re-sanitized at apply time (approval) — never trust the stored Json.
+        One exception to "anyone": proposing a NEW image upload requires sign-in
+        (Image.createdByHumanId is NOT NULL and storage quotas are per-identity);
+        anonymous submitters can still propose every other field, including
+        selecting an already-attached event image as hero.
+    - id: FR-007
+      description: >
+        Only a whitelisted set of fields is suggestion-editable: title, body,
+        startsAt, endsAt, timezone, addressText + geo (countryCode,
+        region, locality, postalCode, lat, lng — geohash re-derived server-side),
+        categoryId, heroImageId, ageLimit. Money/tax/payout/ticket/ownership/status
+        fields are NEVER accepted in a suggestion. The SAME whitelist applies to
+        suggestions on ALL event types — owners edit money/ticket fields
+        exclusively through their normal direct-edit path.
+        body is the FULL structured EventBody JSON: validated against
+        eventBodySchema and passed through the SAME embed-allowlist sanitization
+        the owned builder save path uses (extract save-event-shared's media-embed
+        re-verification into a shared helper consumed by both paths), with plain
+        text extracted from sections for ContentFilterPort — enforced at submit
+        AND again at apply.
+        heroImageId must reference an Image belonging to the event: either one
+        already attached, or one uploaded UNATTACHED by the signed-in submitter
+        via the suggestion upload flow (FR-015). The image is attached + set as
+        hero only when the suggestion is APPROVED; rejected/orphaned uploads are
+        collected by the existing detached-image sweep.
+    - id: FR-008
+      description: >
+        Suggestion review routes to the event's approver side: COMMUNITY listing —
+        any COMMUNITY_MODERATOR; org-owned event — ORG_EDIT_ROLES members of that
+        org; personal event — the humanId owner. The reviewer decides APPROVE or
+        REJECT. APPROVE atomically applies the diff to the Event and writes an
+        AuditLog row (entity "event", action "event_edit.applied") capturing
+        before/after for each changed field. REJECT records the decision + note.
+        Review uses the claim-pending-for-review atomic guard so two reviewers
+        cannot double-apply the same suggestion.
+    - id: FR-009
+      description: >
+        On APPROVE, if the Event has changed since the suggestion's base version
+        (a whitelisted field it touches now differs from the base snapshot), the
+        conflicting fields are surfaced to the moderator and NOT auto-applied;
+        non-conflicting fields still apply. The suggestion is marked APPROVED with
+        a conflictedFields note.
+    - id: FR-010
+      description: >
+        Users apply to become a moderator via a CommunityModeratorApplication
+        (status PENDING). Platform staff (ADMIN) review and APPROVE/REJECT; APPROVE
+        grants the COMMUNITY_MODERATOR HumanRole and writes an AuditLog row. Mirrors
+        reviewCategoryRequest.
+    - id: FR-011
+      description: >
+        Community listings appear in public discovery/search alongside owned
+        PUBLISHED events. discoverPublicEvents and search indexing must treat
+        ownerless COMMUNITY rows as first-class (no code path may assume an owner
+        exists for a PUBLISHED public event).
+    - id: FR-012
+      description: >
+        Every payout, settlement, tax, refund, order, and ticket query must exclude
+        RSVP/COMMUNITY events. These are enforced at the use-case boundary (RSVP
+        events have no such child rows, but guards prevent creation).
+    - id: FR-013
+      description: >
+        Each community-editable field is tagged "material" or not (material:
+        startsAt, endsAt, addressText+geo; non-material: title, body, category,
+        hero, age, timezone). When an approved suggestion changes a material field,
+        the applied AuditLog row carries a material:true marker. THIS spec only
+        stamps the marker — actually notifying watchers is the separate change-
+        notification spec (depends on the saved/watchlist model). No delivery here.
+    - id: FR-014
+      description: >
+        Takedown: platform ADMIN can cancel a COMMUNITY listing. cancel-event's
+        owner check gains a platform-staff override for ownerless COMMUNITY rows
+        (audited, mirroring the requireScannerAccessOnOrg platform_admin
+        precedent). Moderators cannot remove listings in v1; moderator self-serve
+        takedown/report tooling is follow-up work.
+    - id: FR-015
+      description: >
+        Suggestion image uploads: any SIGNED-IN user can upload an image against
+        a COMMUNITY listing to reference from an edit suggestion. Reuses the
+        existing request/finalize-event-image-upload use-cases with a COMMUNITY
+        branch in the authz check (canEditEvent fails for ownerless rows; the
+        branch allows signed-in uploaders when the event is COMMUNITY). Uploads
+        are quota-checked per uploader (STORAGE_BYTES_HUMAN), created UNATTACHED,
+        and only attach on suggestion APPROVE (FR-007). Nothing public
+        pre-approval. v1 scope: suggestion-borne NEW uploads are COMMUNITY
+        listings only; suggestions on OWNED events may only reference images
+        already attached to that event (no uploading into someone else's event).
+    - id: FR-016
+      description: >
+        Owner-side approval inbox: org dashboards gain a "Suggested edits" inbox
+        listing PENDING suggestions across the org's events (visible to
+        ORG_EDIT_ROLES); personal events get the equivalent on the owner's event
+        manage view. Same diff/conflict UI as the moderator queue. Suggestions on
+        owned events are default-ON for PUBLISHED PUBLIC events; owners are never
+        obligated to act on them (an unreviewed suggestion just stays PENDING).
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Anonymous edit path stays low-friction — the goal is to let people submit,
+        not to fight bots. Submissions run through the existing ContentFilterPort
+        (reuse the category-request content checks) to block slurs/abuse text. NO
+        captcha or bot-detection in v1 (a robot making a valid suggestion is fine —
+        it still requires human moderator approval to go live). A soft per-IP cap on
+        PENDING suggestions is allowed to prevent runaway queue flooding, but is not
+        a hard gate. The real safety is that nothing is public until approved; add a
+        captcha later only if abuse is observed.
+    - id: NFR-002
+      description: >
+        Applying an approved diff is a single DB transaction (repos.tx), consistent
+        with the EventCategoryRequest review use-case. Audit write is in the same tx.
+    - id: NFR-003
+      description: >
+        Adding the two enum columns + check constraint is a backward-compatible
+        migration; all existing events backfill to TICKETED + OWNED. No downtime.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+# Map to hexagonal layers: core → ports → adapters → transport → UI
+
+architecture:
+  core:
+    use_cases:
+      - name: create-community-listing
+        description: >
+          Verified moderator creates a new ownerless RSVP+COMMUNITY event,
+          PUBLISHED immediately. Validates whitelisted fields, content filter,
+          derives geohash. Mirrors event creation minus owner/ticket/tax wiring.
+        input: actorHumanId, title, startsAt, endsAt, timezone, address+geo, categoryId?, body?, heroImageId?, ageLimit?
+        output: event
+        idempotent: false
+        money: false
+      - name: submit-event-edit-suggestion
+        description: >
+          Anyone (anonymous allowed) submits a whitelisted field diff against ANY
+          published public event. Content-filtered, rate-limited, stored PENDING
+          with a base-version snapshot. Never mutates the event. Mirrors
+          requestCategoryOption.
+        input: eventId, submitterHumanId?(null=anon), submitterIp?, fields{...}, note?
+        output: suggestion
+        idempotent: false
+        money: false
+      - name: review-event-edit-suggestion
+        description: >
+          Reviewer APPROVE/REJECT; authz branches on the event — COMMUNITY:
+          COMMUNITY_MODERATOR; org-owned: requireOrgMembership(ORG_EDIT_ROLES);
+          personal: humanId owner. APPROVE atomically applies non-conflicting
+          whitelisted fields + writes before/after AuditLog; REJECT records note.
+          Uses claim-pending-for-review guard. Mirrors reviewCategoryRequest.
+          Re-validates + re-sanitizes every applied value (body schema + embed
+          allowlist + content filter); attaches a suggestion-borne hero image
+          (attached=true, heroImageId set) in the same tx on APPROVE.
+        input: actorHumanId, suggestionId, decision(APPROVE|REJECT), reviewNote?
+        output: suggestion, appliedFields, conflictedFields
+        idempotent: true # (claim guard makes re-review a no-op)
+        money: false
+      - name: rsvp-to-event / cancel-rsvp
+        description: >
+          Signed-in user toggles "I'm going" on a PUBLISHED RSVP event. Idempotent
+          upsert / delete of EventRsvp. No public count exposed.
+        input: actorHumanId, eventId
+        output: rsvp | void
+        idempotent: true
+        money: false
+      - name: apply-to-be-moderator
+        description: >
+          Signed-in user submits a CommunityModeratorApplication (PENDING).
+        input: actorHumanId, statement?
+        output: application
+        idempotent: false
+        money: false
+      - name: review-moderator-application
+        description: >
+          Platform ADMIN APPROVE/REJECT; APPROVE grants COMMUNITY_MODERATOR role +
+          audit. Mirrors reviewCategoryRequest / requirePlatformStaff.
+        input: actorHumanId, applicationId, decision, reviewNote?
+        output: application
+        idempotent: true
+        money: false
+      - name: list-pending-edit-suggestions
+        description: >
+          Two scopes over the same query: moderator queue (all PENDING on
+          COMMUNITY listings) and owner inbox (PENDING across an org's events, or
+          a personal event's). Each returns proposed diffs + conflict status.
+        input: actorHumanId, scope(community|org:orgId|event:eventId), cursor?
+        output: suggestions[]
+        idempotent: true
+        money: false
+      - name: request/finalize-suggestion-image-upload (extends existing use-cases)
+        description: >
+          COMMUNITY branch in request-event-image-upload / finalize-event-image-
+          upload authz: signed-in users may upload UNATTACHED images to COMMUNITY
+          listings for use in suggestions (FR-015). Quota-checked per uploader.
+        input: actorHumanId, eventId, contentType, sizeBytes
+        output: presigned PUT + imageId
+        idempotent: false
+        money: false
+      - name: cancel-event (extended)
+        description: >
+          Platform-staff override for COMMUNITY rows so ADMIN can take down a
+          listing (FR-014). Audited when via=platform_admin.
+        input: (existing)
+        output: (existing)
+        idempotent: true
+        money: false
+
+  ports:
+    new:
+      - repos/event-edit-suggestions (create, findPending, claimPendingForReview, markReviewed, listPending, getById)
+      - repos/community-moderator-applications (create, claimPendingForReview, markReviewed, getById)
+      - repos/event-rsvps (upsert, delete, getForUser, existsForUser)
+    existing:
+      - repos/events (getById, create, update — extend update to whitelisted community fields)
+      - ports/audit (AuditRepo.log — reuse as-is)
+      - ports/content-filter (ContentFilterPort — reuse for suggestion text)
+      - ports/authz (requirePlatformStaff for moderator-app review; hasStaffRole
+        already checks Human.roles[] so COMMUNITY_MODERATOR gating reuses it)
+      - ports/clock
+    extended:
+      - repos/authz gains grantHumanRole (append a HumanRole to Human.roles[]).
+        No grant path exists today — roles is deliberately excluded from
+        UpdateHumanInput and only settable via raw SQL. Needed by FR-010 APPROVE.
+      - transport rate limiting reuses the existing rateLimit middleware +
+        ctx.clientIp (Redis-backed RateLimitPort) for NFR-001's soft per-IP cap.
+
+  adapters:
+    new:
+      - db/prisma/event-edit-suggestions.ts
+      - db/prisma/community-moderator-applications.ts
+      - db/prisma/event-rsvps.ts
+    existing:
+      - db/prisma/events.ts (community-field update path; ownerless create)
+      - db/prisma/audit.ts (reuse)
+
+  transport:
+    trpc_procedures:
+      - community.createListing (protected, moderator)
+      - eventSuggestions.submit (PUBLIC procedure — anonymous allowed; any published public event)
+      - eventSuggestions.review (protected — authz branches: moderator for COMMUNITY, org editor / human owner for OWNED)
+      - eventSuggestions.listForModeration (protected, moderator — COMMUNITY-wide queue)
+      - eventSuggestions.listForOwner (protected — ORG_EDIT_ROLES org scope or personal-event owner scope)
+      - community.rsvp / community.cancelRsvp (protected)
+      - community.applyToBeModerator (protected)
+      - community.requestSuggestionImageUpload / community.finalizeSuggestionImageUpload (protected — any signed-in user, COMMUNITY events only)
+      - moderatorApplications.review (protected, platform ADMIN)
+    webhooks: []
+
+  ui:
+    pages:
+      - NO dedicated /community route — community listings ride the existing
+        /events discovery, search, and map surfaces like any published event.
+      - Event builder gains a top-level "Community vs Ticketed" mode choice
+        (Community: moderator-only, shows the whitelisted field subset, no
+        tickets/pricing/payout steps). No separate /community/new form.
+      - /moderate/suggestions (moderator queue: diff view, approve/reject, conflict banner)
+      - /moderate/applications (admin: review moderator applications)
+      - Org dashboard "Suggested edits" inbox (FR-016) + the personal-event
+        equivalent on the owner's event manage view — same diff/conflict UI as
+        the moderator queue.
+      - /events/[slug] additions — "Suggest an edit" CTA (anon-capable, on ALL
+        published public events) + "I'm going" toggle on RSVP listings
+    components:
+      - Propose-mode event builder — the SAME event edit surface rendered for
+        non-owners/anonymous, limited to the whitelisted field subset; the save
+        action becomes "Submit suggestion" and emits a field diff against the
+        loaded base version. No bespoke EditSuggestionForm to drift out of sync
+        with the real builder.
+      - SuggestionDiffCard (before/after per field, conflict highlight — shared
+        by moderator queue and owner inbox)
+      - RsvpButton (personal state only, no count)
+      - BecomeModeratorCta
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - name: EventEditSuggestion
+      fields: >
+        id, eventId (FK Event — ANY event; approver side derived from the event),
+        submitterHumanId String? (null=anon),
+        submitterIp String?, fields Json (whitelisted proposed values),
+        baseVersion Json (snapshot of whitelisted fields at draft time),
+        note String?, status (PENDING|APPROVED|REJECTED default PENDING),
+        reviewedByHumanId String?, reviewedAt DateTime?, reviewNote String?,
+        appliedFields Json?, conflictedFields Json?, createdAt.
+        Indexes: [status, createdAt], [eventId, status].
+    - name: CommunityModeratorApplication
+      fields: >
+        id, applicantHumanId, statement String?, status (PENDING|APPROVED|REJECTED),
+        reviewedByHumanId String?, reviewedAt?, reviewNote?, createdAt.
+        Index [status, createdAt]. (Mirrors EventCategoryRequest shape.)
+    - name: EventRsvp
+      fields: >
+        id, eventId (FK Event), humanId (FK Human), createdAt.
+        @@unique([eventId, humanId]); @@index([humanId]).
+  modified_models:
+    - name: Event
+      change: >
+        + attendanceMode EventAttendanceMode @default(TICKETED)
+        + stewardship    EventStewardship    @default(OWNED)
+        + relation editSuggestions EventEditSuggestion[]
+        + relation rsvps EventRsvp[]
+        + CHECK constraint, COMMUNITY direction only (FR-002): stewardship='OWNED'
+          OR (humanId IS NULL AND orgId IS NULL AND attendanceMode='RSVP').
+        humanId/orgId already nullable — no column change there.
+    - name: enums
+      change: >
+        + enum EventAttendanceMode { TICKETED RSVP }
+        + enum EventStewardship { OWNED COMMUNITY }
+        + enum EventEditSuggestionStatus { PENDING APPROVED REJECTED }
+        + enum CommunityModeratorApplicationStatus { PENDING APPROVED REJECTED }
+        + HumanRole gains COMMUNITY_MODERATOR.
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Model A means existing code assumes every Event has an owner (humanId or
+      orgId). Ownerless COMMUNITY rows can NPE or leak into owner-scoped queries
+      (dashboards, payouts, "my events", RBAC edit checks).
+    severity: HIGH
+    mitigation: >
+      Audit every read of event.humanId/orgId. Owner-scoped queries must filter
+      stewardship='OWNED'. ensureActorCanEdit must reject COMMUNITY (community
+      edits only flow through the suggestion queue, never direct edit). Add an
+      integration test asserting a COMMUNITY event is invisible to org/human
+      dashboards, payouts, and settlement selection.
+  - risk: >
+      Anonymous edit endpoint is a spam/abuse and injection vector.
+    severity: HIGH
+    mitigation: >
+      PUBLIC procedure but: strict whitelist (unknown fields rejected), Zod-typed
+      values, ContentFilterPort on all free text, per-IP rate limit, and nothing
+      is public pre-approval. Consider a lightweight challenge (hCaptcha) on the
+      anon path in v1.1.
+  - risk: >
+      Owner-side suggestion inboxes (org/personal) accumulate junk suggestions
+      owners never asked for, creating notification fatigue or an ignored queue.
+    severity: LOW
+    mitigation: >
+      Inbox is passive (no obligation, no nag), rate-limited per IP, and
+      content-filtered. If it becomes noise, add a per-event "accept suggestions"
+      toggle as a fast-follow — default stays ON.
+  - risk: >
+      Two suggestions edit the same field; approving one silently stomps context
+      of the other, or a suggestion drafted against stale data reverts a good edit.
+    severity: MEDIUM
+    mitigation: >
+      Store baseVersion snapshot; on APPROVE compare current vs base per field and
+      skip+flag conflicts (FR-009). Moderator sees a conflict banner and current
+      value.
+  - risk: >
+      RSVP events reuse the ticketed publish/discovery pipeline and accidentally
+      pull in currency/tax/attestation stamping or ticket requirements.
+    severity: MEDIUM
+    mitigation: >
+      Branch publish + creation on attendanceMode early; guard ticket-type and
+      checkout use-cases with EVENT_NOT_TICKETED. Cover with tests (FR-003).
+  - risk: >
+      Community listings could be used to impersonate a real org's paid event or
+      post illegal/duplicate content.
+    severity: MEDIUM
+    mitigation: >
+      Moderator gate on creation; report/flag path; dedupe against existing owned
+      events by title+time+geo (warn moderator). Out of scope to fully build in v1
+      beyond the report CTA.
+
+decisions: # resolved 2026-07-01
+  - Check-constraint direction — RESOLVED (Wikipedia-style): DB enforces only
+    COMMUNITY => (ownerless AND RSVP). OWNED => has-owner stays a use-case
+    invariant because Event.humanId is onDelete SetNull — human deletion already
+    orphans personal OWNED events, and Wikipedia's model is precisely that
+    content is ownerless and account removal never cascades into content.
+  - Suggestion body format — RESOLVED: FULL EventBody JSON (not plain text).
+    Strictly validated + sanitized (eventBodySchema, shared embed-allowlist
+    helper extracted from save-event-shared, ContentFilterPort on extracted
+    text) at BOTH submit and apply. Any body write on ANY event goes through
+    the same shared sanitizer.
+  - Suggestion hero images — RESOLVED: uploads ride the normal suggestion →
+    moderator-approval flow (no separate moderator-only upload path). Signed-in
+    uploaders only (Image.createdByHumanId NOT NULL + per-human quota);
+    anonymous submitters may reference already-attached images. Images stay
+    unattached until APPROVE; detached-image sweep GCs the rest.
+  - Takedown — RESOLVED: platform ADMIN only for v1 (cancel-event staff
+    override for COMMUNITY rows). Moderator self-serve moderation tooling
+    (takedown, reports, steward assignment) is deliberate follow-up so the
+    platform owner can eventually be removed from the loop.
+  - Moderator "ownership" of listings — RESOLVED to KEEP OWNERLESS: creator
+    attribution lives in the AuditLog (community_listing.created), never in
+    Event.humanId/orgId (that would leak listings into dashboards/payout
+    paths). A steward-assignment model (which moderator watches which listing)
+    is a FOLLOW-UP spec alongside self-moderation tooling.
+  - OWNED+RSVP — RESOLVED: out of scope for v1. RSVP exists only as part of
+    COMMUNITY. The event builder presents a top-level "Community vs Ticketed"
+    choice; Community mode shows a SUBSET of the builder's fields (the
+    community-editable whitelist) and is moderator-gated. publishEvent fails
+    fast on attendanceMode=RSVP (defense-in-depth, no pipeline branching).
+  - Geo derivation — RESOLVED: geohash6 only (matches existing adapter
+    behavior; geohash8 is never computed for events today).
+  - list-event-ticket-types owner ternary falls through when both owner ids are
+    null — add a null-owner guard even though RSVP events have no ticket types.
+  - New AppErrorCodes registered in @th/errors: EVENT_NOT_TICKETED plus
+    suggestion/application not-found/already-reviewed codes.
+  - Route/namespace — RESOLVED (revised 2026-07-01): COMMUNITY listings SHARE
+    /events/[slug] and ride the normal discovery/search/map surfaces. NO
+    dedicated /community route or feed. No separate slug namespace.
+  - Universal suggestions — RESOLVED: the suggest-edit mechanism ships for ALL
+    events from day one (v1), not community-only. One EventEditSuggestion model,
+    one submit path, one review path; only the review authorization branches
+    (COMMUNITY → moderator, org → ORG_EDIT_ROLES, personal → owner). Org/personal
+    owners review via an owner-side inbox (FR-016).
+  - Suggestion UI — RESOLVED: no bespoke suggest-edit form. The existing event
+    builder/edit surface renders in "propose mode" for non-owners (whitelisted
+    subset; Save → "Submit suggestion" emitting a diff). One surface, no drift.
+  - Ownership model — RESOLVED (final): OWNERLESS, Wikipedia-faithful (page
+    table has no owner column; permission lives on the user via capability
+    roles; moderator application ≈ RfA; AuditLog ≈ revision history). The
+    seeded-"Community org" alternative (moderators as org EDITORs) was REJECTED:
+    org membership would leak unrelated org-editor powers (creating ticketed
+    events, announcements, forms) and the fencing needed roughly equals the
+    ownerless-row audit — in sneakier places.
+  - Moderator tiers — RESOLVED: a single COMMUNITY_MODERATOR role (no auto-approve
+    tier). An ADMIN-only platform page reviews moderator applications
+    (/moderate/applications; moderatorApplications.review requires platform ADMIN).
+  - Anonymous friction — RESOLVED: no captcha/bot-detection in v1 (see NFR-001).
+    Bots submitting valid suggestions is acceptable; human approval is the gate.
+  - Save/bookmark — RESOLVED to SPLIT OUT: a general "saved events / watchlist"
+    model (applies to ALL events, not just community) gets its OWN spec. RSVP
+    ("I'm going") stays in THIS spec as the free-event attendance primitive; it is
+    distinct from save/bookmark (attendance intent vs. keep-for-later). See
+    out_of_scope + the change-notification dependency below.
+  - Change notifications — RESOLVED to SPLIT OUT: notifying watchers when an
+    approved edit changes a material field (date/venue/cancelled) is a Wikipedia-
+    watchlist-style feature that depends on the saved/watchlist model existing
+    first. It gets its OWN spec. THIS spec only tags which whitelisted fields are
+    "material" (FR-013) so the follow-on has a hook; it delivers no notifications.
+
+open_questions: [] # both resolved 2026-07-01:
+# - No existing save/bookmark model to reuse — CONFIRMED (EntityFollow is
+#   entity-page-scoped, not event-scoped; SavedLocation is venue-location reuse).
+#   EventSave is created by docs/specs/2026-07-01/completed/saved-events-watchlist.spec.yaml.
+# - Material field set for FR-013 — CONFIRMED as proposed (startsAt, endsAt,
+#   addressText+geo, future CANCELLED transition; timezone stays non-material
+#   since instants are stored UTC) in
+#   docs/specs/2026-07-01/completed/community-listing-change-notifications.spec.yaml FR-001.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - General saved-events / watchlist model (applies to all events) — OWN SPEC.
+    RSVP stays here; save/bookmark is separate.
+  - Change-notification delivery when a material field changes (Wikipedia
+    watchlist-style) — OWN SPEC, depends on the watchlist model. This spec only
+    stamps the material marker (FR-013).
+  - Converting an existing OWNED/TICKETED event into a COMMUNITY listing (or back).
+  - Public "going" counts, social graph, or attendee lists for RSVP events.
+  - Full revision-diff UI / rollback tooling beyond the AuditLog trail.
+  - Reputation / karma scoring for editors; edit-count leaderboards.
+  - Steward assignment (which moderator watches which listing) + moderator
+    self-serve takedown/report tooling — FOLLOW-UP SPEC (goal: platform owner
+    out of the moderation loop). v1 attribution = AuditLog only.
+  - Paid or ticketed community events (COMMUNITY is RSVP-only by definition).
+  - Mobile/scanner surfaces (web + api only in v1).
+  - Talk-page / discussion threads on listings.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - An existing ticketed event is unchanged: attendanceMode=TICKETED, stewardship=OWNED, all money flows work.
+  - A moderator can create a COMMUNITY listing with humanId=null and orgId=null; the DB check constraint rejects an owned or TICKETED COMMUNITY row (the OWNED=>has-owner direction is use-case-enforced, not DB-enforced).
+  - An anonymous (unauthenticated) request can submit an edit suggestion; it lands PENDING and never mutates the event.
+  - A non-whitelisted field (e.g. admissionTaxRateBps, orgId, status) in a suggestion is rejected.
+  - Approving a suggestion applies the diff in one transaction and writes an AuditLog row with before/after for each changed field; re-approving the same suggestion is a no-op (claim guard).
+  - A suggestion drafted against stale data has its conflicting fields skipped and flagged, non-conflicting fields applied.
+  - A signed-in user can RSVP and un-RSVP idempotently; no public going-count is returned by any query.
+  - Creating a ticket type or checkout against an RSVP event fails with EVENT_NOT_TICKETED.
+  - A COMMUNITY event appears in public discovery/search but never in any org/human dashboard, payout, settlement, or refund query.
+  - Applying to be a moderator creates a PENDING application; a platform ADMIN approval grants COMMUNITY_MODERATOR and audits it.
+  - A suggestion body containing a non-allowlisted media embed or filter-blocked text is rejected at submit; a stored suggestion that somehow contains one is NOT applied at approve (re-sanitization).
+  - A signed-in user can upload an image for a suggestion (unattached); it attaches + becomes hero only on APPROVE. An anonymous suggestion referencing an unattached image it didn't upload is rejected.
+  - A platform ADMIN can cancel a COMMUNITY listing; a moderator or regular user cannot.
+  - A suggestion on an ORG-owned event is reviewable only by that org's OWNER/ADMIN/EDITOR members (via the org inbox); a COMMUNITY_MODERATOR who is not a member cannot review it. A suggestion on a personal event is reviewable only by its humanId owner.
+  - A non-owner (or anonymous visitor) opening the edit surface of a published public event gets propose mode (whitelisted subset, "Submit suggestion"); an owner gets the normal builder with direct save.
+  - No /community route exists; a COMMUNITY listing is reachable via /events/[slug] and appears in the standard discovery feed and search.

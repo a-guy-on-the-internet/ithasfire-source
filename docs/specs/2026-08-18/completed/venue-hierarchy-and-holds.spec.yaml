@@ -1,0 +1,449 @@
+# venue-hierarchy-and-holds.spec.yaml
+#
+# Three-layer venue hierarchy (Place → Room, Calendar) with booking requests
+# routed to named calendars and a per-request conversation stream. Rooms are
+# the concrete physical resources conflicts resolve to; Calendars are named,
+# public-facing programming streams ("Social Club", "Drkmttr Live Music")
+# that own availability and scheduling defaults.
+#
+# The HOLD layer is spec'd here but DEFERRED to a later phase (user-locked,
+# round 3): when built, holds will most likely anchor to an Event rather
+# than the bare (request, room, date) tuple originally sketched. The
+# governing invariant survives either shape: only CONFIRMED events block a
+# Room — a tentative/hold-status event never blocks, so availability reads
+# stay a status filter away from special-case-free.
+#
+# NAMING: the product entity is "Calendar" (user-locked: "Spaces are named
+# calendars"). Code must disambiguate from calendar *views* (EventCalendar
+# component, embed defaultView "calendar"): the Prisma model is `Calendar`,
+# UI copy says "Calendars", and the embed subjectType string is "calendar" —
+# subjectType and defaultView are separate vocabularies and may both hold the
+# word.
+
+version: "1.1"
+updated: "2026-08-18"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    A Place is currently one undifferentiated calendar. Venues with multiple
+    physical rooms (main stage / back bar / patio) or multiple programming
+    identities (a "Social Club" and a "Live Music" stream on the same floor)
+    can't schedule, publicise, or take booking requests against them
+    separately. Booking requests are accept-or-decline with no conversation,
+    candidate dates live in a dead Json array, and availability UI is being
+    built at the wrong level (Place) for this model.
+  solution: >
+    Room becomes the unit of physical availability (child of Place, NEVER of
+    Calendar); Calendar becomes the named public programming stream
+    (availability windows + blackouts, scheduling defaults, booking
+    permissions) joined M:N to Rooms. A booking request routes to a named
+    Calendar and carries a conversation thread where dates get agreed;
+    events minted from a request pull the artist's name into naming.
+    Conflicts are flagged on the admin side — never silent, never
+    hard-blocking. Holds (stacked pending dates, single-transaction
+    confirm) are a deferred later phase, likely event-anchored.
+  users:
+    - Venue owner/staff (rooms & calendars setup, booking inbox + thread)
+    - Performer / booking agent (requests, conversation)
+    - Public visitor (calendar-subject embed widgets)
+    - Organizer creating events directly from a calendar cell
+  surfaces:
+    - web (admin venue calendar, calendar/room management, booking inbox)
+    - embed (calendar-subject widgets)
+    - api (tRPC)
+
+# ── Locked decisions ─────────────────────────────────────────────────────────
+# Round 1 (2026-08-18):
+# - Greenfield: migrations may assume pre-launch data; simple default-minting
+#   for existing rows, no elaborate backfill machinery.
+# - Option 1 pipeline: any pending-state layer lives UPSTREAM of Agreements;
+#   Agreement machinery (payout terms, waivers, finalize) is kept.
+# - Every booking request carries an in-app conversation stream — the
+#   already-specced BookingRequestMessage design (2026-07-14 spec, unbuilt)
+#   is a hard dependency, not a duplicate spec.
+# - Invariants: every Place has ≥1 Room and ≥1 Calendar, minted atomically
+#   at place creation. Calendar never grows physical attributes (capacity,
+#   tech specs live on Room — the guardrail against the duplicate-room /
+#   silent-double-booking failure mode).
+#
+# Round 2 (2026-08-18, second pass):
+# - The entity is named CALENDAR ("Spaces are named calendars" — e.g.
+#   "Social Club", "Drkmttr Live Music").
+# - Place.timezone derives from the place's ADDRESS (lat/lng → IANA lookup),
+#   recomputed on address change — same lifecycle as the existing
+#   admission-tax-rate cache on Place. Not directly user-edited.
+# - A booking request ROUTES to a named Calendar (calendarId on the request).
+# - Conflicts are FLAGGED ON THE ADMIN SIDE — visible warnings, not hard
+#   blocks. Never silent.
+#
+# Round 3 (2026-08-18, third pass):
+# - Calendar model CONFIRMED.
+# - Hours + blackouts live on Calendar; the in-flight place-level
+#   availability UI (PlaceHoursEditor / PlaceBlackoutEditor WIP) re-targets
+#   Calendar. Blackouts must be able to span every calendar of a place —
+#   modelled as place-scoped rows (calendarId NULL = all calendars), with an
+#   "All calendars" choice in the UI (strictly better than copy-to-all
+#   convenience: one row, one edit, no drift).
+# - Event naming pulls the ARTIST'S NAME into the process wherever an event
+#   is minted from a booking request (today's agreement path now; the hold
+#   confirm path when it lands).
+# - HOLDS ARE DEFERRED to a later phase. When built they will most likely be
+#   tied to an Event (tentative-status event that never blocks) rather than
+#   the bare tuple; the deferred section below preserves the requirements
+#   and the invariant so the later design starts warm, not cold.
+
+# ── Requirements — NEAR-TERM SCOPE ───────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Room model: belongs to Place (placeId, name, optional capacity,
+        sortOrder, ACTIVE/RETIRED status). Place creation mints a default
+        "Main Room". A Place can never reach zero active Rooms.
+    - id: FR-002
+      description: >
+        Calendar model: belongs to Place (name — e.g. "Social Club" — slug,
+        description, isDefault, defaultStartTime "HH:mm" wall-clock,
+        optional defaultCategoryId, optional eventTemplate Json for prefill
+        defaults). Place creation mints a default Calendar joined to the
+        default Room. A Place can never reach zero Calendars.
+    - id: FR-003
+      description: >
+        CalendarRoom M:N join. A Calendar schedules into one or more Rooms;
+        a Room can serve many Calendars. Management UI lets venue staff
+        create calendars and assign rooms.
+    - id: FR-004
+      description: >
+        Place.timezone (IANA string): derived from the place's address
+        (lat/lng → timezone lookup) at create, recomputed on address change
+        — mirroring the admission-tax-rate cache lifecycle already on Place.
+        All Calendar wall-clock defaults resolve through it.
+    - id: FR-005
+      description: >
+        Event gains nullable roomId and nullable calendarId. Room = physical
+        blocking; Calendar = programming stream shown on that calendar's
+        surfaces. Calendar rendering filters on Event.calendarId — NEVER via
+        the room join (a shared room must not bleed one stream's events onto
+        another's calendar). Freeform-address events (no placeId) have
+        neither and stay outside the room system. Place-linked event
+        creation requires a room (defaulted when the place has only one).
+    - id: FR-006
+      description: >
+        Conflict detection re-keys from Place to Room and is flag-only,
+        admin-side: overlapping confirmed Events on one Room render the
+        existing conflict warning treatment (glyph + tooltip) on admin
+        calendars; direct event creation (builder) keeps today's
+        warn-don't-block behaviour. No public surface ever shows conflict
+        state.
+    - id: FR-007
+      description: >
+        Availability lives on Calendar (CalendarAvailability: weekly windows
+        + specific-date exceptions, isOpen flag — same shape as the dead
+        Place-level model it replaces), with PLACE-WIDE scope support: a row
+        with calendarId NULL applies to every calendar of the place (venue
+        closed = one blackout row, not N copies). The availability editor
+        offers "All calendars" alongside individual ones. The in-flight
+        PlaceHoursEditor / PlaceBlackoutEditor WIP re-targets this model
+        (user decision — do not ship place-level availability UI).
+    - id: FR-008
+      description: >
+        Booking request routing + payload: BookingRequest gains calendarId
+        (required for TO_VENUE requests; defaulted when the place has one
+        calendar — the request "routes to" a named calendar, whose booking
+        permissions gate who may submit), tags String[], attachments (via
+        existing storage/upload infra), and taxFormStatus enum flag
+        (NONE/REQUESTED/RECEIVED). Never store TINs — identity collection
+        stays deferred to Stripe Connect onboarding. preferredDates REMAINS
+        the artist's opening proposal (structured, validated).
+    - id: FR-009
+      description: >
+        Artist-name event naming: wherever an event is minted from a booking
+        request — today the agreement path (createEventFromAgreement), later
+        the hold confirm — the event title prefills from the request's act
+        (actName, or the performer entity's display name), composable with
+        the calendar's eventTemplate (e.g. "{act} at {calendar name}").
+        Venue staff can edit before publish; the prefill is a default, not a
+        constraint.
+    - id: FR-010
+      description: >
+        Calendar-subject public embeds: embed subjectType "calendar" renders
+        the existing widget filtered to events with that calendarId
+        (PUBLISHED only). Admin embeds subject picker gains Calendar rows
+        for places the org controls. Calendars are the public face of a
+        place's programming.
+    - id: FR-011
+      description: >
+        Calendar-cell create: clicking an empty cell/slot on an admin
+        calendar routes to quick-create prefilled with date (+ time from
+        slot or Calendar.defaultStartTime), calendarId, roomId, and the
+        calendar's template defaults. Extends the in-flight quick-create
+        prefill seam ({ startsAt, placeId } today) — same payload, more keys.
+    - id: FR-012
+      description: >
+        Per-request conversation stream per the 2026-07-14
+        booking-conversation-and-event-step spec (BookingRequestMessage; the
+        request IS the thread). Built in this scope — it is the surface
+        where dates get agreed and where the future hold action will live —
+        not re-specced here.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        The availability/calendar read path contains zero pending-state
+        special cases: it queries confirmed Events by room, full stop.
+        (When deferred holds land, this must survive as a status filter —
+        tentative events never block.)
+    - id: NFR-002
+      description: >
+        Calendar embeds are public and unauthenticated; they must not leak
+        requests, conversations, conflict flags, availability internals, or
+        non-PUBLISHED events.
+    - id: NFR-003
+      description: >
+        All new admin surfaces meet the existing bar: keyboard operable,
+        320px-clean, i18n keys in both catalogs (en/es) with argument
+        parity.
+
+# ── DEFERRED PHASE: Holds ────────────────────────────────────────────────────
+# SUPERSEDED 2026-08-25 by docs/specs/2026-08-25/completed/booking-holds.spec.yaml,
+# which is the authority. The guess below ("a hold IS an Event in a
+# tentative status") was NOT what got built: a hold is its own BookingHold
+# row (separate table, ordered line per calendar+date) and only a confirmed
+# hold mints an Event. Kept as history; do not build from it.
+#
+# User-locked round 3: "holds will have to come later and they will most
+# likely be tied to an event." Preserved requirements for that phase — as
+# originally written:
+#
+# - Likely shape: a hold IS an Event in a tentative/hold status (anchored to
+#   the booking request), NOT a bare tuple. The invariant is restated
+#   status-wise: only CONFIRMED events block a Room; hold-status events
+#   stack on admin calendars and never block. This also collapses "promote
+#   hold to event" into a status transition instead of a record migration.
+# - Holds are minted from the conversation view by venue staff when a date
+#   is agreed ("Place hold"), prefilled from preferredDates; hold naming
+#   pulls the artist's name (FR-009 applies at hold creation, not just
+#   confirm).
+# - Stacking: multiple holds per (room, date) in venue-controlled order;
+#   sibling holds (same request, other dates) and competing holds (other
+#   requests, same date) both release on confirm, with notifications, in
+#   the same transaction that finalizes the Event + mints the Agreement.
+# - Confirm is idempotent; conflicts require explicit acknowledgment
+#   (flag-not-block); two concurrent confirms yield exactly one committed
+#   event without fresh acknowledgment. Double-booking only ever happens as
+#   a deliberate, twice-acknowledged act.
+# - Expiry: manual release + lazy past-date death (computed predicate in
+#   place tz; no cron).
+# - Artists never create or reorder holds; they propose in the thread.
+#
+# Open design question for that phase: tentative events and the "Event is
+# always real" principle — a hold-status event must be invisible to every
+# public surface, ticketing, search indexing, and stats. Enumerate those
+# read paths before choosing this shape over a separate Hold table.
+
+# ── Architecture (near-term scope) ───────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: manage-rooms
+        description: CRUD rooms for a place; enforce ≥1 active room.
+        input: placeId, room fields
+        output: room list
+        idempotent: false
+        money: false
+      - name: manage-calendars
+        description: >
+          CRUD calendars + room assignments + availability (incl. place-wide
+          rows) + defaults; enforce ≥1 calendar per place.
+        input: placeId, calendar fields, roomIds
+        output: calendar with rooms
+        idempotent: false
+        money: false
+      - name: get-calendar-events
+        description: >
+          Public: PUBLISHED events for a named calendar (embed + public
+          place page). Admin variant overlays availability windows and
+          conflict flags.
+        input: calendarId, from, to, viewer
+        output: events (+ windows/conflicts for admin)
+        idempotent: true
+        money: false
+      - name: get-venue-calendar (modified)
+        description: Conflicts re-keyed to Room (FR-006), flag-only.
+        input: placeId, from, to
+        output: events + per-room conflicts
+        idempotent: true
+        money: false
+      - name: create-booking-request (modified)
+        description: FR-008 routing + payload additions.
+        input: existing + calendarId, tags, attachments
+        output: request
+        idempotent: existing semantics (open-pair unique)
+        money: false
+      - name: createEventFromAgreement (modified)
+        description: FR-009 artist-name title prefill via calendar template.
+        input: existing
+        output: existing
+        idempotent: existing (draftEventId anchor)
+        money: false
+      - name: booking-request messages (per 2026-07-14 spec)
+        description: post/list/read-mark thread messages.
+        input: per that spec
+        output: per that spec
+        idempotent: per that spec
+        money: false
+
+  ports:
+    new:
+      - timezone lookup (lat/lng → IANA string; adapter may be a local
+        library, not a network service — decided at implementation)
+    existing:
+      - repos (places, events, booking-requests, agreements)
+      - notification dispatch (jobs outbox)
+      - storage (attachments)
+      - ReporterPort (any swallow branches in calendar overlay reads)
+
+  adapters:
+    new:
+      - prisma rooms repo
+      - prisma calendars repo (incl. CalendarRoom + CalendarAvailability)
+      - prisma booking-request-messages repo (per 2026-07-14 spec)
+    existing:
+      - prisma booking-requests repo (calendarId, tags, attachments,
+        taxFormStatus)
+      - prisma events repo (roomId, calendarId writes + room-scoped
+        conflict query)
+
+  transport:
+    trpc_procedures:
+      - places.rooms.* (list/create/update/retire)
+      - places.calendars.* (list/create/update, assignRooms, availability)
+      - booking.messages.* (per 2026-07-14 spec)
+      - embeds: "calendar" subject resolution in getForWidget /
+        getCalendarEvents
+    webhooks: []
+
+  ui:
+    pages:
+      - /admin/[slug]/places/[placeId]/calendars (management)
+      - /admin/[slug]/places/[placeId]/calendar (conflict flags +
+        cell-create; hold overlay arrives with the deferred phase)
+    components:
+      - CalendarEditor, RoomList (management)
+      - Availability editor re-targeted to CalendarAvailability with an
+        "All calendars" scope (absorbs the PlaceHoursEditor /
+        PlaceBlackoutEditor WIP)
+      - Booking thread view (per 2026-07-14 spec)
+      - Embed subject picker: Calendar rows
+      - QuickCreateEventForm: extended prefill (calendar/room/template)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - Room
+    - Calendar
+    - CalendarRoom
+    - CalendarAvailability (nullable calendarId = place-wide row)
+    - BookingRequestMessage (per 2026-07-14 spec)
+    # Hold — built as a separate BookingHold table; see
+    # docs/specs/2026-08-25/completed/booking-holds.spec.yaml.
+  modified_models:
+    - Place (timezone, address-derived)
+    - Event (roomId, calendarId)
+    - BookingRequest (calendarId, tags, attachments, taxFormStatus;
+      preferredDates kept as structured opening proposal)
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      The untracked PlaceHoursEditor / PlaceBlackoutEditor WIP ships at
+      Place level before the re-target lands, producing two availability
+      systems.
+    severity: MEDIUM
+    mitigation: >
+      RESOLVED as a decision (round 3): that UI re-targets
+      CalendarAvailability with the "All calendars" scope. Coordination
+      remains: whoever owns that WIP needs this spec before their next
+      session.
+  - risk: >
+      Calendar filtering via rooms instead of Event.calendarId would bleed
+      one stream's events onto another stream sharing the room.
+    severity: MEDIUM
+    mitigation: >
+      Locked in FR-005: rendering filters on Event.calendarId; rooms are
+      used ONLY for conflicts. Spec'd explicitly so reviewers can flag
+      drift.
+  - risk: >
+      Deferred-holds shape (tentative-status Event) leaking into public
+      surfaces, ticketing, search, or stats when that phase lands.
+    severity: HIGH (deferred phase)
+    mitigation: >
+      The deferred section requires enumerating every Event read path
+      before choosing that shape; NFR-001 pins the status-filter invariant
+      now so near-term code is written against it.
+  - risk: >
+      Naming collision in code: "calendar" now means an entity, a view mode,
+      an embed subjectType, AND an embed defaultView.
+    severity: LOW
+    mitigation: >
+      Header naming note: Prisma model `Calendar`, subjectType "calendar",
+      view vocabulary unchanged; reviewers hold the line on qualified names
+      in ambiguous scopes (namedCalendar / calendarView locals).
+
+open_questions:
+  - Booking permissions granularity on Calendar (who may submit: anyone /
+    signed-in / invite-only?) — defaulting to current place-level behaviour
+    until product says otherwise.
+  - Can the artist propose ADDITIONAL dates mid-conversation that update
+    preferredDates, or are new candidates plain thread messages until staff
+    acts? (Defaulting to thread-messages-only; revisit if friction shows.)
+  - Event title template syntax for FR-009 ("{act} at {calendar name}") —
+    exact variables and fallback when actName is null (anonymous embed
+    inquiries).
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - The Hold layer (deferred phase above — spec'd, not built now).
+  - Ticketing changes of any kind — ticket types, pricing, on-sale windows,
+    promos, payout clauses attach exclusively to Event and are untouched.
+  - Rich template editor for Calendar event templates (Json defaults only).
+  - Public per-Room calendars (rooms are admin-facing only).
+  - Reply-by-email ingestion for conversation threads (per the 2026-07-14
+    spec's own phasing).
+  - Retiring Agreement machinery (option 2 from scoping) — explicitly kept.
+
+# ── Acceptance Criteria (near-term scope) ────────────────────────────────────
+
+acceptance_criteria:
+  - Creating a Place mints exactly one default Room and one default Calendar
+    joined to it; neither can be deleted down to zero.
+  - Place.timezone is populated from the address at create and updates when
+    the address changes; no UI exists to set it directly.
+  - A TO_VENUE booking request routes to a named Calendar; a place with two
+    calendars ("Social Club", "Drkmttr Live Music") receives each request
+    on the chosen one.
+  - A blackout saved with "All calendars" scope closes every calendar of
+    the place via a single row; editing it once updates all of them.
+  - An event minted from a booking request (agreement path) arrives titled
+    from the act's name composed with the calendar's template; staff can
+    edit it before publish.
+  - Overlapping confirmed Events on one Room are flagged (glyph + tooltip)
+    on admin calendars only; no public surface shows conflict state.
+  - An embed with subjectType "calendar" shows only that calendar's
+    PUBLISHED events; conflict flags and availability internals never
+    appear in its payload.
+  - Clicking an empty cell on an admin calendar lands on quick-create with
+    date, time, calendar, room, and category prefilled; the created event
+    carries that roomId and calendarId.
+  - Every booking request detail view shows its message thread; venue and
+    performer can exchange messages (per the 2026-07-14 spec's ACs).
+  - An event on a room shared by two calendars shows only on its own
+    calendar's surfaces; conflict detection still sees both.

@@ -49,18 +49,22 @@ describe("launch ticket packs (FR-013)", () => {
         priceCents: 2000,
         pricingMode: "FIXED",
         capacity: 100,
-        doorPriceCents: null,
+        scheduledPriceChange: null,
       }),
     ]);
   });
 
-  it("advance-plus-door: ONE type, 1500¢ advance, 2000¢ door, one capacity pool (FR-004)", () => {
+  it("advance-plus-door: ONE type, 1500¢ advance rising to 2000¢ 24 hours before the show, one capacity pool", () => {
     const [tpl] = encodeTicketPackTemplates(LAUNCH_TICKET_PACKS[1]!);
     expect(tpl!.ticketTypes).toHaveLength(1);
     expect(tpl!.ticketTypes[0]).toMatchObject({
       pricingMode: "FIXED",
       priceCents: 1500,
-      doorPriceCents: 2000,
+      scheduledPriceChange: {
+        // Same day-of-show offset as the web Advance/Door presets.
+        at: { anchor: "EVENT_START", offsetMinutes: -1440 },
+        priceCents: 2000,
+      },
       capacity: 100,
     });
   });
@@ -108,8 +112,10 @@ describe("launch ticket packs (FR-013)", () => {
           if (entry.suggestedCents !== null) {
             expect(Number.isInteger(entry.suggestedCents)).toBe(true);
           }
-          if (entry.doorPriceCents !== null) {
-            expect(Number.isInteger(entry.doorPriceCents)).toBe(true);
+          if (entry.scheduledPriceChange != null) {
+            expect(
+              Number.isInteger(entry.scheduledPriceChange.priceCents),
+            ).toBe(true);
           }
           expect(entry.resaleAllowed).toBe(false);
           expect(entry.resaleCapCents).toBeNull();

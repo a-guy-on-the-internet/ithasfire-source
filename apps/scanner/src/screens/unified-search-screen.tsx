@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -23,6 +23,7 @@ import {
   SquareSecondaryButton,
   StatusBadge,
   Text,
+  ToneResultState,
   TopBar,
   useColors,
   useStyles,
@@ -31,7 +32,10 @@ import {
 } from "@th/ui-native";
 import { feedbackKindForOutcome } from "../lib/feedback-signatures";
 import { safeTimeString } from "../lib/format";
-import { presentScanResult } from "../lib/scan-result-presentation";
+import {
+  presentScanResult,
+  type ScanPresentation,
+} from "../lib/scan-result-presentation";
 import { describeScanResult } from "../lib/scan-result-types";
 import { triggerFeedback } from "../lib/feedback";
 import {
@@ -40,9 +44,11 @@ import {
   type VolunteerCandidate,
 } from "../lib/use-people-search";
 import {
+  SCAN_GLYPH_COMPONENTS,
   UnifiedResultView,
   type UnifiedResolveResult,
 } from "./unified-result-view";
+import { LateRefusalNotice } from "./late-refusal-notice";
 
 // ── Inline session type (tsconfig-alias workaround, see slice 2 notes) ──────
 type TypedSessionContext = {
@@ -104,14 +110,55 @@ export const UnifiedSearchScreen = ({
   onBack,
   onAdmit,
   onCheckIn,
+  refusal = null,
+  onReleaseVerdict,
+  onResultShown,
+  lateNotice = null,
+  onDismissLateNotice,
   backLabel = "Back to camera",
 }: {
   eventId: string;
   eventName?: string | null;
   sessionContext: ScannerSessionContext | null;
   onBack: () => void;
-  onAdmit: (ticketCode: string) => void;
+  /**
+   * `forResult` is THIS screen's card, so the recent-scans row carries the
+   * holder name and ticket id (and can be undone). `onConfirmed` fires when
+   * the admission is in — ACCEPTED, or queued offline / on a transient error —
+   * so the card confirms it and stops offering Admit; the host's re-resolve
+   * never reaches this screen.
+   */
+  onAdmit: (
+    ticketCode: string,
+    opts: {
+      forResult: UnifiedResolveResult;
+      onConfirmed: (scannedAt: Date | string | null) => void;
+    },
+  ) => void;
   onCheckIn: (signupId: string) => void;
+  /**
+   * A refused admit or a failed write from THIS screen's ADMIT / CHECK IN —
+   * the host owns that state (the round trip runs in the scan screen), and
+   * used to write it to a camera layout that is not mounted in search mode.
+   * The operator got the refusal buzz and still saw VALID with ADMIT enabled.
+   * Shown in place of the result, so ADMIT is not on screen under it.
+   */
+  refusal?: ScanPresentation | null;
+  /**
+   * Clear the host's verdict state: the refusal shown here AND the identity of
+   * the admit it belonged to. Called on dismiss and whenever this screen
+   * resolves someone new, so a late refusal for the previous person counts as
+   * LATE and can never take over the next person's card.
+   */
+  onReleaseVerdict?: () => void;
+  /**
+   * Reports whether this screen has a result up. The host's "is the screen
+   * occupied?" check cannot see this screen's local state otherwise.
+   */
+  onResultShown?: (shown: boolean) => void;
+  /** A late refusal for an EARLIER person; the host times it out. */
+  lateNotice?: string | null;
+  onDismissLateNotice?: () => void;
   backLabel?: string;
 }) => {
   const shared = useStyles();
@@ -120,11 +167,17 @@ export const UnifiedSearchScreen = ({
   const [draft, setDraft] = useState("");
   const [focused, setFocused] = useState(false);
   const [result, setResult] = useState<UnifiedResolveResult | null>(null);
+  /**
+   * The ticket on this card whose admit the server ACCEPTED. Same meaning as
+   * the camera's "just admitted": the card reads ADMITTED · DONE and offers no
+   * second Admit.
+   */
+  const [admittedCode, setAdmittedCode] = useState<string | null>(null);
   const [resolveError, setResolveError] = useState<string | null>(null);
   const [resolving, setResolving] = useState(false);
 
-  // Same decision table as the scan screen (FR-003), so a ticket resolved by
-  // NAME reads identically to the same ticket resolved by CAMERA. Rendered
+  // Same decision table as the scan screen, so a ticket resolved by NAME reads
+  // identically to the same ticket resolved by CAMERA. Rendered
   // `inline` rather than full-bleed: this screen is a scrolling document with
   // a keyboard, a query field and a result list on screen at once.
   const presentation = useMemo(
@@ -137,6 +190,8 @@ export const UnifiedSearchScreen = ({
                 result.kind === "ticket"
                   ? safeTimeString(result.scannedAt)
                   : null,
+              admitted:
+                result.kind === "ticket" && result.ticketCode === admittedCode,
             }),
           )
         : null,
@@ -161,6 +216,9 @@ export const UnifiedSearchScreen = ({
 
   const resolveByRaw = useCallback(
     async (raw: string) => {
+      // Someone new: release the previous verdict (see `onReleaseVerdict`).
+      onReleaseVerdict?.();
+      setAdmittedCode(null);
       setResolveError(null);
       setResolving(true);
       try {
@@ -170,7 +228,7 @@ export const UnifiedSearchScreen = ({
         })) as UnifiedResolveResult;
         setResult(next);
         // No announce here: `UnifiedResultView` announces the composed verdict
-        // (provenance first, then verdict, holder, type, guidance). Announcing
+        // (provenance first, then state, then word, then who). Announcing
         // "Result kind ticket." alongside it just made TalkBack say a word
         // that means nothing to an operator, twice per scan.
         void triggerFeedback(
@@ -187,7 +245,7 @@ export const UnifiedSearchScreen = ({
         setResolving(false);
       }
     },
-    [eventId, utils.scan.resolvePayload],
+    [eventId, onReleaseVerdict, utils.scan.resolvePayload],
   );
 
   /**
@@ -201,6 +259,9 @@ export const UnifiedSearchScreen = ({
    */
   const resolveVolunteerCandidate = useCallback(
     async (candidate: VolunteerCandidate) => {
+      // Someone new: release the previous verdict (see `onReleaseVerdict`).
+      onReleaseVerdict?.();
+      setAdmittedCode(null);
       setResolveError(null);
       setResolving(true);
       try {
@@ -240,12 +301,27 @@ export const UnifiedSearchScreen = ({
         setResolving(false);
       }
     },
-    [eventId, mintScanTokenMutation, utils.scan.resolvePayload],
+    [eventId, mintScanTokenMutation, onReleaseVerdict, utils.scan.resolvePayload],
+  );
+
+  useEffect(() => {
+    onResultShown?.(!!result);
+  }, [onResultShown, result]);
+  useEffect(
+    () => () => {
+      // Leaving search: its card is no longer on screen.
+      onResultShown?.(false);
+    },
+    [onResultShown],
   );
 
   const dismissResult = () => {
     setResult(null);
+    setAdmittedCode(null);
     setResolveError(null);
+    // Always release: the refused card is stale once dismissed, and after a
+    // normal admit the host must stop treating that admit as on screen.
+    onReleaseVerdict?.();
   };
 
   const handleRowPress = (row: PeopleSearchResult) => {
@@ -393,6 +469,13 @@ export const UnifiedSearchScreen = ({
             provenance LAST, which is the one ordering that misleads.
           */}
           <View testID="unified-search-result-region">
+            {lateNotice ? (
+              <LateRefusalNotice
+                message={lateNotice}
+                onDismiss={() => onDismissLateNotice?.()}
+                testID="unified-search-late-refusal"
+              />
+            ) : null}
             {resolveError ? (
               <SquareCard
                 tone="danger"
@@ -405,13 +488,49 @@ export const UnifiedSearchScreen = ({
               </SquareCard>
             ) : null}
 
-            {result && presentation ? (
+            {refusal ? (
+              <ToneResultState
+                tone={refusal.tone}
+                glyph={SCAN_GLYPH_COMPONENTS[refusal.glyph]}
+                state={refusal.state}
+                word={refusal.word}
+                detail={refusal.detail}
+                layout="inline"
+                testID="unified-search-refusal"
+              />
+            ) : result && presentation ? (
               <UnifiedResultView
                 result={result}
                 presentation={presentation}
                 layout="inline"
                 canCheckInVolunteer={canCheckIn}
-                onAdmitTicket={onAdmit}
+                onAdmitTicket={(code) =>
+                  onAdmit(code, {
+                    forResult: result,
+                    onConfirmed: (scannedAt) => {
+                      // Patch THIS card from the answer we already trust —
+                      // the same move as the web's `resolveAdmitOutcome`.
+                      // Matched on the code: never put one person's admission
+                      // on another person's card.
+                      const at =
+                        scannedAt instanceof Date
+                          ? scannedAt
+                          : scannedAt
+                            ? new Date(scannedAt)
+                            : null;
+                      setResult((prev) =>
+                        prev?.kind === "ticket" && prev.ticketCode === code
+                          ? {
+                              ...prev,
+                              status: "SCANNED",
+                              scannedAt: at ?? prev.scannedAt,
+                            }
+                          : prev,
+                      );
+                      setAdmittedCode(code);
+                    },
+                  })
+                }
                 admitPending={false}
                 onCheckInVolunteer={onCheckIn}
                 checkInPending={false}
@@ -426,7 +545,7 @@ export const UnifiedSearchScreen = ({
       </KeyboardAvoidingView>
 
       <SafeAreaView edges={["bottom"]} style={shared.stickyFooter}>
-        {result || resolveError ? (
+        {result || resolveError || refusal ? (
           <SquarePrimaryButton
             label="Dismiss result"
             onPress={dismissResult}

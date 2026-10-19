@@ -1,0 +1,230 @@
+# moderator-place-page.spec.yaml
+#
+# A community moderator (or platform ADMIN) edits the page of a place nobody
+# owns, with the same editor and the same powers an owner has, until a real
+# person claims the place.
+
+version: "1.0"
+updated: "2026-10-16"
+
+# ── Rulings ──
+# R1  owner, 2026-10-14: "we need community/moderators to be able to add things
+#     to the place"
+# R2  owner, 2026-10-14, asked to be precise: "MODERATORS GET FULL SUPER POWER
+#     OVER ALL EDITOR FEATURES OF AN ENTITY LIKE A PLACE TILL THEY BECOME OWNED
+#     BY THE REAL PERSON"
+#     → editor PARITY, no block allowlist; bounded by ownership.
+#
+# R3  owner, 2026-10-14, closing Q1: "Yeah human is not allowed. Places are
+#     the only thing that gets moderated if not claimed." Scope is PLACE
+#     pages and nothing else. HUMAN is ruled OUT explicitly, not deferred.
+#     ORGANIZATION is out too (and has no unowned state to moderate).
+#
+# R4  owner, 2026-10-16, answering Q5: "We should try to tie to account ids"
+#     → the handover read ties each moderator change to the moderator's
+#     account id. Only the place owner reads it (unchanged authz).
+# R5  owner, 2026-10-16, answering Q3: "Yep they'll do the image review
+#     process we have. And.... we need a platform folder to hold these images
+#     to that get moved over when claimed" → moderator page uploads go
+#     through the existing image review, live in a platform-owned storage
+#     folder (not the moderator's quota), and move to the owner on claim.
+# R6  owner, 2026-10-16, answering Q2: "Yep" → public suggestions for place
+#     pages, like community listings. A new feature: scoped in its own spec.
+# R7  owner, 2026-10-16, on D3: "Yep." → moderators keep not setting place
+#     facts in the page draft. Closed.
+#
+# Orchestrator decisions (session of 2026-10-14, not the owner's; the owner may
+# overturn any of them, see open_questions):
+# D1  Scope is PLACE pages. ORGANIZATION pages have no unowned state (an org
+#     always has members; only places are claimed), so parity there has nothing
+#     to grant. HUMAN pages are OUT — OWNER RULED 2026-10-14, see R3. D1 is no
+#     longer an orchestrator guess on this point; it is the owner's boundary.
+# D2  Parity. A moderator passes the PLACE page access check wherever an owner
+#     would: getMyPage (and its first-load template seed), updatePage,
+#     managePageBlocks, updatePageTheme, requestPageImageUpload,
+#     finalizePageImageUpload, and the draft use cases when they are wired.
+#     Nothing is moderator-only and nothing is owner-only on the page.
+#     track_record, venue_stats and audience_stats stay unwritable because
+#     they are unwritable for EVERYONE (heading-only schemas, BLOCK_PINNED
+#     refusals, the pinned-kind unique index). If R2 was meant to reach the
+#     track record, that is a change to the trust model and goes back to the
+#     owner first (pro-social principle 5, "trust comes from traces").
+# D3  The boundary is ownership: `findOwnerlessWriteBlock` answering "OWNED" or
+#     "CLAIM_PENDING" refuses; the place must be ACTIVE. "OWNED_EVENTS_AT_PLACE"
+#     does NOT refuse a PAGE write: that rule exists because ticket emails read
+#     the live place name and address, and page content (bio, images, blocks,
+#     theme) reaches no ticket. A pending claim freezes the page: the claimant
+#     is judged against, and will inherit, the page as it stood.
+#     Place FACTS (name, address, pin) are not page content. In the moderator
+#     editor they go through `updateCommunityPlace` and keep all of its rules
+#     (including OWNED_EVENTS_AT_PLACE and address-withheld).
+# D4  Re-check under lock. For a moderator actor, every write takes
+#     `places.lockPlaceForClaim` and re-runs D3 inside the transaction that
+#     writes (claim submit and review take the same lock), so a claim landing
+#     between the editor opening and the save refuses the save. That covers
+#     image finalize too, so an upload started before the claim does not land
+#     after it. The owner path is unchanged.
+# D5  Audit. Every moderator page write logs `entity_page.community_updated`
+#     in the same transaction: actor, place id, page id, the operation, and
+#     `from` / `to` of what changed. Owner page writes stay unaudited (as
+#     today; follow-up F1).
+# D6  Handover on claim. Pro-social principle 4, protect the weaker side: the
+#     new owner decides, and nothing speaks in their name before they do.
+#      - Moderator content persists through the claim. Deleting it on claim
+#        would blank a page visitors use and discard work the owner may want.
+#      - The public page keeps the community attribution (D7) until the owner
+#        decides, so the page does not start speaking as the venue on the day
+#        the claim is approved.
+#      - The owner's editor opens with a notice: who wrote what, and when,
+#        read from the D5 audit rows. Two actions: "Keep it" and "Clear it".
+#        Clear is ONE action: bio, avatar and banner emptied, the MAIN
+#        section's blocks back to the place template (pinned blocks and every
+#        other section, e.g. memberships, kept), theme reset. Clear is refused
+#        (`handover_draft_pending`) while the page has an unpublished draft:
+#        the owner publishes or discards it first, so Clear never drops the
+#        owner's own unpublished work. Images Clear removes go to the deletion
+#        outbox under `community_handover_clear`; the drain re-checks the page,
+#        theme, blocks, draft and Place row before deleting, so an image the
+#        owner puts back survives. A draft Discard's deletion rows
+#        (`page_draft_discard`) get the same delete-time re-check (F4,
+#        419b46b5c). Both choices log
+#        `entity_page.community_handover` with the choice; Clear also records
+#        the before-state (bounded) for recovery. Clear also removes the
+#        owner's own main-section edits made since the claim: the notice
+#        shows before editing and the confirmation says so.
+#        (Orchestrator, 2026-10-15, after review; pro-social principle 4.)
+#      - The handover read names each writer and ties the change to the
+#        writer's account id (R4, reverses the 2026-10-15 names-only call);
+#        a missing name reads "A moderator".
+#      - Derived, not a stored flag: the notice and the attribution show while
+#        an `entity_page.community_updated` row exists that is newer than the
+#        page's latest `entity_page.community_handover` row.
+#      - Claim approval itself stays untouched ("a claim changes only the
+#        place's verification").
+# D7  Attribution. The place page reuses `CommunityListingNotice`'s pattern
+#     with the existing title wording ("Community-maintained"). It does NOT
+#     reuse "anyone can suggest edits": no one but a moderator can change a
+#     place page, so that line would be false (honesty floor). The byline says
+#     moderators keep the page until its owner claims it. Final words: the ui
+#     step, through the unslop skill.
+# D8  Entry. A moderator opens the editor from the place page (an Edit page
+#     action shown when a probe says yes) and from the /platform/places panel.
+#     The editor route is outside /admin/{slug} (a moderator holds no admin
+#     slug for an unowned place) and mounts the same `PageEditorView`.
+# D9  Images. SUPERSEDED by R5 for moderator uploads: they go through image
+#     review, are stored in a platform folder outside the moderator's quota,
+#     and move to the owner on claim. Owner uploads are unchanged.
+# D10 Orchestrator decision, 2026-10-16, how R5 is built (not the owner's):
+#     - Folder. Page image keys are already `entity-pages/place/{placeId}/…`:
+#       held by the place, never by the moderator. That prefix IS the
+#       platform folder, so nothing moves at claim; the claimant inherits the
+#       objects where they are.
+#     - Review. A moderator's finalize enqueues an image review record
+#       (PAGE_MEDIA, subject PLACE) in its claim transaction. The public page
+#       hides an image until it is approved: avatar and banner go null, an
+#       image field or list item is dropped, and a block that still names a
+#       pending image elsewhere (rich text) is left out whole. Owner uploads
+#       get no record and are never hidden. The follows list hides a pending
+#       place avatar the same way. An image deleted on purpose before its scan
+#       is resolved without a storage-fault report, and the moderation drain
+#       counts it apart (`removedBeforeScan`) so a place merge, which deletes
+#       every page image at once, cannot trip the orphan breaker.
+#     - Quota. STORAGE_BYTES_PLACE, 512 MiB per place. A moderator's request
+#       only checks it (declared size); the finalize charges the stripped
+#       copy's size, once, in the claim transaction, after checking again.
+#       An unfinished request costs the place nothing. Owner uploads charge
+#       the owner as before. A place quota offers no expansion request.
+#     - Block images. For a COMMUNITY MODERATOR only, a block image URL
+#       added or changed through managePageBlocks must be this page's own
+#       stripped upload or already live on one of its blocks (the rule draft
+#       save and publish apply). Closes an outside URL or raw upload skipping
+#       strip and review. Not for an owner (revised 2026-10-16, after review):
+#       the owner's live editor takes a typed photo URL, and undo of a deleted
+#       block re-adds its snapshot; the rule broke both, and owner uploads are
+#       not reviewed, so the bypass it closes exists only for moderators.
+#     Follow-ups, not built: credit the place quota when an image is deleted
+#     or leaves the page (today nothing credits it back); a per-place quota
+#     reset on /platform/quotas; an "awaiting review" marker in the editor;
+#     PLACE usage rows on place merge and delete; an ORG page's team member
+#     avatarUrl (objectList) is not covered by the block image-URL rule
+#     (pre-existing); web copy for INVALID_BLOCK_DATA `image_url_not_allowed`
+#     (the editor toast shows the generic error today).
+
+summary:
+  problem: >
+    All ~493 imported places have bare pages. The editor is gated by
+    canManagePlace (verified human owner or owning-org editor), and an
+    unowned place has neither, so nobody can write the page and the template
+    blocks never seed.
+  solution: >
+    One PLACE page access check with a moderator branch bounded by
+    findOwnerlessWriteBlock, re-checked under the claim lock on every write,
+    audited; a probe and an editor route for moderators; community
+    attribution on the public page; an owner handover notice with keep or
+    clear after a claim.
+  users:
+    - community moderators and platform ADMINs (write)
+    - visitors (read, see who wrote it)
+    - the person who later claims the place (inherits, decides)
+  surfaces: [api, web]
+
+lifecycle:
+  # No new model. Writes are the existing EntityPage / PageBlock / PageTheme
+  # use cases; the only new rows are audit rows (append-only).
+  create: existing (template seed on first editor load)
+  read: existing getMyPage / getPublicPage; new probe; new handover read
+  update: existing editor use cases, new actor
+  remove: Clear-it on handover (D6) resets the page; the page row stays
+  audit rows: append-only, no update or delete
+
+functional_requirements:
+  FR-001: >
+    A COMMUNITY_MODERATOR or ADMIN may run every PLACE page editor use case on
+    an ACTIVE place where findOwnerlessWriteBlock is null or
+    "OWNED_EVENTS_AT_PLACE". Anyone else is refused exactly as today.
+  FR-002: >
+    "OWNED" or "CLAIM_PENDING" refuses a moderator with PLACE_HAS_OWNER and
+    meta.reason, re-checked under lockPlaceForClaim inside the writing
+    transaction.
+  FR-003: >
+    The PLACE access check lives in ONE function used by every page use case
+    (today four private copies plus ensureEntityPageAccess).
+  FR-004: >
+    Each moderator write logs entity_page.community_updated (actor, placeId,
+    pageId, op, from, to) in its transaction.
+  FR-005: >
+    A probe answers canEditPage and the refusal reason for the current actor,
+    advisory, mirroring getCommunityPlaceEditability.
+  FR-006: >
+    getPublicPage for a PLACE returns the community attribution (derived per
+    D6) so the page can render it.
+  FR-007: >
+    The owner gets a handover read (writers, times, ops) and a keep/clear
+    action; clear resets page, main-section blocks and theme in one
+    transaction (refused while a draft is pending) and both choices log
+    entity_page.community_handover.
+  FR-008: >
+    Web: Edit page entry for moderators on the place page and the platform
+    panel; a moderator editor route mounting PageEditorView; the attribution
+    on the public place page; the handover notice in the owner's editor.
+
+non_goals:
+  - HUMAN pages (OWNER RULED OUT, R3 — not an open question, do not build)
+  - ORGANIZATION pages (R3; and orgs have no unowned state anyway)
+  - public suggestions for place pages (R6: wanted, scoped separately)
+  - auditing owner page writes (F1)
+
+open_questions:
+  # Q1 is CLOSED. Owner ruled 2026-10-14, verbatim: "Yeah human is not allowed.
+  # Places are the only thing that gets moderated if not claimed." Recorded as
+  # R3. Do not reopen it, and do not build moderator access for HUMAN or
+  # ORGANIZATION pages. PLACE only.
+  # Q2, Q3 and Q5 are CLOSED by the owner on 2026-10-16: see R4, R5, R6.
+  Q4: >
+    Is D6 right - content persists, attribution stays until the owner
+    chooses keep or clear?
+
+follow_ups:
+  F1: Owner page writes leave no audit row (pre-existing).
+  F2: managePageBlocks and updatePageTheme do not mark search reindex
+      (pre-existing; parity keeps it).

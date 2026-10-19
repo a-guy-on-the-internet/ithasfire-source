@@ -18,7 +18,7 @@ Read [.claude/curation/config.json](.claude/curation/config.json). Use `staleEve
 
 Domain: `packages/db/prisma/*.prisma`. Relevant model is `Event` with `status` (`DRAFT | PUBLISHED | CANCELLED | COMPLETED | ARCHIVED`), `startsAt`, `endsAt`, `stewardship`, `attendance_mode`, `locality`/`region` (city/state), and `body` jsonb (links live here — no dedicated URL column).
 
-**Connection (read-only, SELECT only):** prefer **`$CURATION_DB_URL`** if set — that's the prod read-only connection injected by `.claude/curation/run.sh` (already forced read-only via `PGOPTIONS`). If it's unset, fall back to the localhost `DATABASE_URL` in `.env.local`. Strip any `?query` params before passing the URL to `psql`. Record which DB you used in the artifact's Notes. If you cannot connect at all, STOP and tell the user — a freshness sweep with no data is worthless.
+**Connection (read-only, SELECT only):** prefer **`$CURATION_DB_URL`** if set — that's the prod read-only connection injected by `.claude/curation/run.sh` (already forced read-only via `PGOPTIONS`). If it's unset, fall back to the localhost `DATABASE_URL` in `.env.local`. When `$CURATION_DB_URL` is set, use it or nothing: if it fails to connect, never fall back to the local DB — STOP and say so. Strip any `?query` params before passing the URL to `psql`. Record which DB you used in the artifact's Notes, and put a machine-checkable marker as the FIRST line under the H1 title: `DB: prod` if `$CURATION_DB_URL` was used, `DB: local — not actionable` if you fell back to the local DB (`/curation-apply` refuses local-DB artifacts). If you cannot connect at all, STOP and tell the user — a freshness sweep with no data is worthless.
 
 Pull (respecting `maxItemsPerRun`), filtered to in-scope regions where applicable:
 - **Past-dated & still PUBLISHED** — `status = PUBLISHED AND coalesce(endsAt, startsAt) < now() - gracePeriodDays`. These need `COMPLETED` or `ARCHIVED`.
@@ -35,6 +35,7 @@ Write to `docs/curation/<YYYY-MM-DD>/stale-event-sweep.md` (date via `date +%F`)
 
 ```
 # Freshness Sweep — <date>
+DB: prod | DB: local — not actionable
 
 ## Summary
 - Scope: <regions or platform-wide>

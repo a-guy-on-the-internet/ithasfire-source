@@ -7,7 +7,13 @@ import {
   parseResendDeliveryEvents,
 } from "../src/routes/resend/webhook";
 
-const webhookSecret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
+// Self-signing fixture: this test sets RESEND_WEBHOOK_SECRET to this same
+// constant and signs its own payloads with it, so the value never needs to be
+// the real one. It is deliberately base64 of readable text — the previous
+// random-looking value matched GitHub's Stripe webhook-signing-secret pattern
+// (whsec_ + 32 alphanumerics) and raised a secret-scanning alert on a Svix
+// secret that was never a Stripe key.
+const webhookSecret = "whsec_Z2l0bGVha3MtZmFrZS1ub3QtYS1yZWFsLXNlY3JldA==";
 
 function makeLogger() {
   const logger = {
@@ -466,6 +472,12 @@ function makeDeliverabilityPort(overrides: Record<string, unknown> = {}) {
 async function makeWebhookApp(input: {
   secret: string | undefined;
   deliverability: ReturnType<typeof makeDeliverabilityPort>;
+  /**
+   * When present, the plugin also wires the booking-inquiry bounce fan-in.
+   * Omitted by most specs on purpose — the route must survive a deps bag with
+   * no tRPC repos rather than 500 on an OPTIONAL side effect.
+   */
+  markInquirerEmailUndeliverable?: (input: unknown) => Promise<number>;
 }) {
   vi.resetModules();
   if (input.secret) {
@@ -484,6 +496,18 @@ async function makeWebhookApp(input: {
   app.decorate("deps", {
     logger,
     emailDeliverability: input.deliverability,
+    ...(input.markInquirerEmailUndeliverable
+      ? {
+          trpc: {
+            repos: {
+              bookingRequests: {
+                markInquirerEmailUndeliverable:
+                  input.markInquirerEmailUndeliverable,
+              },
+            },
+          },
+        }
+      : {}),
   });
 
   await app.register(rawBody);
@@ -491,6 +515,182 @@ async function makeWebhookApp(input: {
 
   return app;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Booking-inquiry fan-in (booking-inquirer-outreach, 2026-09-05)
+//
+// The deliverability port DELIBERATELY refuses to flag an UNVERIFIED AuthUser,
+// and every shadow minted for an anonymous booking inquirer is unverified —
+// so without this fan-in a venue's bounced reply leaves no trace the venue can
+// see. These cover the wiring, not the stamp itself (that lives in
+// `markBookingInquirerUndeliverable`'s own suite).
+// ─────────────────────────────────────────────────────────────────────────────
+
+function makeDeliverability(replayed = false) {
+  return {
+    getByEmail: vi.fn(),
+    clearByEmail: vi.fn(),
+    anonymizeForUser: vi.fn(),
+    recordProviderEvent: vi.fn(async (input: Record<string, unknown>) => ({
+      id: "delivery-event",
+      provider: input.provider,
+      providerEventId: input.providerEventId,
+      eventType: input.eventType,
+      email: input.email,
+      status: input.status,
+      occurredAt: input.occurredAt,
+      processedAt: new Date("2026-09-05T12:01:00.000Z"),
+      authUserId: null,
+      replayed,
+    })),
+  };
+}
+
+describe("resend webhook booking-inquiry fan-in", () => {
+  it("marks matching inquiries undeliverable on a permanent bounce", async () => {
+    const markBookingInquirerUndeliverable = vi.fn(async () => ({
+      stamped: 2,
+    }));
+
+    const result = await handleResendWebhookPayload({
+      payload: {
+        id: "evt_bounce",
+        type: "email.bounced",
+        created_at: "2026-09-05T12:00:00.000Z",
+        data: { to: ["Jo@Example.com"], bounce: { type: "Permanent" } },
+      },
+      deliverability: makeDeliverability(),
+      logger: makeLogger(),
+      markBookingInquirerUndeliverable,
+    });
+
+    expect(markBookingInquirerUndeliverable).toHaveBeenCalledWith({
+      email: "jo@example.com",
+      status: "BOUNCED",
+      occurredAt: new Date("2026-09-05T12:00:00.000Z"),
+    });
+    expect(result.bookingInquiriesStamped).toBe(2);
+  });
+
+  it("fans a complaint in as COMPLAINED", async () => {
+    const markBookingInquirerUndeliverable = vi.fn(async () => ({
+      stamped: 1,
+    }));
+
+    await handleResendWebhookPayload({
+      payload: {
+        id: "evt_complaint",
+        type: "email.complained",
+        created_at: "2026-09-05T12:00:00.000Z",
+        data: { to: ["jo@example.com"] },
+      },
+      deliverability: makeDeliverability(),
+      logger: makeLogger(),
+      markBookingInquirerUndeliverable,
+    });
+
+    expect(markBookingInquirerUndeliverable).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "COMPLAINED" }),
+    );
+  });
+
+  it("still fans in on a REPLAYED event (the stamp is idempotent + monotonic)", async () => {
+    // Skipping replays would lose the fan-in entirely for every event already
+    // delivered before this code shipped.
+    const markBookingInquirerUndeliverable = vi.fn(async () => ({
+      stamped: 1,
+    }));
+
+    await handleResendWebhookPayload({
+      payload: {
+        id: "evt_replay",
+        type: "email.bounced",
+        created_at: "2026-09-05T12:00:00.000Z",
+        data: { to: ["jo@example.com"], bounce: { type: "Permanent" } },
+      },
+      deliverability: makeDeliverability(true),
+      logger: makeLogger(),
+      markBookingInquirerUndeliverable,
+    });
+
+    expect(markBookingInquirerUndeliverable).toHaveBeenCalledOnce();
+  });
+
+  it("is not called for an unsupported event type", async () => {
+    const markBookingInquirerUndeliverable = vi.fn(async () => ({
+      stamped: 0,
+    }));
+
+    const result = await handleResendWebhookPayload({
+      payload: { id: "evt_open", type: "email.opened", data: {} },
+      deliverability: makeDeliverability(),
+      logger: makeLogger(),
+      markBookingInquirerUndeliverable,
+    });
+
+    expect(result.ignored).toBe(true);
+    expect(markBookingInquirerUndeliverable).not.toHaveBeenCalled();
+  });
+
+  it("reaches the fan-in through the SIGNED ROUTE when repos are wired", async () => {
+    const markInquirerEmailUndeliverable = vi.fn(async () => 1);
+    const app = await makeWebhookApp({
+      secret: webhookSecret,
+      deliverability: makeDeliverabilityPort(),
+      markInquirerEmailUndeliverable,
+    });
+    const payload = JSON.stringify({
+      type: "email.bounced",
+      created_at: "2026-09-05T10:00:00.000Z",
+      data: { email: "jo@example.com", bounce: { type: "Permanent" } },
+    });
+
+    await postSignedResend(app, payload, "msg_svix_fanin");
+
+    expect(markInquirerEmailUndeliverable).toHaveBeenCalledWith({
+      contactEmail: "jo@example.com",
+      status: "BOUNCED",
+      at: new Date("2026-09-05T10:00:00.000Z"),
+    });
+  });
+
+  it("still ACKs 200 when the deps bag has no tRPC repos at all", async () => {
+    // Regression guard: reaching into `app.deps.trpc.repos` from inside the
+    // handler used to 500 every signed request on a narrow deps bag. The
+    // fan-in is OPTIONAL; a bounce webhook must never fail because of it.
+    const app = await makeWebhookApp({
+      secret: webhookSecret,
+      deliverability: makeDeliverabilityPort(),
+    });
+    const payload = JSON.stringify({
+      type: "email.bounced",
+      created_at: "2026-09-05T10:00:00.000Z",
+      data: { email: "jo@example.com", bounce: { type: "Permanent" } },
+    });
+
+    await postSignedResend(app, payload, "msg_svix_no_repos");
+  });
+
+  it("omits the counter entirely when no fan-in is wired (existing callers)", async () => {
+    const result = await handleResendWebhookPayload({
+      payload: {
+        id: "evt_no_fanin",
+        type: "email.bounced",
+        created_at: "2026-09-05T12:00:00.000Z",
+        data: { to: ["jo@example.com"], bounce: { type: "Permanent" } },
+      },
+      deliverability: makeDeliverability(),
+      logger: makeLogger(),
+    });
+
+    expect(result).toEqual({
+      recorded: 1,
+      replayed: 0,
+      ignored: false,
+      eventType: "email.bounced",
+    });
+  });
+});
 
 function signSvixPayload(input: { payload: string; id: string }) {
   const timestamp = new Date();

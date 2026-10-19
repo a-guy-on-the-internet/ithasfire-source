@@ -1,0 +1,118 @@
+# Spec: Consumer Discovery Navigation Flow
+meta:
+  owner: apps-web
+  status: draft
+  reviewers:
+    - product
+    - design
+    - platform
+    - growth
+  last_updated: 2025-11-26
+summary: |
+  Define the consumer-facing navigation model for discovering events across web (desktop/tablet) and
+  responsive mobile web. Captures the lightweight top navigation, hero search, category browsing, and
+  saved/my tickets tabs. Admin/organizer tooling is intentionally hidden behind explicit entry points to
+  avoid overwhelming attendees. Mobile native apps share the same IA via the overlay spec.
+scope:
+  in_scope:
+    - `/discover`, `/categories`, `/saved`, `/my-tickets` navigation and header behaviors.
+    - Hero search bar with quick filters and location/date pickers.
+    - Mobile bottom-tab nav mirroring simplified IA.
+    - Entry points into organizer/admin surfaces via "For organizers" link.
+  out_of_scope:
+    - Checkout/ticket purchase flows (existing specs).
+    - Admin hub tiles (separate spec).
+    - Super-admin or internal tooling.
+personas:
+  - casual_attendee: first-time visitor looking for events nearby this weekend.
+  - loyal_fan: has saved organizers, wants quick access to saved + my tickets.
+  - traveler: visiting new city, filters by location/date combos.
+entry_points:
+  - Root marketing site CTA → `/discover`.
+  - Direct search results deep links (utm preserved).
+  - Email push (Saved events reminders) linking to `/saved` or event detail.
+  - Organizer CTA "For organizers" leads to admin login page.
+information_architecture:
+  desktop_top_nav:
+    - Logo (links to `/discover`).
+    - Nav links: Discover, Categories, Saved, My Tickets.
+    - Utility items: Search icon (focus hero input), Language selector (future), Profile menu.
+    - CTA button: "For organizers" (ghost button) linking to admin entry.
+  hero_search:
+    - Big input with placeholders "Search artists, venues, vibes".
+    - Quick chips: Tonight, This Weekend, Free, Trending, Family Friendly.
+    - Location dropdown defaulting to geo-IP; manual override stored in localStorage.
+    - Date range picker (Today / Tomorrow / Custom).
+  category_scroller:
+    - Horizontal scroll of major categories with icons (Music, Comedy, Sports, Festivals, Food & Drink, Wellness, Learning).
+    - Each chip navigates to `/categories/<slug>` and updates hero heading.
+  saved_strip:
+    - For signed-in users, show carousel of saved events under hero; fallback CTA to "Sign in to save".
+mobile_nav:
+  - Bottom tab bar with icons + labels (Discover, Saved, Tickets, Profile).
+  - Middle floating action button for search overlay on small phones.
+  - Top app bar condenses to search field + filter button.
+  - Organizer link moves into profile tab sheet.
+flows:
+  search_flow:
+    steps:
+      1. User types query or selects quick chip → `eventSearch.autocomplete` invoked.
+      2. Results preview panel shows top 3 events + categories; pressing enter navigates to `/discover?q=...`.
+      3. Filter drawer available (price, category, date, location). State synced to URL params.
+      4. On empty results, show alternative suggestions + "Alert me" CTA.
+  categories_flow:
+    - Selecting category loads grid with pinned filters (category locked, others adjustable).
+    - Provide breadcrumb back to All Categories.
+  saved_flow:
+    - If unauthenticated: show promo hero + login/register CTAs.
+    - If authenticated: display grouped lists (Upcoming, Past) with quick actions (share, remove).
+  my_tickets_flow:
+    - Surfaces scannable QR, event info, support link.
+  organizer_link_flow:
+    - Click/ tap opens modal explaining difference and routes to `/admin/login` with redirect param.
+states_and_edge_cases:
+  unauthenticated:
+    - Saved/My Tickets prompt sign-in CTA but keep nav accessible.
+  zero_results:
+    - Display `EventGrid` empty state, recommended categories, and ability to request notifications.
+  offline:
+    - Toast "Offline"; disable search submission but leave cached cards.
+  location_permission_denied:
+    - Default to manual city picker with helpful copy.
+  accessibility:
+    - Provide skip link, ensure tab order from top nav → hero search → content.
+    - Search input announced with description for quick chips.
+    - Bottom nav uses `role="tablist"`; highlight active tab via `aria-selected`.
+analytics:
+  - discovery.nav_click (destination)
+  - discovery.search_submit (queryLength, filtersApplied)
+  - discovery.quick_chip (chipId)
+  - discovery.category_select (categoryId)
+  - discovery.saved_view (auth state)
+  - discovery.organizer_cta_click
+  - discovery.bottom_tab_switch (tab)
+data_dependencies:
+  queries:
+    - `eventSearch.autocomplete({ query, location })`
+    - `eventSearch.discoverFeed({ filters, cursor })`
+    - `eventSearch.categories()` for taxonomy + imagery.
+    - `consumer.saves.list()` (requires auth) for saved events.
+    - `consumer.tickets.list()` for QR + orders summary.
+  mutations:
+    - `consumer.saves.toggle({ eventId, next })`
+    - `consumer.alerts.subscribe({ query, location })` for zero result alerting.
+seo_considerations:
+  - Server-render hero + first grid to keep LCP under 2.5s.
+  - Structured data markup (`ItemList`) for top events on /discover and /categories.
+performance:
+  - Defer Saved carousel fetch until after hero idle (signed-in only).
+  - Use IntersectionObserver to lazy load category sections.
+  - Cache taxonomy for 24h via SW.
+open_questions:
+  - Should "Events near me" require explicit opt-in vs auto geolocation?
+  - Do we need a global promo bar (e.g., featured festival) above nav?
+  - When user has both consumer + organizer roles, should we surface hub shortcut in profile menu?
+next_steps:
+  - Work with design on desktop + mobile wireframes.
+  - Coordinate with Search/Events backend to ensure `eventSearch.autocomplete` covers chips.
+  - Implement A/B tests for hero layout variations (two-up vs single column) before GA.

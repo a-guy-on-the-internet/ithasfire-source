@@ -101,4 +101,78 @@ describe("ensurePlaces", () => {
       }),
     );
   });
+
+  /**
+   * `Place.attendeeReviewsPublic` is `@default(false)` in the schema because
+   * in prod it is the venue owner's opt-in. The seed inverts that on purpose:
+   * with the gate shut on every seeded venue, the public rating block and the
+   * attendee aggregate never render and dev/QA cannot reach them. Asserted on
+   * BOTH branches — `update` is what makes a reseed converge an existing row.
+   */
+  it("publishes attendee reviews on every seeded venue, on reseed too", async () => {
+    const upsert = vi.fn(async ({ create }: any) => ({ id: create.id }));
+    const prisma = makePrismaStub(upsert) as any;
+
+    await ensurePlaces(prisma, [
+      {
+        id: "place-3",
+        name: "Review Venue",
+        address: "789 Loud Ave",
+        city: "Nashville",
+        region: "TN",
+        country: "US",
+        postcode: "37203",
+        lat: 36.1627,
+        lng: -86.7816,
+      },
+      // Unverified venues are gated out of the directory, but the review
+      // switch is independent of verification — it still comes on.
+      {
+        id: "place-4",
+        name: "Unverified Venue",
+        address: "1 Quiet Ln",
+        city: "Memphis",
+        region: "TN",
+        country: "US",
+        postcode: "38103",
+        lat: 35.1495,
+        lng: -90.049,
+        unverified: true,
+      },
+    ]);
+
+    for (const call of upsert.mock.calls) {
+      const { create, update } = call[0] as any;
+      expect(create.attendeeReviewsPublic).toBe(true);
+      expect(update.attendeeReviewsPublic).toBe(true);
+    }
+    expect(upsert).toHaveBeenCalledTimes(2);
+  });
+
+  it("honours a fixture that opts out of public attendee reviews", async () => {
+    const upsert = vi.fn(async ({ create }: any) => ({ id: create.id }));
+    const prisma = makePrismaStub(upsert) as any;
+
+    await ensurePlaces(prisma, [
+      {
+        id: "place-5",
+        name: "Private Feedback Venue",
+        address: "2 Closed Ct",
+        city: "Austin",
+        region: "TX",
+        country: "US",
+        postcode: "78702",
+        lat: 30.2672,
+        lng: -97.7431,
+        attendeeReviewsPublic: false,
+      },
+    ]);
+
+    expect(upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ attendeeReviewsPublic: false }),
+        update: expect.objectContaining({ attendeeReviewsPublic: false }),
+      }),
+    );
+  });
 });

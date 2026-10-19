@@ -58,9 +58,19 @@ export {
   ensureFeePolicy,
 } from "./finance.js";
 
+export { ensurePayoutHistory } from "./payouts.js";
+
+export { ensureMembershipFixtures } from "./memberships.js";
+
 export { ensureCategories } from "./categories.js";
 export { ensureGenreTags } from "./tags.js";
 export { ensurePlaces, backfillEventVenueDefaults } from "./places.js";
+export {
+  attachThirdPartyDemoEvents,
+  stampSeedVenueConfirmations,
+  UNCONFIRMED_DEMO_EVENT_TITLES,
+} from "./venue-confirmation.js";
+export { ensureBookingRequests } from "./booking-requests.js";
 export {
   ensurePlaceLayouts,
   linkEventsToPlaceLayouts,
@@ -87,6 +97,7 @@ export {
 
 export { seedDevLoginExtras } from "./extras.js";
 export { seedAttendeeReviewShow } from "./attendee-review-fixture.js";
+export { seedTrackRecordFixture } from "./track-record-fixture.js";
 export { wipeSeedData } from "./wipe.js";
 export { ensurePlatformWaivers } from "./waivers.js";
 export { seedWaiverClauses } from "./waiver-clauses.js";

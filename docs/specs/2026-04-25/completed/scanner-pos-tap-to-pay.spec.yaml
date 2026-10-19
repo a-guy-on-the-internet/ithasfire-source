@@ -1,0 +1,899 @@
+# scanner-pos-tap-to-pay.spec.yaml
+#
+# Turn the scanner mobile app into a per-event point-of-sale, accepting
+# in-person card payments via Stripe Terminal "Tap to Pay" on iPhone /
+# Android NFC. Door staff can sell day-of tickets and merch with the same
+# device they're already using to scan.
+
+version: "1.3"
+updated: "2026-04-26"
+
+product_stances:
+  - "Anonymous by default. No buyer contact required to sell."
+  - "Auto-admit on sale. The sale IS the admission."
+  - "No tipping. Ever. The disclosure copy is part of the spec."
+  - "Cash is a first-class payment channel. $0 cash sale = comp ticket with operator audit."
+  - "Merch is the next slice, not this one — see follow_ups."
+
+decisions:
+  - id: D-2026-04-26-charge-model
+    decided: "2026-04-26"
+    title: "POS uses separate charges and transfers, not direct charges"
+    context: >
+      M3 adapter (commit aee23cd4) shipped with direct charges
+      (`stripeAccount` request option + `application_fee_amount`),
+      which would have put POS funds directly on the connected
+      account at PI success, bypassing the platform's existing
+      Settlement → transfer pipeline.
+    decision: >
+      POS PaymentIntents are created on the platform account, with
+      `payment_method_types=["card_present"]` and
+      `capture_method=automatic`, WITHOUT `stripeAccount` request
+      option and WITHOUT `application_fee_amount`. Funds land on
+      the platform balance. The existing `createSettlementsFromOrder`
+      → `executeSettlementTransfer` pipeline performs the transfer
+      to the connected account on the same payout schedule as web
+      orders.
+    rationale: >
+      - Funds-flow parity with web checkout (NFR-003 stays as written).
+      - Single Settlement code path; no POS-specific branch.
+      - Refund mechanics reuse `refundOrder` unchanged.
+      - Platform-controlled payout timing per `payoutTerms`, not
+        Stripe's connected-account default schedule.
+      - Stripe Terminal explicitly supports SCT for `card_present`
+        and Tap to Pay (verified against
+        https://docs.stripe.com/terminal/features/connect).
+    consequences:
+      - M3 adapter `createCardPresentPaymentIntent` must be revised
+        to drop `stripeAccountId` arg and `applicationFeeAmount`
+        arg from its public signature; metadata still carries
+        `destinationAccountId` for audit (mirrors web pattern).
+      - Connected accounts must still have `card_present` capability
+        active. New requirement — request it at Connect-account
+        creation time (see queued follow-up).
+      - Statement descriptor on cardholder receipts shows the
+        platform name by default; we can pass
+        `statement_descriptor_suffix` per PI to surface the org name
+        ("Ithas Fire · Punkhouse") — same approach we use on web.
+      - 30-min dev spike required against a real Stripe test Connect
+        account to confirm no unstated `on_behalf_of` requirement
+        before locking M4.2.
+related:
+  - docs/specs/2026-04-24/scanner-foundation.spec.yaml
+  - docs/specs/2026-04-25/unified-scan-resolver.spec.yaml
+
+scope_note: >
+  This spec ADDS a third scanner mode ("sell") alongside the existing
+  unified scan and volunteer flows. It REUSES the existing checkout /
+  finalize-payment-intent pipeline (orders, splits, settlements,
+  ticket minting, webhook DLQ). It does NOT introduce a parallel order
+  type, parallel ledger, or parallel ticket model. The only net-new
+  payment surface is Stripe Terminal as an alternative collection
+  method on a regular Order with a regular PaymentIntent.
+
+  Reader hardware support (BBPOS WisePOS, Verifone P400) is OUT OF
+  SCOPE for this slice — Tap to Pay on iPhone (iOS 16.4+, iPhone XS or
+  newer) and Tap to Pay on Android (NFC, Android 11+) only. External
+  readers can ship as a follow-up using the same Terminal SDK.
+
+dependencies:
+  hard:
+    - existing Stripe payment-processor adapter
+      (packages/adapters/src/payment-processors/stripe/stripe-adapter.ts)
+    - existing Order model + status machine
+      (packages/db/prisma/order.prisma)
+    - existing finalize-from-payment-intent use case
+      (packages/core/src/use-cases/orders/finalize-from-payment-intent.ts)
+    - existing Payee model with stripeAccountId + chargesEnabled
+    - existing scanner auth + event-selector context
+    - '"@stripe/stripe-terminal-react-native" SDK (new dep, apps/scanner/package.json)'
+    - card_present capability requested **on-demand**, not at Connect
+      account create time. Stripe rejects `capabilities[card_present]`
+      in `accounts.create` for Express accounts ("Received unknown
+      parameter… Did you mean card_payments?"). Pattern:
+      `accounts.update(accountId, { capabilities: { card_present:
+      { requested: true } } })` triggered when the org/human opts
+      into the scanner POS. Required wiring (when scanner POS
+      onboarding lands):
+        1. `PaymentProcessor.requestInPersonCapability(accountId)`
+           port method.
+        2. `enable-in-person-sales` use case (org-membership or
+           human-self gated) that calls the port and refreshes the
+           cached `Payee.capabilities`.
+        3. tRPC procedure on the `stripeConnect` (or a new `pos`)
+           router calling the use case.
+        4. `pos.startSale` precheck (FR below) blocks until Stripe
+           reports `card_present` = active.
+  soft:
+    - external Stripe Terminal hardware readers (out-of-spec; future)
+    - per-event merch catalog UI (out-of-spec; lean on TicketType for v1)
+    - cash drawer / receipt printer integrations (future)
+
+summary:
+  problem: >
+    Day-of ticket sales at the gate currently require either (a) a web
+    checkout on the buyer's phone — slow, often fails on bad venue Wi-Fi,
+    requires the buyer to already have a Ithas Fire account or sign up in
+    line — or (b) a separate Square / Stripe Terminal device the org has
+    to procure, configure, and reconcile against Ithas Fire orders by
+    hand. Walk-up revenue leaks: lines back up, buyers bounce, and the
+    org's books split across two systems.
+
+    The scanner app is already in the operator's hand, already auth'd to
+    the org, already scoped to one event via the new event selector, and
+    already wired to the org's connected Stripe account through the
+    Payee. Adding "tap a card to sell a ticket" closes the loop without
+    new hardware or a second app.
+  solution: >
+    Introduce a "Sell" mode in the scanner shell. The operator picks a
+    ticket type (or a small list of "door items" — GA, VIP, merch SKU),
+    confirms the amount, and presses a primary CTA. The phone enters
+    Tap to Pay collection mode via Stripe Terminal SDK. On success the
+    server finalises a regular Order through the existing pipeline,
+    mints the ticket(s), and the operator hands the buyer a printed /
+    emailed / SMS'd ticket QR — or, more often, scans them straight in
+    on the same device.
+
+    Server side:
+      1. New `pos.connectionToken` tRPC procedure (POST) returns a
+         short-lived Stripe Terminal connection token bound to the
+         org's Connect account.
+      2. New `pos.startSale` use case opens a PENDING order with
+         payment_method_types=["card_present"] and
+         capture_method=automatic, returns clientSecret + orderId.
+      3. Client SDK collects + processes the payment on-device.
+      4. Existing webhook + confirm-payment finalises the order;
+         tickets mint via the same path as web checkout.
+      5. New `pos.completeSale` query returns the minted ticket QR(s)
+         + delivery channels for the operator to present.
+  users:
+    - Door operators with ORG_SCAN_ROLES (sell + scan in one flow)
+    - Org admins / owners (configure POS catalog per event)
+    - Buyers walking up to the gate (no app, no account required;
+      contact captured for receipt + ticket delivery)
+  surfaces:
+    - scanner
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Add a third tab / entry to the scanner Home: "Sell". Visible
+        only when (a) the operator's role on the selected event's org
+        is SCANNER or higher, AND (b) the event has at least one
+        TicketType currently on sale (active, in sale window, capacity
+        remaining). Card sales additionally require the event's Payee
+        (subjectType=ORGANIZATION, subjectId=event.orgId) to have
+        chargesEnabled=true AND `card_present` capability active —
+        but cash sales are available even without those (no Stripe
+        path required for cash). When no eligible TicketType exists
+        the tab is hidden — not greyed.
+
+    - id: FR-002
+      description: >
+        Sell home shows a vertical list of "door items": every active
+        TicketType for the selected event currently in its sale window
+        with capacity > 0, with name, price, remaining capacity.
+        Tapping an item opens a quantity stepper (default 1, min 1,
+        max = lesser of TicketType.maxPerOrder and current remaining).
+        A running cart total renders at the bottom. Cart total uses
+        TicketType.doorPriceCents when set, falling back to the public
+        price.
+
+    - id: FR-003
+      description: >
+        Cart footer shows two primary actions side by side: "Tap to
+        Pay" (card) and "Cash". Both go straight to their respective
+        flows — no buyer contact prompt by default. The walk-up
+        reality is "take the money, give the wristband, move on."
+        Friction kills the line.
+
+        Tap to Pay path:
+          a. Surface the Tap to Pay native UI immediately.
+          b. In parallel, call `pos.startSale({ eventId, items })`
+             with `buyerContact: null`.
+          c. The Terminal SDK collects + processes the payment.
+          d. On payment success, the server auto-admits the ticket(s)
+             (FR-013) and the scanner shows a big green "ADMIT" card
+             with the count of tickets sold and a "Send receipt"
+             secondary action.
+
+        Cash path (FR-015):
+          a. Brief confirmation sheet showing the amount due
+             (editable — operator can set any value including 0
+             for comp); operator confirms collection.
+          b. Call `pos.recordCashSale({ eventId, items, amountCollectedCents })`.
+          c. Server creates a SUCCEEDED Order with paymentChannel=CASH
+             inline (no Stripe call, no webhook), auto-admits per
+             FR-013, returns minted tickets.
+          d. Same green ADMIT result view, with the same "Send receipt"
+             secondary action.
+
+        "Send receipt", when tapped on either path, opens the buyer
+        contact sheet (email OR phone) and fires receipt + ticket
+        delivery after the fact.
+
+    - id: FR-013
+      description: >
+        Auto-admit on sale. Tickets minted via POS are written
+        directly with status=SCANNED and a synthetic admit audit
+        entry tagged `source=POS_AUTO_ADMIT`, actorHumanId=operator,
+        scannedAt=order.completedAt. The operator does NOT need to
+        re-scan a freshly-minted ticket; the sale itself counts as
+        admission. The home screen's admitted counter increments
+        immediately.
+
+        Override: operators can toggle "Sell without admitting" per
+        sale (e.g. selling at a pre-sale window where admission opens
+        later). When toggled, tickets mint with status=VALID and the
+        normal scan flow admits them later. Default is OFF (auto-admit
+        on) because that's the gate-line use case.
+
+    - id: FR-004
+      description: >
+        Buyer identity — anonymity is the default, schema stays clean:
+          - Every POS sale creates a per-sale phantom Human row with
+            source=POS_WALKUP and all-null contact fields (no email,
+            no phone, no name). Order.buyerHumanId points at it.
+            Ticket.ownerHumanId points at it. All FKs stay NOT NULL,
+            no schema migration to nullable, no code paths assume
+            null elsewhere.
+          - If the operator later provides contact via "Send receipt":
+            * If email/phone matches an EXISTING non-walkup Human,
+              re-point the order/tickets at that Human and delete the
+              phantom row in the same tx.
+            * Otherwise update the phantom row with the supplied
+              contact (still source=POS_WALKUP, no password, no
+              welcome email).
+          - "Send sign-up link" fires a magic-link invite (existing
+            adapter); on claim, the existing account-merge flow folds
+            the POS_WALKUP Human into the buyer's real account.
+          - Phantom rows show up in audit / refund logs as
+            "Walk-up · {orderShortId}" — never as an empty name.
+
+    - id: FR-005
+      description: >
+        Idempotency:
+          - `pos.startSale` uses the same checkout idempotency pattern
+            as web (`pos:{actorHumanId}:{clientKey}`, 2-min TTL,
+            payload-hash collision check).
+          - The Terminal SDK's processPayment carries Stripe's own
+            idempotency on the PaymentIntent; double-tap on "Charge"
+            returns the in-flight PI.
+          - `pos.completeSale` is a read-only finaliser look-up; the
+            server-side finalisation is owned by the existing
+            payment_intent.succeeded webhook + confirm-payment path.
+
+    - id: FR-006
+      description: >
+        Offline / spotty Wi-Fi behaviour:
+          - Tap to Pay REQUIRES network for online auth (Stripe does
+            not currently support truly offline collection on Tap to
+            Pay; documented Stripe limitation).
+          - The scanner shows a clear "Cannot accept cards offline"
+            banner if `pos.connectionToken` fails or the SDK reports
+            no connectivity. The Sell tab is otherwise greyed with a
+            retry CTA.
+          - Existing scan queue is unaffected — sells do NOT queue
+            for later replay; failed sales just retry.
+
+    - id: FR-007
+      description: >
+        Ticket delivery is opt-in via the post-sale "Send receipt"
+        sheet:
+          - Default: nothing is sent. The buyer walks away with their
+            wristband / stamp / whatever physical token the venue
+            uses. The QR exists in the system but no one needs it.
+          - When the operator taps "Send receipt" and provides email,
+            the standard ticket email queues through the existing
+            transactional-email queue.
+          - When phone is provided, the ticket SMS fires via the
+            existing SMS adapter (when configured).
+          - "Print receipt" remains available — renders a printable
+            receipt URL on a 1-time signed link, no contact needed.
+
+    - id: FR-008
+      description: >
+        Refunds at the gate:
+          - Operators with ORG_EDIT_ROLES on the event's org may tap a
+            recently-completed sale (last 15 min, in-memory list on
+            the device) and issue a full refund. Partial refunds and
+            sales older than 15 min must go through the web admin
+            (existing refund tooling).
+          - Card sales (paymentChannel=POS) flow through the existing
+            `refundOrder` use case; no new money path.
+          - Cash sales (paymentChannel=CASH) flip the Order to
+            REFUNDED and the Ticket(s) to REFUNDED inline; no
+            payment-processor call. The operator is trusted to return
+            the cash and the action is logged with actorHumanId for
+            org-level audit. A $0 cash sale (comp) refund is a
+            no-money-moves admit-counter decrement.
+
+    - id: FR-009
+      description: >
+        Telemetry surfaces operator-level outcomes ONLY (no PAN, no PII):
+          - pos.start_sale.attempt
+          - pos.tap_to_pay.collect_started
+          - pos.tap_to_pay.collect_succeeded
+          - pos.tap_to_pay.collect_failed (+ Stripe decline_code)
+          - pos.complete_sale.success
+          - pos.refund.gate_issued
+
+    - id: FR-010
+      description: >
+        Receipts: a sale produces an Order whose receipt page is the
+        same one used by web checkout. The on-device receipt view is
+        a thin wrapper over the existing receipt URL with a "Print"
+        action that triggers AirPrint / Android system print.
+
+    - id: FR-011
+      description: >
+        Auto-admit (FR-013) replaces the "Scan now" round-trip. The
+        sale path writes the same audit + counters that `scanTicket`
+        would have written — same `ticket_admitted` audit event,
+        same eventual-consistency increment of the home counter — so
+        the SCANNED status is observationally identical to a normal
+        scan. The only difference is the audit entry's
+        `source=POS_AUTO_ADMIT` tag for reporting.
+
+    - id: FR-012
+      description: >
+        Out-of-scope for this slice (track separately):
+          - Till management / cash drawer reconciliation reports
+            (cash IS tracked at the Order level per FR-015, but
+            per-operator till close-out is not)
+          - Split tender (e.g. card + cash combo)
+          - External Bluetooth / BBPOS / Verifone reader pairing
+          - Per-event price overrides at the till
+          - Promo code redemption at the door
+          - Tax-exempt buyer flow
+
+    - id: FR-014
+      description: >
+        Ithas Fire does NOT implement tipping at the POS. Stripe
+        Terminal supports tip prompts; we explicitly disable them in
+        SDK config (collectConfiguration: { tipEligibleAmount: 0 } or
+        equivalent — verify exact SDK shape at impl).
+
+        On the Sell screen footer, render a small immutable line
+        (i18n key `pos.noTipDisclosure`):
+
+          "We don't tip. Tipping is a mechanism for the rich to avoid
+           paying their workers a living wage. The price you see is
+           the price you pay; our staff are paid by us, not you."
+
+        This copy is part of the spec, not a one-liner. The org
+        cannot disable or override it. If an org cannot live with
+        this stance, they should not use this feature.
+
+    - id: FR-015
+      description: >
+        Cash is a first-class payment channel. The operator can take
+        cash for any tier on the Sell screen — even when the org's
+        Connect account is missing `card_present` capability or has
+        chargesEnabled=false. There is no till management; Ithas Fire
+        records the SALE, not the drawer.
+
+        Mechanics:
+          - `pos.recordCashSale({ eventId, items, amountCollectedCents,
+             clientKey })` creates an Order with paymentChannel=CASH,
+            status=SUCCEEDED, no PaymentIntent, no Settlement row,
+            no Stripe call. Tickets mint and auto-admit per FR-013
+            inline within the same DB transaction.
+          - The operator can set `amountCollectedCents` to ANY value
+            including 0. A $0 cash sale IS the comp-ticket flow —
+            same Order shape, same audit entry (actorHumanId,
+            paymentChannel=CASH, amount=0), zero money tracked. There
+            is no separate "comp" channel or button.
+          - Idempotency key: `cash:{actorHumanId}:{clientKey}`, 2-min
+            TTL, payload-hash collision check. Same pattern as
+            startPosSale.
+          - `Order.amountCents` records what the operator said was
+            collected. Ithas Fire does NOT verify this against the
+            sum of TicketType prices — operators can run discounts,
+            negotiate, etc.
+
+        Implications:
+          - No cash order ever appears in the Settlement pipeline.
+            Period. There is nothing to transfer; the org received
+            the money directly.
+          - Refunds (FR-008) for cash flip Order + Ticket state with
+            no money movement; org trusts operator returned the cash.
+          - Reporting: org admin sees `paymentChannel` in the orders
+            list and can filter to CASH for an event-level cash
+            total. No till close-out report in v1.
+          - The anti-tipping disclosure (FR-014) renders on the Cash
+            confirmation sheet too, not just the card sheet.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Time-to-charge p95 (operator taps "Charge" → Tap to Pay surface
+        ready) < 800ms. PaymentIntent creation runs in parallel with
+        the Terminal SDK init.
+
+    - id: NFR-002
+      description: >
+        Terminal SDK connection tokens MUST be minted server-side and
+        never logged. The token endpoint enforces ORG_SCAN_ROLES on the
+        currently-selected event's org and embeds the org's Connect
+        accountId; operators cannot mint a token for an org they don't
+        belong to.
+
+    - id: NFR-003
+      description: >
+        Money discipline: the POS payment path goes through the SAME
+        finalize-from-payment-intent + Settlement + transfer pipeline
+        as web checkout, using separate charges and transfers (see
+        decision D-2026-04-26-charge-model). The PaymentIntent is
+        created on the platform account with
+        payment_method_types=["card_present"], capture_method=automatic,
+        NO `stripeAccount` request option, NO `application_fee_amount`.
+        Funds land on the platform balance; the existing
+        `executeSettlementTransfer` job moves them to the connected
+        account per the event's `payoutTerms` schedule, with
+        `source_transaction` pinned to the card-present charge.
+
+        We do NOT branch the ledger, do NOT bypass the platform's cut,
+        do NOT skip the Payee.chargesEnabled gate. Auditors should not
+        be able to tell a POS order from a web order except via the
+        `paymentChannel="POS"` tag on the Order and the
+        `paymentMethodType="card_present"` on the resulting Charge.
+
+        Cash orders (paymentChannel="CASH", FR-015) are categorically
+        different — no PaymentIntent, no Stripe call, no Settlement
+        row. They never enter the transfer pipeline. The org received
+        the money directly. Auditors distinguish them by the
+        `paymentChannel="CASH"` tag and the absence of a
+        stripePaymentIntentId on the Order.
+
+    - id: NFR-004
+      description: >
+        PCI: rely entirely on Stripe Terminal's certified scope. No
+        card data, no track data, no PIN ever crosses Ithas Fire
+        servers or our SDK code paths. Payment method type on the
+        Order is always "card_present" for POS sales.
+
+    - id: NFR-005
+      description: >
+        Privacy: walk-up "guest" Humans are flagged source=POS_WALKUP
+        and are excluded from marketing audiences by default.
+        Existing audit-log compaction rules apply.
+
+    - id: NFR-006
+      description: >
+        Accessibility: the Sell surface follows the same
+        keyboard/voiceover contract as the rest of the scanner app.
+        Currency is rendered with locale-aware formatting using the
+        existing i18n helpers.
+
+contracts:
+  use_cases:
+    - name: startPosSale
+      location: packages/core/src/use-cases/pos/start-pos-sale.ts
+      rbac: ORG_SCAN_ROLES
+      money: true
+      idempotent: true
+      description: >
+        Creates a PENDING order + PaymentIntent on the platform
+        account (separate-charge-and-transfer model — see decision
+        D-2026-04-26). Pins payment_method_types=["card_present"],
+        capture_method="automatic". Stores destinationAccountId
+        (orgPayee.stripeAccountId) in PI metadata for the later
+        Settlement transfer. The platform's cut is taken implicitly
+        — Settlement amount = order total minus platform fee per
+        the same fee policy as web checkout. Returns clientSecret
+        + orderId.
+    - name: completePosSale
+      location: packages/core/src/use-cases/pos/complete-pos-sale.ts
+      rbac: ORG_SCAN_ROLES
+      money: false
+      idempotent: true
+      description: >
+        Read-only finaliser. Polls Order status (server-side, fast
+        path through confirm-payment if the webhook hasn't fired yet)
+        and returns the minted ticket(s) with code + holder display +
+        delivery status. The actual finalisation continues to be
+        driven by the payment_intent.succeeded webhook.
+    - name: posMintConnectionToken
+      location: packages/core/src/use-cases/pos/mint-connection-token.ts
+      rbac: ORG_SCAN_ROLES
+      money: false
+      idempotent: false
+      description: >
+        Server-side helper that calls Stripe Terminal's
+        `terminal.connection_tokens.create` with the org's connected
+        accountId. Token is short-lived (Stripe default) and returned
+        directly; never persisted.
+    - name: refundPosSale
+      location: packages/core/src/use-cases/pos/refund-pos-sale.ts
+      rbac: ORG_EDIT_ROLES
+      money: true
+      idempotent: true
+      description: >
+        Thin wrapper that delegates to the existing `refundOrder`
+        use case after asserting the order's paymentChannel="POS"
+        and is within the gate-refund window (15 min). Older or
+        web-channel refunds go through the standard admin UI.
+    - name: recordCashSale
+      location: packages/core/src/use-cases/pos/record-cash-sale.ts
+      rbac: ORG_SCAN_ROLES
+      money: true
+      idempotent: true
+      description: >
+        Creates a SUCCEEDED Order with paymentChannel=CASH inline,
+        with zero Stripe involvement. amountCollectedCents is
+        operator-supplied (may be 0 for a comp). Mints tickets and
+        auto-admits per FR-013 in the same DB tx. Does NOT write a
+        Settlement row. Idempotency key: `cash:{actorHumanId}:{clientKey}`.
+        See FR-015 for full contract.
+    - name: refundCashSale
+      location: packages/core/src/use-cases/pos/refund-cash-sale.ts
+      rbac: ORG_EDIT_ROLES
+      money: false
+      idempotent: true
+      description: >
+        Asserts paymentChannel=CASH and order within 15-min gate
+        refund window. Flips Order.status=REFUNDED and
+        Ticket.status=REFUNDED inline; decrements admit counter;
+        writes audit entry with actorHumanId. NO payment-processor
+        call. Operator is trusted to physically return the cash.
+
+  port_additions:
+    - name: payments.createTerminalConnectionToken
+      location: packages/ports/src/payment-processor.port.ts
+      signature: |
+        createTerminalConnectionToken(args: {
+          stripeAccountId: string;
+        }): Promise<{ secret: string }>
+      adapter_impl:
+        location: packages/adapters/src/payment-processors/stripe/stripe-adapter.ts
+        notes: >
+          Calls `stripe.terminal.connectionTokens.create({}, {
+          stripeAccount: args.stripeAccountId })`. Do NOT log the
+          returned `secret`. Wrap errors into the standard
+          PaymentProcessorError types.
+    - name: payments.createCardPresentPaymentIntent
+      location: packages/ports/src/payment-processor.port.ts
+      signature: |
+        createCardPresentPaymentIntent(args: {
+          amountCents: number;
+          currency: string;
+          destinationAccountId: string;  // stored in metadata; NOT used as stripeAccount header
+          metadata: Record<string, string>;
+          idempotencyKey: string;
+          statementDescriptorSuffix?: string;  // org name on cardholder receipt
+        }): Promise<{ paymentIntentId: string; clientSecret: string }>
+      adapter_impl:
+        notes: >
+          Plain platform-account PaymentIntent. Pins
+          payment_method_types=["card_present"], capture_method="automatic".
+          Metadata MUST include orderId, eventId, paymentChannel="POS",
+          destinationAccountId. Do NOT pass `stripeAccount` request
+          option. Do NOT pass `application_fee_amount`. The existing
+          `executeSettlementTransfer` performs the transfer to
+          `destinationAccountId` later, using `source_transaction`.
+          M3 adapter (commit aee23cd4) must be revised to match this
+          signature before M4.2 (`startPosSale`) lands.
+
+  transport:
+    - router: pos
+      location: packages/transport/trpc/src/routers/pos.ts (new)
+      procedures:
+        - name: connectionToken
+          kind: mutation
+          input: |
+            z.object({ eventId: z.string().min(1) })
+          output: |
+            z.object({ secret: z.string() })
+          notes: >
+            Mutation (not query) so it never gets cached and so
+            client devtools don't show it in query history.
+        - name: startSale
+          kind: mutation
+          input: StartPosSaleInput
+          output: StartPosSaleOutput
+        - name: completeSale
+          kind: query
+          input: |
+            z.object({ orderId: z.string().min(1) })
+          output: CompletePosSaleOutput
+        - name: refundRecentSale
+          kind: mutation
+          input: |
+            z.object({ orderId: z.string().min(1) })
+        - name: recordCashSale
+          kind: mutation
+          input: RecordCashSaleInput
+          output: RecordCashSaleOutput
+
+data:
+  new_models: []
+  modified_models:
+    - model: Order
+      changes:
+        - add `paymentChannel` enum column (WEB | POS | CASH), default WEB
+        - keep buyerHumanId NOT NULL (FR-004 phantom Human approach)
+        - keep existing status machine, idempotency
+    - model: TicketType
+      changes:
+        - add `doorPriceCents` nullable int (override; if null fall
+          back to the public price)
+    - model: Human
+      changes:
+        - add `source` enum (WEB | POS_WALKUP | IMPORT | other
+          existing), default WEB
+  migrations_needed: true
+  migrations:
+    - 20260426_pos_paymentchannel_and_walkup
+    - 'index orders(paymentChannel, createdAt) for the gate-refund "recent sales" lookup'
+
+scanner_ui:
+  home:
+    - 'Add "Sell" tab next to existing Scan tab. Hidden when ineligible (FR-001). Test ID — `nav-tab-sell`.'
+  sell_screen:
+    - DoorItemList — every active TicketType for the event in its sale window with capacity > 0
+    - QuantityStepper, CartTotalBar (uses doorPriceCents when set)
+    - BuyerContactSheet (email | phone, validation reused from web)
+    - TapToPaySurface (Terminal SDK presents native UI; we render our own progress + cancel chrome around it)
+    - CashConfirmSheet — shows the amount due, editable to any value including 0; primary action "Confirm — Cash collected"; renders the FR-014 anti-tipping disclosure
+    - SaleResultView — 'shows minted ticket QR(s), "Scan now" CTA, "Send receipt" CTA, "Refund" CTA (if ORG_EDIT_ROLES)'
+  test_ids:
+    - sell-door-item-{ticketTypeId}
+    - sell-cart-total
+    - sell-tap-to-pay-button
+    - sell-cash-button
+    - sell-cash-amount-input
+    - sell-cash-confirm-button
+    - sell-buyer-contact-input
+    - sell-tap-to-pay-status
+    - sell-result-ticket-{ticketCode}
+    - sell-result-scan-now
+    - sell-result-refund
+
+telemetry:
+  events:
+    - pos.start_sale.attempt
+    - pos.start_sale.success
+    - pos.start_sale.failed
+    - pos.connection_token.minted
+    - pos.tap_to_pay.collect_started
+    - pos.tap_to_pay.collect_succeeded
+    - pos.tap_to_pay.collect_failed
+    - pos.complete_sale.success
+    - pos.cash_sale.recorded
+    - pos.cash_sale.comp_recorded  # amountCollectedCents == 0
+    - pos.refund.gate_issued       # tag with channel=POS|CASH
+
+risks:
+  - risk: >
+      Tap to Pay availability gating — iOS 16.4+ on iPhone XS+ only,
+      Android NFC + Android 11+ only. Older devices in the operator
+      fleet will see the Sell tab hidden with no clear reason.
+    severity: MEDIUM
+    mitigation: >
+      Detect SDK availability at boot via the Terminal SDK's
+      `supportsReadersOfType` check; surface a one-line "Tap to Pay
+      not supported on this device" footer in the Sell-tab placeholder
+      so the operator knows it's a device limitation, not a bug.
+  - risk: >
+      Connect account in restricted state — sales succeed at the
+      gate but funds get held by Stripe.
+    severity: HIGH
+    mitigation: >
+      `pos.startSale` re-checks `payee.chargesEnabled` AND
+      `payee.payoutsEnabled` at sale time, not just at tab-render
+      time. Reject with `payee_restricted` error and surface a
+      "Charges disabled — contact your org owner" banner.
+  - risk: >
+      Walk-up "guest" Humans collide with future real signups for the
+      same email.
+    severity: MEDIUM
+    mitigation: >
+      Keep the existing email-uniqueness invariant. If a Human with
+      that email already exists, attach the order to it. If not,
+      create a guest with no password and source=POS_WALKUP. When
+      the buyer later signs up with the same email, existing
+      account-claim flow merges them (already implemented for
+      magic-link onboarding).
+  - risk: >
+      Refund abuse — staff issuing refunds to friends after the sale.
+    severity: MEDIUM
+    mitigation: >
+      Gate-refund is ORG_EDIT_ROLES only (not SCAN). Every refund
+      writes to the audit log with actorHumanId and orderId. The
+      15-min window keeps the on-device list small and prevents the
+      scanner from becoming a generic refund console.
+  - risk: >
+      Network drops mid-collection leave an in-flight PaymentIntent.
+    severity: MEDIUM
+    mitigation: >
+      Stripe Terminal SDK handles in-flight recovery on reconnect.
+      Server-side, the existing payment_intent.canceled webhook
+      already drives the Order back to CANCELLED. Operator sees a
+      clear "Sale failed — try again" state and no double charge.
+  - risk: >
+      Connected account missing `card_present` capability — POS
+      sales fail at PI create time with "capability not active".
+      Existing test/seed accounts in our DB do not have it requested.
+    severity: HIGH
+    mitigation: >
+      (a) Adapter revision: `createConnectAccount` requests
+      `card_present` alongside `card_payments` and `transfers`.
+      (b) Backfill script run against all existing test + prod
+      Connect accounts before M7 end-to-end test. (c) Rollout
+      gating: `pos.startSale` checks `payee.capabilities.card_present
+      === "active"` and surfaces a clear "POS not enabled — contact
+      org owner" error rather than a Stripe 400.
+  - risk: >
+      Tax handling at the door — venue tax stamping on web checkout
+      relies on a known billing address; walk-up buyers don't enter
+      one.
+    severity: MEDIUM
+    mitigation: >
+      Use the EVENT's venue address as the tax origin for POS sales
+      (same data we already have). Document this as an explicit
+      contract: door sales tax = venue-jurisdiction tax.
+
+open_questions:
+  - Multi-currency — current spec assumes the event's currency. POS
+    inherits it. No multi-currency UX.
+  - Anonymous order reconciliation — when buyerHumanId is null, how
+    do we surface those in the org's "recent orders" admin views?
+    Probably as "Walk-up sale · {time}" without a buyer column.
+    Confirm with admin UI before build.
+
+out_of_scope:
+  - External Bluetooth readers (BBPOS WisePOS, Verifone P400)
+  - Cash / split tender
+  - Tipping (codified anti-tipping stance, see FR-014)
+  - Promo code redemption at the door
+  - Per-operator till reconciliation reports
+  - Multi-variant merch (size/color matrices) — see follow-up
+  - Refunds older than 15 minutes from the device (use web admin)
+
+follow_ups:
+  merch_freeform_amount:
+    status: planned-next-likely-cheap
+    rationale: >
+      Most punk-show merch is "tape, $5. patch, $3. shirt, $20." The
+      operator does not want to maintain a catalog. They want to type
+      a number and an optional label, tap a card, and move on.
+
+      This collapses the merch problem to its smallest form:
+        - No SKU model.
+        - No inventory counter.
+        - No variants.
+        - No QR. No email. No admission.
+        - Order with a single OrderItem of kind=MERCH_FREEFORM,
+          amount = whatever the operator typed, label = whatever
+          string they typed (or "Merch" if blank).
+
+      Uses the same PaymentIntent + Settlement pipe as ticket sales.
+      The only NEW data is `OrderItem.kind` enum extension and a
+      nullable `OrderItem.label` for the freeform string. No new
+      table.
+
+      Build cost on top of v1 POS: roughly half a day. Worth shipping
+      adjacent to the ticket POS since the UI is one extra "Custom
+      amount" tile on the Sell screen.
+
+  merch_at_pos:
+    status: planned-after-freeform
+    why_not_now: >
+      Merch belongs in this same flow. Same operator, same phone,
+      same Connect account, same Settlement pipeline. The reason it
+      isn't IN v1 is purely scope discipline — we want one shippable
+      slice (tickets-at-the-door) before we widen the catalog.
+    feasibility_summary: >
+      Lower than it looks. The Order/PaymentIntent/Settlement pipe
+      is sale-shape-agnostic. What's missing is a non-ticket sellable
+      item model. Three options, in ascending cleanliness:
+
+        A. Hijack TicketType. Add `kind: TICKET | MERCH` and
+           `deliveryKind: ADMISSION | NONE`. Merch items mint a
+           "ticket" with deliveryKind=NONE and never need to scan.
+           Cheapest path; pollutes the TicketType model's semantics.
+
+        B. New `DoorItem` model. (id, eventId, name, priceCents,
+           inventory, kind=MERCH, optional variants:JSONB). Sales
+           still flow through Order + OrderItem (existing model
+           accepts a polymorphic itemRef). Cleanest separation;
+           one new table + one migration to make OrderItem polymorphic.
+
+        C. Generalise to `SellableItem` across tickets + merch +
+           future (parking, locker, drink ticket). Largest blast
+           radius; deferred.
+
+      Recommendation when we tackle it: option B. Roughly 2–3 days
+      of build time on top of the v1 POS slice (model + admin
+      catalog UI + sell-screen item type-switching).
+    inventory_invariants:
+      - Merch inventory is a simple int counter on DoorItem; no
+        seat semantics, no holds, no reservations. Decrement
+        atomically inside the same Prisma tx as Order create.
+      - Out-of-stock surfaces as a greyed item on the Sell screen
+        with "0 left" — do not let operators add to cart.
+    delivery:
+      - No QR. No email. No SMS. The buyer walks away with the
+        physical merch. Receipt remains the same opt-in URL as
+        ticket sales.
+    out_of_v1_for_merch:
+      - Variants (S/M/L, colors) — track as a single flat SKU per
+        size/color combo for v1, or punt entirely to v2.
+      - Restock workflows — merch counter is org-admin editable in
+        the catalog UI; no PO / receiving flow.
+      - Sales tax category overrides per merch item — inherit
+        venue-jurisdiction tax for v1.
+
+acceptance_criteria:
+  - An operator with SCANNER role on a Connect-enabled org event sees
+    a Sell tab in the scanner Home and can complete a $1 test sale
+    end-to-end on iPhone in Tap to Pay sandbox mode WITHOUT entering
+    any buyer contact.
+  - A successful anonymous sale produces an Order with
+    paymentChannel="POS", SUCCEEDED status, buyerHumanId=NULL, a
+    minted Ticket with status=SCANNED (auto-admit), and an entry in
+    the same Settlement queue as a web order of the same amount.
+  - The home screen's admitted counter increments immediately on a
+    successful POS sale — no second scan needed.
+  - '"Send receipt" with email creates / attaches a POS_WALKUP guest Human and sends the standard ticket email.'
+  - The Sell screen renders the anti-tipping disclosure copy in full
+    and the Stripe Terminal SDK does NOT show a tip prompt during
+    collection.
+  - When the org's Payee is RESTRICTED, the Sell tab is hidden and
+    a forced sale attempt server-side returns `payee_restricted`.
+  - Refunding a POS sale within 15 minutes via the device produces
+    the same ledger entries as a web refund of the same order. The
+    refunded ticket is moved to status=REFUNDED and the admit
+    counter decrements.
+  - Telemetry shows the full pos.* event chain for a successful
+    sale with no PAN or buyer-PII fields in the payloads.
+  - A POS sale produces a platform-balance charge (NOT on the
+    connected account). The resulting Settlement is transferred
+    to the connected account by the existing
+    `executeSettlementTransfer` job, with `source_transaction` set
+    to the card-present charge ID. Total platform fee for the POS
+    order matches the web fee policy for an order of the same
+    amount and event.
+  - A cash sale of $30 produces an Order with paymentChannel=CASH,
+    status=SUCCEEDED, amountCents=3000, no stripePaymentIntentId,
+    no Settlement row, with a minted Ticket auto-admitted per
+    FR-013. The home screen admit counter increments immediately.
+  - A cash sale at $0 (comp) produces the same Order shape with
+    amountCents=0, mints a Ticket, auto-admits, and writes an audit
+    entry attributable to actorHumanId. No Stripe call ever fires
+    on this path.
+  - Refunding a cash sale within 15 minutes via the device flips
+    Order and Ticket status to REFUNDED, decrements the admit
+    counter, and writes an audit entry. No payment-processor call
+    occurs. The Sell tab is available even with `card_present`
+    capability inactive on the connected account, so long as at
+    least one TicketType is on sale.
+
+rollout:
+  feature_flag: scanner.pos_tap_to_pay
+  default: 'ON globally; gating is per-event (FR-001 conditions — at least one TicketType on sale + scanner role; card path additionally requires chargesEnabled + card_present capability).'
+  migration:
+    - DECISION D-2026-04-26 — confirm via 30-min dev spike that
+      Tap to Pay PI creation on the platform account (no
+      `stripeAccount` header) succeeds against a Stripe test
+      Connect account with `card_present` active. Block M4.2 until
+      green.
+    - Revise M3 adapter `createCardPresentPaymentIntent` to drop
+      `stripeAccountId` and `applicationFeeAmount` args; update
+      port signature accordingly.
+    - Add `card_present` capability request to `createConnectAccount`
+      + run one-shot backfill script against existing accounts.
+    - Ship Order.paymentChannel (WEB | POS | CASH, default WEB) +
+      TicketType.doorPriceCents (nullable) + Human.source
+      migrations behind no-op defaults.
+    - Add Stripe Terminal SDK to apps/scanner; gate the new tab on
+      device capability (no global flag check).
+    - Add `pos.connectionToken` first; verify in dev with a Stripe
+      test Connect account.
+    - Add `startPosSale` + `completePosSale` + tRPC procedures.
+    - Wire scanner Sell screen end-to-end against Stripe sandbox.
+    - Flip on. Watch pos.tap_to_pay.collect_failed by decline_code;
+      watch Settlement creation parity vs web orders for the first
+      week of real sales.

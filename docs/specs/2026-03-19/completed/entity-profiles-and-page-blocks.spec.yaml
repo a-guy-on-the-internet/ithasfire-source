@@ -1,0 +1,801 @@
+status: complete
+priority: p0
+depends_on: []
+blocks:
+  - artist-epk-book-me.spec.yaml
+  - fan-follow-notify.spec.yaml
+  - artist-earnings-dashboard.spec.yaml
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Implementation Progress
+# ───────────────────────────────────────────────────────────────────────────────
+
+progress:
+  completed:
+    schema:
+      - EntityPage, PageTheme, PageBlock, PageSlugHistory models in entity-page.prisma
+      - PageOwnerType and PageVisibility enums in enums.prisma
+      - Composite unique on (ownerType, ownerId), global slug uniqueness
+      - Migration 20260319021320_entity_pages_replace_profiles (drops old Profile tables)
+    types:
+      - EntityPageRecord, PageThemeRecord, PageBlockRecord, PublicPageData, EntitySummary (packages/types)
+      - SeoEntityPage, buildEntityPageJsonLd, buildEntityPageMetadata (packages/types/seo)
+    ports:
+      - EntityPagesRepo in packages/ports (getByOwner, getBySlug, upsert, isSlugAvailable, resolveSlugHistory, recordSlugHistory, theme CRUD, block CRUD)
+    adapters:
+      - makeEntityPagesRepo in packages/adapters/db/prisma/entity-pages.ts
+      - ProfilesRepo backward-compat shim in packages/adapters/db/prisma/profiles.ts (delegates to EntityPage with ownerType=HUMAN)
+    core:
+      - Block kinds registry with per-ownerType validation (block-kinds.ts)
+      - getPublicPage (slug resolution, slug history redirect, visibility gating, entity summary loading)
+      - getMyPage (authed, includes hidden blocks)
+      - updatePage (slug change with history recording, owner access control)
+      - updatePageTheme (colors, font, layout key)
+      - managePageBlocks (add/edit/reorder/toggleVisibility/delete via discriminated union)
+      - checkSlugAvailability
+      - Tests: 129 entity-pages tests across 7 files
+    transport:
+      - entityPagesRouter in packages/transport/trpc (6 procedures: getBySlug, isSlugAvailable, getMyPage, updatePage, updatePageTheme, managePageBlocks)
+    web_routes:
+      - /p/[slug] — universal page route with metadata, JSON-LD, redirect
+      - /humans/[slug] — HUMAN alias (type guard + redirect for non-HUMAN entities)
+      - /places/[slug] — PLACE alias (type guard + redirect)
+      - /orgs/[slug] — ORGANIZATION alias (type guard + redirect)
+      - Shared toSeoEntityPage helper (deduplicated across all 4 routes)
+      - EntityPageJsonLd component wrapping buildEntityPageJsonLd
+      - EntityPageShell with theme CSS custom properties injection
+    seed:
+      - extras.ts seeds EntityPage + PageTheme + PageBlocks (replaces old Profile seeding)
+
+  remaining:
+    block_rendering:
+      status: done
+      description: >
+        Block kind → React component registry.  25 block components (17 real + 8 stubs
+        for data-driven kinds) in apps/web/src/app/p/[slug]/_components/blocks/.
+        BLOCK_REGISTRY maps kind → component.  BlockRenderer + BlockFallback handle
+        lookup + dev-only unknown-kind warnings.  EntityPageShell uses BlockRenderer.
+      priority: p1
+    layout_shells:
+      status: done
+      description: >
+        Three type-specific header components extracted from EntityPageShell into
+        apps/web/src/app/p/[slug]/_components/headers/:
+        - HumanPageHeader: banner + Avatar + name + bio + "Book Me" CTA
+          (shown when bookingEmail set) + Follow button placeholder.
+        - PlacePageHeader: banner + Avatar (square) + name + bio + address
+          line with map-pin SVG icon + "Verified Venue" Badge (when PUBLIC).
+        - OrgPageHeader: banner + Avatar (square) + name + bio + trust-tier
+          Badge (tone=success, variant=soft) + "Organization" label.
+        EntityPageShell dispatches to the correct header based on entity.type
+        and continues to inject theme CSS custom properties + render page blocks.
+        New CSS classes added to entity-page-shell.module.css: headerActions,
+        ctaButton, secondaryButton, addressLine, verificationRow, memberCount.
+        Uses @th/ui Avatar and Badge throughout.
+      priority: p2
+      note: >
+        The generic shell is fine for now.  Type-specific shells can be added
+        incrementally without breaking the existing routes.
+    editing_routes:
+      status: done
+      description: >
+        Page editor UI routes implemented with shared PageEditorView component
+        (apps/web/src/components/entity-pages/) reused across all three routes:
+        - /account/page (human's own page editor)
+        - /admin/[slug]/page (org page editor, added to ADMIN_SECTIONS with FileText icon)
+        - /admin/[slug]/places/[placeId]/page (place page editor within org admin)
+        Editors include: PageFieldsEditor (slug, displayName, bio, visibility with
+        live slug availability check), PageThemeEditor (colors, font, layout with
+        color preview swatches), PageBlocksEditor (add/reorder/toggle/delete blocks
+        with per-ownerType valid-kind filtering).
+      priority: p1
+    auto_create_pages:
+      status: done
+      description: >
+        Auto-creating EntityPage rows when new Orgs/Places/Humans are provisioned.
+        HUMAN pages are auto-created via the ProfilesRepo shim in
+        provision-human-for-auth-user.  ORGANIZATION pages are now auto-created
+        inside createOrg (packages/core/src/use-cases/orgs/create-org.ts) within
+        the same transaction that creates the org.  PLACE pages are auto-created
+        inside upsertPlace (packages/core/src/use-cases/places/upsert-place.ts)
+        within the creation transaction (skipped on updates).  Both use
+        sanitizeText from slug-utils to derive a URL-safe page slug with an 8-char
+        ID suffix for uniqueness.  Tests added to both use cases.
+      priority: p2
+    styling_refactor:
+      status: done
+      description: >
+        Replaced all inline styles across the 18 block/shell components with a
+        shared CSS module and reusable @th/ui component integration.
+        New files:
+          - block-primitives.tsx — 6 shared primitives (BlockSection, BlockHeading,
+            BlockBodyText, BlockEmpty, BlockPillLink, BlockListCard).
+          - block-primitives.module.css — ~220 lines of shared CSS classes
+            (blockSection, blockHeading, chipRow, gridAutoFill, statGroup,
+            videoWrapper, ctaButton, etc.).
+          - entity-page-shell.module.css — shell layout classes.
+        @th/ui reuse:
+          - Avatar (TeamBlock hero, EntityPageShell page avatar)
+          - Chip (GenreTagsBlock with variant=subtle, AmenitiesBlock with variant=outline)
+          - Badge (EntityPageShell trust badge with tone=success, variant=soft)
+        All 18 files (14 blocks + StubBlocks + BlockFallback + UpcomingEventsBlock +
+        EntityPageShell) now use the shared primitives and CSS module classes
+        instead of raw inline style objects.
+      priority: p1
+    profiles_shim_removal:
+      status: done
+      description: >
+        Fully removed the ProfilesRepo shim and all ProfileRecord references.
+        Migrated every call site from repos.profiles / trpc.profiles to
+        repos.entityPages / trpc.entityPages.  Detailed changelist:
+
+        Core use cases migrated (7 files):
+          - get-my-profile, set-avatar-from-upload, set-banner-from-upload,
+            create-human, provision-human-for-auth-user,
+            list-event-owner-entities, build-search-index.
+
+        Adapter migrated:
+          - better-auth-authn-adapter.ts (tx.profiles → tx.entityPages)
+          - apps/api/src/auth/better-auth.ts (avatar sync on auth user update)
+
+        Transport:
+          - profilesRouter deleted; 5 procedures merged into entityPagesRouter
+            (getMyProfile, requestAvatarUpload, setAvatarFromUpload,
+            requestBannerUpload, setBannerFromUpload).
+
+        Web call sites (4 files):
+          - AppNavbar, ProfileMenu, WelcomeProfileCard, account/settings/page
+            all switched from trpc.profiles to trpc.entityPages.
+
+        Types cleanup:
+          - HumanWithProfile → HumanWithPage (profile field → page field)
+            in ports/repos/humans.ts, adapters/db/prisma/humans.ts,
+            build-search-index.ts, and test fakes.
+          - packages/types/src/repos/profiles.ts deleted (ProfileRecord,
+            UpsertProfileInput removed).
+          - Export removed from packages/types/src/index.ts.
+
+        Infrastructure removed:
+          - packages/ports/src/repos/profiles.ts (ProfilesRepo interface)
+          - packages/adapters/src/db/prisma/profiles.ts (shim implementation)
+          - packages/transport/trpc/src/routers/profiles.ts (profiles router)
+          - packages/types/src/repos/profiles.ts (ProfileRecord types)
+          - "profiles" removed from with-dependency-guard.ts repoKeys array
+
+        Test fakes cleaned (~50 files):
+          - All profiles: stubs removed from mock repos/txRepos across
+            core, adapters, and transport test files.
+          - profilesRepoPrototype removed from test-utils prototypes.
+          - create-agreement-deps, upsert-agreement-test-context, and
+            create-event-deps updated to use HumanWithPage/PageSummary.
+          - Router contract test and profiles.test.ts updated.
+      priority: p3
+
+task: >
+  Generalise the current human-only Profile / ProfileTheme / ProfileModule
+  system into an entity-agnostic "Page + PageBlock" system that serves
+  Humans, Organizations, and Places equally.  This is the prerequisite for
+  public profile pages, the EPK spec, org landing pages, and rich place pages.
+
+goal: >
+  One composable rendering pipeline for every entity's public page.  A place
+  page, an artist EPK, and an org landing page should all be assembled from
+  the same building blocks — ordered, themed, entity-scoped page blocks —
+  with kind-specific renderers on the frontend and kind-specific validation
+  in core.  Avoid three parallel profile systems that drift apart.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Context: What Exists Today
+# ───────────────────────────────────────────────────────────────────────────────
+
+current_state:
+  profile_models: >
+    Profile (humanId PK, slug, displayName, bio, avatarUrl, bannerUrl,
+    visibility).  ProfileTheme (humanId PK, colors, fontKey, layoutKey).
+    ProfileModule (id, humanId FK, kind, orderIndex, data JSON).
+    All three are keyed exclusively on humanId — no place or org can use them.
+
+  profile_module_kinds: >
+    Existing kinds: "about", "shows", "music", "photos", "links",
+    "custom_html_sanitized".  Stored as a free-form string, no enum.
+    The EPK spec proposes 7 more human-specific kinds (tracks, video, press,
+    stats, past_shows, rider, genre_tags).
+
+  profile_slug_history: >
+    ProfileSlugHistory tracks human slug changes.  PlaceSlugHistory and
+    OrgSlugHistory exist separately on their respective models.
+
+  profile_repo: >
+    ProfilesRepo has only getByHumanId + upsert.  No public lookup by slug,
+    no module reads, no theme reads.
+
+  place_pages: >
+    /places/id/[placeId] renders a bare-bones page (name, address, status,
+    upcoming events).  /places/[slug] is a stub returning notFound().
+    Place has no bio, bannerUrl, or page-block capability.
+
+  org_pages: >
+    No public org page exists.  Organization has slug, name, contactEmail,
+    physicalAddress, trustTier — but no public-facing rendering.
+
+  polymorphic_precedent: >
+    The codebase already uses entity-type discriminators in several places:
+    - Embed: subjectType ("event"|"organization"|"place") + subjectId
+    - PlaceOwnerType: HUMAN | ORGANIZATION
+    - ImageOwnerType: EVENT | ORG
+    - PayeeSubjectType: HUMAN | ORGANIZATION
+    - InviteListOwnerType: HUMAN | ORGANIZATION
+    - SavedLocation: ownerType + ownerId
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Design: Rename & Generalise
+# ───────────────────────────────────────────────────────────────────────────────
+
+naming:
+  rationale: >
+    "Profile" implies a person.  "Page" is what we're actually building — a
+    public landing page for any entity.  "ProfileModule" becomes "PageBlock"
+    because it's a composable content block on that page.  "ProfileTheme"
+    becomes "PageTheme".
+
+  rename_map:
+    Profile: EntityPage
+    ProfileTheme: PageTheme
+    ProfileModule: PageBlock
+    ProfileSlugHistory: "(keep per-entity slug histories as-is)"
+    ProfileVisibility: PageVisibility
+    ProfilesRepo: EntityPagesRepo
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Schema Changes
+# ───────────────────────────────────────────────────────────────────────────────
+
+schema:
+  new_enum:
+    name: PageOwnerType
+    values:
+      - HUMAN
+      - ORGANIZATION
+      - PLACE
+    note: >
+      Follows the same pattern as PlaceOwnerType, ImageOwnerType, etc.
+      Could be unified into a single EntityType enum later, but keeping
+      it scoped avoids coupling unrelated subsystems.
+
+  entity_page:
+    replaces: Profile
+    model: |
+      model EntityPage {
+        id          String         @id @default(uuid())
+        ownerType   PageOwnerType
+        ownerId     String         // humanId | orgId | placeId
+        slug        String         @unique
+        displayName String?
+        bio         String?
+        avatarUrl   String?
+        bannerUrl   String?
+        visibility  PageVisibility @default(PUBLIC)
+
+        theme       PageTheme?
+        blocks      PageBlock[]
+        slugHistory PageSlugHistory[]
+
+        createdAt   DateTime       @default(now())
+        updatedAt   DateTime       @updatedAt
+
+        @@unique([ownerType, ownerId])
+        @@index([slug])
+        @@index([ownerType, ownerId])
+      }
+    notes:
+      - >
+        Composite unique on (ownerType, ownerId) enforces one page per entity.
+        The old Profile.humanId PK becomes ownerId with ownerType=HUMAN.
+      - >
+        slug remains globally unique — no collisions between a human slug and
+        a place slug.  This means /p/<slug> resolves unambiguously without
+        needing a type prefix in the URL (though we can still use typed routes
+        like /places/<slug> and /humans/<slug> as aliases).
+      - >
+        displayName on EntityPage is a page-level override.  The canonical
+        name lives on Human.displayName / Organization.name / Place.name.
+        When null, the renderer falls back to the entity's canonical name.
+
+  page_theme:
+    replaces: ProfileTheme
+    model: |
+      model PageTheme {
+        id           String  @id @default(uuid())
+        pageId       String  @unique
+        colorPrimary String?
+        colorBg      String?
+        colorText    String?
+        fontKey      String?
+        layoutKey    String?
+
+        page EntityPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
+      }
+    notes:
+      - >
+        FK to EntityPage.id instead of humanId.  A place or org can
+        have its own theme exactly the same way a human can.
+
+  page_block:
+    replaces: ProfileModule
+    model: |
+      model PageBlock {
+        id         String @id @default(uuid())
+        pageId     String
+        kind       String // free-form, validated per ownerType in core
+        orderIndex Int    @default(0)
+        data       Json   @default("{}")
+        visible    Boolean @default(true)
+
+        page EntityPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
+
+        @@index([pageId, orderIndex])
+      }
+    notes:
+      - >
+        Added a `visible` flag so users can hide a block without deleting it
+        (draft mode, seasonal content, etc.).
+      - >
+        `kind` stays a free-form string.  Validation lives in core, not in
+        the database.  This keeps migrations out of the picture when adding
+        new block kinds.
+
+  page_slug_history:
+    replaces: ProfileSlugHistory
+    model: |
+      model PageSlugHistory {
+        id         String   @id @default(uuid())
+        pageId     String
+        slug       String   @unique
+        recordedAt DateTime @default(now())
+
+        page EntityPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
+
+        createdAt DateTime @default(now())
+
+        @@index([pageId, recordedAt])
+      }
+    notes:
+      - >
+        Subsumes ProfileSlugHistory.  PlaceSlugHistory and OrgSlugHistory
+        remain on their respective models for now because slugs there serve
+        routing (Place.slug is used in event URLs, Org.slug in admin URLs).
+        PageSlugHistory tracks the *page* slug specifically (which may diverge
+        from the entity's admin slug over time).
+
+  page_visibility_enum:
+    replaces: ProfileVisibility
+    values:
+      - PUBLIC
+      - PRIVATE
+      - UNLISTED   # new: accessible via direct link but not indexed
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Block Kinds by Owner Type
+# ───────────────────────────────────────────────────────────────────────────────
+
+block_kinds:
+  universal:
+    note: Available to all entity types (HUMAN, ORGANIZATION, PLACE)
+    kinds:
+      - about          # Rich text / markdown bio section
+      - links          # External links (social, website, etc.)
+      - photos         # Photo gallery
+      - custom_html_sanitized  # Free-form sanitized HTML
+      - upcoming_events  # Auto-populated upcoming events list
+      - announcements  # Recent announcements feed
+
+  human_only:
+    note: Only valid when ownerType = HUMAN
+    kinds:
+      - shows          # Existing "shows" kind (legacy, basic)
+      - music          # Existing "music" kind (legacy, basic)
+      - tracks         # EPK: audio player with uploads + embeds
+      - video          # EPK: video embeds
+      - press          # EPK: press mentions
+      - stats          # EPK: computed performance stats
+      - past_shows     # EPK: data-backed past show list
+      - rider          # EPK: technical rider
+      - genre_tags     # EPK: genre classification
+
+  place_only:
+    note: Only valid when ownerType = PLACE
+    kinds:
+      - location_map   # Embedded map with pin (uses existing lat/lng)
+      - capacity_info  # Capacity, standing/seated, layout preview
+      - house_rules    # House rules / policies
+      - amenities      # Amenities list (parking, accessibility, etc.)
+      - resident_artists  # Auto-populated from EventHuman at this place
+      - booking_info   # How to book this venue (availability, contact)
+
+  org_only:
+    note: Only valid when ownerType = ORGANIZATION
+    kinds:
+      - team           # Public team members (from OrgMember, opt-in)
+      - mission        # Mission statement / org description
+      - managed_places # Auto-populated places the org manages
+      - past_events    # Auto-populated completed events
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Migration Strategy
+# ───────────────────────────────────────────────────────────────────────────────
+
+migration:
+  status: done
+  migration_file: packages/db/prisma/migrations/20260319021320_entity_pages_replace_profiles/migration.sql
+  approach: >
+    Rename + widen in a single migration.  The Profile table has very few rows
+    (only dev-seeded humans).  No production data to worry about yet — but
+    write the migration as if there were, so the pattern is established.
+
+  steps:
+    - step: 1
+      status: done
+      description: >
+        Create new tables (EntityPage, PageTheme, PageBlock, PageSlugHistory)
+        with the new enums (PageOwnerType, PageVisibility).
+
+    - step: 2
+      status: done
+      description: >
+        Migrate existing Profile → EntityPage rows:
+          INSERT INTO EntityPage (id, ownerType, ownerId, slug, displayName, bio, avatarUrl, bannerUrl, visibility)
+          SELECT uuid_generate_v4(), 'HUMAN', humanId, slug, displayName, bio, avatarUrl, bannerUrl, visibility::text::PageVisibility
+          FROM Profile;
+        Then migrate ProfileTheme → PageTheme and ProfileModule → PageBlock
+        with FK remapping.
+
+    - step: 3
+      status: done
+      description: >
+        Migrate ProfileSlugHistory → PageSlugHistory with pageId FK.
+
+    - step: 4
+      status: done
+      description: >
+        Drop old tables (Profile, ProfileTheme, ProfileModule, ProfileSlugHistory).
+        Remove the ProfileVisibility enum.
+
+    - step: 5
+      status: not-started
+      description: >
+        Auto-create EntityPage rows for existing Organizations (ownerType=ORGANIZATION,
+        slug from Organization.slug) and Places (ownerType=PLACE, slug from
+        Place.slug where not null).  These start with no blocks — admins/owners
+        add content later.
+
+  seed_update:
+    status: done
+    note: >
+      extras.ts updated to create EntityPage + PageTheme + PageBlock instead of
+      Profile + ProfileTheme + ProfileModule.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Port & Adapter Changes
+# ───────────────────────────────────────────────────────────────────────────────
+
+ports:
+  entity_pages_repo:
+    status: done
+    replaces: ProfilesRepo
+    methods:
+      - name: getByOwner
+        signature: "(ownerType: PageOwnerType, ownerId: string) => Promise<EntityPageRecord | null>"
+        note: Replaces getByHumanId.  Works for any entity type.
+
+      - name: getBySlug
+        signature: "(slug: string) => Promise<EntityPageRecord | null>"
+        note: >
+          Public lookup.  Returns the page plus ownerType so the renderer
+          knows which block kinds are valid and which entity to fetch
+          canonical data from.
+
+      - name: upsert
+        signature: "(input: UpsertEntityPageInput) => Promise<EntityPageRecord>"
+        note: Replaces the existing upsert.  Input includes ownerType + ownerId.
+
+      - name: isSlugAvailable
+        signature: "(slug: string, excludePageId?: string) => Promise<boolean>"
+        note: Checks global slug uniqueness, optionally excluding a given page.
+
+      - name: resolveSlugHistory
+        signature: "(slug: string) => Promise<string | null>"
+        note: Returns the current slug if the input slug exists in PageSlugHistory.
+
+      - name: recordSlugHistory
+        signature: "(pageId: string, slug: string) => Promise<void>"
+        note: Records a slug change so old URLs can redirect.
+
+      - name: listBlocks
+        signature: "(pageId: string) => Promise<PageBlockRecord[]>"
+        note: Returns blocks ordered by orderIndex, respecting visible flag.
+
+      - name: createBlock
+        signature: "(input: UpsertPageBlockInput) => Promise<PageBlockRecord>"
+        note: Create a single block.
+
+      - name: updateBlock
+        signature: "(input: UpdatePageBlockInput) => Promise<PageBlockRecord>"
+        note: Update a single block.
+
+      - name: reorderBlocks
+        signature: "(pageId: string, blockIds: string[]) => Promise<void>"
+        note: Batch-update orderIndex based on array position.
+
+      - name: deleteBlock
+        signature: "(blockId: string) => Promise<void>"
+
+      - name: getTheme
+        signature: "(pageId: string) => Promise<PageThemeRecord | null>"
+
+      - name: upsertTheme
+        signature: "(input: UpsertPageThemeInput) => Promise<PageThemeRecord>"
+
+  backward_compat:
+    status: done
+    description: >
+      Thin ProfilesRepo shim in packages/adapters/db/prisma/profiles.ts
+      delegates to EntityPage with ownerType=HUMAN hardcoded.  Still used by
+      getMyProfile, avatar/banner upload use cases, and profilesRouter.
+      Will be removed once all call sites migrate to EntityPagesRepo.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Use Cases
+# ───────────────────────────────────────────────────────────────────────────────
+
+use_cases:
+  - name: getPublicPage
+    status: done
+    description: >
+      Fetch an entity's public page by slug.  Returns EntityPage + blocks +
+      theme + the canonical entity data (name, avatar fallback, etc.).
+      This is the SSR data-loader for /p/<slug>, /humans/<slug>,
+      /places/<slug>, /orgs/<slug>.
+    input: "{ slug: string }"
+    output: >
+      { page: EntityPageRecord, blocks: PageBlockRecord[], theme: PageThemeRecord | null,
+        entity: HumanPublicData | OrgPublicData | PlacePublicData,
+        redirect: boolean }
+    auth: None (public).  Respects visibility flag.
+    notes: >
+      Also resolves historical slugs via PageSlugHistory and returns
+      redirect=true so the caller can 301 to the current slug.
+
+  - name: getMyPage
+    status: done
+    description: >
+      Fetch the authenticated user's own page (or an entity page they have
+      edit rights on).  Includes hidden blocks.
+    input: "{ ownerType: PageOwnerType, ownerId: string }"
+    output: Same as getPublicPage but includes visible=false blocks.
+    auth: Must be the owner or org admin / place owner.
+
+  - name: updatePage
+    status: done
+    description: >
+      Update page-level fields (displayName, bio, avatarUrl, bannerUrl,
+      visibility, slug).  Records slug history on slug change.
+    input: "{ ownerType, ownerId, ...fields }"
+    auth: Owner / org admin / place owner.
+
+  - name: managePageBlocks
+    status: done
+    description: >
+      CRUD for blocks — add, edit, reorder, toggle visibility, delete.
+      Core validates that the block kind is valid for the ownerType
+      (e.g., "rider" is rejected for a PLACE page).
+    input: "{ pageId, action: 'add'|'edit'|'reorder'|'toggleVisibility'|'delete', ...payload }"
+    auth: Owner / org admin / place owner.
+
+  - name: updatePageTheme
+    status: done
+    description: Update theme colors, font, and layout key.
+    input: "{ pageId, ...themeFields }"
+    auth: Owner / org admin / place owner.
+
+  - name: checkSlugAvailability
+    status: done
+    description: >
+      Check if a slug is available for use (not taken by another EntityPage).
+      Optionally excludes a given pageId so the current owner can re-check
+      their own slug.
+    input: "{ slug: string, excludePageId?: string }"
+    output: "{ available: boolean }"
+    auth: Authenticated.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Routing
+# ───────────────────────────────────────────────────────────────────────────────
+
+routes:
+  public:
+    - path: /p/[slug]
+      status: done
+      description: >
+        Universal page route.  Resolves slug → EntityPage, determines
+        ownerType, renders the appropriate layout.  This is the canonical
+        shareable URL.
+
+    - path: /humans/[slug]
+      status: done
+      description: >
+        Alias for /p/<slug> when ownerType=HUMAN.  Redirects to /p/<slug>
+        if the slug doesn't belong to a human entity.  (Originally planned
+        as /artists/[slug] but renamed to match the HUMAN entity type —
+        not all humans are artists.)
+
+    - path: /places/[slug]
+      status: done
+      description: >
+        Alias for /p/<slug> when ownerType=PLACE.  Replaces the current
+        stub.  Falls back to the existing /places/id/[placeId] for
+        places without a page.
+
+    - path: /orgs/[slug]
+      status: done
+      description: >
+        Alias for /p/<slug> when ownerType=ORGANIZATION.
+
+  editing:
+    - path: /account/page
+      status: done
+      description: >
+        Human's own page editor.  Uses PageEditorView with ownerType=HUMAN
+        and humanId resolved from useEventOwnerEntities.  Linked from the
+        account menu (/account).
+
+    - path: /admin/[slug]/page
+      status: done
+      description: >
+        Org page editor, added to ADMIN_SECTIONS in the admin layout
+        with FileText icon.
+
+    - path: /admin/[slug]/places/[placeId]/page
+      status: done
+      description: >
+        Place page editor within the org admin.  Back-links to the
+        place edit page.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Rendering Architecture
+# ───────────────────────────────────────────────────────────────────────────────
+
+rendering:
+  block_registry:
+    status: done
+    description: >
+      A client-side registry maps block kind → React component.  The page
+      renderer iterates over blocks and looks up the component by kind.
+      Unknown kinds render a graceful fallback (hidden in production,
+      yellow warning box in dev).  25 block kinds mapped: 6 universal,
+      5 place, 4 human content, 4 human data-driven stubs, 6 place stubs,
+      2 org content, 2 org stubs.  Lives in apps/web/src/app/p/[slug]/_components/blocks/.
+    files:
+      - apps/web/src/app/p/[slug]/_components/blocks/block-registry.ts
+      - apps/web/src/app/p/[slug]/_components/blocks/BlockRenderer.tsx
+      - apps/web/src/app/p/[slug]/_components/blocks/BlockFallback.tsx
+      - apps/web/src/app/p/[slug]/_components/blocks/index.ts
+
+  layout_shells:
+    status: done
+    description: >
+      Three type-specific header components in headers/:
+      - HumanPageHeader: banner + avatar + name + "Book Me" CTA + follow button
+      - PlacePageHeader: banner + avatar (square) + name + address + map pin + "Verified Venue" badge
+      - OrgPageHeader: banner + avatar (square) + name + trust badge + organization label
+      EntityPageShell dispatches to the correct header by entity.type, injects
+      theme CSS vars, and renders the block list.
+    files:
+      - apps/web/src/app/p/[slug]/_components/EntityPageShell.tsx
+      - apps/web/src/app/p/[slug]/_components/headers/HumanPageHeader.tsx
+      - apps/web/src/app/p/[slug]/_components/headers/PlacePageHeader.tsx
+      - apps/web/src/app/p/[slug]/_components/headers/OrgPageHeader.tsx
+      - apps/web/src/app/p/[slug]/_components/headers/index.ts
+      - apps/web/src/app/p/[slug]/_components/entity-page-shell.module.css
+
+  theme_application:
+    status: done
+    description: >
+      PageTheme values are injected as CSS custom properties on the page
+      container.  Blocks inherit them automatically.  This means a place
+      can have a dark theme with custom accent colors, same as an artist.
+    note: >
+      EntityPageShell.buildThemeVars() injects --th-color-primary, --th-color-bg,
+      --th-color-text, --th-font-key, --th-layout-key.  The container uses them
+      for backgroundColor and color.  Downstream blocks inherit via CSS cascade.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Impact on Existing Specs
+# ───────────────────────────────────────────────────────────────────────────────
+
+spec_impacts:
+  artist_epk_book_me: >
+    EPK module kinds (tracks, video, press, stats, past_shows, rider,
+    genre_tags) become PageBlock kinds restricted to ownerType=HUMAN.
+    "Book Me" CTA fields move from Profile to EntityPage (or stay as
+    a human-specific extension — see open question below).
+
+  fan_follow_notify: >
+    Follow button lives in HumanPageShell.  Follower count rendered by
+    the "stats" block.  No schema change needed — ArtistFollow still
+    references humanId directly.
+
+  artist_earnings_dashboard: >
+    Independent — lives in /dashboard, not on the public page.  No impact.
+
+  place_pages: >
+    Place.slug now resolves to an EntityPage.  The existing bare-bones
+    PlaceContent component is replaced by the block-based renderer with
+    location_map, upcoming_events, capacity_info, etc.
+
+  org_pages: >
+    Org.slug resolves to an EntityPage.  Org admins can add blocks via
+    the page editor in /admin/[slug]/page.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Open Questions
+# ───────────────────────────────────────────────────────────────────────────────
+
+open_questions:
+  - question: >
+      Should "Book Me" CTA fields (bookMeEnabled, bookMeLabel, bookMeMessage)
+      live as columns on EntityPage or as a dedicated PageBlock kind?
+    leaning: >
+      PageBlock with kind="book_me_cta".  It's content the owner configures
+      and positions, not page metadata.  The shell can detect whether a
+      book_me_cta block exists and render it in a sticky position if the
+      layout calls for it.
+    status: open
+
+  - question: >
+      Should we keep per-entity slug histories (PlaceSlugHistory, OrgSlugHistory)
+      or consolidate them into PageSlugHistory?
+    resolution: >
+      Keep both.  Entity slugs serve admin routing (org admin URLs,
+      place management).  Page slugs serve public vanity URLs.  They might
+      diverge (e.g., org slug "acme-events" but page slug "acme").
+      PageSlugHistory is implemented and working; per-entity slug histories
+      remain on their respective models.
+    status: resolved
+
+  - question: >
+      Do events need EntityPage too?
+    leaning: >
+      Not yet.  Events already have their own rich display page with
+      description, images, ticket types, etc.  If we ever want event pages
+      to be block-composed, this system supports it — just add EVENT to
+      PageOwnerType.  But that's future scope.
+    status: open
+
+  - question: >
+      Global slug uniqueness means a human can't take a slug already used
+      by a place.  Is that acceptable?
+    resolution: >
+      Yes.  Implemented with a unique constraint on EntityPage.slug.
+      checkSlugAvailability use case and isSlugAvailable repo method
+      enforce this at the application layer too.
+    status: resolved
+
+  - question: >
+      Should the existing Profile model fields (bio, avatarUrl, bannerUrl)
+      on Human/Org/Place be duplicated onto EntityPage, or should EntityPage
+      be the single source of truth?
+    resolution: >
+      EntityPage is the source of truth for public display.  Human.displayName,
+      Org.name, Place.name remain canonical identity fields.  EntityPage fields
+      are optional overrides for the public page (e.g., a stage name vs legal
+      name).  Implemented: the display name fallback chain is
+      page.displayName → entity.name → page.slug.
+    status: resolved
+
+  - question: >
+      Should the HUMAN alias route be /artists/[slug] or /humans/[slug]?
+    resolution: >
+      /humans/[slug].  Not all humans are artists — the entity type is HUMAN,
+      so the URL should match.  Originally planned as /artists, renamed
+      during implementation.
+    status: resolved

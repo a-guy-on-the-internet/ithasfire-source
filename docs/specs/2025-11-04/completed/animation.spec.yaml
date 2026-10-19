@@ -1,0 +1,160 @@
+# Copilot Task: Add Reanimated + React Native Skia to our monorepo (web + mobile)
+goal: |
+  Install and wire up React Native Reanimated and @shopify/react-native-skia so they work across:
+  - apps/web (Next.js + Tamagui, React 18/19)
+  - apps/mobile and apps/scanner (Expo/React Native)
+  using our existing monorepo (pnpm + Turbo). Configure Babel/Next/Metro, iOS/Android, and ensure
+  SSR-safe imports for web. Do not break existing Tamagui setup.
+
+context:
+  stack:
+    - pnpm workspaces + turbo
+    - Next.js app at apps/web (using @tamagui/next-plugin)
+    - Expo apps at apps/mobile and apps/scanner
+    - packages/ui (Tamagui components)
+    - packages/ports, packages/core, packages/adapters, etc.
+  assumptions:
+    - Node 18+
+    - Expo SDK >= 50 (Hermes default)
+    - Next.js >= 14
+    - React Native Reanimated v3+
+    - Using Tamagui + react-native-web on web
+
+constraints:
+  - Reanimated Babel plugin MUST be last in the plugins array.
+  - Keep config centralized when possible; allow app-level overrides.
+  - Support web tree-shaking and avoid server-side import crashes (wrap Skia usage with “use client” where needed).
+  - Do not add code that causes SSR runtime imports of Skia/Reanimated in server components.
+
+deliverables:
+  - Updated dependencies in the right workspaces
+  - Babel, Next, Metro, and tsconfig changes
+  - iOS/Android native config for Reanimated/Skia (Expo prebuild aware)
+  - Minimal example components to validate both libs on web + mobile
+  - Verification steps (scripts + manual checks)
+  - Notes for common pitfalls
+
+packages_to_install:
+  root_workspace:
+    runtime:
+      - react-native-reanimated
+      - @shopify/react-native-skia
+      - react-native-gesture-handler
+    dev:
+      - @types/react-native # if needed for web TS hints
+
+dependency_scopes:
+  - apps/web: add to transpilePackages in next.config and tamagui plugin
+  - apps/mobile, apps/scanner: ensure added to Expo project deps
+  - packages/ui: can import Reanimated/Skia for client-only components
+
+files_to_edit:
+  - babel:
+      path_candidates:
+        - babel.config.js
+        - babel.config.cjs
+      changes:
+        - Ensure presets remain (next/babel or metro preset), then add:
+          "plugins": [
+            ["react-native-reanimated/plugin", { "relativeSourceLocation": true }]
+          ]
+          # IMPORTANT: plugin last
+  - next_config:
+      path: apps/web/next.config.ts
+      changes:
+        - Wrap with @tamagui/next-plugin (if not already).
+        - Ensure transpilePackages includes:
+          - "react-native-reanimated"
+          - "@shopify/react-native-skia"
+          - "react-native-gesture-handler"
+          - "react-native"
+          - "react-native-web"
+        - Ensure images/webpack rules do not SSR-import Skia.
+        - Example: set experimental.optimizePackageImports or alias if needed.
+  - tamagui_next_plugin:
+      path: apps/web/next.config.ts
+      changes:
+        - withTamagui({ config: "./tamagui.config.ts", components: ["tamagui"] })
+        - keep withTranspileModules list updated to include reanimated/skia
+  - metro_config:
+      path_candidates:
+        - apps/mobile/metro.config.js
+        - apps/scanner/metro.config.js
+      changes:
+        - Enable assetExts/sourceExts defaults
+        - Ensure resolver.extraNodeModules maps "react-native" correctly
+        - Include Skia/Reanimated in transformer options if required by versions
+  - expo_app_json:
+      path_candidates:
+        - apps/mobile/app.json
+        - apps/mobile/app.config.ts
+        - apps/scanner/app.json
+      changes:
+        - plugins: include ["react-native-reanimated"] if needed for your SDK
+  - ios_android_native (Expo prebuild):
+      ios:
+        - Ensure Hermes is enabled (Expo SDK usually defaults)
+        - Pod install after prebuild
+      android:
+        - No ProGuard changes usually needed with SDK >= 50, confirm minSdk/NDK if Skia needs it (Skia bundles its own)
+  - tsconfig:
+      path_candidates:
+        - tsconfig.base.json
+        - apps/web/tsconfig.json
+        - packages/ui/tsconfig.json
+      changes:
+        - Add "types": ["react", "react-dom"]
+        - For client-only files in packages/ui, ensure "moduleResolution": "bundler" if using React 19 / Next 15
+  - example_components:
+      - packages/ui/src/ui/AnimatedBox.tsx:
+          - “use client”
+          - minimal Reanimated shared value + animated view
+      - packages/ui/src/ui/SkiaDemo.tsx:
+          - “use client”
+          - minimal <Canvas> with a rect/circle
+      - apps/web/src/app/(app)/playground/page.tsx:
+          - client component importing both demos
+      - apps/mobile/App.tsx:
+          - screen rendering both demos behind a toggle
+
+code_guidelines:
+  - Always mark Reanimated/Skia demo components with `"use client"`.
+  - Guard web SSR imports:
+      - dynamic(() => import("..."), { ssr: false }) for pages that showcase Skia.
+  - Ensure any animated style hooks run client-side only.
+  - For Tamagui, wrap animated components with styled() only if needed and tested.
+
+verification:
+  scripts:
+    - pnpm i
+    - pnpm turbo run build --filter=apps/web
+    - pnpm turbo run dev --filter=apps/web
+    - pnpm turbo run start --filter=apps/mobile # or expo start
+  manual:
+    - Web: visit /playground, confirm animated box moves and Skia canvas renders.
+    - Mobile: run on iOS/Android simulators, confirm both demos render without redboxes.
+    - Confirm no “Reanimated plugin not found” or “Skia not supported” errors.
+  CI:
+    - Ensure build step runs `expo prebuild --non-interactive` for EAS-like pipeline when building native apps.
+
+common_pitfalls_and_fixes:
+  - Reanimated plugin not last in Babel → move it to the end.
+  - SSR crash on web due to Skia import → wrap usage with dynamic import (ssr: false) or “use client”.
+  - Missing transpilePackages → Next fails to compile reanimated/skia.
+  - Expo prebuild not run after adding native modules → run `npx expo prebuild` and commit ios/android or rely on EAS.
+  - Gesture handler order: ensure import "react-native-gesture-handler" at app entry (mobile).
+
+acceptance_criteria:
+  - Web and mobile both render a moving animated box (Reanimated) and a basic Skia canvas without runtime errors.
+  - Next.js build succeeds with Tamagui + transpilePackages.
+  - Expo dev client builds and runs on iOS and Android.
+  - No SSR errors in logs for pages that do not mount client demos.
+
+out_of_scope:
+  - Complex animation examples
+  - Skia image decoding performance tuning
+  - SSR rendering of Skia (we will no-op on server)
+
+notes:
+  - Keep example components tiny; the goal is to validate wiring.
+  - Prefer colocating “demo” pages under an internal route group like (app)/playground for easy manual testing.

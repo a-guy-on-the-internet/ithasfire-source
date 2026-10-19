@@ -1,0 +1,58 @@
+# Spec: Inventory Reconciliation Job
+meta:
+  owner: revenue-ops
+  status: draft
+  reviewers:
+    - platform-eng
+    - finance
+summary: |
+  Nightly job that reconciles ticket inventory counts, order states, and Stripe balances to
+  detect oversells, missing refunds, or mismatched revenue figures before the next business day.
+scope:
+  included:
+    - Gathering ticket availability from Postgres (events, ticket_types, orders, tickets).
+    - Pulling payment and refund status from Stripe APIs.
+    - Emitting anomaly reports when discrepancies exceed thresholds.
+    - Triggering automated corrective actions (optional) for low-risk cases.
+  excluded:
+    - Manual refund processing (escalate via ticket).
+    - Settlement transfers (covered by payout readiness).
+execution:
+  orchestration: keda-cronjob
+  image: ghcr.io/ithasfire/jobs:revenue-latest
+  command: ["node", "dist/revenue/reconcile-inventory.js"]
+  schedule:
+    cron: "0 4 * * *"  # nightly at 04:00 UTC
+inputs:
+  postgres_tables:
+    - events
+    - ticket_types
+    - orders
+    - tickets
+  stripe_endpoints:
+    - payment_intents
+    - refunds
+  config:
+    thresholds:
+      oversell_tickets: 1
+      pending_refunds_hours: 24
+outputs:
+  metrics:
+    - reconcile.oversell_count
+    - reconcile.pending_refunds
+    - reconcile.stripe_variance_cents
+  reports:
+    - CSV dumped to R2 `finance/reconciliation/{date}.csv`
+  notifications:
+    - Slack message to #revenue-ops with summary counts.
+failure_modes:
+  - name: stripe_rate_limit
+    mitigation: exponential backoff, resume from checkpoint.
+  - name: data_skew
+    mitigation: rerun job with tighter date range, coordinate with DB team.
+acceptance_criteria:
+  - All anomalies logged with actionable detail (event, ticket_type, delta).
+  - Job completes in under 10 minutes for 10k orders.
+  - False-positive rate under 5% after tuning thresholds.
+rollout_notes:
+  - Start read-only (report-only) for two weeks before enabling automated credits/refunds.

@@ -4,16 +4,27 @@ import Stripe from "stripe";
 
 import { finalizePaymentIntent } from "@th/core/use-cases/orders/finalize-from-payment-intent";
 import {
+  releaseRetiredCartHolds,
+  settleCarriedOverCartPaymentIntent,
+} from "@th/core/use-cases/orders/_shared/retire-carried-over-cart";
+import {
   closeDispute,
   openDispute,
+  recordEarlyFraudWarning,
   recordFundsWithdrawn,
   refreshDispute,
+  resolveEarlyFraudWarning,
   type StripeDisputeLifecycleInput,
 } from "@th/core/use-cases/disputes";
+import {
+  assembleDisputeEvidence,
+  syncDisputeEvidenceDetails,
+} from "@th/core/use-cases/disputes/evidence";
 import { reconcileStripeFullRefund } from "@th/core/use-cases/orders/reconcile-stripe-full-refund";
 import { ensureEntityDefaultPayoutTermsForAccount } from "@th/core/use-cases/payout-terms/ensure-entity-default-payout-terms-for-account";
 import { sendTicketIssuedEmail } from "@th/core/use-cases/orders/send-ticket-issued-email";
 import { sendResalePurchaseEmail } from "@th/core/use-cases/resale/send-resale-purchase-email";
+import { sendBankPaymentFailedEmail } from "@th/core/use-cases/orders/send-bank-payment-failed-email";
 import { notifyResaleSellerSold } from "@th/core/use-cases/resale/notify-resale-seller-sold";
 import { getMetaString } from "@th/core/lib/orders/meta";
 import {
@@ -21,6 +32,7 @@ import {
   AccountDeauthorizedZ,
   ChargeRefundedZ,
   CustomerUpdatedZ,
+  EarlyFraudWarningZ,
   RefundUpdatedZ,
   MembershipInvoiceZ,
   MembershipSubscriptionZ,
@@ -327,7 +339,120 @@ const plugin: FastifyPluginAsync = async (app) => {
     stripe: Stripe,
     options: { replay?: boolean } = {},
   ): Promise<{ ok: boolean; error?: string }> => {
-    const webhookDlq = new WebhookDlq(app.deps.redis);
+    // Trim failures after a successful push are reported (step "dlq_trim"),
+    // never thrown: the event is stored, so the store-failed alert must not fire.
+    const webhookDlq = new WebhookDlq(app.deps.redis, (err, ctx) =>
+      reportWebhookSideEffect(err, { ...ctx?.extra, step: "dlq_trim" }),
+    );
+
+    // Best-effort side effects that must never fail the event (the lifecycle
+    // write is the outcome) but must not be silent either: log at error and
+    // report to Sentry via the wired reporter (falls back to the SDK).
+    const reportWebhookSideEffect = (
+      err: unknown,
+      extra: Record<string, unknown> & { step: string },
+    ) => {
+      try {
+        const report = app.deps.trpc.reportError ?? Sentry.captureException;
+        report(err, {
+          tags: { webhook: "stripe", step: extra.step },
+          extra,
+        });
+      } catch {
+        // A throwing reporter never changes webhook behaviour.
+      }
+    };
+
+    // Mirrors Stripe's `evidence_details` onto the local Dispute row after
+    // the lifecycle use case has run for this event.
+    const syncEvidenceDetailsBestEffort = async (
+      event: Stripe.Event,
+      stripeDisputeId: string,
+    ) => {
+      const evidenceDetails = readDisputeEvidenceDetails(event);
+      if (!evidenceDetails) return;
+      try {
+        await syncDisputeEvidenceDetails(
+          { repos: app.deps.trpc.repos, logger: app.deps.trpc.logger },
+          { stripeDisputeId, evidenceDetails },
+        );
+      } catch (err) {
+        // Route-scoped pino `logger`, not `app.log`: the app boots with
+        // `logger: false`, so `app.log` never reaches the API log file.
+        logger.error("stripe_webhook_dispute_evidence_details_sync_failed", {
+          eventId: event.id,
+          stripeDisputeId,
+          error: err instanceof Error ? err.message : String(err),
+          appCode: resolveWebhookAppCode(err) ?? undefined,
+        });
+        reportWebhookSideEffect(err, {
+          step: "sync_dispute_evidence_details",
+          eventId: event.id,
+          stripeDisputeId,
+        });
+      }
+    };
+
+    // Closes the active Radar early fraud warning on a charge once the
+    // window has shut — the dispute the warning predicted landed (DISPUTED)
+    // or the charge was fully refunded in time (REFUNDED). Best-effort next
+    // to the lifecycle / ledger write that is the event's outcome: a failure
+    // here must not make Stripe replay (and re-run) that write, so it is
+    // logged, reported and swallowed. A missed close self-heals on the next
+    // `radar.early_fraud_warning.updated` (Stripe flips `actionable`).
+    const resolveEarlyFraudWarningBestEffort = async (
+      event: Stripe.Event,
+      input: {
+        stripeChargeId: string | null;
+        resolution: "DISPUTED" | "REFUNDED";
+        sourceId: string;
+        /** `charge.refunded` facts; the use case decides "fully refunded". */
+        refund?: { stripeFullyRefunded: boolean; amountRefundedCents: number };
+      },
+    ) => {
+      if (!input.stripeChargeId) return;
+      try {
+        const result = await resolveEarlyFraudWarning(
+          {
+            repos: app.deps.trpc.repos,
+            clock: app.deps.trpc.clock,
+            logger: app.deps.trpc.logger,
+          },
+          {
+            stripeChargeId: input.stripeChargeId,
+            resolution: input.resolution,
+            stripeEventId: event.id,
+            stripeEventType: event.type,
+            sourceId: input.sourceId,
+            ...(input.refund ? { refund: input.refund } : {}),
+          },
+        );
+        if (result.resolved) {
+          logger.warn("stripe_webhook_early_fraud_warning_resolved", {
+            eventId: event.id,
+            stripeChargeId: input.stripeChargeId,
+            earlyFraudWarningId: result.earlyFraudWarningId,
+            resolution: result.resolution,
+          });
+        }
+      } catch (err) {
+        // `logger`, not `app.log`: the app boots with `logger: false`, so
+        // `app.log` is a no-op and this error would never reach Sentry.
+        logger.error("stripe_webhook_early_fraud_warning_resolve_failed", {
+          eventId: event.id,
+          stripeChargeId: input.stripeChargeId,
+          resolution: input.resolution,
+          error: err instanceof Error ? err.message : String(err),
+          appCode: resolveWebhookAppCode(err) ?? undefined,
+        });
+        reportWebhookSideEffect(err, {
+          step: "resolve_early_fraud_warning",
+          eventId: event.id,
+          stripeChargeId: input.stripeChargeId,
+          resolution: input.resolution,
+        });
+      }
+    };
 
     // We only handle the event(s) we support; everything else is acknowledged.
     // The entire switch is wrapped in a catch-all: if any handler throws an
@@ -406,7 +531,7 @@ const plugin: FastifyPluginAsync = async (app) => {
 
           // Best-effort: persist the payment method type (card, us_bank_account, etc.)
           try {
-            const { methodType } =
+            const { methodType, cardChecks } =
               await app.deps.trpc.payments.getPaymentMethodType({
                 paymentIntentId: pi.id,
               });
@@ -420,6 +545,16 @@ const plugin: FastifyPluginAsync = async (app) => {
             // The payment is already finalized and the ticket already issued;
             // failing the whole event over a missing payment-method label would
             // trade a real delivery for a label.
+
+            // Card AVS/CVC checks — chargeback evidence, same charge read.
+            // Written only when Stripe reported them (a null here would
+            // clobber nothing, but stays explicit). Going-forward only.
+            if (cardChecks) {
+              await app.deps.trpc.repos.orders.setPaymentCardChecks(
+                result.orderId,
+                cardChecks,
+              );
+            }
           } catch (err) {
             app.log.warn(
               {
@@ -429,6 +564,14 @@ const plugin: FastifyPluginAsync = async (app) => {
               },
               "stripe_webhook_set_payment_method_type_failed",
             );
+            // Evidence capture is the one part of this branch worth seeing
+            // in Sentry: a silent miss here is a thinner chargeback defence
+            // months later.
+            reportWebhookSideEffect(err, {
+              step: "set_payment_card_checks",
+              orderId: result.orderId,
+              paymentIntentId: pi.id,
+            });
           }
 
           if (app.deps.mailer) {
@@ -465,11 +608,14 @@ const plugin: FastifyPluginAsync = async (app) => {
                 : undefined;
 
               if (listingId) {
-                await notifyResaleSellerSold(notifyDeps, {
-                  orderId: result.orderId,
-                  listingId,
-                  publicAppUrl,
-                });
+                await notifyResaleSellerSold(
+                  { ...notifyDeps, reportError: app.deps.trpc.reportError },
+                  {
+                    orderId: result.orderId,
+                    listingId,
+                    publicAppUrl,
+                  },
+                );
               }
             } else {
               await sendTicketIssuedEmail(
@@ -477,6 +623,7 @@ const plugin: FastifyPluginAsync = async (app) => {
                   repos: app.deps.trpc.repos,
                   mailer: app.deps.mailer,
                   logger: app.deps.logger,
+                  reportError: app.deps.trpc.reportError,
                 },
                 {
                   orderId: result.orderId,
@@ -554,14 +701,43 @@ const plugin: FastifyPluginAsync = async (app) => {
             try {
               const order = await app.deps.trpc.repos.orders.getById(orderId);
               if (order && order.status === "PENDING") {
-                // Link the PI if it hasn't been linked yet (covers race with client confirm)
-                if (!order.stripePaymentIntentId) {
-                  await app.deps.trpc.repos.orders.linkPaymentIntent(
+                // Link the PI if it hasn't been linked yet (covers race with
+                // client confirm), then PENDING → PROCESSING — both as CASes.
+                // `order` was read without a lock; a retire / release / reaper
+                // that cancelled it since (handing back its credit and seats)
+                // must win, never be flipped back to PROCESSING. Unreachable
+                // today for createCheckout orders (their client secret is only
+                // issued after checkout's own link CAS wins, so no payment can
+                // start on an order cancelled before that); belt-and-braces.
+                const linked =
+                  order.stripePaymentIntentId === pi.id ||
+                  (!order.stripePaymentIntentId &&
+                    (await app.deps.trpc.repos.orders.linkPaymentIntentIfPending(
+                      orderId,
+                      pi.id,
+                    )));
+                const advanced =
+                  linked &&
+                  (await app.deps.trpc.repos.orders.markProcessingIfPending(
                     orderId,
-                    pi.id,
-                  );
+                  ));
+                if (!advanced) {
+                  const fresh =
+                    await app.deps.trpc.repos.orders.getById(orderId);
+                  const alreadyAdvanced =
+                    fresh?.stripePaymentIntentId === pi.id &&
+                    (fresh.status === "PROCESSING" ||
+                      fresh.status === "SUCCEEDED");
+                  if (!alreadyAdvanced) {
+                    // A processing payment against an order that is no longer
+                    // payable. Loud: the catch below DLQs it and reports to
+                    // Sentry; when the funds settle, finalize refuses the
+                    // order (ORDER_NOT_PROCESSABLE) the same way.
+                    throw new Error(
+                      `stripe_webhook_processing_order_not_pending:${fresh?.status ?? "missing"}`,
+                    );
+                  }
                 }
-                await app.deps.trpc.repos.orders.markProcessing(orderId);
 
                 // Best-effort: persist the payment method type early
                 try {
@@ -655,6 +831,16 @@ const plugin: FastifyPluginAsync = async (app) => {
         // If an ACH debit or bank transfer fails after entering "processing",
         // Stripe sends payment_intent.payment_failed. Cancel the order so
         // inventory is released. The buyer will need to start a new checkout.
+        //
+        // "Released" means the ticket-type hold AND the promo hold, fee-waiver
+        // allowance and spent platform credit that hang off the order. A bare
+        // `cancel*Order` only frees the first, and the cart reaper never
+        // revisits a CANCELLED row, so anything not handed back here is gone
+        // for good (the promo hold at least dies at its TTL; the other two do
+        // not). `releaseRetiredCartHolds` is the one place that knows that
+        // list — same helper the reaper and checkout use. Seats are NOT
+        // released here: they become orphans and the seat reaper frees them
+        // at their own TTL (pre-existing, reaper-owned).
         case "payment_intent.payment_failed": {
           const pi = event.data.object as {
             id: string;
@@ -665,23 +851,201 @@ const plugin: FastifyPluginAsync = async (app) => {
           if (orderId) {
             try {
               const order = await app.deps.trpc.repos.orders.getById(orderId);
-              if (order && order.status === "PROCESSING") {
-                await app.deps.trpc.repos.orders.cancelProcessingOrder(orderId);
-                app.log.info(
-                  { orderId },
-                  "stripe_webhook_processing_order_cancelled",
+              if (
+                order &&
+                (order.status === "PROCESSING" || order.status === "PENDING")
+              ) {
+                // A "failed" PI is NOT a dead PI. Stripe puts it back in
+                // `requires_payment_method`, where it stays CONFIRMABLE — a
+                // card decline and an ACH return both land there. Cancelling
+                // the order first would let a late confirm of the old client
+                // secret (another card, another bank account) finalise into
+                // a CANCELLED order: ORDER_NOT_PROCESSABLE, DLQ, charge with
+                // no ticket. So for BOTH statuses the PI is settled first and
+                // the order is only cancelled once it is proven dead. The
+                // Stripe round-trips run OUTSIDE the transaction on purpose
+                // (see the helper's placement note); the status CAS inside
+                // it covers an order that finalised in between.
+                const linkedPaymentIntentId = order.stripePaymentIntentId;
+                if (linkedPaymentIntentId && linkedPaymentIntentId !== pi.id) {
+                  // Data anomaly: the event names one PI, the order row is
+                  // linked to another. The LINKED one is what a stale client
+                  // secret could still confirm against this order, so that
+                  // is the one settled; say so, because it should not happen.
+                  logger.error("stripe_webhook_payment_failed_pi_mismatch", {
+                    orderId,
+                    linkedPaymentIntentId,
+                    eventPaymentIntentId: pi.id,
+                  });
+                }
+                const settle = await settleCarriedOverCartPaymentIntent(
+                  {
+                    id: orderId,
+                    stripePaymentIntentId: linkedPaymentIntentId ?? pi.id,
+                  },
+                  {
+                    payments: app.deps.trpc.payments,
+                    logger,
+                    reportError: app.deps.trpc.reportError,
+                    caller: "stripe-webhook:payment_failed",
+                  },
                 );
-              } else if (order && order.status === "PENDING") {
-                // A payment can fail while still PENDING (e.g. card decline
-                // before the processing webhook arrives, or microdeposit failure).
-                await app.deps.trpc.repos.orders.cancelPendingOrder(orderId);
-                app.log.info(
-                  { orderId },
-                  "stripe_webhook_pending_order_cancelled",
-                );
+
+                if (settle.settled) {
+                  const from = order.status;
+                  const cancelled = await app.deps.trpc.repos.tx((tx) =>
+                    releaseRetiredCartHolds(tx, orderId, {
+                      from,
+                      now: app.deps.trpc.clock.now(),
+                      // PENDING CAS also pins the PI as read: createCheckout
+                      // links its PaymentIntent after commit, so an order read
+                      // with none may carry one now that was never settled.
+                      // (Ignored for the PROCESSING CAS.)
+                      expectedPaymentIntentId: linkedPaymentIntentId ?? null,
+                      caller: "stripe-webhook:payment_failed",
+                      logger,
+                      reportError: app.deps.trpc.reportError,
+                    }),
+                  );
+                  if (cancelled) {
+                    app.log.info(
+                      { orderId },
+                      from === "PROCESSING"
+                        ? "stripe_webhook_processing_order_cancelled"
+                        : "stripe_webhook_pending_order_cancelled",
+                    );
+                    // A bank payment (ACH) that failed days after it was
+                    // accepted: the buyer left the page long ago, so tell
+                    // them. A PENDING failure is a decline they saw on the
+                    // page; no email. Gated on the winning CAS, which wins
+                    // once per order, so a redelivered event sends nothing.
+                    // The use case never throws, and no branch here changes
+                    // the response or the DLQ outcome.
+                    if (from === "PROCESSING") {
+                      if (app.deps.mailer) {
+                        await sendBankPaymentFailedEmail(
+                          {
+                            repos: app.deps.trpc.repos,
+                            mailer: app.deps.mailer,
+                            logger: app.deps.logger,
+                            reportError: app.deps.trpc.reportError,
+                          },
+                          {
+                            orderId,
+                            publicAppUrl:
+                              env.PUBLIC_WEB_URL ?? "http://127.0.0.1:3000",
+                          },
+                        );
+                      } else {
+                        // Unlike a ticket email, a replay could never send
+                        // this: the cancel CAS has already won. So no DLQ;
+                        // `logger.error` keeps it visible in Sentry.
+                        app.log.error(
+                          {
+                            eventId: event.id,
+                            orderId,
+                            hasHost: Boolean(env.SMTP_HOST),
+                            hasFrom: Boolean(env.SMTP_DEFAULT_FROM_EMAIL),
+                          },
+                          "stripe_webhook_bank_payment_failed_email_no_mailer",
+                        );
+                      }
+                    }
+                  } else {
+                    // The cancel CAS lost after the settle: the order moved on
+                    // (finalized, already cancelled, or now carries a PI this
+                    // handler never settled). Nothing held is released; the
+                    // order's current owner handles it.
+                    app.log.info(
+                      {
+                        orderId,
+                        from,
+                        settledPaymentIntentId: linkedPaymentIntentId ?? pi.id,
+                      },
+                      "stripe_webhook_payment_failed_cancel_cas_lost",
+                    );
+                  }
+                } else if (
+                  settle.refusal.reason === "pi_terminal_not_canceled"
+                ) {
+                  // The PI is `succeeded` (finalize owns it) or `processing`
+                  // (the buyer is mid-retry; Stripe will send another
+                  // payment_failed or a succeeded). Not a failure and not
+                  // ours to act on — the helper has already reported it under
+                  // this caller, so only the decision is logged. No second
+                  // Sentry event.
+                  app.log.info(
+                    {
+                      orderId,
+                      paymentIntentId: pi.id,
+                      status: settle.refusal.status,
+                      orderStatus: order.status,
+                    },
+                    "stripe_webhook_payment_failed_retire_refused",
+                  );
+                } else if (order.status === "PENDING") {
+                  // Stripe unreachable / no processor. A PENDING order with
+                  // its hold intact is exactly what the expired-cart reaper
+                  // reads, so it gets another look at the hold TTL — nothing
+                  // is lost by answering 200. Already reported by the helper.
+                  app.log.warn(
+                    {
+                      orderId,
+                      paymentIntentId: pi.id,
+                      refusal: settle.refusal.reason,
+                    },
+                    "stripe_webhook_pending_order_retire_refused",
+                  );
+                } else {
+                  // Same refusal on a PROCESSING order has NO safety net:
+                  // `listExpiredPending` reads PENDING rows only and the seat
+                  // reaper treats PROCESSING as open, so if this event is
+                  // answered 200 nothing will ever revisit the order. Preserve
+                  // it in the DLQ for replay instead.
+                  throw new WebhookStageError(
+                    {
+                      stage: "payment_intent.payment_failed:settle_pi",
+                      message: "stripe_webhook_payment_failed_settle_refused",
+                      title: "Stripe: failed PI could not be settled",
+                      description:
+                        "Stripe reported a payment failure on a PROCESSING order, but its PaymentIntent could not be proven dead (Stripe unreachable or no processor), so the order was NOT cancelled and its holds are still taken. No reaper revisits PROCESSING orders — replay this event from the webhook DLQ.",
+                      fields: [
+                        { name: "Event", value: event.id, inline: true },
+                        { name: "Order", value: orderId, inline: true },
+                        { name: "PaymentIntent", value: pi.id, inline: true },
+                        {
+                          name: "Refusal",
+                          value: settle.refusal.reason,
+                          inline: true,
+                        },
+                      ],
+                      tags: {
+                        stripeEventId: event.id,
+                        orderId,
+                        refusal: settle.refusal.reason,
+                      },
+                      extra: {
+                        eventId: event.id,
+                        orderId,
+                        paymentIntentId: pi.id,
+                        refusal: settle.refusal.reason,
+                      },
+                    },
+                    {
+                      cause:
+                        settle.refusal.reason === "pi_settle_failed"
+                          ? settle.refusal.error
+                          : new Error(settle.refusal.reason),
+                    },
+                  );
+                }
               }
               // Already CANCELLED, SUCCEEDED, etc. — no-op.
             } catch (err) {
+              // A stage error raised above already carries its own context;
+              // re-wrapping it would bury the settle refusal under a generic
+              // "handler error" title in Sentry and the DLQ.
+              if (err instanceof WebhookStageError) throw err;
               throw new WebhookStageError(
                 {
                   stage: "payment_intent.payment_failed:apply",
@@ -958,12 +1322,35 @@ const plugin: FastifyPluginAsync = async (app) => {
                     logger: app.deps.logger,
                     // Refund-debit swallows must reach Sentry (Step C review).
                     reportError: app.deps.trpc.reportError ?? undefined,
+                    // Lets the partial arm read the refund's metadata and flip
+                    // exactly the items our own refund named (money audit #10).
+                    payments: app.deps.trpc.payments,
+                    // A claim's refund going through tells the buyer (once).
+                    mailer: app.deps.mailer ?? null,
+                    publicAppUrl: app.deps.trpc.publicAppUrl ?? null,
                   },
                   input,
                 ),
             },
             parsed.data,
           );
+          // A full refund closes the early-fraud-warning window. "Full" is
+          // judged by the use case from BOTH signals: Stripe's `refunded`
+          // flag OR the local order reading REFUNDED — a platform refund
+          // withholds the processing fee by design, so Stripe reports it as
+          // a partial (`refunded: false`) and the flag alone never fires. A
+          // genuinely partial refund (order PART_REFUNDED) leaves it open.
+          if (parsed.data.amount_refunded > 0) {
+            await resolveEarlyFraudWarningBestEffort(event, {
+              stripeChargeId: parsed.data.id,
+              resolution: "REFUNDED",
+              sourceId: parsed.data.refunds?.data[0]?.id ?? parsed.data.id,
+              refund: {
+                stripeFullyRefunded: parsed.data.refunded,
+                amountRefundedCents: parsed.data.amount_refunded,
+              },
+            });
+          }
           break;
         }
 
@@ -978,6 +1365,63 @@ const plugin: FastifyPluginAsync = async (app) => {
             { eventId: event.id, ...result },
             "stripe_webhook_dispute_created",
           );
+          await syncEvidenceDetailsBestEffort(event, input.stripeDisputeId);
+          // The chargeback an early fraud warning predicted has landed.
+          await resolveEarlyFraudWarningBestEffort(event, {
+            stripeChargeId: input.stripeChargeId,
+            resolution: "DISPUTED",
+            sourceId: input.stripeDisputeId,
+          });
+
+          // Auto-assemble the evidence package for a LINKED, formal dispute
+          // so the desk opens on a draft rather than a blank. Skipped for
+          // triage (no order to read) and for warnings/inquiries (no
+          // evidence to respond with yet). Best-effort: the lifecycle write
+          // above is the event's outcome — a failed assembly must not make
+          // Stripe retry (and re-run) the lifecycle, so it is logged,
+          // reported and swallowed here; ops can re-assemble from the desk.
+          if (
+            result.orderId &&
+            result.status !== "NEEDS_TRIAGE" &&
+            !result.status.startsWith("WARNING_")
+          ) {
+            try {
+              const assembled = await assembleDisputeEvidence(
+                {
+                  repos: app.deps.trpc.repos,
+                  // Per-dispute mutex shared with the desk's edit/approve/
+                  // submit — a slow assembly here must never overwrite a
+                  // package ops already approved.
+                  idempotency: app.deps.trpc.idempotency,
+                  clock: app.deps.trpc.clock,
+                  logger: app.deps.trpc.logger,
+                  reportError: app.deps.trpc.reportError ?? undefined,
+                },
+                { disputeId: result.disputeId },
+              );
+              logger.info("stripe_webhook_dispute_evidence_assembled", {
+                eventId: event.id,
+                disputeId: result.disputeId,
+                skipped: assembled.skipped,
+                assembledVersion: assembled.evidence?.assembledVersion ?? null,
+              });
+            } catch (err) {
+              // Route-scoped pino `logger`, not `app.log` (a no-op under
+              // `logger: false`): the live run's first assembly failure was
+              // visible only in Sentry for exactly this reason.
+              logger.error("stripe_webhook_dispute_evidence_assemble_failed", {
+                eventId: event.id,
+                disputeId: result.disputeId,
+                error: err instanceof Error ? err.message : String(err),
+                appCode: resolveWebhookAppCode(err) ?? undefined,
+              });
+              reportWebhookSideEffect(err, {
+                step: "assemble_dispute_evidence",
+                eventId: event.id,
+                disputeId: result.disputeId,
+              });
+            }
+          }
           break;
         }
 
@@ -991,6 +1435,7 @@ const plugin: FastifyPluginAsync = async (app) => {
             { eventId: event.id, ...result },
             "stripe_webhook_dispute_updated",
           );
+          await syncEvidenceDetailsBestEffort(event, input.stripeDisputeId);
           break;
         }
 
@@ -1021,6 +1466,121 @@ const plugin: FastifyPluginAsync = async (app) => {
             { eventId: event.id, ...result },
             "stripe_webhook_dispute_closed",
           );
+          await syncEvidenceDetailsBestEffort(event, input.stripeDisputeId);
+          break;
+        }
+
+        // Informational: Stripe returned the disputed funds to our balance
+        // (the dispute was won, or a withdrawal was reversed). NO ledger
+        // change here — `charge.dispute.closed` is the money-bearing event;
+        // its WON path releases the payee holds and reverses any realised
+        // debits, and it fires on the same transition. This case only mirrors
+        // `funds_withdrawn`'s observability (warn log + audit row) so the
+        // dispute timeline reads withdrawn → reinstated end to end.
+        case "charge.dispute.funds_reinstated": {
+          const input = buildDisputeLifecycleInput(event);
+          if (!input) {
+            throw parseFailure(event, event.type, null);
+          }
+          const reinstatedAt = stripeEventCreatedAt(event);
+          try {
+            const local = await app.deps.trpc.repos.disputes.findByStripeDisputeId(
+              input.stripeDisputeId,
+            );
+            await app.deps.trpc.repos.audit.log({
+              entity: "dispute",
+              entityId: local?.id ?? input.stripeDisputeId,
+              action: "dispute.funds_reinstated",
+              data: {
+                stripeEventId: event.id,
+                stripeDisputeId: input.stripeDisputeId,
+                stripeChargeId: input.stripeChargeId,
+                paymentIntentId: input.paymentIntentId,
+                orderId: local?.orderId ?? null,
+                amountCents: input.amountCents,
+                currency: input.currency,
+                stripeStatus: input.stripeStatus,
+                fundsReinstatedAt: reinstatedAt.toISOString(),
+              },
+              at: reinstatedAt,
+            });
+            logger.warn("stripe_webhook_dispute_funds_reinstated", {
+              eventId: event.id,
+              stripeDisputeId: input.stripeDisputeId,
+              disputeId: local?.id ?? null,
+              orderId: local?.orderId ?? null,
+              amountCents: input.amountCents,
+              fundsReinstatedAt: reinstatedAt.toISOString(),
+            });
+          } catch (err) {
+            throw new WebhookStageError(
+              {
+                stage: "charge.dispute.funds_reinstated:audit",
+                message: "stripe_webhook_dispute_funds_reinstated_audit_failed",
+                title: "Stripe: dispute funds_reinstated not recorded",
+                description:
+                  "The audit row for a dispute funds reinstatement could not be written. No money moved on this event; it is in the webhook DLQ for replay.",
+                fields: [
+                  { name: "Event", value: event.id, inline: true },
+                  { name: "Dispute", value: input.stripeDisputeId, inline: true },
+                ],
+                tags: {
+                  stripeEventId: event.id,
+                  stripeDisputeId: input.stripeDisputeId,
+                },
+                extra: {
+                  eventId: event.id,
+                  stripeDisputeId: input.stripeDisputeId,
+                },
+              },
+              { cause: err },
+            );
+          }
+          break;
+        }
+
+        // ── Radar early fraud warnings ──────────────────────────────────
+        // The card issuer told Stripe this charge is probably fraud — usually
+        // days BEFORE the chargeback. Persist + link + ping ops with a refund
+        // path (the Discord alert is best-effort INSIDE the use case). The
+        // row write is the event's outcome and DLQs on failure like every
+        // other handler; `.updated` re-runs the same idempotent intake so
+        // `actionable` follows Stripe (it flips off once disputed/refunded)
+        // and never re-alerts.
+        case "radar.early_fraud_warning.created":
+        case "radar.early_fraud_warning.updated": {
+          const parsed = EarlyFraudWarningZ.safeParse(event.data.object);
+          if (!parsed.success) {
+            throw parseFailure(event, event.type, parsed.error);
+          }
+          const efw = parsed.data;
+          // Only present when a client expanded `charge` / `payment_intent`;
+          // the PaymentIntent lookup is the normal linkage path.
+          const raw = toRecord(event.data.object);
+          const chargeMetadata = readStringMap(toRecord(raw?.charge)?.metadata);
+          const paymentIntentMetadata = readStringMap(
+            toRecord(raw?.payment_intent)?.metadata,
+          );
+          const result = await recordEarlyFraudWarning(app.deps.trpc, {
+            stripeEventId: event.id,
+            stripeEventType: event.type,
+            stripeEfwId: efw.id,
+            stripeChargeId: efw.charge,
+            paymentIntentId: efw.payment_intent ?? null,
+            metadataOrderId:
+              paymentIntentMetadata.orderId ?? chargeMetadata.orderId ?? null,
+            // Same precedence as `buildDisputeLifecycleInput`; a stamped
+            // eventId that disagrees with the order withholds the owner.
+            metadataEventId:
+              paymentIntentMetadata.eventId ?? chargeMetadata.eventId ?? null,
+            fraudType: efw.fraud_type,
+            actionable: efw.actionable,
+            stripeCreatedAt: new Date(efw.created * 1000),
+          });
+          logger.warn("stripe_webhook_early_fraud_warning", {
+            eventId: event.id,
+            ...result,
+          });
           break;
         }
 
@@ -1057,6 +1617,12 @@ const plugin: FastifyPluginAsync = async (app) => {
                       logger: app.deps.logger,
                       // Refund-debit swallows must reach Sentry (Step C review).
                       reportError: app.deps.trpc.reportError ?? undefined,
+                      // Lets the partial arm read the refund's metadata and flip
+                      // exactly the items our own refund named (money audit #10).
+                      payments: app.deps.trpc.payments,
+                      // A claim's refund going through tells the buyer (once).
+                      mailer: app.deps.mailer ?? null,
+                      publicAppUrl: app.deps.trpc.publicAppUrl ?? null,
                     },
                     input,
                   ),
@@ -1195,6 +1761,7 @@ const plugin: FastifyPluginAsync = async (app) => {
               idempotency: app.deps.trpc.idempotency,
               clock: app.deps.trpc.clock,
               logger: app.deps.logger,
+              reportError: app.deps.trpc.reportError ?? null,
               // Dev/e2e seam (same env flag the checkout settlement path
               // uses): schedule the settlement for immediate payout so the
               // batch runner can be exercised without a month boundary.
@@ -1259,6 +1826,7 @@ const plugin: FastifyPluginAsync = async (app) => {
               idempotency: app.deps.trpc.idempotency,
               clock: app.deps.trpc.clock,
               logger: app.deps.logger,
+              reportError: app.deps.trpc.reportError ?? null,
             },
             {
               stripeInvoiceId: invoice.id,
@@ -1353,6 +1921,7 @@ const plugin: FastifyPluginAsync = async (app) => {
               mailer: app.deps.mailer,
               clock: app.deps.trpc.clock,
               logger: app.deps.logger,
+              reportError: app.deps.trpc.reportError ?? null,
               publicAppUrl: env.PUBLIC_WEB_URL ?? "http://127.0.0.1:3000",
             },
             {
@@ -1608,7 +2177,18 @@ const plugin: FastifyPluginAsync = async (app) => {
           stage: staged?.context.stage,
           error: errorMsg,
         });
-        return { ok: false as const, error: errorMsg };
+        // A refused idempotency claim is not a handler bug. The common case
+        // is an attempt still in flight (claims expire after 300 s); the
+        // rare tail is the 15-minute `failed:` marker a DETERMINISTIC
+        // rejection leaves — transient failures release their claim (see
+        // core lib/idempotency-claim.ts), so a marker means a replay would
+        // reproduce the rejection anyway. The port exposes no TTL read, so
+        // the hint quotes the adapter's retention.
+        const replayError =
+          resolveWebhookAppCode(rootError) === "IDEMPOTENCY_LOCK_IN_PROGRESS"
+            ? `${errorMsg} — an attempt for this event is in flight; retry in ~5 minutes (claims expire after 300 s). If it still refuses after that, a previous attempt was rejected deterministically and left a 15-minute marker — a replay will reproduce that rejection; fix the payload or the guard first.`
+            : errorMsg;
+        return { ok: false as const, error: replayError };
       }
 
       try {
@@ -1636,6 +2216,9 @@ const plugin: FastifyPluginAsync = async (app) => {
           },
           "stripe_webhook_dlq_store_failed",
         );
+        // Guarded report (CLAUDE.md swallow rule). dlqErr comes from
+        // execOrThrow, which carries no key or payload.
+        reportWebhookSideEffect(dlqErr, { step: "dlq_store", eventId: event.id });
       }
       return { ok: false as const, error: errorMsg };
     }
@@ -1858,6 +2441,31 @@ function buildDisputeLifecycleInput(
       chargeMetadata,
       paymentIntentMetadata,
     },
+  };
+}
+
+/**
+ * Reads `evidence_details` off a dispute event. `due_by` is only included
+ * when present so the sync never nulls a deadline the lifecycle write kept.
+ * Returns null when the hash is absent entirely (nothing to mirror).
+ */
+function readDisputeEvidenceDetails(event: Stripe.Event): {
+  dueBy?: Date | null;
+  hasEvidence: boolean | null;
+  pastDue: boolean | null;
+  submissionCount: number | null;
+} | null {
+  const dispute = toRecord(event.data.object);
+  const details = toRecord(dispute?.evidence_details);
+  if (!details) return null;
+  const readBool = (value: unknown): boolean | null =>
+    typeof value === "boolean" ? value : null;
+  const dueBy = readUnixSeconds(details.due_by);
+  return {
+    ...(dueBy ? { dueBy } : {}),
+    hasEvidence: readBool(details.has_evidence),
+    pastDue: readBool(details.past_due),
+    submissionCount: readNumber(details.submission_count),
   };
 }
 

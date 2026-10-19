@@ -1,0 +1,178 @@
+status: complete
+note: New spec for full-event search contracts (ports + shared DTOs) powering autocomplete, global search, and ranking analytics.
+task: Define search-centric ports that keep vector + lexical search adapters behind `@th/ports` while serving both sync (autocomplete) and async (indexing) workflows.
+repo_root: packages/ports/src/search
+goal: Provide stable TypeScript interfaces + zod schemas for indexing, querying, and telemetry so adapters (Elastic/OpenSearch/pgvector/etc.) can be swapped without touching core use cases.
+
+files:
+  - path: packages/ports/src/search/index.port.ts
+  - path: packages/ports/src/search/query.port.ts
+  - path: packages/ports/src/search/telemetry.port.ts
+  - path: packages/ports/src/search/prompts.port.ts
+  - path: packages/ports/src/search/types.ts
+  - path: packages/ports/src/index.ts
+
+constraints:
+  - Ports expose only typed DTOs + zod schemas; adapters return plain objects (no vendor SDK types).
+  - All methods surface typed errors with `{ code: SearchPortErrorCode; message; details? }` and never reject with raw Error subclasses.
+  - Query surfaces support multi-tenant scoping (orgId, venueId) without trusting caller-provided ACL; adapters must enforce scopes again.
+  - Humans can host/manage events without org membership; filters and documents must support `ownerHumanId` so we can search by human ID directly.
+  - Index writes run inside adapters' own retry/backoff logic; upstream callers treat them as fire-and-forget with success/failure summaries.
+  - Query responses include both raw scores and normalized `confidence` (0-1) to support downstream blending.
+  - Ports must remain framework-agnostic (no Fastify/tRPC or Prisma imports) per hexagonal rules.
+  - Embedding creation is delegated to the shared `EmbeddingProviderPort`; search documents can omit vectors when adapters call that port on-demand.
+  - Learning-to-rank adjustments happen via batch materializations downstream of telemetry; transports should not expect real-time weight shifts.
+
+shared_types (types.ts):
+  SearchDocument:
+    - eventId: string
+    - slug: string | null
+    - orgId: string | null
+    - ownerType: "ORG" | "HUMAN"
+    - ownerHumanId: string | null # populated when humans host without an org
+    - title: string
+  - artists: string[]
+  - tags: string[] # genres/styles like "bubble pop grunge", sports types, themes
+    - venueName: string | null
+    - addressText: string | null
+    - city: string | null
+    - regionCode: string | null
+    - countryCode: string | null
+    - startsAt: Date | null
+    - endsAt: Date | null
+    - status: "DRAFT" | "PUBLISHED" | "HIDDEN"
+    - popularityScore: number # normalized 0-1000
+    - recencyScore: number # epoch millis used for decay
+    - summary: string | null
+    - embeddingVersion: string
+  - embeddingVector: number[] | null # may be null when adapter/provider generates vectors lazily
+  SearchSuggestion:
+    - eventId: string
+    - slug?: string | null
+    - title: string
+    - subtitle?: string | null
+    - helper?: string | null
+    - matchReason?: "title" | "artist" | "venue" | "city" | "semantic"
+    - confidence: number # 0-1 inclusive
+  SearchResult:
+    - eventId: string
+    - slug?: string | null
+    - title: string
+    - snippet?: string | null
+    - badges?: string[]
+    - location?: { city?: string; regionCode?: string; venueName?: string }
+    - startsAt?: Date | null
+    - matchReasons: string[]
+    - score: number
+    - confidence: number
+    - ticketAvailability?: {
+        status: "AVAILABLE" | "LOW" | "SOLD_OUT" | "UNKNOWN";
+        remaining?: number;
+        lastUpdatedAt?: Date | null;
+      }
+  QueryFilters:
+    - orgId?: string
+    - ownerHumanId?: string
+    - venueId?: string
+    - status?: ("PUBLISHED" | "HIDDEN")[]
+    - dateRange?: { gte?: Date; lte?: Date }
+    - regionCodes?: string[]
+    - tags?: string[]
+  QueryContext:
+    - requestId?: string
+    - actorId?: string
+    - ip?: string
+    - userAgent?: string
+  SearchPortErrorCode:
+    - "invalid_input"
+    - "not_found"
+    - "forbidden"
+    - "dependency_failed"
+    - "transient"
+    - "unimplemented"
+
+ports:
+  SearchIndexPort (index.port.ts):
+    methods:
+      - upsertDocuments(input: {
+          documents: SearchDocument[];
+          mode?: "merge" | "replace";
+          traceId?: string;
+        }): Promise<Result<{ indexed: number; failed: number; failureReasons?: Record<string, string> }, SearchPortError>>
+      - deleteDocuments(input: {
+          eventIds?: string[];
+          orgId?: string;
+          slug?: string;
+        }): Promise<Result<{ deleted: number }, SearchPortError>>
+      - refreshIndexes(): Promise<Result<{ refreshedAt: Date }, SearchPortError>>
+    notes:
+      - `SearchDocument.embeddingVector` may be empty (adapter computes) but version required for migrations.
+      - Upserts may split into batches (adapter-specific) yet must preserve transactional semantics per batch; failures include per-id reasons.
+      - `refreshIndexes` is optional for adapters lacking explicit refresh; they should return `{ refreshedAt: new Date() }` regardless.
+      - Partial updates (e.g., only `popularityScore` or `ticketAvailability`) are allowed when `mode="merge"`; adapters should avoid forcing new embeddings if textual fields unchanged.
+
+  SearchQueryPort (query.port.ts):
+    methods:
+      - autocomplete(input: {
+          query: string;
+          limit?: number;
+          filters?: QueryFilters;
+          context?: QueryContext;
+        }): Promise<Result<{ suggestions: SearchSuggestion[]; latencyMs: number }, SearchPortError>>
+      - search(input: {
+          query: string;
+          limit?: number;
+          offset?: number;
+          filters?: QueryFilters;
+          context?: QueryContext;
+          includeFacets?: boolean;
+          includeAvailability?: boolean;
+        }): Promise<Result<{ results: SearchResult[]; facets?: Record<string, Array<{ label: string; count: number }>>; latencyMs: number }, SearchPortError>>
+      - related(input: {
+          eventId: string;
+          limit?: number;
+          context?: QueryContext;
+        }): Promise<Result<{ results: SearchResult[] }, SearchPortError>>
+    notes:
+      - `autocomplete` must honor `query.length >= 2`; adapters should short-circuit with empty array otherwise.
+      - `search` responses include `matchReasons` (adapter-chosen) to power UI badges.
+      - `includeFacets` default false; adapters may return `city`, `tag`, `date_bucket` facets when true.
+      - `related` is semantic-only; fallback to shared organizers/tags when embeddings unavailable.
+
+  SearchTelemetryPort (telemetry.port.ts):
+    methods:
+      - recordInteraction(input: {
+          query: string;
+          suggestionId?: string;
+          eventId?: string;
+          action: "view" | "click" | "purchase";
+          context?: QueryContext & { latencyMs?: number; rank?: number };
+        }): Promise<Result<{ recorded: boolean }, SearchPortError>>
+    notes:
+      - Interaction events are persisted to analytics storage (BigQuery/Redshift) and replayed in batch to derive ranking weights.
+      - No streaming feedback loops; downstream jobs read aggregated metrics hourly to update `popularityScore`/boosts as part of reindexing.
+      - Enables learning-to-rank feedback loops without leaking analytics SDK specifics.
+  SearchPromptPort (prompts.port.ts):
+    methods:
+      - listPrompts(input: {
+          orgId?: string;
+          ownerHumanId?: string;
+          regionCode?: string;
+          limit?: number;
+        }): Promise<Result<{ prompts: Array<{ id: string; title: string; subtitle?: string; helper?: string }> }, SearchPortError>>
+    notes:
+      - Keeps curated helper prompts behind a dedicated port per single-responsibility guidance.
+      - Implementations may source prompts from analytics/marketing datasets but must return deterministic payloads for caching.
+
+
+tests (interface-level expectations):
+  - Type tests verifying exported DTOs match spec shapes (use `expectTypeOf`).
+  - Vitest contract tests ensuring zod schemas accept nullable fields noted above and reject oversize vectors (>1536 dims by default).
+  - Mock adapter tests confirming `Result` unions contain `code` values listed in `SearchPortErrorCode`.
+  - Serialization tests guaranteeing `SearchDocument` converts Date fields to ISO strings via helper before transport/adapters persist them.
+
+open_questions:
+  - trending_prompts_port: ✅ Decided — handled via `SearchPromptPort` in this spec so transports can fetch curated prompts without analytics coupling.
+  - embedding_vector_requirement: Keep optional but log warning when null so contract stays deterministic; adapters rely on `EmbeddingProviderPort` when vectors missing.
+  - per_org_quotas: Need finer plan — likely combine `SearchIndexPort.upsertDocuments` guardrails (adapter enforces max docs per org) with billing service signals; spec leaves hook via `forbidden` error + `details.quota` payload.
+  - learning_to_rank_feedback: ✅ Batch decision — telemetry flows into warehouse tables and nightly/forced reindex runs consume aggregated boosts rather than streaming deltas.

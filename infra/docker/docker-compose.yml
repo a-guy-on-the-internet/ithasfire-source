@@ -1,0 +1,148 @@
+services:
+  db:
+    image: postgis/postgis:15-3.4
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-dev}
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-dev}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "yes"]
+
+  stripe-mock:
+    image: stripe/stripe-mock:latest
+    restart: always
+    ports:
+      - "12111:12111"
+    command: ["-verbose"]
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.11
+    restart: always
+    environment:
+      MEILI_ENV: development
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-dev-master-key}
+      MEILI_LOG_LEVEL: DEBUG
+    ports:
+      - "7700:7700"
+    volumes:
+      - meilisearch-data:/meili_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: always
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+    environment:
+      MP_SMTP_BIND_ADDR: "0.0.0.0:1025"
+      MP_UI_BIND_ADDR: "0.0.0.0:8025"
+
+  tileserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.tileserver
+    restart: always
+    ports:
+      - "8081:8080"
+    volumes:
+      # place your .pmtiles in infra/docker/tileserver/data/ (see scripts/dev/download-tiles.sh)
+      - ./tileserver/data:/data/data
+      - ./tileserver/config/config.json:/data/config.json:ro
+      - ./tileserver/styles:/data/styles:ro
+    environment:
+      - NODE_ENV=production
+      # Headless X display the static-image renderer draws into (see
+      # tileserver/cors-proxy.mjs). Forwarded so .env can override it.
+      - XVFB_DISPLAY=${XVFB_DISPLAY:-:99}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    restart: always
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      # Allow browser-based uploads (presigned PUTs from localhost dev server)
+      MINIO_API_CORS_ALLOW_ORIGIN: "*"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    volumes:
+      - minio-data:/data
+    command: ["server", "/data", "--console-address", ":9001"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  valhalla:
+    image: ghcr.io/gis-ops/docker-valhalla/valhalla:latest
+    restart: always
+    ports:
+      - "8002:8002"
+    volumes:
+      - valhalla-tiles:/custom_files
+    environment:
+      # Downloads a tiny PBF on first run so the graph builds quickly.
+      # Replace with a larger extract for real routing coverage.
+      tile_urls: "https://download.geofabrik.de/europe/andorra-latest.osm.pbf"
+      use_tiles_ignore_pbf: "False"
+      serve_tiles: "True"
+      build_admins: "True"
+      build_time_zones: "True"
+      force_rebuild: "False"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8002/status"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+
+  # One-shot init container: creates the default dev bucket if it doesn't exist.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-minioadmin} $${MINIO_ROOT_PASSWORD:-minioadmin} &&
+        mc mb --ignore-existing local/$${MINIO_BUCKET:-th-dev} &&
+        mc anonymous set download local/$${MINIO_BUCKET:-th-dev} &&
+        echo 'Bucket ready'
+      "
+
+volumes:
+  db-data:
+  redis-data:
+  meilisearch-data:
+  minio-data:
+  valhalla-tiles:

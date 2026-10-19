@@ -1,0 +1,83 @@
+# event-carousel.component.yaml
+meta:
+  goal: Provide a reusable carousel surface optimized for showcasing EventCard collections on desktop/tablet while gracefully degrading to stacked cards on mobile.
+  files:
+    shared:
+      component: packages/ui/src/ui/tamagui/components/event-grid/EventCarousel.tsx
+      hook: packages/ui/src/ui/tamagui/components/event-grid/use-event-carousel.ts
+      tests: packages/ui/src/ui/tamagui/components/__tests__/EventCarousel.test.tsx
+      stories: packages/ui/src/ui/tamagui/components/EventCarousel.stories.tsx
+  exports:
+    - EventCarousel
+    - EventCarouselSlide
+    - useEventCarousel
+  dependencies:
+    - Tamagui primitives (Stack, XStack, YStack)
+    - react-native-reanimated & react-native-gesture-handler for native momentum
+    - ResizeObserver (web) for responsive calculations
+props:
+  required:
+    - items: Array<EventSummary>
+  optional:
+    - renderItem?: (event: EventSummary, context: EventCarouselRenderContext) => React.ReactNode
+    - initialIndex?: number (default 0)
+    - visibleCount?: number | { mobile: 1; tablet?: 2; desktop?: 3 }
+    - slideWidth?: number | { min?: number; max?: number }
+    - gap?: number (defaults to theme spacing $4)
+    - autoplay?: { enabled: boolean; intervalMs?: number; pauseOnHover?: boolean }
+    - loop?: boolean (default false)
+    - controls?: { showArrows?: boolean; showIndicators?: boolean; placement?: "inside" | "outside" }
+    - onIndexChange?: (nextIndex: number, source: "control" | "swipe" | "autoplay") => void
+    - pagination?: { type?: "fraction" | "dots"; render?: CustomPaginationRenderer }
+    - testIdBase?: string (default "event-carousel")
+    - qaId?: string
+layout:
+  structure:
+    - Root container (YStack) with optional header slot for section title/actions.
+    - Viewport frame (XStack) applying overflow hidden and border radius token.
+    - Track (animated Stack) translating horizontally with transforms for slide changes.
+    - Slide slots wrap rendered cards, ensuring consistent width and spacing.
+    - Controls row with arrows, indicators, and optional autoplay toggle.
+  responsive:
+    - On mobile, coerce to single visible slide with snapping; expose optional peek of adjacent slide via padding.
+    - Tablet/Desktop: compute slide width based on `visibleCount` and container width minus gap padding.
+    - Provide `useEventCarousel` hook returning derived layout (slideWidth, trackWidth, current range).
+interactions:
+  - Arrow buttons navigate prev/next, disabled when at bounds unless `loop` true.
+  - Swipe gestures (native + web pointer) move between slides with momentum and snap.
+  - Keyboard controls: left/right arrows move slides; Home/End jump to start/end; apply focus management for accessible navigation.
+  - Indicators clickable to jump to specific slide.
+  - Autoplay optionally cycles slides; pauses on hover/focus when configured.
+states:
+  - default (interactive), focused (when controls engaged), disabled (when items length <= visibleCount and `loop=false`).
+  - Autoplay running vs paused state; expose data attribute for styling.
+  - Loading skeleton: fallback to `EventCardSkeletonGroup` sized to visible count until data available.
+  - Empty state: render fallback copy ("No events available") and hide controls.
+a11y:
+  - Root uses `role="region"` with `aria-label` describing carousel contents ("Upcoming events carousel").
+  - Track labeled with `aria-roledescription="carousel"`; slides use `role="group"` and include positional labels ("Slide 2 of 5").
+  - Controls have `aria-controls` linking to track; indicators use `aria-selected` to reflect active slide.
+  - Announce slide changes via `aria-live="polite"` region when autoplay or control navigation updates index.
+rendering:
+  - Use transform-based slide transitions (translateX) for smooth 60fps animations.
+  - Support reduced motion by skipping animation and instantly updating transform.
+  - Optionally apply depth scaling on center slide (design TBD) but default to flat layout.
+  - Ensure SSR compatibility by deferring ResizeObserver usage until after mount and falling back to CSS width percentages.
+quality:
+  - Strict TypeScript; expose `EventCarouselContext` for nested controls.
+  - Keep dependencies optional: degrade gracefully when gesture-handler unavailable (web).
+  - Provide deterministic keys for slides using event id.
+tests:
+  - Snapshot DOM structure verifying accessibility props.
+  - Behavior tests for next/prev navigation, loop handling, and index change callback.
+  - Swipe gesture simulation (where feasible) to ensure snap logic works.
+  - Autoplay timer tests using fake timers.
+  - Reduced motion test verifying no transition classes applied.
+non_goals:
+  - Advanced virtualization; limited to small slide counts (<50).
+  - Mixed content carousel (stick to EventCard surface for now).
+  - Drag-to-reorder behavior.
+implementation_notes:
+  - Integrate with EventGrid by having `variant="carousel"` reuse this component internally.
+  - Consider pointer events vs touch events nuance; use unified gesture resolver.
+  - Export from `components/index.ts` once implemented.

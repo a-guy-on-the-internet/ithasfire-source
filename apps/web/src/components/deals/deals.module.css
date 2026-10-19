@@ -1,0 +1,1277 @@
+/* ───────────────────────────────────────────────────────────────────────────
+   THE DEAL — the money part of the terms (deal-terms-and-settlement FR-003),
+   drawn after canvas QVdGnAjDwxNyTPa5L5LnMz boards A1 / P1.
+
+   CONTENT, so strict Swiss: radius 0, 2px ink frames and rules, no shadows,
+   decisive inversion for the chosen preset. Montserrat reads; Plex Mono
+   carries the label idiom (kickers, table heads, the "Settled directly"
+   stamp), always with its paired tracking.
+
+   CONTAINER queries, not media queries: the editor mounts inside the
+   agreement page AND inside the event builder's Revenue splits, whose admin
+   rail takes width away at wide viewports. `container-type` sits on `.root`,
+   a parent of everything queried.
+
+   ACCENT BUDGET: the left rule on the "who pays whom" line, focus rings, and
+   the text of the one link (`.link`, `--accentText`, "Open the agreement").
+   Nothing rests on the accent.
+   ─────────────────────────────────────────────────────────────────────────── */
+
+.root {
+  container-type: inline-size;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  width: 100%;
+  min-width: 0;
+  color: var(--color, #211c16);
+  font-family: var(--font-body);
+}
+
+/* ── Header ──────────────────────────────────────────────────────────────── */
+
+.header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+}
+
+.titleRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  min-width: 0;
+}
+
+.title {
+  margin: 0;
+  font-size: 28px;
+  line-height: 1.1;
+  font-weight: 900;
+  letter-spacing: -0.5px;
+  text-transform: uppercase;
+}
+
+.lede {
+  margin: 0;
+  font-size: var(--fs-body, 15px);
+  line-height: 1.5;
+  color: var(--colorMuted, #5c544a);
+}
+
+.link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  font-weight: 700;
+  color: var(--accentText, #a8300f);
+  text-decoration: none;
+}
+
+.link:hover {
+  text-decoration: underline;
+}
+
+.link:focus-visible,
+.presetButton:focus-visible,
+.field input:focus-visible,
+.field select:focus-visible,
+.check input:focus-visible {
+  outline: 2px solid var(--accent, #e2481d);
+  outline-offset: 2px;
+}
+
+/* ── Label idiom ─────────────────────────────────────────────────────────── */
+
+.kicker {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-xs, 10px);
+  letter-spacing: var(--tr-mono-xs, 2.5px);
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--colorMuted, #5c544a);
+}
+
+.stamp {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-2xs, 9.5px);
+  letter-spacing: var(--tr-mono-2xs, 2.5px);
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--colorMuted, #5c544a);
+}
+
+.hint {
+  margin: 0;
+  font-size: var(--fs-sm, 13.3px);
+  line-height: 1.45;
+  color: var(--colorMuted, #5c544a);
+}
+
+.notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  font-size: var(--fs-sm, 13.3px);
+  line-height: 1.45;
+  color: var(--colorMuted, #5c544a);
+}
+
+.notice svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+/* ── Blocks (read-only explanation, errors, empty state) ─────────────────── */
+
+.block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  border: 2px solid var(--borderColor, #211c16);
+  background: var(--surface, #fdfaf3);
+}
+
+.blockDanger {
+  border-color: var(--danger, #b91c1c);
+}
+
+.blockTitle {
+  margin: 0;
+  font-size: var(--fs-body, 15px);
+  font-weight: 700;
+}
+
+.blockBody {
+  margin: 0;
+  font-size: var(--fs-sm, 13.3px);
+  line-height: 1.5;
+}
+
+.dangerText {
+  color: var(--danger, #b91c1c);
+}
+
+/* ── Preset picker ───────────────────────────────────────────────────────── */
+
+.presets {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.presetRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.presetButton {
+  min-height: 44px;
+  padding: 0 16px;
+  border: 2px solid var(--borderColor, #211c16);
+  border-radius: 0;
+  background: transparent;
+  color: var(--color, #211c16);
+  font-family: var(--font-body);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition:
+    background-color 150ms ease-out,
+    color 150ms ease-out;
+}
+
+.presetButton:hover:not(:disabled) {
+  background: var(--surfaceMuted, #efe7d6);
+}
+
+.presetButton[aria-pressed="true"],
+.presetButton[aria-pressed="true"]:hover {
+  background: var(--color, #211c16);
+  color: var(--background, #f6f0e4);
+}
+
+.presetButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* ── Forms (preset form, clause edit, cost edit) ─────────────────────────── */
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 16px;
+  border: 2px solid var(--borderColor, #211c16);
+  background: var(--surface, #fdfaf3);
+}
+
+.formGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px 16px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.field input,
+.field select {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 12px;
+  border: 2px solid var(--borderColor, #211c16);
+  border-radius: 0;
+  background: var(--surface, #fdfaf3);
+  color: var(--color, #211c16);
+  font-family: var(--font-body);
+  font-size: 16px;
+}
+
+.field input[aria-invalid="true"] {
+  border-color: var(--danger, #b91c1c);
+}
+
+.affixed {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.affix {
+  font-weight: 700;
+  color: var(--colorMuted, #5c544a);
+}
+
+.fieldError {
+  margin: 0;
+  font-size: var(--fs-sm, 13.3px);
+  color: var(--danger, #b91c1c);
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  font-size: var(--fs-sm, 13.3px);
+  cursor: pointer;
+}
+
+.check input {
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  accent-color: var(--color, #211c16);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.actionsEnd {
+  margin-left: auto;
+}
+
+/* ── Section heads ───────────────────────────────────────────────────────── */
+
+.sectionHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 16px;
+  padding-bottom: 8px;
+  border-bottom: 2px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+/* The calculator's head sits inside its own frame: no rule under it. */
+.sectionHeadFlush {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.calcSource {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sectionHeadText {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.sectionTitle {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.sectionTotal {
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Clause rows ─────────────────────────────────────────────────────────── */
+
+.list {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.clauseRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px 16px;
+  padding: 16px 0;
+  border-bottom: 2px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+@container (min-width: 720px) {
+  .clauseRow {
+    grid-template-columns: minmax(0, 200px) minmax(0, 1fr) auto;
+    align-items: start;
+  }
+}
+
+.who {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.whoName {
+  font-size: 17px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.whoMeta {
+  font-size: var(--fs-sm, 13.3px);
+  color: var(--colorMuted, #5c544a);
+}
+
+.terms {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.termsLine {
+  margin: 0;
+  font-size: 16px;
+  line-height: 1.4;
+}
+
+.termsMain {
+  font-weight: 700;
+}
+
+.rowForm {
+  min-width: 0;
+}
+
+@container (min-width: 720px) {
+  .rowForm {
+    grid-column: 2 / -1;
+  }
+}
+
+.rowSide {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ── Status tags (board A1 / P1) ────────────────────────────────────────────
+   Outlined, no fill, radius 0: a rule and Plex Mono text in one status token.
+   Not @th/ui Badge, whose fixed status hexes fall under 4.5:1 on Stub. Each
+   token below is defined in stub, light (swiss) and dark (ember); the
+   fallback is the Stub value. Wraps rather than truncating a payee's name. */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-height: 22px;
+  padding: 2px 8px;
+  border: 1.5px solid currentColor;
+  border-radius: 0;
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-2xs, 9.5px);
+  letter-spacing: var(--tr-mono-2xs, 2.5px);
+  font-weight: 600;
+  line-height: 1.35;
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+}
+
+.tagNeutral {
+  color: var(--colorMuted, #5c544a);
+}
+
+.tagWarning {
+  color: var(--warningSoft, #92400e);
+}
+
+.tagAgreed {
+  color: var(--success, #166534);
+}
+
+.tagDeclined {
+  color: var(--dangerSoft, #b91c1c);
+}
+
+/* The scope control may shrink below its content width so its segments wrap
+   inside the add-payee panel at 320. */
+.scope {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.scope.scope > div {
+  flex-shrink: 1;
+  max-width: 100%;
+}
+
+@container (min-width: 720px) {
+  .rowSide {
+    justify-content: flex-end;
+  }
+}
+
+/* ── Add a payee ─────────────────────────────────────────────────────────── */
+
+.addPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border: 2px dashed var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+.chipRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.searchWrap {
+  position: relative;
+}
+
+.searchGrow {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.results {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 50;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 2px solid var(--borderColor, #211c16);
+  border-top: 0;
+  background: var(--surface, #fdfaf3);
+}
+
+.result {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 12px;
+  border: 0;
+  background: transparent;
+  color: var(--color, #211c16);
+  font-family: var(--font-body);
+  font-size: 15px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.result:hover,
+.result[aria-selected="true"] {
+  background: var(--surfaceMuted, #efe7d6);
+}
+
+/* ── Off the top ─────────────────────────────────────────────────────────── */
+
+/* An open cost form takes the whole row. */
+.costRow.costRowForm {
+  display: block;
+}
+
+/* Stacked on a narrow screen (the name keeps the full width); side by side from 480. */
+.costRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  gap: 8px 16px;
+  padding: 12px 0;
+  border-bottom: 2px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+.costSide {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
+@container (min-width: 480px) {
+  .costRow {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .costSide {
+    justify-content: flex-end;
+  }
+}
+
+.costAmount {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── The resale slot (step C2 fills it) ──────────────────────────────────── */
+
+.slot:empty {
+  display: none;
+}
+
+/* ── Resale (board RC1): its own framed block after Off the top, because the
+   platform pays it on every resale, unlike the clauses above. ──────────── */
+
+.resale {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  /* Phone: the block sits inside the page's own frames, so it gives back
+     what width it can (board RC1-phone). */
+  padding: 12px;
+  border: 2px solid var(--borderColor, #211c16);
+  background: var(--surface, #fdfaf3);
+  min-width: 0;
+}
+
+@container (min-width: 480px) {
+  .resale {
+    padding: 18px;
+  }
+}
+
+.resaleHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+}
+
+/* Phone: the limit wraps under the title, flush left (board RC1-phone);
+   wider, it sits at the head's far end. */
+.resaleLimit {
+  flex-basis: 100%;
+}
+
+@container (min-width: 480px) {
+  .resaleLimit {
+    flex-basis: auto;
+    margin-left: auto;
+  }
+}
+
+.resaleSentence {
+  margin: 0;
+  font-size: var(--fs-body, 15px);
+  line-height: 1.5;
+}
+
+.resaleFields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+/* The three fields side by side once the block is wide (board RC1 desktop). */
+@container (min-width: 720px) {
+  .resaleFields {
+    grid-template-columns: minmax(0, 1.3fr) minmax(0, 0.7fr) minmax(0, 1.3fr);
+  }
+}
+
+/* Each segmented control is one row of equal segments (short labels keep it
+   on one row at 320); it never pushes its column wider. */
+.resaleFields > .field > div {
+  max-width: 100%;
+}
+
+.resaleGroup {
+  display: flex;
+  flex-direction: column;
+}
+
+.resaleGroupHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px 8px;
+}
+
+.linkButton {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-family: var(--font-body);
+  font-size: var(--fs-sm, 13.3px);
+  cursor: pointer;
+}
+
+.linkButton:disabled {
+  color: var(--colorMuted, #5c544a);
+  text-decoration: none;
+  cursor: not-allowed;
+}
+
+.linkButton:focus-visible {
+  outline: 2px solid var(--accent, #e2481d);
+  outline-offset: 2px;
+}
+
+.resaleRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 2px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+/* Phone: a recipient's portion ("All of the share") goes under the name so
+   the name keeps the row's width; side by side from 480. */
+.resaleRecipient {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.resaleRecipient > .resaleAmount {
+  text-align: left;
+}
+
+@container (min-width: 480px) {
+  .resaleRecipient {
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .resaleRecipient > .resaleAmount {
+    text-align: right;
+  }
+}
+
+.resaleRow > .who {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.resaleAmount {
+  flex: 0 0 auto;
+  text-align: right;
+  font-size: var(--fs-body, 15px);
+  font-variant-numeric: tabular-nums;
+}
+
+.resaleName {
+  font-size: var(--fs-body, 15px);
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.resaleStrong {
+  font-size: var(--fs-body, 15px);
+  font-weight: 700;
+}
+
+.resaleExample {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px;
+  border: 2px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+  background: var(--surfaceMuted, #efe7d6);
+}
+
+@container (min-width: 480px) {
+  .resaleExample {
+    padding: 14px;
+  }
+}
+
+/* The example's first row sits under its kicker, not under a rule. */
+.resaleExample .resaleRow:first-child {
+  border-top: 0;
+}
+
+.resaleFoot {
+  padding-top: 8px;
+  border-top: 2px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+/* ── Calculator ──────────────────────────────────────────────────────────── */
+
+.calc {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 16px;
+  border: 2px solid var(--borderColor, #211c16);
+  background: var(--surfaceMuted, #efe7d6);
+}
+
+@container (min-width: 720px) {
+  .calc {
+    padding: 24px;
+  }
+}
+
+.tierRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.tierRow input {
+  box-sizing: border-box;
+  width: 112px;
+  min-height: 44px;
+  padding: 0 12px;
+  border: 2px solid var(--borderColor, #211c16);
+  border-radius: 0;
+  background: var(--surface, #fdfaf3);
+  color: var(--color, #211c16);
+  font-family: var(--font-body);
+  font-size: 18px;
+  font-weight: 700;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.tierRow input[aria-invalid="true"] {
+  border-color: var(--danger, #b91c1c);
+}
+
+.table {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.tableHead {
+  display: none;
+}
+
+.tableRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 16px;
+  padding: 12px 0;
+  border-bottom: 2px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+.cellName {
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.cellEntitled {
+  font-weight: 900;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.cellHow {
+  grid-column: 1 / -1;
+  font-size: var(--fs-sm, 13.3px);
+  line-height: 1.45;
+  color: var(--colorMuted, #5c544a);
+}
+
+.cellPair {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  font-size: var(--fs-sm, 13.3px);
+}
+
+.cellPairItem {
+  display: inline-flex;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.cellPaid,
+.cellSettle {
+  display: none;
+}
+
+.totalRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  padding: 12px 0;
+  border-top: 2px solid var(--borderColor, #211c16);
+  font-weight: 900;
+}
+
+@container (min-width: 720px) {
+  .tableHead,
+  .tableRow,
+  .totalRow {
+    display: grid;
+    /* The Entitled column has a floor: a money figure never breaks across
+       lines ("$20,250.0 / 0" at an 838px container). */
+    grid-template-columns:
+      minmax(0, 1.3fr) minmax(11ch, 0.8fr) minmax(0, 2.4fr) minmax(0, 1fr)
+      minmax(0, 1fr);
+    gap: 16px;
+    align-items: baseline;
+  }
+
+  .cellEntitled,
+  .cellPaid,
+  .cellSettle {
+    white-space: nowrap;
+  }
+
+  /* The total ("$20,250.00 ✓") runs into the empty How column. */
+  .totalRow > :nth-child(2) {
+    grid-column: 2 / span 2;
+    white-space: nowrap;
+  }
+
+  .tableHead {
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+  }
+
+  .cellEntitled {
+    text-align: left;
+  }
+
+  .cellHow {
+    grid-column: auto;
+  }
+
+  .cellPair {
+    display: none;
+  }
+
+  .cellPaid,
+  .cellSettle {
+    display: block;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .cellSettle {
+    font-weight: 700;
+  }
+
+  .headRight {
+    text-align: right;
+  }
+}
+
+.calcFoot {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px 24px;
+}
+
+@container (min-width: 720px) {
+  .calcFoot {
+    grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+    align-items: start;
+  }
+}
+
+.waterfall {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.waterRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  font-size: 15px;
+}
+
+.waterAmount {
+  font-weight: 700;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.waterPool {
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 2px solid var(--borderColor, #211c16);
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.summary {
+  margin: 0;
+  padding: 12px 16px;
+  border-left: 4px solid var(--accent, #e2481d);
+  background: var(--surface, #fdfaf3);
+  font-size: var(--fs-sm, 13.3px);
+  line-height: 1.5;
+}
+
+.summary strong {
+  font-weight: 700;
+}
+
+.shortfall {
+  display: flex;
+  gap: 10px;
+  padding: 12px 16px;
+  border: 2px solid var(--danger, #b91c1c);
+  background: var(--surface, #fdfaf3);
+}
+
+.shortfall svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--danger, #b91c1c);
+}
+
+.shortfallKicker {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-xs, 10px);
+  letter-spacing: var(--tr-mono-xs, 2.5px);
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--danger, #b91c1c);
+}
+
+/* ── The bill (board A1): numbered, read-only, above the deal ──────────── */
+
+.billRow {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 8px 16px;
+  padding: 12px 0;
+  border-bottom: 2px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+.billRow > .rowSide {
+  grid-column: 2;
+}
+
+@container (min-width: 520px) {
+  .billRow {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+  }
+
+  .billRow > .rowSide {
+    grid-column: auto;
+  }
+}
+
+.billIndex {
+  min-width: 2ch;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm, 11px);
+  letter-spacing: var(--tr-mono-sm, 2px);
+  font-weight: 600;
+  color: var(--colorMuted, #5c544a);
+  font-variant-numeric: tabular-nums;
+}
+
+.plainLink {
+  color: inherit;
+  text-decoration: none;
+}
+
+.plainLink:hover {
+  text-decoration: underline;
+}
+
+.plainLink:focus-visible {
+  outline: 2px solid var(--accent, #e2481d);
+  outline-offset: 2px;
+}
+
+/* ── The deal in plain words (the booking thread's terms strip) ──────────── */
+
+.summary {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  min-width: 0;
+}
+
+.summaryLine {
+  margin: 0;
+  font-size: var(--fs-sm, 13.3px);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.summaryName {
+  font-weight: 700;
+}
+
+.summaryMuted {
+  color: var(--colorMuted, #5c544a);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .presetButton {
+    transition: none;
+  }
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ── The frozen deal (freeze-the-deal FR-010, board option A) ──────────────
+   The band under the header: a 2px ink frame on the raised surface while
+   frozen, the bare frame while the frozen terms change. The footer that
+   commits a change sits under a 4px ink rule. "Not saved" is the one accent
+   text here (`--accentText`, AA as a label); the struck old value is muted. */
+
+.frozenBand {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 16px;
+  padding: 16px;
+  border: 2px solid var(--borderColor, #211c16);
+  background: var(--surfaceMuted, #efe7d6);
+}
+
+.frozenBandChanging {
+  background: transparent;
+}
+
+.frozenBandText {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex: 1 1 320px;
+  min-width: 0;
+}
+
+.frozenBandText > svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.frozenBandWords {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+/* At 320 the action's label is wider than the band; let it wrap inside the
+   band instead of spilling past the border. `:root` matches the specificity
+   of Tamagui's atomic `:root ._ws-nowrap` / height classes. */
+.frozenBandAction {
+  min-width: 0;
+  max-width: 100%;
+}
+
+:root .frozenBandAction > button {
+  max-width: 100%;
+}
+
+:root .frozenBandAction > button > span {
+  white-space: normal;
+  text-align: center;
+  line-height: 1.4;
+}
+
+.frozenBandBody {
+  font-size: 14px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.overline {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm, 11px);
+  letter-spacing: var(--tr-mono-sm, 2px);
+  font-weight: 600;
+  line-height: 1.45;
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+}
+
+.overlineMuted {
+  color: var(--colorMuted, #5c544a);
+}
+
+.notSaved {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm, 11px);
+  letter-spacing: var(--tr-mono-sm, 2px);
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--accentText, #a8300f);
+}
+
+.was {
+  color: var(--colorMuted, #5c544a);
+  text-decoration: line-through;
+}
+
+/* A changed row's old words sit on their own line above the new ones. */
+.termsWas {
+  display: block;
+  font-weight: 400;
+}
+
+.changeFooter {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 16px;
+  border-top: 4px solid var(--borderColor, #211c16);
+}
+
+.changeFooterText {
+  margin: 0;
+  font-size: var(--fs-body, 15px);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+/* ── Changes since it froze (board History) ──────────────────────────────── */
+
+.changes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pageSectionTitle {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.changeList {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.changeItem {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 0;
+  border-top: 2px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+.changeItem:first-child {
+  border-top-color: var(--borderColor, #211c16);
+}
+
+.changeLines {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+}
+
+.changeLine {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 2px 16px;
+  font-size: var(--fs-body, 15px);
+  line-height: 1.45;
+}
+
+@container (min-width: 560px) {
+  .changeLine {
+    grid-template-columns: minmax(0, 200px) minmax(0, 1fr);
+  }
+}
+
+.changeSubject {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.changeValues {
+  margin: 0;
+  overflow-wrap: anywhere;
+}

@@ -1,0 +1,50 @@
+/* ── Staff ticket-pack catalogue (ticket-type-packs FR-012) ────────────────
+   Mirrors volunteer-packs.module.css: table-like rows → GRID so the columns
+   line up across rows (DS §5). Fixed metric columns, fluid identity,
+   content-sized actions. Collapses by RE-DECLARING grid-template-columns —
+   never by hiding a cell. No colours live here. */
+
+.catalogueRow {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) 96px 96px 132px auto;
+	gap: 20px;
+	align-items: center;
+	width: 100%;
+}
+
+@media (max-width: 900px) {
+	.catalogueRow {
+		grid-template-columns: minmax(0, 1fr);
+		gap: 16px;
+	}
+
+	.catalogueRow > .metric {
+		display: flex;
+		flex-direction: row;
+		align-items: baseline;
+		gap: 8px;
+	}
+}
+
+/* One metric cell: an overline label above a large tabular numeral. */
+.metric {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+}
+
+/* The entry editor's field row: name is fluid, money/capacity fixed. */
+.entryRow {
+	display: grid;
+	grid-template-columns: minmax(0, 2fr) 110px 110px 110px 96px auto;
+	gap: 12px;
+	align-items: end;
+	width: 100%;
+}
+
+@media (max-width: 900px) {
+	.entryRow {
+		grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+	}
+}

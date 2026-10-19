@@ -11,7 +11,7 @@ related:
     "organising-events/find-an-order",
     "organising-events/issue-comp-tickets",
   ]
-specs: ["2026-08-04/scan-ticket-redesign"]
+specs: ["2026-08-04/completed/scan-ticket-redesign"]
 ---
 
 Two ways to check people in: the scan page in your organiser dashboard, or the operator app on an Android phone. This article covers both, and what each scan result is telling you.
@@ -22,14 +22,14 @@ Pick the right event. The scan page selects your soonest upcoming event automati
 
 ## The scan page
 
-Tap **Scan** in the middle of the action bar, or open **/admin/{your-slug}/scan** on any phone, tablet or laptop with a camera. Nothing to install, and it now works in Safari on iPhone as well as Chrome and Android.
+Tap **Scan** — the raised button in the middle of the bar at the bottom of the screen on a phone, or the **Scan** entry in the sidebar on a larger screen — or open **/admin/{your-slug}/scan** directly. Works on any phone, tablet or laptop with a camera. Nothing to install, and it now works in Safari on iPhone as well as Chrome and Android.
 
 Two modes, switched with the **Camera** and **Search** buttons:
 
 - **Camera** points at a QR code and reads it
 - **Search** finds someone by name, email or ticket code
 
-The page needs a connection. It has no torch and no offline queue — if the venue's signal is patchy or the door is busy, use the operator app instead.
+The page needs a connection. It has no torch and no offline queue — if the place's signal is patchy or the door is busy, use the operator app instead.
 
 ## Scanning someone in
 
@@ -77,6 +77,8 @@ Switch to **Search** and look the person up by name, email or ticket code. You'l
 
 Volunteer passes resolve on the same screen and show **VOLUNTEER** with the role and shift. Check them in with **Check in** rather than Admit.
 
+Some volunteers have no pass: someone who signed up while signed out, using an email address that already has an account, isn't linked to that account, so no badge or QR can be issued for them. The badge sheet counts them. Check them in from the **Signups** tab instead.
+
 Volunteer check-in needs an Owner, Admin or Editor role. Operators with the Scanner role see the button locked, which is deliberate — ask an organiser to check volunteers in, or upgrade the role before the shift. See [managing volunteers](/help/organising-events/manage-volunteers).
 
 ## Counts at the door
@@ -89,11 +91,21 @@ Several people can scan at once. A ticket admitted at one door reads as **ALREAD
 
 ## The operator app
 
-For a busy door, a dark room, or a venue whose wifi comes and goes, the operator app does things a browser can't: it keeps a torch, holds a local copy of the guest list so it can scan without signal, and queues admissions to sync when the connection returns.
+For a busy door, a dark room, or a place whose wifi comes and goes, the operator app does things a browser can't: it keeps a torch, holds a local copy of the guest list so it can scan without signal, and queues admissions to sync when the connection returns.
 
 :::action
 Install links, onboarding emails for your door staff, and account recovery all live on **Scanner Setup** in your dashboard, at **/admin/{your-slug}/scanner-setup**.
 :::
+
+### When someone's scanner access is removed
+
+The operator app checks the account's access when it opens, when it comes back to the foreground, and when the phone gets its connection back. Once someone has no Scanner, Admin or Owner role left in any organisation, the next check shows them **Access denied** and deletes the guest list, tickets and recent scans stored on that phone. If they still scan for another organisation, your event's guest list leaves the phone at its next sync instead.
+
+A sale still going through at the door gets up to three minutes to finish. After that the app clears it, and **Access denied** says whether the sale was cancelled or may still have gone through, so nobody takes cash for it twice.
+
+Admissions scanned before the change stay on the phone and keep sending while the person is signed in. Any the server refuses count as failed. The **Access denied** screen shows how many scans are unsent or failed, and asks before a **Sign out** that would delete them.
+
+If you give the role back, they tap **Check again** and carry on without signing out.
 
 ## What can go wrong
 

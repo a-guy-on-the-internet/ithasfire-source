@@ -1,0 +1,63 @@
+/* "Back to the app" — the outline CTA (PagePrimitives `ButtonOutline`), as a
+   plain anchor because its href is the app's URL scheme. Strict Swiss: square,
+   2px ink border, colour-inversion hover, 44px touch floor. */
+.backLink {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 10px 20px;
+  border-radius: 0;
+  border: 2px solid var(--borderColor, #211c16);
+  background: transparent;
+  color: var(--color, #211c16);
+  font-size: 14px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  text-decoration: none;
+  transition:
+    background-color 150ms ease,
+    color 150ms ease;
+}
+
+.backLink:hover {
+  background: var(--color, #211c16);
+  color: var(--background, #f6f0e4);
+}
+
+.backLink:focus-visible {
+  outline: 2px solid var(--color, #211c16);
+  outline-offset: 2px;
+}
+
+/* "Return to the app" after a pass — the page's one primary action. The
+   #B93312 rung (`ACCENT_FILL`), never `accent`: white on it is 5.92:1; on
+   #E2481D neither polarity clears AA. Hover climbs to `ACCENT_FILL_HOVER`.
+   Applied ON TOP of .backLink; declared after it, so it wins at equal
+   specificity. */
+.returnLink {
+  border-color: var(--brandSecondaryHover, #b93312);
+  background: var(--brandSecondaryHover, #b93312);
+  color: var(--onBrandSecondary, #ffffff);
+}
+
+.returnLink:hover {
+  border-color: var(--brandSecondaryStrong, #94270c);
+  background: var(--brandSecondaryStrong, #94270c);
+  color: var(--onBrandSecondary, #ffffff);
+}
+
+/* Press rung (`brandSecondaryPress`, Stub #7A1F08, 10.38:1 with white). */
+.returnLink:active {
+  border-color: var(--brandSecondaryPress, #7a1f08);
+  background: var(--brandSecondaryPress, #7a1f08);
+  color: var(--onBrandSecondary, #ffffff);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .backLink,
+  .returnLink {
+    transition: none;
+  }
+}

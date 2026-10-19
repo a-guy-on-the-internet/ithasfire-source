@@ -1,0 +1,377 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   THE PRINTABLE TICKET SHEET — document-specific styles
+   ═══════════════════════════════════════════════════════════════════════════
+
+   Layers on top of `src/app/_print/print.css`, which owns `@page`, the
+   `--print-*` palette, chrome suppression and the shared paper primitives.
+   Only rules that are TRUE OF TICKET STUBS SPECIFICALLY belong here — the
+   hours statement and the volunteer badge reuse the layer, not this file.
+
+   Ink on paper: hairline rules, no shadows, no large filled areas, tabular
+   numerals. `borderRadius: 0` throughout — nothing here sets a radius, and
+   nothing should.
+
+   ── The three-per-page arithmetic ─────────────────────────────────────────
+   Letter content box = 279.4 − 24 (the 12mm `@page` margins) = 255.4mm.
+   A4 = 297 − 24 = 273mm. Budget on the tighter of the two:
+     sheet header + rule ≈ 22mm
+     footer rule + note  ≈ 11mm
+     2 cut rules × 8mm   = 16mm
+     ⇒ 255.4 − 49 = 206.4mm for three stubs = 68mm each.
+   `min-height: 54mm` plus 4mm block padding gives a 62mm stub, so three fit
+   with ~20mm of slack for a wrapped venue name — and a fourth (another 62mm)
+   cannot, on either paper size. min-height, never height: content PUSHES.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Sheet header ──────────────────────────────────────────────────────────── */
+
+.th-ticket-sheet__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 4mm;
+  padding-bottom: 3mm;
+  /* Never orphan the header at the foot of a page. */
+  break-after: avoid;
+  page-break-after: avoid;
+}
+
+.th-ticket-sheet__wordmark {
+  display: block;
+  width: 34mm;
+  height: auto;
+}
+
+/* Order code · N-of-M · print timestamp. Uppercase letterspaced meta, tabular
+   so the timestamp digits align if two sheets are laid side by side. */
+.th-ticket-sheet__meta {
+  margin: 0;
+  font-size: 7pt;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--print-muted);
+  text-align: right;
+}
+
+.th-ticket-sheet__meta-sep {
+  padding-inline: 1.5mm;
+  color: var(--print-rule-soft);
+}
+
+/* ── Stub list ─────────────────────────────────────────────────────────────── */
+
+.th-ticket-sheet__stubs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/*
+ * Each <li> is "the cut rule that opens this stub, plus the stub" — and the
+ * avoid-break lives HERE, on the pair, not only on the stub inside it.
+ *
+ * Found by printing a 7-stub sheet: with the rule only on `.th-ticket-stub`,
+ * the browser was free to break BETWEEN the cut rule and its stub, which left
+ * a scissors glyph and a dashed line marooned at the foot of page 1 with
+ * nothing beneath it to cut. A cut line that cuts nothing is worse than no
+ * line. Binding the pair moves the rule to page 2 with the stub it belongs to.
+ * (A cut rule at the TOP of a continuation page is fine — it reads as the
+ * sheet edge.)
+ */
+.th-ticket-sheet__stubs > li {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+/*
+ * AT MOST three stubs to a page — enforced, not left to the paper size.
+ *
+ * Measured: with natural flow, US Letter fits 3 and A4 fits 4 (A4 is 42mm
+ * taller). A physical artefact whose structure depends on which paper the
+ * operator's printer happened to be loaded with is a support ticket waiting to
+ * happen: "cut on the dashed lines, three tickets per sheet" has to be true
+ * every time, and a box office handling a stack wants the cut lines in the
+ * same place on every sheet.
+ *
+ * This forces a break BEFORE the 4th, 7th, 10th … stub, so it can only ever
+ * REDUCE the count on a page. It cannot cause an overflow: if three unusually
+ * tall stubs don't fit, `break-inside: avoid` still splits them between pages
+ * normally. The guarantee is an upper bound, which is the safe direction.
+ */
+@media print {
+  .th-ticket-sheet__stubs > li:nth-child(3n + 1):not(:first-child) {
+    break-before: page;
+    page-break-before: always;
+  }
+}
+
+/*
+ * Table-like row ⇒ GRID, with a fixed first and last column and a fluid middle
+ * (the design-system rule for stub organisms). `minmax(0, 1fr)` rather than
+ * `1fr`: a long unbreakable event title against a bare `1fr` blows the column
+ * out and pushes the tear-off off the page.
+ *
+ * Scan column is 38mm = the 32mm QR plus the 3mm quiet-zone padding each side.
+ */
+/*
+ * Column budget, measured rather than guessed. Letter content box is 191.8mm.
+ *
+ *   scan 38mm + gap 5 + body 1fr + gap 5 + tear 36mm  ⇒  body = 107.8mm
+ *
+ * The body column was 99.8mm (tear 42mm, gaps 6mm) and the event title —
+ * the most important text on the stub — wrapped to two lines for an ordinary
+ * name while the tear column sat half empty below its three short items. The
+ * title cannot span INTO the tear column: the ORDER / ADMITS labels occupy the
+ * same band. So the width comes out of the tear column instead, which needs
+ * only enough room for an 8-char order code and a signable box.
+ *
+ * Scan stays 38mm — that is the 32mm QR plus its 3mm quiet zone each side and
+ * is not negotiable.
+ */
+.th-ticket-stub {
+  display: grid;
+  grid-template-columns: 38mm minmax(0, 1fr) 36mm;
+  column-gap: 5mm;
+  align-items: start;
+  min-height: 54mm;
+  padding-block: 4mm;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+/* ── Scan block ────────────────────────────────────────────────────────────── */
+
+.th-ticket-stub__scan {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2mm;
+}
+
+/*
+ * The quiet zone. The QR SVG served by /tickets/qr/[code] already paints its
+ * own opaque white background rect (it is SVG CONTENT, so it survives Chrome's
+ * "Background graphics: off" default), and this panel adds the physical margin
+ * a scanner wants around the symbol. `print-color-adjust: exact` is belt and
+ * braces for the case where the sheet is printed onto tinted stock or with
+ * backgrounds forced on.
+ */
+.th-ticket-qr {
+  padding: 3mm;
+  background-color: var(--print-paper);
+  border: 1px solid var(--print-rule);
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+  line-height: 0;
+}
+
+/*
+ * 32mm printed. The route emits `scalable: true`, so the SVG carries a viewBox
+ * and no intrinsic width — it scales to whatever CSS says WITHOUT touching the
+ * route's `cellSize`, which is tuned for door-scanning reliability and is also
+ * what ticket emails render.
+ */
+.th-ticket-qr__img {
+  display: block;
+  width: 32mm;
+  height: 32mm;
+}
+
+.th-ticket-stub__code {
+  margin: 0;
+  font-size: 8pt;
+  font-weight: 700;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+/* ── Body ──────────────────────────────────────────────────────────────────── */
+
+.th-ticket-stub__body {
+  display: flex;
+  flex-direction: column;
+  gap: 2mm;
+  min-width: 0;
+}
+
+/* Ticket-type kicker. Accent-as-ink (`--print-accent`, #B93312), not the
+   #E2481D fill value: at 7pt on paper the lighter orange has no AA foreground
+   contrast and photocopies to mush. */
+.th-ticket-stub__kicker {
+  margin: 0;
+  font-size: 7pt;
+  font-weight: 700;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--print-accent);
+}
+
+/*
+ * 15pt, not 16pt. Paired with the wider body column above, this is what makes an
+ * ordinary event name — "Bombino & the Desert Blues Revue", 32 characters — set
+ * on ONE line at Letter geometry (measured: 105.6mm needed, 107.8mm available).
+ * A genuinely long name still wraps, which is correct: content pushes, the stub
+ * has no fixed height, and nothing clips.
+ */
+.th-ticket-stub__title {
+  margin: 0;
+  font-size: 15pt;
+  font-weight: 700;
+  line-height: 1.08;
+  letter-spacing: -0.3px;
+  overflow-wrap: anywhere;
+}
+
+/* Two columns so Date/Venue and Holder/Presented-by align down the sheet —
+   columns aligning across rows is exactly the grid test. */
+.th-ticket-stub__fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2.5mm 5mm;
+  margin: 1mm 0 0;
+}
+
+.th-ticket-field {
+  min-width: 0;
+}
+
+/* <dd> carries a 40px UA indent. */
+.th-ticket-field dd {
+  margin: 0.6mm 0 0;
+}
+
+.th-ticket-field__sub {
+  display: block;
+  margin-top: 0.4mm;
+}
+
+/* ── Tear-off column ───────────────────────────────────────────────────────── */
+
+.th-ticket-stub__tear {
+  display: flex;
+  flex-direction: column;
+  gap: 3mm;
+  padding-left: 5mm;
+  border-left: 1px dashed var(--print-rule-soft);
+  align-self: stretch;
+  min-width: 0;
+}
+
+.th-ticket-stub__tear-value {
+  margin: 0.6mm 0 0;
+}
+
+/*
+ * Manual reconciliation: when a scanner fails or the door has no signal, staff
+ * initial the box and the stub becomes the record. Deliberately empty and
+ * deliberately bordered — a border is foreground, so it prints even with
+ * "Background graphics" off, which a shaded box would not.
+ */
+.th-ticket-stub__initial {
+  margin-top: 1mm;
+  height: 11mm;
+  border: 1px solid var(--print-rule);
+}
+
+/* ── Cut rules ─────────────────────────────────────────────────────────────── */
+
+.th-ticket-cut {
+  display: flex;
+  align-items: center;
+  gap: 2mm;
+  height: 8mm;
+}
+
+.th-ticket-cut__glyph {
+  font-size: 9pt;
+  line-height: 1;
+  color: var(--print-rule-soft);
+}
+
+.th-ticket-cut__rule {
+  flex: 1;
+  border-top: 1px dashed var(--print-rule-soft);
+}
+
+/* ── Footer ────────────────────────────────────────────────────────────────── */
+
+.th-ticket-sheet__footer {
+  margin-top: 3mm;
+  padding-top: 2mm;
+  border-top: 1px solid var(--print-rule);
+  font-size: 7pt;
+  font-weight: 700;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
+  color: var(--print-muted);
+  text-align: center;
+}
+
+/* Screen-only note pointing at the browser's own Save-as-PDF. */
+.th-ticket-sheet__hint {
+  margin: 4mm 0 0;
+  font-size: 8pt;
+  line-height: 1.45;
+  color: var(--print-muted);
+}
+
+/* ── Screen-only states (loading / empty / error) ──────────────────────────── */
+
+.th-ticket-sheet__notice {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 24px 0;
+}
+
+.th-ticket-sheet__notice-title {
+  margin: 0;
+  font-size: 13pt;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+.th-ticket-sheet__notice-body {
+  margin: 0;
+  font-size: 10pt;
+  line-height: 1.45;
+  color: var(--print-muted);
+  max-width: 60ch;
+}
+
+/* ── Narrow screens ────────────────────────────────────────────────────────── */
+
+@media screen and (max-width: 820px) {
+  /*
+   * The three-column stub is a PAPER layout; it does not survive a phone. Below
+   * the preview threshold the grid re-declares to one column and the tear-off's
+   * vertical dashed rule becomes a horizontal one. Nothing is hidden — grids
+   * collapse by re-declaring `grid-template-columns`, never by dropping
+   * content, and every field on this stub is on the printed artefact.
+   *
+   * Print media is unaffected: these rules are `@media screen`.
+   */
+  .th-ticket-stub {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 5mm;
+    min-height: 0;
+  }
+
+  .th-ticket-stub__scan {
+    align-items: flex-start;
+  }
+
+  .th-ticket-stub__tear {
+    padding-left: 0;
+    padding-top: 4mm;
+    border-left: 0;
+    border-top: 1px dashed var(--print-rule-soft);
+  }
+
+  .th-ticket-sheet__meta {
+    text-align: left;
+  }
+}

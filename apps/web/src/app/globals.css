@@ -1,0 +1,3061 @@
+/* Universal box-sizing reset — without this, `width: 100%` + padding
+   overflows the parent by the padding amount, causing content to clip
+   off the right edge on narrow viewports (especially iOS). */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+:root {
+  /* Swiss International Typographic Style — Ithas Fire Edition.
+     "Stub" light scheme: warm cream ticket-stub paper (#F6F0E4), warm ink text
+     (#211C16), burnt-orange for action, ink for structure, print-style hard
+     ink borders. Mirrors the `stubTheme` token values (packages/ui …/tokens/
+     colors.ts) so SSR first paint, no-JS, and plain-CSS consumers match the
+     Tamagui base theme. Platform theme presets may override at runtime via
+     ActiveThemeInjector. */
+  --background: #f6f0e4;
+  --foreground: #211c16;
+  --font-heading: var(
+    --th-font-body,
+    "Montserrat",
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    Helvetica,
+    Arial,
+    sans-serif
+  );
+  --font-body: var(
+    --th-font-body,
+    "Montserrat",
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    Helvetica,
+    Arial,
+    sans-serif
+  );
+  /* IBM Plex Mono — the second brand font (reinstated 2026-08-26). It carries
+     the tracked-uppercase label idiom: labels, kickers, meta lines, prices,
+     index numbers, table heads, and genuine code. Self-hosted via
+     `next/font/local` in `layout.tsx`; the system stack is the fallback so an
+     un-hydrated or font-blocked render still lands on a monospace face rather
+     than the body sans. */
+  --font-mono:
+    var(--th-font-mono), ui-monospace, "SFMono-Regular", Menlo, Monaco,
+    Consolas, "Liberation Mono", monospace;
+
+  /* Alias tokens (plain CSS variables). */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-body);
+  color-scheme: light;
+
+  /* ── Sans ladder, lower rungs (design system, tokens/typescale.css) ──
+     The mono ladder below was ported from that file; these three were not,
+     which left surfaces picking 10/12/13/14/15 by feel. Body is where the two
+     ladders meet. Only the rungs below body are defined here — headings and
+     display are clamp()ed in the folder and belong with a heading pass, not
+     with this one. */
+  --fs-body: 15px;
+  --fs-sm: 13.3px;
+  --fs-cap: 11.9px;
+
+  /* ── Mono ladder (design system, tokens/typescale.css) ──────────────
+     Tracked uppercase reads larger than it measures, so every mono step
+     runs 1–3px under its sans counterpart. Tracking is part of the step:
+     a size without its paired tracking is not the idiom. */
+  --fs-mono-lg: 13px; /* prices, big meta, kbd */
+  --fs-mono-md: 11.5px; /* meta lines, table cells */
+  --fs-mono-sm: 11px; /* labels, kickers, meta (buttons stay on the sans) */
+  --fs-mono-xs: 10px; /* field labels, table heads */
+  --fs-mono-2xs: 9.5px; /* tags, badges, stamps */
+  --tr-mono-lg: 0.4px;
+  --tr-mono-md: 1.4px;
+  --tr-mono-sm: 2px;
+  --tr-mono-xs: 2.5px;
+  --tr-mono-2xs: 2.5px;
+
+  /* The two label idioms. `--label-*` is the workhorse (field labels, table
+     heads, meta); `--kicker-*` is the wider-tracked editorial variant that
+     sits above a headline. Both are always uppercase. */
+  --label-size: 11px;
+  --label-tracking: 2px;
+  --label-weight: 600;
+  --kicker-size: 11px;
+  --kicker-tracking: 3px;
+
+  /* Form input contract — per-context overrides via embed/checkout containers. */
+  --input-accent: var(--accent, #e2481d);
+  --input-error: #ef4444;
+
+  /* ── Imagery (packages/ui/.../tokens/imagery.ts) ────────────────────
+     Every organizer upload passes through one warm-print filter and sits in a
+     2px ink frame. The frame is what makes an awkward crop read as intentional.
+     Ratios are here as well as in TS so a plain-CSS surface can reach them. */
+  --ratio-hero: 21 / 9;
+  --ratio-card: 3 / 2;
+  --ratio-poster: 2 / 3;
+  --ratio-thumb: 4 / 3;
+  --ratio-square: 1 / 1;
+  --img-filter: grayscale(1) sepia(0.34) saturate(1.45) contrast(1.04)
+    brightness(1.02);
+  --img-filter-hover: grayscale(1) sepia(0.24) saturate(1.6) contrast(1.08)
+    brightness(1.04);
+  --img-frame-width: 2px;
+
+  /* ── Motion tokens ─────────────────────────────────────────────────
+     Mirror of src/lib/motion/index.ts. CSS keyframes + inline styles
+     should reference these vars so duration/easing values stay aligned
+     across CSS and JS. If you add a new token, add it in both places. */
+  --motion-micro: 120ms;
+  --motion-fast: 180ms;
+  --motion-base: 220ms;
+  --motion-medium: 320ms;
+  --motion-slow: 480ms;
+  --motion-ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-ease-sharp: cubic-bezier(0.4, 0, 0.6, 1);
+  --motion-ease-decelerate: cubic-bezier(0.16, 1, 0.3, 1);
+  --motion-ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* ── Design System v2 — semantic token fallbacks ───────────────────
+     Stub (warm-paper light) values; ActiveThemeInjector overrides theme keys
+     at runtime as inline body vars with the same names. */
+  --support: #f59e0b;
+  --onSupport: #211c16;
+  --structure: #211c16;
+  --structurePress: #000000;
+  --onStructure: #fdfaf3;
+  --borderColorSoft: rgba(33, 28, 22, 0.3);
+  /* Status/text theme keys — mirrored so no-fallback var() consumers don't
+     depend on the theme query resolving (first paint, query failure). */
+  --accent: #e2481d;
+  --colorMuted: #5c544a;
+  /* Foregrounds on `backgroundInverted` — mirrored for the same reason as
+     `--colorMuted` above: the ink auth card paints before the theme query
+     resolves, and a missing muted-on-ink value falls back to nothing. */
+  --colorMutedInverted: #bdb4a6;
+  --dangerSoftInverted: #f87171;
+  /* Paired fills/ladders for the foregrounds mirrored above. A foreground
+     mirrored WITHOUT its fill re-creates the shared.ts invariant bug at the
+     CSS layer: e.g. `--onStructure` resolved here while `--accentHard` did
+     not, so a filled Chip outside (or before) the Tamagui theme scope painted
+     a paper-white label over an invalid → transparent fill, with the border
+     falling back to black currentColor. Mirror the pair, not just one half.
+     Values = stubTheme (packages/ui …/tokens/colors.ts), same as the rest of
+     this block. */
+  --color: #211c16;
+  --surface: #fdfaf3;
+  --surfaceMuted: #efe7d6;
+  --surfaceStrong: #211c16;
+  --borderColor: #211c16;
+  --accentSoft: rgba(226, 72, 29, 0.1);
+  --accentHard: #b93312;
+  --accentHover: #b93312;
+  --accentText: #b93312;
+  --accentTextPress: #98240b;
+  --success: #166534;
+  --warning: #92400e;
+  --danger: #b91c1c;
+  /* Legible status TEXT variants — Stub already darkens the status colors for
+     legibility on cream, so the Soft variants match the fills. */
+  --dangerSoft: #b91c1c;
+  --warningSoft: #92400e;
+  --info: #211c16;
+  /* v2 structural vars (not theme keys — static across themes). */
+  --bw-structure: 2px;
+  --bw-hair: 1px;
+  /* Ledger shell registers (design system navigation.css) — topbar /
+     section tabs / context strip heights, consumed by the admin ledger shell
+     (`@th/ui` AdminLedgerShell) and any page that must offset against them.
+     Registers are NOT sticky; these are measurements, not sticky offsets. */
+  --nav-topbar-h: 56px;
+  --nav-sections-h: 40px;
+  --nav-context-h: 34px;
+  --shadow-subtle: 2px 2px 0 rgba(33, 28, 22, 0.85);
+  --shadow-card: 4px 4px 0 rgba(33, 28, 22, 0.85);
+  --shadow-pop: 6px 6px 0 rgba(33, 28, 22, 0.9);
+  --shadow-overlay: 10px 10px 0 rgba(33, 28, 22, 0.9);
+}
+
+/* Stretched link — the wallet row.
+   `TicketWalletCard` makes its TITLE the anchor rather than wrapping the whole
+   card, so the row's quiet actions stay real buttons instead of controls nested
+   inside a link. This overlay gives the anchor the whole row's hit area back.
+   It is a pseudo-element, which Tamagui has no prop for, so it lives here. */
+.th-wallet-link::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+
+/* ── Density ─────────────────────────────────────────────────────────
+   Dashboard and admin get denser, not different: same paper, same ink, same
+   labels — only geometry moves. Scope with `data-density` on any container;
+   comfortable is the default, so an unmarked page is already correct.
+   Mirrors packages/ui/src/ui/tamagui/tokens/density.ts. */
+:root,
+[data-density="comfortable"] {
+  --row-h: 56px;
+  --row-pad-y: 16px;
+  --row-pad-x: 16px;
+  --cell-leading: 1.5;
+  --stack-gap: 16px;
+  --panel-pad: 24px;
+  --control-h: 44px;
+  --label-size-d: 11px;
+  --body-size-d: 15px;
+}
+
+[data-density="compact"] {
+  --row-h: 40px;
+  --row-pad-y: 8px;
+  --row-pad-x: 12px;
+  --cell-leading: 1.35;
+  --stack-gap: 12px;
+  --panel-pad: 16px;
+  --control-h: 36px;
+  --label-size-d: 10px;
+  --body-size-d: 13.5px;
+}
+
+/* Touch surfaces (attendee, scanner) may never inherit compact's shorter
+   controls — hit targets win over information density. A compact container
+   keeps its tighter padding and leading; it gives back the heights. */
+[data-density="compact"][data-touch="true"] {
+  --control-h: 44px;
+  --row-h: 44px;
+}
+
+html {
+  font-family: var(--font-body);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: inherit;
+  /* Reset the UA's 8px default. The app shell is full-bleed — that margin was
+     insetting every page by 8px, which stayed invisible only because the shell
+     painted the same colour as the canvas behind it. It shows up the moment
+     anything full-width gets its own fill (the navbar's glass over an event
+     poster), and it also made the sticky navbar jump 8px on first scroll. */
+  margin: 0;
+  /* Prevent horizontal scroll from any full-bleed section (e.g. the home
+     hero map's `width: 100vw` margin trick). `clip` is the spec-correct
+     "no scroll, no scrollbar gutter" — supported in all modern browsers,
+     unlike `hidden` which can suppress sticky positioning. */
+  overflow-x: clip;
+}
+
+/* Embed routes render inside third-party iframes — let the host page
+   background show through so the widget feels seamless. The marker is a
+   `data-th-embed` attribute the ROOT LAYOUT renders on <body> for the
+   `/embed/*` route context (lib/route-context.ts). It replaced a class an
+   inline script added, which React stripped whenever it re-acquired the body
+   singleton — every rule here was dead and the embed painted the cream page
+   background instead of showing the host through. `/embed/*` is
+   appearance-locked to the platform's LIGHT theme (Stub + the active preset —
+   lib/route-context.ts), so every `var(--<token>)` here is already the light
+   value; these rules only add the host `--hf-*` override layer on top
+   (embed-theme.ts). */
+body[data-th-embed] {
+  /* Transparent by default (the embed contract: the host page shows
+     through). A host that CHOSE a background colour (`?bg=`) gets it painted
+     here — the admin configurator's "Set colour" means an opaque widget. */
+  background: var(--hf-bg, transparent);
+  color-scheme: light;
+  /* Inherited text colour: the platform ink, unless the host set fontColor. */
+  color: var(--hf-text, var(--foreground, #211c16));
+  /* Focus ring: the host's accent when it set one, else the platform's. The
+     global `:focus-visible` rules paint with this var. Declared HERE, on the
+     element that carries the theme vars, so `var(--accent)` resolves against
+     the active theme (see the note on `body { --focus-color }` above). */
+  --focus-color: var(--hf-accent, var(--accent, #e2481d));
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  font-family: inherit;
+}
+
+/* ============================================================
+   FOCUS — one treatment, everywhere
+   ============================================================
+   Ported verbatim from the design system folder's
+   `tokens/focus.css`: "ONE treatment, loud, everywhere.
+   Non-negotiable. 3px flame outline at 2px offset. On accent
+   fills the ring flips to ink so it never disappears into the
+   button it is outlining. Never use :focus (mouse noise) and
+   never remove the ring without replacing it with this one."
+
+   Before this existed the app had exactly ONE `:focus-visible`
+   rule (`.th-place-edit-link`) plus eleven hand-rolled copies of
+   the same idea at the wrong width, so every other control in
+   the app fell back to Chrome's default blue `rgb(0, 95, 204)`
+   ring — off-palette, and invisible on a dark surface.
+
+   `:where()` on purpose: zero specificity, so this is a FLOOR.
+   Anything that already styles its own focus keeps winning, and
+   this can never fight a component for its ring. The corollary
+   is that a `outline: none` further down still beats it — the
+   input block immediately below is the one place that mattered,
+   and it re-states the ring explicitly.
+
+   `var(--token, <stub value>)`: the theme injector sets `--<key>`
+   at runtime and the fallback is what SSR / first paint renders,
+   so each fallback is the Stub value for that token. */
+:root {
+  --focus-width: 3px;
+  --focus-offset: 2px;
+}
+
+/* The COLOURS resolve on `body`, not `:root`, and the difference
+   is load-bearing. A custom property whose value contains `var()`
+   is substituted where it is DECLARED, not where it is used — so
+   `--focus-color: var(--accent)` on `:root` would bake in the
+   Stub `#E2481D` and the ring would stay burnt-orange in every
+   theme. The theme class (`t_stub` / `t_ember` / a platform
+   preset from ActiveThemeInjector) lands on `body`, which is
+   where `--accent` actually gets its per-theme value. Measured:
+   declared on `:root` the ring stayed `rgb(226, 72, 29)` under
+   `t_ember`; declared here it follows the theme.
+
+   Caveat: a nested `<Theme>` subtree that re-declares `--accent`
+   deeper still inherits body's colour. Those surfaces are what
+   the two alternates below are for — set `--focus-color` on the
+   container and every ring inside it flips. */
+body {
+  --focus-color: var(--accent, #e2481d);
+  /* On an accent fill the ring flips to ink, or it disappears
+     into the button it is outlining. */
+  --focus-color-on-accent: var(--structure, #211c16);
+  /* Ink panels and scan mode: amber, the one hue that holds
+     against both the accent and the ink. */
+  --focus-color-on-inverse: var(--support, #f59e0b);
+
+  /* ── The inverse-surface palette ────────────────────────────
+     Five values naming one idea: "a panel painted in the
+     theme's INVERTED polarity" (ink on Stub, white on Ember).
+
+     They live HERE, on `body`, for the same reason the three
+     focus colours above do — a custom property containing
+     `var()` is substituted where it is DECLARED, and `body`
+     carries the theme class, so this is the only place these
+     resolve per-theme. They are deliberately NOT redeclared on
+     the panels that consume them, which is what lets a panel
+     rebind `--color`/`--surface`/… in terms of them without
+     creating a custom-property cycle (a cycle makes BOTH
+     properties invalid, silently).
+
+     `--fill-on-inverse` is the resting fill for a SOLID control
+     sitting on the inverse surface. It is the page canvas
+     colour on purpose: on an ink panel the primary CTA is a
+     chip of the paper the panel is printed on. */
+  --surface-inverse: var(--backgroundInverted, #211c16);
+  --on-surface-inverse: var(--colorInverted, #fdfaf3);
+  --on-surface-inverse-muted: var(--colorMutedInverted, #bdb4a6);
+  --on-surface-inverse-danger: var(--dangerSoftInverted, #f87171);
+  --fill-on-inverse: var(--background, #f6f0e4);
+}
+
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: var(--focus-width) solid var(--focus-color);
+  outline-offset: var(--focus-offset);
+}
+
+/* ── Insetting the ring, for rows that touch their container's edge ──
+   An outline is drawn OUTSIDE the border box, so a full-bleed row —
+   one exactly as wide as its parent — has its left and right strokes
+   painted outside that parent. If the parent scrolls (any `overflow`
+   other than `visible`, and `overflow-y: auto` alone is enough because
+   `overflow-x` then computes to `auto` too) the browser clips them and
+   the ring reads as two loose horizontal rules rather than a box.
+
+   `--focus-offset` INHERITS, so a container flips every ring beneath it
+   with one declaration and no per-row bookkeeping. Put this on the
+   scrolling container, or on the rows themselves when only some of a
+   container's controls are full-bleed.
+
+   Only the offset changes: width and colour still come from the system,
+   so this stays one treatment. */
+[data-focus-inset] {
+  --focus-offset: calc(-1 * var(--focus-width));
+}
+
+/* ── Table frame + pager: one rule, not two ─────────────────────────────
+   `TableContainer` (data-dt-frame) draws the table's 2px bottom rule, and
+   `Pagination` (data-dt-pager) draws a 2px top rule of its own. Directly
+   after a frame the pager's rule would double it 8px below, so it stands
+   down there; a pager with no frame before it (universal search results,
+   the attendee feedback list, the volunteer signups scroller) keeps its
+   rule. A table with a pager belongs in a TableContainer: a bare DataTable's
+   card-mode list draws its own bottom rule and would double the pager's.
+   !important beats Tamagui's atomic border class. */
+[data-dt-frame] + [data-dt-pager] {
+  border-top-width: 0 !important;
+}
+
+/* ============================================================
+   Unified Input Styling (transparent / glassmorphic)
+   ============================================================
+   All native HTML inputs share the checkout-inspired styling
+   with transparent backgrounds, subtle borders, and smooth
+   focus transitions.
+
+   CAUTION — despite the name, this reaches the underlying
+   <input> that Tamagui's TextInput renders too: this block's
+   selector specificity (0,6,1) beats any atomic class Tamagui
+   compiles from a style prop (0,2,0), so a `paddingLeft="$6"`-
+   style prop on a Tamagui input LOSES this cascade rather than
+   being "unaffected" by it. TextInput's own inset affordances
+   (StatusIconWrapper/ClearButton padding) and AmountInput's
+   prefix/suffix clearance both have to fight this rule with an
+   imperative `!important` DOM patch (see `patchInputDOM` in
+   TextInput.tsx and `patchAffixClearance` in AmountInput.tsx)
+   rather than relying on a style prop. Narrowing this selector
+   to exclude Tamagui-managed inputs would remove the need for
+   those patches — flagged as a follow-up, not fixed here.
+   ============================================================ */
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not(
+    [type="file"]
+  ):not([type="hidden"]):not([type="color"]),
+textarea,
+select {
+  background: var(--background, #f6f0e4);
+  color: var(--color, #211c16);
+  border: 2px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+  border-radius: 0;
+  padding: 10px 14px;
+  font-size: 14px;
+  /* Kept: this suppresses the UA ring on MOUSE focus, which is
+     the noise the system's "never use :focus" line is about. The
+     keyboard ring is restored explicitly below — this selector's
+     specificity (0,6,1) beats the `:where()` floor, so without
+     that rule every text field in the app would have no ring. */
+  outline: none;
+  transition: border-color 0.15s ease-out;
+}
+
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not(
+    [type="file"]
+  ):not([type="hidden"]):not([type="color"]):focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: var(--focus-width) solid var(--focus-color);
+  outline-offset: var(--focus-offset);
+}
+
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not(
+    [type="file"]
+  ):not([type="hidden"]):not([type="color"]):focus,
+textarea:focus,
+select:focus {
+  border-color: var(--accent, #e2481d);
+}
+
+/* ── The auth card is an INK panel ─────────────────────────────────────────
+   `[data-auth-card]` is set by `AuthCardShell`; `[data-auth-ink]` marks a
+   control that sits ON that panel without being inside it (the overlay's
+   close button, which is absolutely positioned over the card).
+
+   ## Why the surface flip is a var rebind and not a sweep of style props
+
+   Two reasons, one of them absolute:
+
+   1. **A style prop cannot reach the fields.** The `input:…` block above is
+      (0,6,1) and paints EVERY native input's `background` / `color` / `border`
+      from `--background` / `--color` / `--borderColorSoft`. Tamagui compiles a
+      style prop to a (0,2,0) atomic class, so `backgroundColor="$x"` on an
+      auth field LOSES that cascade. Rebinding the properties is the only lever
+      that reaches it without reopening app-wide input styling.
+   2. **Seven panels, one card.** Sign-in, sign-up, verify-email, 2FA setup,
+      2FA challenge, recovery and welcome all mount the same shell — plus the
+      same cards again inside the overlays. A per-panel sweep is seven places
+      to forget; a rebind is one, and a control that paints itself `$color` or
+      `$surfaceMuted` flips with it for free.
+
+   This is the SEMANTIC tier being redefined for a subtree, which is what a
+   theme does (v2 §2: "Themes redefine this layer; components never change").
+   Every value below is a semantic token pointed at the inverse-surface palette
+   declared on `body`, never a literal.
+
+   ## The three values that are NOT a straight polarity flip
+
+   - `--accent` is UNCHANGED. Flame #E2481D on ink is 4.17:1 — legal as LINE
+     WORK (the 3:1 non-text floor: the step band, the notice rules, the active
+     OTP cell), illegal as a label. So it stays where it was and…
+   - `--accentText` becomes `--support`. Accent-as-a-LABEL is the whole job of
+     `accentText`, and on ink it goes the WRONG WAY: #A8300F is 2.49:1 there,
+     worse than the accent it deepens. Amber is 7.87:1 and is already this
+     surface's designated hue (see `--focus-color-on-inverse` above).
+   - The primary CTA is a CREAM fill with an ink label, not a flame one.
+     #E2481D has no AA foreground in either polarity (white 4.06:1, ink
+     4.38:1), so a flame CTA on ink is unreadable whichever label it takes.
+     Cream on ink is the true inverse of the light card: 16.22:1.
+
+   Measured on #211C16 (Stub `backgroundInverted`), WCAG 2.1:
+     paper #FDFAF3 16.22 · muted #BDB4A6 8.24 · amber #F59E0B 7.87
+     danger #F87171 6.11 · flame #E2481D 4.17 (line work only)
+     accentText #A8300F 2.49 FAIL · dangerSoft #B91C1C 2.61 FAIL
+     warning #92400E 2.38 FAIL · colorMuted #5C544A 2.06 FAIL
+
+   NOT rebound, and deliberately: `--success` (#166534 = 2.37:1 on ink). No
+   auth panel uses a success tone today; if one grows a `tone="success"` Alert
+   it needs a legible-green-on-inverse token first. */
+[data-auth-card],
+[data-auth-ink] {
+  /* ── Surfaces ──────────────────────────────────────────────────────
+     The panel itself, then the lifted fills that sit on it. Cream at a
+     low alpha rather than a second opaque ink: `color-mix`, because
+     concatenating an alpha suffix onto a `var()` is invalid CSS (v2 §4). */
+  --surface: var(--surface-inverse);
+  /* PAPER, not the panel's ink — `surfaceStrong` is the documented FILL that
+     `onStructure` is the foreground for (see the invariant note on
+     `intentVisualConfigs` in packages/ui/…/components/shared.ts). `onStructure`
+     inverts to ink below, so pointing this at ink too would pair ink on ink. */
+  --surfaceStrong: var(--on-surface-inverse);
+  /* The boxed field's fill — one step off the panel, exactly as the cream
+     card's field sits one step below its surface.
+
+     12%, not the 6% first drawn. Measured on the running page, 6% composited
+     to #2E2923 = 1.17:1 against the panel: the fill contributed nothing and
+     the field was legible only via its border. Cream at a low alpha does not
+     travel over ink the way ink at a low alpha travels over cream, which is
+     the correction applied to every structural value in this block.
+     `--surfaceMuted` (the disabled CTA's ground, the meter track, the icon
+     discs) took the same treatment at 16%: at 8% a disabled button read as an
+     absence rather than a control. Neither is a WCAG floor — the 2px border
+     is the boundary that owes 3:1 — both are legibility. */
+  --background: color-mix(in srgb, var(--on-surface-inverse) 12%, transparent);
+  --backgroundFocus: color-mix(
+    in srgb,
+    var(--on-surface-inverse) 12%,
+    transparent
+  );
+  --backgroundHover: color-mix(
+    in srgb,
+    var(--on-surface-inverse) 10%,
+    transparent
+  );
+  --backgroundPress: color-mix(
+    in srgb,
+    var(--on-surface-inverse) 14%,
+    transparent
+  );
+  --backgroundStrong: color-mix(
+    in srgb,
+    var(--on-surface-inverse) 10%,
+    transparent
+  );
+  --surfaceMuted: color-mix(in srgb, var(--on-surface-inverse) 16%, transparent);
+  --mutedSurface: color-mix(in srgb, var(--on-surface-inverse) 16%, transparent);
+  /* `ghost`'s hover fill. 12% keeps a paper label at 11.34:1 on it. */
+  --surfaceRaised: color-mix(
+    in srgb,
+    var(--on-surface-inverse) 12%,
+    transparent
+  );
+  --surfaceOverlay: color-mix(
+    in srgb,
+    var(--on-surface-inverse) 6%,
+    transparent
+  );
+  /* 18% (Ember's weight), not Stub's 10%: a 10% flame wash over ink is not
+     a surface, it is nothing. The glyph on it still clears 3:1. */
+  --accentSoft: color-mix(in srgb, var(--accent, #e2481d) 18%, transparent);
+
+  /* ── Type ──────────────────────────────────────────────────────────
+     `--colorInverted` inverts BACK to the panel's own ink: on this surface
+     "inverted" means the label on a filled control, not the body copy. */
+  --color: var(--on-surface-inverse);
+  --colorMuted: var(--on-surface-inverse-muted);
+  --muted: var(--on-surface-inverse-muted);
+  --colorInverted: var(--surface-inverse);
+
+  /* ── Rules and boxes ───────────────────────────────────────────────
+     40%, not the 32% the specimen drew: 32% lands at 2.83:1 against the
+     panel and a boxed field's border IS the control's boundary, so it owes
+     WCAG 1.4.11's 3:1. 40% measures 3.69:1, and still reads as a hairline
+     against the full-paper border a focused field firms up to (16.22:1). */
+  --borderColor: var(--on-surface-inverse);
+  --borderColorStrong: var(--on-surface-inverse);
+  --borderColorSoft: color-mix(
+    in srgb,
+    var(--on-surface-inverse) 40%,
+    transparent
+  );
+
+  /* ── Structure = the `secondary` button, and every 4px notice rule ──
+     The variant inverts around one token, so pointing `--structure` at paper
+     and `--onStructure` at ink turns "ink outline that fills with ink" into
+     "paper outline that fills with paper" — the same grammar, photographed
+     in negative. Press holds at the hover fill (the rung rule forbids moving
+     a fill TOWARD its label); `scale: 0.98` from the atom carries the press. */
+  --structure: var(--on-surface-inverse);
+  --structurePress: var(--on-surface-inverse);
+  --onStructure: var(--surface-inverse);
+
+  /* ── The primary CTA's fill ladder ─────────────────────────────────
+     Cream fill, ink label. Rest is the page canvas (#F6F0E4, 14.89:1),
+     hover the brighter panel paper (#FDFAF3, 16.22:1) — the ladder still
+     moves AWAY from the label at every rung, it just travels the other
+     direction because the polarity is flipped. Press holds at hover for the
+     same reason `--structurePress` does. */
+  --brandSecondaryHover: var(--fill-on-inverse);
+  --brandSecondaryStrong: var(--on-surface-inverse);
+  --brandSecondaryPress: var(--on-surface-inverse);
+  --onBrandSecondary: var(--surface-inverse);
+
+  /* ── Accent-as-a-label → amber ─────────────────────────────────────
+     See the header. `accentTextPress` collapses onto the same amber: the
+     `outlined` variant that distinguishes them is not used on this surface,
+     and inventing a second amber rung to keep a ladder nobody climbs would
+     be worse than saying so here. */
+  --accentText: var(--support, #f59e0b);
+  --accentTextPress: var(--support, #f59e0b);
+
+  /* ── Status ────────────────────────────────────────────────────────
+     Danger keeps a red (see `dangerSoftInverted` in tokens/colors.ts for why
+     it does not become amber); caution becomes amber, which is the role
+     `support` already names. Together with the unchanged flame these give
+     the password meter three separable rungs on ink — weak 6.11, okay 7.87,
+     strong 4.17 — where its Stub values measure 2.61 and 2.38. */
+  --danger: var(--on-surface-inverse-danger);
+  --dangerSoft: var(--on-surface-inverse-danger);
+  --warning: var(--support, #f59e0b);
+  --warningSoft: var(--support, #f59e0b);
+
+  /* ── Chrome autofill ───────────────────────────────────────────────
+     Predicted, with every precondition measured on the running page: this
+     subtree computes `color-scheme: light`, so Chrome paints its LIGHT
+     autofill ground rgb(232,240,254) — while the input block above forces a
+     cream `-webkit-text-fill-color`. Author colour wins, author background
+     does not, so an autofilled field would render cream on pale at 1.10:1.
+     The huge inset shadow is the standard override (background-color itself
+     is not honoured on an autofilled control); repeating the fill colour in
+     `-webkit-text-fill-color` is required because the UA sets it too. */
+  & input:-webkit-autofill,
+  & input:-webkit-autofill:hover,
+  & input:-webkit-autofill:focus,
+  & input:-webkit-autofill:active {
+    -webkit-text-fill-color: var(--color) !important;
+    caret-color: var(--color) !important;
+    -webkit-box-shadow: 0 0 0 1000px var(--surface-inverse) inset !important;
+    box-shadow: 0 0 0 1000px var(--surface-inverse) inset !important;
+    transition: background-color 5000s ease-in-out 0s;
+  }
+
+  --input-error: var(--on-surface-inverse-danger);
+
+  /* ── Focus ─────────────────────────────────────────────────────────
+     The design system's own ink-surface ring. One declaration flips every
+     ring in the subtree, because `--focus-color` is what both the
+     `:focus-visible` floor and the auth-scoped input rule below read. */
+  --focus-color: var(--focus-color-on-inverse);
+}
+
+/* ── The auth card's focus state ───────────────────────────────────────────
+   Scoped to `[data-auth-card]` (set by `AuthCardShell`), NOT global.
+
+   Two things are wrong on a focused auth field, and they are the same thing
+   twice: the border carries the whole cue, and it carries it in FLAME.
+
+     1. The block above swaps a focused field's border to `--accent`. On the
+        credential step that painted a flame box around the password input
+        directly above a receded, grey "SIGN IN" — the exact shape of a
+        rejected submission, on a field the reader had merely clicked into.
+     2. There is no ring to fall back on. `TextInput`'s own `focusRing`
+        (packages/ui/…/forms/TextInput.tsx) is `outlineWidth: 0` — it
+        deliberately REMOVES the outline on `:focus`, because the border
+        recolour was meant to be the entire cue. Tamagui emits that as
+        `outline-width: 0 !important` at `:root:root:root:root ._x:focus`,
+        which beats the `:focus-visible` ring above on source order. Measured
+        on /sign-in before this block: `outlineWidth: "0px"`.
+
+   So: restore the design system's ring (3px at 2px offset, the `--focus-*`
+   custom properties the rest of the app already uses) and hold the border at
+   `--borderColor`. The ring does the work; the border only firms up.
+
+   Both values now come from the ink-panel block above, so on the shipped card
+   the ring is AMBER (`--focus-color-on-inverse`) and the firmed border is
+   PAPER — 16.22:1 against the panel, up from the 3.69:1 hairline it rests at.
+   The literal `#211c16` fallback below is still `--borderColor`'s Stub value
+   (the gate checks that); it is unreachable in practice, because the block
+   above declares `--borderColor` on the very same element.
+
+   `!important` is load-bearing, not laziness. Tamagui compiles pseudo-state
+   styles to `:root:root:root:root ._btc-0focus-accent:focus { … !important }`
+   — (0,6,0) AND important — so an ordinary rule at any specificity loses.
+
+   `:not([aria-invalid="true"])` keeps the error state intact: an invalid field
+   falls through to its own red border instead of being forced back to ink by
+   a rule that outranks it. The auth cards set `aria-invalid` alongside
+   `status="error"` for exactly this reason (`TextInput` does not set it
+   itself — flagged as a follow-up in @th/ui).
+
+   NOT FIXED HERE, deliberately: the `input:…` block above painting EVERY
+   native input in the app is a real pre-existing problem (it also overrides
+   the 2px ink box the DS specifies for a boxed field down to
+   `--borderColorSoft`), as is `TextInput`'s ringless focus state. Both are
+   their own diff. */
+[data-auth-card]
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not(
+    [type="file"]
+  ):not([type="hidden"]):not([type="color"]):not([aria-invalid="true"]):focus {
+  border-color: var(--borderColor, #211c16) !important;
+}
+
+[data-auth-card]
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not(
+    [type="file"]
+  ):not([type="hidden"]):not([type="color"]):focus-visible {
+  outline: var(--focus-width) solid var(--focus-color) !important;
+  outline-offset: var(--focus-offset) !important;
+}
+
+/* There is deliberately NO `[required]` visual. Required fields are UNMARKED and
+   optional ones say "(optional)" — docs/design/design-system-v2.md §6a, 2026-08-26.
+   The former accent left-bar rule lived here; do not reintroduce it. */
+
+/* Invalid state: red border. Uses aria-invalid so call sites opt in
+   alongside their existing validation logic. */
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not(
+    [type="file"]
+  ):not([type="hidden"]):not([type="color"])[aria-invalid="true"],
+textarea[aria-invalid="true"],
+select[aria-invalid="true"] {
+  border-color: var(--input-error) !important;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--colorMuted, #5c544a);
+}
+
+select {
+  appearance: none;
+  /* Stub (light) is the shipped default — native <select>/<option> chrome must
+     render light. `dark` here forced the OS dropdown panel dark on a cream app. */
+  color-scheme: light;
+  /* Chevron stroke = the Stub muted ink (#5C544A). A data: URI can't read a CSS
+     var, so this hex is intentional; keep it in step with --colorMuted. */
+  background-image: url("data:image/svg+xml,%3Csvg width='12' height='8' viewBox='0 0 12 8' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1.5L6 6.5L11 1.5' stroke='%235C544A' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 32px;
+}
+
+/* Skin native <option> dropdown panels (Windows won't inherit the select's own
+   colours). Tracks the active theme: Stub paper + ink by default. The fallbacks
+   are the Stub values, so first paint matches the hydrated theme. */
+option {
+  background: var(--background, #f6f0e4);
+  color: var(--foreground, #211c16);
+}
+
+/* ── Embed widget overrides for the unified input block ──
+   The embed (body[data-th-embed] — see embed-theme.ts) skins its inputs via
+   inline styles, which win over the rules above for background/color/
+   border/padding/font-size. The select chevron is owned by the component
+   (EmbedCheckoutFormSection renders a <ChevronDown>): an inline `background:`
+   shorthand resets any stylesheet background-image, so a CSS chevron here
+   would either be dead or, once live, a second arrow. Things inline styles
+   CANNOT reach: */
+
+/*   1. Placeholder colour — ::placeholder can't be styled inline. The global
+      rule paints the platform `--colorMuted`; this adds the host fontColor
+      layer, matching embed TEXT_MUTED. */
+body[data-th-embed] input::placeholder,
+body[data-th-embed] textarea::placeholder {
+  color: var(--hf-text-muted, var(--colorMuted, #5c544a));
+}
+
+/*   2. The event title <h1> inside the shared EventDetail (embed detail
+      screen). It is painted inline from Tamagui (`theme.color.val`) — the
+      platform ink, but blind to the host fontColor override. Stylesheet
+      !important beats the inline non-important declaration and routes the
+      heading through the host layer. */
+body[data-th-embed] .event-content-meta h1 {
+  color: var(--hf-text, var(--color, #211c16)) !important;
+}
+
+a,
+p,
+span,
+label,
+li,
+div {
+  font-family: inherit;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+strong,
+b {
+  font-family: var(--font-heading);
+}
+
+code,
+pre,
+kbd,
+samp {
+  font-family: var(--font-mono);
+}
+
+/* ============================================================
+   Auth Overlay Animations
+   Keyframe definitions only. Durations, easings, and the rules
+   for *when* to slide live in src/components/auth/auth-motion.ts
+   so the timing system has a single source of truth.
+   ============================================================ */
+@keyframes th-auth-card-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(40px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes th-auth-card-slide-out {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(40px) scale(0.97);
+  }
+}
+
+@keyframes th-auth-backdrop-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes th-auth-backdrop-fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+/* Auth panel slide transitions (stepper panels) */
+@keyframes th-auth-panel-slide-in-from-right {
+  from {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes th-auth-panel-slide-in-from-left {
+  from {
+    opacity: 0;
+    transform: translateX(-100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes th-auth-panel-slide-out-to-left {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(-100%);
+  }
+}
+
+@keyframes th-auth-panel-slide-out-to-right {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+}
+
+/* Fade-in-down for error alerts inside auth cards */
+@keyframes th-auth-alert-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.th-auth-alert-enter {
+  animation: th-auth-alert-enter 0.25s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Shake animation for form validation errors */
+@keyframes th-auth-shake {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  15% {
+    transform: translateX(-6px);
+  }
+  30% {
+    transform: translateX(5px);
+  }
+  45% {
+    transform: translateX(-4px);
+  }
+  60% {
+    transform: translateX(3px);
+  }
+  75% {
+    transform: translateX(-2px);
+  }
+}
+
+.th-auth-shake {
+  animation: th-auth-shake 0.4s ease-in-out;
+}
+
+/* ─── Success pop for 2FA verification ─── */
+@keyframes th-auth-success-pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+  60% {
+    transform: scale(1.08);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.th-auth-success-pop {
+  animation: th-auth-success-pop 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+/* ─── Reduce motion ─── */
+@media (prefers-reduced-motion: reduce) {
+  .th-auth-field-stagger > *,
+  .th-auth-shake,
+  .th-auth-alert-enter,
+  .th-auth-success-pop,
+  .th-auth-form-slide-up,
+  .th-checkout-slide-forward,
+  .th-embed-slide-forward,
+  .th-checkout-slide-back,
+  .th-embed-slide-back,
+  .th-checkout-fade-in,
+  .th-embed-fade-in,
+  .th-checkout-fade-in-up,
+  .th-embed-fade-in-up,
+  .th-checkout-confirmation-pop,
+  .th-embed-confirmation-pop,
+  .th-checkout-stagger > *,
+  .th-embed-stagger > *,
+  .th-card-stagger > * {
+    animation: none !important;
+  }
+}
+
+/* ============================================================
+   Shared Checkout / Embed Screen Transitions
+   ============================================================
+   These keyframes are used by both the web checkout and the embed
+   widget.  The utility classes below (th-checkout-*) work in any
+   colour scheme via inherited colours; the legacy th-embed-* names
+   are kept as aliases so the embed page.tsx keeps working.
+   ============================================================ */
+@keyframes th-checkout-slide-in-right {
+  from {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes th-checkout-slide-in-left {
+  from {
+    opacity: 0;
+    transform: translateX(-24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes th-checkout-fade-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes th-checkout-fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes th-checkout-confirmation-pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+  70% {
+    transform: scale(1.05);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* ── Shell horizontal grid ─────────────────────────────────────────
+   The gutter shared by the navbar, the page body and the footer, published
+   as a custom property so a band built from plain DOM cells (the footer's
+   Swiss grid) can key off the SAME breakpoint as the two Tamagui bands
+   instead of a JS media query.
+
+   641px is Tamagui's `$gtSm` (`media.gtSm` in packages/ui/.../tamagui/index.ts).
+   It has to be a real media query, not `useIsMobile()`: that hook flips at
+   600px and returns false during SSR, which put the footer on a different
+   edge than the nav across 600–640 and made it first-paint at the desktop
+   gutter on phones.
+
+   Values mirror SHELL_GUTTER_MOBILE / SHELL_GUTTER in
+   src/components/layout/shell-metrics.ts — a unit test asserts the two agree,
+   because a silent drift here is exactly the misalignment this removes. */
+.th-shell-band {
+  --shell-gutter: 16px;
+}
+
+@media (min-width: 641px) {
+  .th-shell-band {
+    --shell-gutter: 32px;
+  }
+}
+
+/* ── Shared utility classes (work in both web checkout and embed) ── */
+/* Slide classes use fill-mode `backwards`, NOT `both`: their end keyframe
+   equals the natural state, but `both` keeps applying it forever — and a
+   persisted transform (even the identity matrix) turns the wrapper into a
+   containing block, so position:fixed descendants (the embed mobile CTA
+   bar) pin to the wrapper instead of the viewport and scroll-lock over
+   the content. `backwards` plays identically, then stops applying. */
+.th-checkout-slide-forward,
+.th-embed-slide-forward {
+  animation: th-checkout-slide-in-right 0.28s cubic-bezier(0.16, 1, 0.3, 1)
+    backwards;
+}
+
+.th-checkout-slide-back,
+.th-embed-slide-back {
+  animation: th-checkout-slide-in-left 0.28s cubic-bezier(0.16, 1, 0.3, 1)
+    backwards;
+}
+
+.th-checkout-fade-in,
+.th-embed-fade-in {
+  animation: th-checkout-fade-in 0.3s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.th-checkout-fade-in-up,
+.th-embed-fade-in-up {
+  animation: th-checkout-fade-in-up 0.35s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.th-checkout-confirmation-pop,
+.th-embed-confirmation-pop {
+  animation: th-checkout-confirmation-pop 0.45s
+    cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+/* Stagger children for list items */
+.th-checkout-stagger > *,
+.th-embed-stagger > * {
+  animation: th-checkout-fade-in-up 0.3s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.th-checkout-stagger > *:nth-child(1),
+.th-embed-stagger > *:nth-child(1) {
+  animation-delay: 0ms;
+}
+.th-checkout-stagger > *:nth-child(2),
+.th-embed-stagger > *:nth-child(2) {
+  animation-delay: 40ms;
+}
+.th-checkout-stagger > *:nth-child(3),
+.th-embed-stagger > *:nth-child(3) {
+  animation-delay: 80ms;
+}
+.th-checkout-stagger > *:nth-child(4),
+.th-embed-stagger > *:nth-child(4) {
+  animation-delay: 120ms;
+}
+.th-checkout-stagger > *:nth-child(5),
+.th-embed-stagger > *:nth-child(5) {
+  animation-delay: 160ms;
+}
+.th-checkout-stagger > *:nth-child(6),
+.th-embed-stagger > *:nth-child(6) {
+  animation-delay: 200ms;
+}
+.th-checkout-stagger > *:nth-child(7),
+.th-embed-stagger > *:nth-child(7) {
+  animation-delay: 240ms;
+}
+.th-checkout-stagger > *:nth-child(8),
+.th-embed-stagger > *:nth-child(8) {
+  animation-delay: 280ms;
+}
+.th-checkout-stagger > *:nth-child(n + 9),
+.th-embed-stagger > *:nth-child(n + 9) {
+  animation-delay: 300ms;
+}
+
+/* Checkout sidebar — hidden on small screens, shown ≥ 768px.
+   `--always` keeps it visible (full-width, in-flow) on phones too: used
+   inside resize-bridged iframes where the fixed mobile CTA bar is
+   suppressed (position:fixed pins to the iframe's content height, not
+   the visitor's screen) so the order total must stay in the flow. */
+.th-embed-checkout-sidebar {
+  display: none;
+}
+.th-embed-checkout-sidebar--always {
+  display: block;
+}
+@media (max-width: 767px) {
+  .th-embed-checkout-sidebar--always {
+    width: 100% !important;
+  }
+}
+/* Checkout two-column layout — stacks on mobile, side-by-side ≥ 768px.
+   Direction MUST live here (not inline on the element) or the media
+   query below can never flip it to row. */
+.th-embed-checkout-cols {
+  flex-direction: column;
+  padding: 20px;
+}
+@media (min-width: 768px) {
+  .th-embed-checkout-sidebar {
+    display: block;
+  }
+  .th-embed-checkout-cols {
+    flex-direction: row;
+    align-items: flex-start;
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+}
+/* Standalone (non-iframe) pages render the fixed mobile CTA bar over the
+   bottom ~70px of the viewport at phone widths — give the content enough
+   bottom clearance that its last elements can scroll above the bar. */
+@media (max-width: 768px) {
+  .th-embed-checkout-cols--with-fixed-bar {
+    padding-bottom: 120px;
+  }
+}
+
+/* Fixed CTA bar action label: the explicit long form fits ≥380px; below
+   that the bar row (Total block + nowrap button) would overflow the
+   viewport edge, so a compact label swaps in. */
+.th-embed-cta-label-short {
+  display: none;
+}
+@media (max-width: 379px) {
+  .th-embed-cta-label-long {
+    display: none;
+  }
+  .th-embed-cta-label-short {
+    display: inline;
+  }
+}
+
+/* Billing two-field rows (city + state, postal + country). minmax(0, 1fr),
+   NOT bare 1fr: 1fr floors at min-content, and the state/country <select>s'
+   min-content width is their widest option label — wider than half a phone
+   viewport, which pushed the right cell past the viewport edge behind an
+   overflow-x:hidden ancestor (unreachable by scrolling). */
+.th-embed-checkout-field-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+}
+/* Below ~380px a half-width cell is ~135px, which cannot show "United
+   States" (or most state names) without clipping at the field border.
+   Collapse to one column by re-declaring the template — never by hiding
+   a cell. Same rung as the CTA label swap above. */
+@media (max-width: 379px) {
+  .th-embed-checkout-field-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Embed event-detail inline CONTINUE (sticky, in-flow). When the fixed
+   mobile CTA bar is rendered (standalone, non-iframe pages) the inline
+   CTA hides at phone widths — both sat at the viewport bottom and the
+   fixed bar (z-1000) swallowed the inline button's clicks. Inside
+   resize-bridged iframes the fixed bar is suppressed instead, and this
+   inline CTA is the load-bearing action at every width. */
+@media (max-width: 768px) {
+  .th-embed-inline-cta--with-fixed-bar {
+    display: none !important;
+  }
+}
+
+/* ── Skeleton pulse (MyTickets, reusable) ──────────────────── */
+@keyframes th-skeleton-pulse {
+  0%,
+  100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* ── Staggered card entrance ───────────────────────────────── */
+@keyframes th-card-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.th-card-stagger > * {
+  animation: th-card-fade-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.th-card-stagger > *:nth-child(1) {
+  animation-delay: 0ms;
+}
+.th-card-stagger > *:nth-child(2) {
+  animation-delay: 60ms;
+}
+.th-card-stagger > *:nth-child(3) {
+  animation-delay: 120ms;
+}
+.th-card-stagger > *:nth-child(4) {
+  animation-delay: 180ms;
+}
+.th-card-stagger > *:nth-child(5) {
+  animation-delay: 240ms;
+}
+.th-card-stagger > *:nth-child(n + 6) {
+  animation-delay: 300ms;
+}
+
+/* ── Order detail — sticky shrinking event header ──────────────
+   The order's event title + status pin beneath the navbar as the page
+   scrolls. Once "stuck" the title shrinks and the venue/date metadata row
+   collapses, leaving a compact bar. The `.is-stuck` flip is driven by an
+   IntersectionObserver sentinel in OrderDetail.tsx — a CSS-only transition
+   rather than scroll-linked JS, which stays smooth under iOS Safari momentum
+   scrolling (where scroll events don't fire continuously). */
+.th-order-detail-header {
+  position: sticky;
+  top: 0; /* mobile: navbar auto-hides on scroll, so pin at the very top */
+  z-index: 20; /* below the navbar (50), above the content cards */
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  background-color: var(--background, #f6f0e4);
+  padding-bottom: 16px;
+  border-bottom: 2px solid var(--borderColor, #211c16);
+  transition:
+    padding var(--motion-base, 220ms) var(--motion-ease-standard, ease),
+    border-color var(--motion-base, 220ms) var(--motion-ease-standard, ease);
+}
+
+@media (min-width: 768px) {
+  /* desktop: navbar stays pinned (68px tall) — sit just beneath it */
+  .th-order-detail-header {
+    top: 68px;
+  }
+}
+
+.th-order-detail-header__bar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.th-order-detail-header__title {
+  flex: 1;
+  min-width: 0;
+  margin: 0; /* reset UA heading margins */
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 28px;
+  line-height: 1.15;
+  letter-spacing: -0.5px;
+  text-transform: uppercase;
+  color: var(--foreground, #211c16);
+  /* Wrap long titles across up to 2 lines, then ellipsis — never a hard
+     mid-word cut at 390px. overflow-wrap:anywhere breaks an over-long single
+     token; word-break:normal keeps ordinary words whole. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  word-break: normal;
+  transition: font-size var(--motion-base, 220ms)
+    var(--motion-ease-standard, ease);
+}
+
+/* Metadata row collapses smoothly when the header is stuck. We animate
+   grid-template-rows 1fr → 0fr rather than a fixed max-height: this never
+   clips content in the expanded state, no matter how many lines a long venue
+   name + date wrap to. The grid child needs min-height:0 + overflow:hidden
+   for the row track to actually collapse. */
+.th-order-detail-header__meta {
+  display: grid;
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transition:
+    grid-template-rows var(--motion-base, 220ms)
+      var(--motion-ease-standard, ease),
+    opacity var(--motion-base, 220ms) var(--motion-ease-standard, ease);
+}
+
+.th-order-detail-header__meta > * {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.th-order-detail-header.is-stuck {
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.th-order-detail-header.is-stuck .th-order-detail-header__title {
+  font-size: 17px;
+  /* Collapse to a single line while pinned so the sticky bar stays compact. */
+  -webkit-line-clamp: 1;
+}
+
+.th-order-detail-header.is-stuck .th-order-detail-header__meta {
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .th-order-detail-header,
+  .th-order-detail-header__title,
+  .th-order-detail-header__meta {
+    transition: none;
+  }
+}
+
+/* ── Admin dashboard staggered entrance ────────────────────── */
+@keyframes th-admin-slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.th-admin-stagger > * {
+  animation: th-admin-slide-up 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.th-admin-stagger > *:nth-child(1) {
+  animation-delay: 0ms;
+}
+.th-admin-stagger > *:nth-child(2) {
+  animation-delay: 70ms;
+}
+.th-admin-stagger > *:nth-child(3) {
+  animation-delay: 140ms;
+}
+.th-admin-stagger > *:nth-child(4) {
+  animation-delay: 210ms;
+}
+.th-admin-stagger > *:nth-child(5) {
+  animation-delay: 280ms;
+}
+.th-admin-stagger > *:nth-child(n + 6) {
+  animation-delay: 350ms;
+}
+
+/* ── Admin skeleton loading bars ───────────────────────────── */
+.th-skeleton-bar {
+  background: linear-gradient(
+    90deg,
+    var(--surfaceMuted, #1e2e52) 25%,
+    var(--borderColorSoft, #2a3e66) 50%,
+    var(--surfaceMuted, #1e2e52) 75%
+  );
+  background-size: 200% 100%;
+  animation: th-admin-skeleton-shimmer 1.5s ease-in-out infinite;
+}
+
+@keyframes th-admin-skeleton-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+/* ============================================================
+   Swiss International Typographic Style — Pattern Overlays
+   ============================================================
+   These CSS-generated patterns add visual richness and tactile
+   depth while maintaining the flat, objective aesthetic.
+   Apply to muted surfaces and background areas only.
+   ============================================================ */
+
+/* Grid Pattern: 24×24px grid lines at visible opacity */
+.swiss-grid-pattern {
+  background-image:
+    linear-gradient(to right, currentColor 1px, transparent 1px),
+    linear-gradient(to bottom, currentColor 1px, transparent 1px);
+  background-size: 24px 24px;
+  opacity: 0.05;
+  pointer-events: none;
+}
+
+/* Dot Matrix: radial gradient dots, 16×16px spacing.
+   Apply as a pseudo-element overlay so it layers over any background. */
+.swiss-dots {
+  position: relative;
+}
+.swiss-dots::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: radial-gradient(
+    circle,
+    currentColor 0.5px,
+    transparent 0.5px
+  );
+  background-size: 16px 16px;
+  opacity: 0.04;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Diagonal Lines: 45-degree repeating lines, 10px spacing.
+   Applied as a pseudo-element to layer over backgrounds. */
+.swiss-diagonal {
+  position: relative;
+}
+.swiss-diagonal::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: repeating-linear-gradient(
+    45deg,
+    transparent,
+    transparent 4px,
+    currentColor 4px,
+    currentColor 5px
+  );
+  background-size: 10px 10px;
+  opacity: 0.025;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Noise Texture: SVG fractal noise overlay.
+   Applied to body for global paper-grain warmth. */
+.swiss-noise {
+  position: relative;
+}
+.swiss-noise::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  opacity: 0.018;
+  pointer-events: none;
+  z-index: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 256px 256px;
+}
+
+/* Combined pattern: dots + diagonal (for rich muted surfaces) */
+.swiss-dots-diagonal {
+  position: relative;
+}
+
+/* ds-color-ok-start: THEME-BRANCHED PAIR. The rules below paint the Ember/navy branch; the
+   `.t_stub` block at the end of the region overrides them with Stub paper+ink. Each branch IS a
+   theme's value, so each must state its literal — routing them through `var()` would resolve to
+   one theme and collapse the branch. The MapLibre popup panel is a hard navy card in BOTH themes
+   (it has no `.t_stub` override), so its border and close glyph stay light on purpose. */
+/* ── Hero map popup (MapLibre GL) ────────────────────────────── */
+.hero-map-popup .maplibregl-popup-content {
+  background: rgba(15, 27, 51, 0.92);
+  border: 1px solid #35589a;
+  border-radius: 0;
+  padding: 10px 14px;
+  box-shadow: none;
+}
+.hero-map-popup .maplibregl-popup-tip {
+  border-top-color: rgba(15, 27, 51, 0.92);
+}
+.hero-map-popup .maplibregl-popup-close-button {
+  /* The popup panel is a hard navy card in BOTH themes (no `.t_stub` override
+     below), so the close glyph stays light — `onStructure` is light in every
+     theme (paper on Stub, white on Ember). */
+  color: color-mix(in srgb, var(--onStructure, #fdfaf3) 50%, transparent);
+  font-size: 16px;
+  padding: 2px 6px;
+}
+
+/* ── Hero map location search overlay (dark theme) ───────────── */
+.hero-map-location-overlay {
+  --foreground: #ffffff;
+  --background: rgba(15, 27, 51, 0.92);
+}
+.hero-map-location-overlay input {
+  background: rgba(15, 27, 51, 0.92) !important;
+  /* #5A78A6 = 3.8:1 on the dark overlay (WCAG 1.4.11); #2A3E66 was 1.6:1.
+     Matches the dark theme borderColor token. */
+  border-color: #5a78a6 !important;
+  color: #ffffff !important;
+  font-size: 13px !important;
+  font-weight: 500;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.hero-map-location-overlay input::placeholder {
+  /* Ember base — the `.t_stub` block below overrides this with an ink tint. */
+  color: color-mix(in srgb, var(--onStructure, #fdfaf3) 45%, transparent);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-weight: 600;
+}
+.hero-map-location-overlay input:focus {
+  border-color: var(--accent, #e2481d) !important;
+}
+/* Dropdown suggestions — dark panel */
+.hero-map-location-overlay [role="listbox"] {
+  background: rgba(15, 27, 51, 0.96) !important;
+  border-color: #5a78a6 !important;
+  max-height: 200px;
+}
+.hero-map-location-overlay [role="option"] {
+  color: #ffffff !important;
+}
+.hero-map-location-overlay [role="option"][aria-selected="true"] {
+  background: rgba(53, 88, 154, 0.3) !important;
+}
+
+/* ── Hero map location search overlay (Stub / light theme) ───────
+   The dark navy overlay above is invisible-wrong over the light Stub
+   basemap, so the `.t_stub` subtree swaps to a warm-paper surface with
+   ink text + soft ink borders. Ember keeps the navy rules above. */
+.t_stub .hero-map-location-overlay {
+  --foreground: #211c16;
+  --background: rgba(246, 240, 228, 0.92);
+}
+.t_stub .hero-map-location-overlay input {
+  background: rgba(246, 240, 228, 0.92) !important;
+  border-color: rgba(33, 28, 22, 0.3) !important;
+  color: #211c16 !important;
+}
+.t_stub .hero-map-location-overlay input::placeholder {
+  color: rgba(33, 28, 22, 0.55);
+}
+.t_stub .hero-map-location-overlay input:focus {
+  border-color: #e2481d !important;
+}
+.t_stub .hero-map-location-overlay [role="listbox"] {
+  background: rgba(253, 250, 243, 0.98) !important;
+  border-color: rgba(33, 28, 22, 0.3) !important;
+}
+.t_stub .hero-map-location-overlay [role="option"] {
+  color: #211c16 !important;
+}
+.t_stub .hero-map-location-overlay [role="option"][aria-selected="true"] {
+  background: rgba(226, 72, 29, 0.12) !important;
+}
+/* ds-color-ok-end */
+
+/* ── Hero map skeleton pulse animation ───────────────────────── */
+@keyframes hero-map-skeleton-pulse {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+.swiss-dots-diagonal::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    radial-gradient(circle, currentColor 0.5px, transparent 0.5px),
+    repeating-linear-gradient(
+      45deg,
+      transparent,
+      transparent 4px,
+      currentColor 4px,
+      currentColor 5px
+    );
+  background-size:
+    16px 16px,
+    10px 10px;
+  opacity: 0.03;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Swiss section-number (unused variant removed; swiss-section-num below is the active one) */
+
+/* ============================================================
+   Swiss Structural Grid Lines — kept minimal.
+   Only actively-used rules remain. Unused rule-top, rule-bottom,
+   rule-strong, accent-left, rule-left, hairline, nav-rule, and
+   footer-rule classes were removed (zero component references).
+   Re-add from git history if needed.
+   ============================================================ */
+
+/* ============================================================
+   Phase 2 — Swiss Typographic Scale & Grid System
+   ============================================================
+   Oversized headings, section-number prefixes, asymmetric
+   two-column layouts, and vertical rhythm utilities.
+   ============================================================ */
+
+/* ── Oversized display headings ─────────────────────────────── */
+
+.swiss-display-xl {
+  font-size: clamp(3rem, 8vw, 6rem);
+  font-weight: 900;
+  line-height: 0.92;
+  letter-spacing: -0.04em;
+  text-transform: uppercase;
+}
+
+.swiss-display-lg {
+  font-size: clamp(2.25rem, 6vw, 4rem);
+  font-weight: 900;
+  line-height: 0.95;
+  letter-spacing: -0.035em;
+  text-transform: uppercase;
+}
+
+.swiss-display-md {
+  font-size: clamp(1.5rem, 4vw, 2.5rem);
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: -0.025em;
+  text-transform: uppercase;
+}
+
+/* ── Section number prefix ──────────────────────────────────── */
+/* Use as: <span class="swiss-section-num">01</span>           */
+
+.swiss-section-num {
+  display: inline-block;
+  /* Montserrat (inherited) — decorative numerals align via tabular-nums. */
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent, #e2481d);
+  font-variant-numeric: tabular-nums;
+  min-width: 2.5ch;
+}
+
+/* Accent-coloured section number — now same as base (kept for backwards compat) */
+.swiss-section-num--accent {
+  color: var(--accent, #e2481d);
+}
+
+/* ── Numbered section layout ────────────────────────────────── */
+/* Section with a leading number + ruled top.
+   Structure:
+     <section class="swiss-numbered-section">
+       <div class="swiss-numbered-section__head">
+         <span class="swiss-section-num">01</span>
+         <h2>Title</h2>
+       </div>
+       <div> ... content ... </div>
+     </section>
+*/
+
+.swiss-numbered-section {
+  border-top: 2px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+  padding-top: 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.swiss-numbered-section__head {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+}
+
+.swiss-numbered-section__head h2,
+.swiss-numbered-section__head h3 {
+  font-size: clamp(1.125rem, 2.5vw, 1.5rem);
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  margin: 0;
+}
+
+/* ── Asymmetric two-column grid ─────────────────────────────── */
+/* Wide (2fr) / narrow (1fr) columns that stack on mobile.       */
+
+.swiss-asym-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 48px;
+}
+
+@media (min-width: 768px) {
+  .swiss-asym-grid {
+    grid-template-columns: 2fr 1fr;
+    gap: 64px;
+  }
+}
+
+/* Reversed: narrow / wide */
+.swiss-asym-grid--reversed {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 48px;
+}
+
+@media (min-width: 768px) {
+  .swiss-asym-grid--reversed {
+    grid-template-columns: 1fr 2fr;
+    gap: 64px;
+  }
+}
+
+/* Equal halves */
+.swiss-asym-grid--halves {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 48px;
+}
+
+@media (min-width: 768px) {
+  .swiss-asym-grid--halves {
+    grid-template-columns: 1fr 1fr;
+    gap: 64px;
+  }
+}
+
+/* ── Swiss column sidebar layout ────────────────────────────── */
+/* Number + label in a narrow gutter column, content in the main */
+
+.swiss-gutter-layout {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+}
+
+@media (min-width: 768px) {
+  .swiss-gutter-layout {
+    grid-template-columns: 80px 1fr;
+    gap: 24px;
+  }
+}
+
+.swiss-gutter-layout__label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+@media (min-width: 768px) {
+  .swiss-gutter-layout__label {
+    text-align: right;
+    padding-top: 4px;
+  }
+}
+
+/* ── Vertical rhythm spacers ────────────────────────────────── */
+
+.swiss-space-xs {
+  height: 16px;
+}
+.swiss-space-sm {
+  height: 24px;
+}
+.swiss-space-md {
+  height: 48px;
+}
+.swiss-space-lg {
+  height: 80px;
+}
+.swiss-space-xl {
+  height: 120px;
+}
+
+/* ── Typographic detail classes ──────────────────────────────── */
+
+.swiss-caps {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 700;
+}
+
+.swiss-overline {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--colorMuted, #5c544a);
+}
+
+/* ── Stripe accent bar ──────────────────────────────────────── */
+/* A thin horizontal colour stripe used as a section break.      */
+
+.swiss-stripe {
+  height: 3px;
+  background: linear-gradient(
+    to right,
+    var(--accent, #e2481d) 0%,
+    var(--accent, #e2481d) 30%,
+    var(--structure, #211c16) 30%,
+    var(--structure, #211c16) 100%
+  );
+  border: 0;
+}
+
+.swiss-stripe--full {
+  height: 3px;
+  background: var(--accent, #e2481d);
+  border: 0;
+}
+
+/* ── Hanging number (for large decorative section numbers) ──── */
+
+.swiss-hanging-num {
+  /* Montserrat (inherited) — ghost numerals, tabular so pairs set evenly. */
+  font-variant-numeric: tabular-nums;
+  font-size: clamp(3rem, 6vw, 5rem);
+  font-weight: 900;
+  line-height: 0.85;
+  letter-spacing: -0.04em;
+  /* Ghost number on the page background — an ink tint on Stub's cream, not the
+     old white (which was invisible once Stub became the default). */
+  color: color-mix(in srgb, var(--color, #211c16) 6%, transparent);
+  user-select: none;
+}
+
+/* ── Navbar Glass Effect ──────────────────────────────────── */
+/* Strip ALL opaque backgrounds inside the navbar — wrapper owns the BG.
+   The deep selector ensures Tamagui's inline styles are overridden. */
+.swiss-navbar-wrapper > div,
+.swiss-navbar-wrapper > div > div,
+.swiss-navbar-wrapper > div > div > div {
+  background-color: transparent !important;
+  background: transparent !important;
+  border-bottom-color: transparent !important;
+}
+
+/* Base: transitions are driven by inline style in ScrollAwareNavbar.
+   Text/glass colors branch on `data-navbar-theme` (set in ScrollAwareNavbar
+   from the active Tamagui theme) so the bar abides by theming instead of
+   hardcoding the Ember-dark look. Ember → white on navy glass; Stub/light →
+   ink on warm-paper glass. */
+/* ds-color-ok-start: THEME-BRANCHED PAIR — `[data-navbar-theme="dark"|"light"]` is set by
+   ScrollAwareNavbar from the ACTIVE Tamagui theme, so each branch is that theme's own value and
+   must state it literally. A `var()` here would resolve to whichever theme is live and paint both
+   branches the same, which is precisely the Ember-hardcoded look this block replaced. */
+.swiss-navbar-wrapper {
+  border-bottom: 1px solid transparent;
+}
+.swiss-navbar-wrapper[data-navbar-theme="dark"] {
+  color: #ffffff;
+  --navbar-glass-fill: rgba(15, 25, 50, 0.55);
+  --navbar-glass-border: color-mix(
+    in srgb,
+    var(--onStructure, #fdfaf3) 6%,
+    transparent
+  );
+}
+.swiss-navbar-wrapper[data-navbar-theme="light"] {
+  color: #211c16;
+  --navbar-glass-fill: rgba(246, 240, 228, 0.72);
+  --navbar-glass-border: rgba(33, 28, 22, 0.1);
+}
+
+/* Transparent: at page top — fully clear, no blur (both themes). */
+/* NOTE: declare `backdrop-filter` UNPREFIXED ONLY. Lightning CSS (Turbopack's
+   minifier, active in dev too) treats the standard and `-webkit-` forms as one
+   logical property and collapses them to the last-declared one. A hand-written
+   `-webkit-backdrop-filter` after the standard one therefore *deletes* the
+   standard declaration from the served bytes — and Chrome does not support the
+   `-webkit-` form, so the rule arrives with zero declarations and the frost
+   silently disappears. Lightning CSS autoprefixes from browserslist; let it. */
+.swiss-navbar-wrapper[data-navbar-state="transparent"] {
+  background-color: transparent;
+  backdrop-filter: none;
+}
+
+/* Solid: scrolled — frosted glass with hairline divider. The fill/border pair
+   lives on the theme branch above (`--navbar-glass-*`) so this rule and the
+   immersive one below cannot drift apart.
+
+   The `:has()` arm keeps that same glass at the TOP of the page whenever the
+   route mounts a full-bleed backdrop (`.hero-backdrop` — today the public event
+   page's blurred poster). The transparent state assumes the bar is sitting on
+   the page background, where the theme's ink is legible by construction; over
+   an arbitrary poster it is not, and a dark image swallowed the entire bar
+   (logo, theme/language icons, "Sign in"). Recolouring to light-on-dark instead
+   is not an option from CSS: that chrome is Tamagui-themed ink on nested spans,
+   not something a scrim can flip. Cream at 0.72 over pure black composites to
+   #b1ada4 → 7.55:1 against `#211c16` ink, so the WORST case still clears AA on
+   any poster (measured, not estimated).
+
+   `:has()` rather than a React flag because the navbar is a SIBLING of the
+   content that mounts the backdrop (see AppShell) — no ancestor can know — and
+   CSS is right on the very first paint, with no hydration flip.
+
+   ORDER-DEPENDENT: this must stay AFTER the `transparent` rule above. The
+   `:has()` arm ties it at (0,2,1), so source order is what decides. */
+.swiss-navbar-wrapper[data-navbar-state="solid"],
+body:has(.hero-backdrop) .swiss-navbar-wrapper {
+  background-color: var(--navbar-glass-fill);
+  border-bottom-color: var(--navbar-glass-border);
+  backdrop-filter: blur(20px) saturate(180%);
+}
+
+/* SVG icons (lucide-react) + ghost/outlined buttons: text color per theme. */
+.swiss-navbar-wrapper[data-navbar-theme="dark"] svg,
+.swiss-navbar-wrapper[data-navbar-theme="dark"] button {
+  color: #ffffff !important;
+}
+.swiss-navbar-wrapper[data-navbar-theme="light"] svg,
+.swiss-navbar-wrapper[data-navbar-theme="light"] button {
+  color: #211c16 !important;
+}
+
+/* Search input inside navbar: tinted to sit on the theme's glass. */
+.swiss-navbar-wrapper[data-navbar-theme="dark"] input {
+  background-color: color-mix(
+    in srgb,
+    var(--onStructure, #fdfaf3) 12%,
+    transparent
+  ) !important;
+  color: #ffffff !important;
+  border-color: color-mix(
+    in srgb,
+    var(--onStructure, #fdfaf3) 25%,
+    transparent
+  ) !important;
+}
+.swiss-navbar-wrapper[data-navbar-theme="dark"] input::placeholder {
+  color: color-mix(
+    in srgb,
+    var(--onStructure, #fdfaf3) 55%,
+    transparent
+  ) !important;
+}
+.swiss-navbar-wrapper[data-navbar-theme="light"] input {
+  background-color: rgba(33, 28, 22, 0.06) !important;
+  color: #211c16 !important;
+  border-color: rgba(33, 28, 22, 0.22) !important;
+}
+.swiss-navbar-wrapper[data-navbar-theme="light"] input::placeholder {
+  color: rgba(33, 28, 22, 0.5) !important;
+}
+
+/* Language switcher select inside navbar. */
+.swiss-navbar-wrapper[data-navbar-theme="dark"] select {
+  color: #ffffff !important;
+  background-color: transparent !important;
+  border-color: color-mix(
+    in srgb,
+    var(--onStructure, #fdfaf3) 25%,
+    transparent
+  ) !important;
+}
+.swiss-navbar-wrapper[data-navbar-theme="light"] select {
+  color: #211c16 !important;
+  background-color: transparent !important;
+  border-color: rgba(33, 28, 22, 0.22) !important;
+}
+/* ds-color-ok-end */
+
+/* Design System v2: the navbar pill reskins (`.nav-action-pill`) and the
+   notification-sidebar glass/pill overrides that lived here are retired —
+   pills are removed from the nav per the v2 doc, and AlertsSidebar renders
+   its own v2 atoms (square ghost trigger, square count badge). */
+
+@media (prefers-reduced-motion: reduce) {
+  .swiss-navbar-wrapper {
+    transition-duration: 200ms !important;
+    transition-timing-function: ease-out !important;
+  }
+}
+
+/* ============================================================
+   View Transitions — PUBLIC surface only
+   ============================================================
+   Driven by <PageTransition> (app/_components/PageTransition.tsx), which tags
+   the page boundary with the view-transition-class `th-page` on the public
+   surface and sets `default="none"` on /admin, /platform and /moderate. Read
+   that file before changing any of this — it explains why the boundary is
+   scoped rather than global (it replays its animation on streaming
+   navigations).
+
+   Only that page region animates. The navbar/footer (outside the boundary)
+   stay completely still.
+   ============================================================ */
+::view-transition-old(root),
+::view-transition-new(root),
+/* The root GROUP animates for 250ms by default too — easy to miss, since only
+   the old/new halves are usually spelled out. */
+::view-transition-group(root) {
+  animation: none;
+}
+
+/* Selectors below match the view-transition-CLASS `th-page` (assigned by
+   <PageTransition>), NOT a name. React de-duplicates colliding explicit names
+   — with `name="page-content"` the old/new halves alternated between
+   `page-content` and `page-content_1`, so half of every navigation missed
+   these rules and silently used the browser default. Classes never collide. */
+::view-transition-group(.th-page) {
+  /* Prevent the transition container from retaining the old page's height.
+     Without this, navigating from a tall page to a short one leaves massive
+     whitespace below until the animation completes. */
+  overflow: clip;
+  block-size: auto !important;
+  /* Kill the browser's DEFAULT group animation. Left on, it interpolates the
+     group's transform/size between the old and new snapshot geometry over
+     250ms — so content still visibly slid and resized even with the old/new
+     animations below reduced to a pure opacity fade. `block-size: auto` above
+     defeats the height half of it; this stops the rest. It appears nowhere in
+     this stylesheet and is invisible to grep — only getAnimations() reveals
+     it, so do not assume it is gone because you cannot see it. */
+  animation: none !important;
+}
+
+/* Cross-fade, NOT a slide — deliberately. A 20px translateX read as a
+   jitter/bounce whenever the boundary animated twice; opacity degrades far
+   more gracefully if a replay ever slips through on a streaming public
+   route. Also avoids the transient horizontal overflow a translate can cause
+   at narrow viewports. */
+::view-transition-old(.th-page) {
+  animation: th-vt-fade-out 90ms ease-out;
+  /* Old snapshot shouldn't push layout */
+  position: absolute;
+  inset-block-start: 0;
+}
+
+::view-transition-new(.th-page) {
+  animation: th-vt-fade-in 140ms ease-out;
+}
+
+@keyframes th-vt-fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes th-vt-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-old(.th-page),
+  ::view-transition-new(.th-page) {
+    animation: none !important;
+  }
+}
+
+/* ============================================================
+   Shared loading / reveal primitives
+   - .th-skeleton: shimmer block. Apply inline style for size.
+   - .th-stagger-fade > *: fade-in with translateY, staggered
+     up to 4 children. Re-key the parent to retrigger.
+   ============================================================ */
+@keyframes th-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+@keyframes th-stagger-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.th-skeleton {
+  /* Ink tints, not white: these blocks render on Stub's paper surfaces, where a
+     white shimmer is invisible. */
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--color, #211c16) 4%, transparent) 0%,
+    color-mix(in srgb, var(--color, #211c16) 10%, transparent) 50%,
+    color-mix(in srgb, var(--color, #211c16) 4%, transparent) 100%
+  );
+  background-size: 200% 100%;
+  animation: th-shimmer 1.4s ease-in-out infinite;
+  border-radius: 2px;
+}
+.th-stagger-fade > * {
+  animation: th-stagger-fade-in 220ms cubic-bezier(0.4, 0, 0.2, 1) both;
+}
+.th-stagger-fade > *:nth-child(2) {
+  animation-delay: 60ms;
+}
+.th-stagger-fade > *:nth-child(3) {
+  animation-delay: 120ms;
+}
+.th-stagger-fade > *:nth-child(4) {
+  animation-delay: 180ms;
+}
+.th-stagger-fade > *:nth-child(5) {
+  animation-delay: 240ms;
+}
+.th-stagger-fade > *:nth-child(6) {
+  animation-delay: 300ms;
+}
+.th-stagger-fade > *:nth-child(7) {
+  animation-delay: 360ms;
+}
+.th-stagger-fade > *:nth-child(8) {
+  animation-delay: 420ms;
+}
+.th-stagger-fade > *:nth-child(9) {
+  animation-delay: 480ms;
+}
+.th-stagger-fade > *:nth-child(10) {
+  animation-delay: 540ms;
+}
+.th-stagger-fade > *:nth-child(n + 11) {
+  animation-delay: 600ms;
+}
+@media (prefers-reduced-motion: reduce) {
+  .th-skeleton,
+  .th-stagger-fade > * {
+    animation: none !important;
+  }
+}
+
+/* ============================================================
+   iOS Safari input zoom guard
+   Safari auto-zooms the whole page when a focused input's
+   font-size is below 16px. Tamagui's double-styled Input
+   (styled() around the styleable Input HOC) drops both the
+   `fontSize` and `style` props before they reach the DOM, so
+   the 16px floor must be enforced in CSS. Apply .th-no-zoom to
+   a wrapper around the input(s). !important is required: this
+   file's own `input:not([type=...])...` reset (0,3,1) and
+   Tamagui's `:root ._fs-*` runtime rules (0,2,0) both outrank
+   a plain (0,1,1) descendant selector.
+   ============================================================ */
+.th-no-zoom input,
+.th-no-zoom textarea {
+  font-size: 16px !important;
+}
+
+/* ============================================================
+   Owner "Suggested edits" inbox (SuggestionInbox.tsx)
+   ------------------------------------------------------------
+   DS v2 §5: a multi-column PAGE REGION is an explicit asymmetric
+   grid (7fr 5fr) — never flex-basis percentages faking columns —
+   and it collapses by RE-DECLARING grid-template-columns, never
+   by hiding content and never via a JS viewport hook (which
+   flashes on SSR / first paint).
+
+   CONTAINER query, not a media query. The inbox is embedded (org
+   dashboard section, event-builder ops shell), and the admin
+   shell's rail is 256px wide (NavigationShell.styles.ts) and only
+   appears at >= 960px (DEFAULT_DRAWER_BREAKPOINT, NavigationShell
+   .tsx). A viewport rule therefore gets it exactly backwards
+   across that boundary: at 940px there is no rail and the panel
+   would land ~358px, at 960px the rail appears and the SAME rule
+   gives it ~267px — the panel shrinking as the window widens.
+   `railState` can also collapse/expand with no viewport change at
+   all, which a media query cannot observe. `@container` measures
+   the width the component actually has, so both problems vanish.
+
+   Threshold 840px of CONTAINER width. The binding constraint is
+   the NARROW track, and at 7fr/5fr that track is 5/12 of
+   (container - 16px gap) — NOT a figure you can set by adding two
+   desired widths together. Requiring >= 340px for the review
+   panel (comfortably above the 272px the DS calls the minimum
+   readable column, because this one stacks a label plus a
+   before/after pair per field) gives 340 x 12/5 + 16 = 832 -> 840.
+   The list then gets >= 476px, well past what a PENDING badge and
+   an event title need.
+
+   Measured consequences (headless Chromium, admin shell
+   reproduced): 1440px viewport -> 1136px container -> 653/467.
+   1200px -> 896px -> 513/367. 960px, where the rail appears ->
+   656px -> one column. 940px, no rail -> 892px -> two columns.
+   The rail crossing now widens or collapses the layout honestly
+   instead of quietly halving the panel.
+   ============================================================ */
+.th-suggestion-inbox {
+  container-type: inline-size;
+}
+.th-suggestion-inbox-cols {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+  align-items: start;
+}
+/* Grid items floor at min-content by default, which lets the row's
+   nowrap+ellipsis event title blow the track out past the viewport. */
+.th-suggestion-inbox-cols > * {
+  min-width: 0;
+}
+/* Placeholder for the second cell while nothing is selected, so the
+   list column never snaps between full width and 7fr on every
+   selection. At one-column widths it would be dead vertical space
+   above the list, so it does not exist there. NOTE: the placeholder
+   is the ONLY thing display-toggled here — the real review panel is
+   never hidden by CSS. */
+.th-suggestion-inbox-placeholder {
+  display: none;
+}
+@container (min-width: 840px) {
+  .th-suggestion-inbox-cols {
+    grid-template-columns: 7fr 5fr;
+  }
+  .th-suggestion-inbox-placeholder {
+    display: block;
+  }
+}
+
+/* ============================================================
+   Attendee-feedback ops surface — DS v2 §5 two-region grid
+   ============================================================
+   Same idiom as the suggestion inbox above, its own class
+   because the two regions are placed rather than flowed.
+
+   DOM order is summary → comments, which IS the stacked phone
+   order: the aggregate is a short scan of how the show went and
+   it frames the prose that explains it. Above the threshold the
+   LIST — the thing the organizer came for — is PLACED into the
+   wide 7fr track and the summary into the narrow 5fr one, so the
+   visual order flips while the source order (and therefore the
+   screen-reader order) stays summary-first. Safe because the
+   summary is inert text with nothing focusable in it.
+
+   CONTAINER query, not a media query — same reason as the inbox
+   above. The admin rail is 256px (NavigationShell.styles.ts) and
+   only appears at >= 960px (DEFAULT_DRAWER_BREAKPOINT), so a
+   viewport rule inverts across that line: at 940px there is no
+   rail and this surface has ~826px to spend, at 960px the rail
+   appears and the SAME rule leaves ~590px — the detail column
+   getting NARROWER as the window gets wider. `container-type:
+   inline-size` sits on `.th-attendee-feedback` (a PARENT — an
+   element cannot match a container query it establishes itself),
+   deliberately NOT on EventOpsShell's shared body node, whose
+   `contain: layout` would become the containing block for
+   AttendeesTab's absolutely-positioned overlay BulkActionBar.
+
+   Threshold 820px of CONTAINER width, derived from the SUMMARY —
+   the narrow track is the binding one, and at 7fr/5fr it is
+   5/12 of (container - 24px gap), NOT the sum of two desired
+   widths. StatCell is a Tamagui stack (flex-shrink: 0, basis
+   auto), so each stat lays out at its MAX-CONTENT width, floored
+   at minWidth 120 — it does not shrink to wrap. Measured in
+   headless Chromium with the real Montserrat: en cells are
+   120/145/120/158/120/127, es 120/140/120/180/120/185. The worst
+   pair is therefore es's 120 + 185 + 16px gap = 321px, and 321
+   is exactly where es flips from a 2+2+1+1 ladder to a clean
+   2+2+2 (measured: 320 -> 2+2+1+1, 321 -> 2+2+2). Taking 330 for
+   slack: 330 x 12/5 + 24 = 816 -> 820.
+
+   Measured consequences (headless Chromium, admin shell
+   reproduced — rail 256 at >=960, ShellLayoutRow $4, ContentArea
+   2px border + $5, EventOpsShell $4): 1440px viewport -> 1070px
+   container -> 610/436. 1200px -> 830px -> 470/336. 1000px ->
+   630px -> one column. 960px, where the rail appears -> 590px ->
+   one column. 940px, no rail -> 826px -> 468/334. The rail
+   crossing now collapses the layout honestly instead of quietly
+   squeezing the summary below its 2-up floor.
+
+   Collapse is a grid-template-columns re-declaration — nothing
+   is ever hidden. */
+.th-attendee-feedback {
+  container-type: inline-size;
+}
+.th-attendee-feedback-cols {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 24px;
+  align-items: start;
+}
+/* Grid items floor at min-content, which lets a long unbroken
+   token in a comment blow the track past the viewport. */
+.th-attendee-feedback-cols > * {
+  min-width: 0;
+}
+@container (min-width: 820px) {
+  .th-attendee-feedback-cols {
+    grid-template-columns: 7fr 5fr;
+  }
+  .th-attendee-feedback-cols > .th-attendee-feedback-list {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .th-attendee-feedback-cols > .th-attendee-feedback-summary {
+    grid-column: 2;
+    grid-row: 1;
+  }
+}
+
+/* ============================================================
+   Venue settings (admin/[slug]/places/[placeId]/settings) — DS v2 §5
+   section index + one open stack of sections ("Option A").
+   ------------------------------------------------------------
+   Replaces the old `/edit` grid (`.th-place-edit` form column +
+   296px aside). The track order is INVERTED — the index sits LEFT,
+   there is no aside — so the threshold below is re-derived from
+   scratch rather than carried over from the 800px it replaced.
+
+   CONTAINER query, not a media query, for the same reason the old
+   block used one: NavigationShell renders NO rail below 960px and a
+   256px rail at/above it, so admin content width is not monotonic in
+   viewport width and a `@media (min-width: N)` rule would INVERT
+   across that line. `container-type: inline-size` sits on
+   `.th-place-settings`, a PARENT of everything that queries it: an
+   element cannot match a container query it establishes itself, and
+   that failure is SILENT (permanently one column, no error, no
+   failing test). Not on a shared shell node — `contain: layout` would
+   become the containing block for a sibling surface's absolutely
+   positioned descendants. Everything this page overlays is safe under
+   it: `Modal` portals to document.body and the address combobox's
+   listbox is absolute inside its own `position: relative` wrapper.
+   An `inline-size` container is queried against its CONTENT box, so
+   the 16px padding is already excluded.
+
+   Threshold 708px of CONTAINER width = 196 index + 32 gap + 480
+   main. The 480 floor is the address panel's: its City/Region and
+   PostalCode/Country rows are wrapping XStacks whose items floor at
+   minWidth 140 / 120, so a row needs 272px of panel inner width to
+   stay two-up (304 of column once the panel's 32px padding is
+   added); 480 keeps them well clear of that wrap point.
+
+   MEASURED in the running app (Playwright, getBoundingClientRect of
+   `.th-place-settings` content box and the grid's computed
+   `grid-template-columns`), 2026-09-28 — not arithmetic. An earlier
+   derivation assumed a 256px rail from 960px up and predicted ONE
+   column at 1000/960; the shell's 960–1199 "compact" layout
+   collapses the rail, so both stay two-up. Note the NON-MONOTONIC
+   step at 1200, where the expanded rail returns:
+     1440 viewport -> 1088 content -> 196px 860px
+     1200          ->  875         -> 196px 646.5px
+     1170          ->  984         -> 196px 756px
+     1000          ->  814         -> 196px 586px
+      960          ->  774         -> 196px 546px
+      940 (mobile, no rail) -> 826 -> 196px 598px
+      320          ->  206         -> one column (chip row)
+   So one column happens only on the mobile shell below ~820px
+   viewport, which is also where the shell pins its bottom nav — the
+   case the pinned save bar is built for. One column is a
+   grid-template-columns re-declaration: nothing is hidden, the index
+   re-presents as a row of jump chips above the sections (the phone
+   board), and the header's Save hands over to the pinned save bar.
+   ============================================================ */
+.th-place-settings {
+  container-type: inline-size;
+  width: 100%;
+  max-width: 1120px;
+  /* margin: auto is pinning, not sibling spacing — DS v2 §4 allows it. */
+  margin-left: auto;
+  margin-right: auto;
+  padding: 16px;
+}
+.th-place-settings-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+/* Grid items floor at min-content by default, which lets a long unbroken
+   owner name, URL or the chip row blow its track out past the viewport. */
+.th-place-settings-cols > * {
+  min-width: 0;
+}
+/* Anchor targets. The document is the scrollport (ContentArea is
+   `overflow: visible` on purpose — NavigationShell.styles.ts); the
+   margin keeps a jumped-to heading clear of the viewport edge. */
+.th-place-settings [data-settings-anchor] {
+  scroll-margin-top: 24px;
+}
+.th-place-settings [data-settings-anchor]:focus {
+  outline: none;
+}
+.th-place-settings [data-settings-anchor]:focus-visible {
+  outline: var(--focus-width) solid var(--focus-color);
+  outline-offset: var(--focus-offset);
+}
+
+/* ── Section index: phone presentation (default) ─────────────
+   A horizontal row of jump chips. `overflow-x: auto` makes it its
+   own scroll container, so six chips never widen the document.
+
+   A scroll container clips on BOTH axes, so the chips' focus ring
+   (3px width + 2px offset = 5px outside the border) was cut off on
+   the top and left. The list is padded by exactly that 5px and pulled
+   back by the same negative margin, so the chips stay aligned with
+   the sections and the ring has room to paint. */
+.th-place-settings-index,
+.th-section-chips {
+  min-width: 0;
+}
+.th-place-settings-index-kicker {
+  display: none;
+}
+.th-place-settings-index-list,
+.th-section-chips-list {
+  display: flex;
+  gap: 8px;
+  margin: -5px;
+  padding: 5px 5px 9px;
+  list-style: none;
+  overflow-x: auto;
+}
+.th-place-settings-index-list > li,
+.th-section-chips-list > li {
+  flex-shrink: 0;
+}
+.th-place-settings-index-link,
+.th-section-chips-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 0 12px;
+  border: 2px solid var(--borderColor, #211c16);
+  background: var(--surface, #fdfaf3);
+  color: var(--color, #211c16);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.th-place-settings-index-link[aria-current="true"],
+.th-section-chips-link[aria-current="true"] {
+  background: var(--structure, #211c16);
+  color: var(--onStructure, #fdfaf3);
+  font-weight: 800;
+}
+.th-place-settings-index-link:focus-visible,
+.th-section-chips-link:focus-visible {
+  outline: var(--focus-width) solid var(--focus-color);
+  outline-offset: var(--focus-offset);
+}
+/* `.th-section-chips` (SectionJumpChips) reuses the phone presentation
+   above verbatim and never takes the two-column one: it is the in-page
+   index only where the shell has no rail. NavigationShell renders the
+   rail from 960px up, and there the rail's children are the index —
+   a media query, not a container query, because the question is "is
+   the rail on screen", which is a viewport fact. */
+@media (min-width: 960px) {
+  .th-section-chips {
+    display: none;
+  }
+}
+/* Payouts section headings are the jump targets: keep a landed heading
+   clear of the viewport edge, and show focus only for keyboard users
+   (a jump focuses the heading programmatically). */
+.th-payouts-section-heading {
+  scroll-margin-top: 16px;
+}
+.th-payouts-section-heading:focus {
+  outline: none;
+}
+.th-payouts-section-heading:focus-visible {
+  outline: var(--focus-width) solid var(--focus-color);
+  outline-offset: var(--focus-offset);
+}
+/* The Payouts answer sentence (board B `.ans .big`). Sentence case, never
+   a heading's uppercase. Sized to its frame (`containerType` on the answer
+   frame in PayoutPanel.tsx), so the admin rail's width is already out of
+   it: 30px on a wide frame, 24px once the frame stacks (< 640px), and
+   smaller again on a phone-width frame. Measured with Montserrat 800 in
+   headless Chromium: the longest sentence ("$4,282.51 goes to your Stripe
+   account tonight. $2,858.48 more ready by Nov 15, 2026.") takes 7 lines at
+   24px in a 150px measure, 5 at 18px — the frame at a 320px viewport is
+   about 190px, so the cell also gives back some padding there. */
+.th-payout-answer {
+  margin: 0;
+  color: inherit;
+  font-family: var(--font-body);
+  font-weight: 800;
+  font-size: 30px;
+  line-height: 1.15;
+  letter-spacing: -0.3px;
+  text-wrap: balance;
+  overflow-wrap: break-word;
+}
+@container (max-width: 640px) {
+  .th-payout-answer {
+    font-size: 24px;
+  }
+}
+@container (max-width: 360px) {
+  .th-payout-answer {
+    font-size: 20px;
+  }
+}
+@container (max-width: 240px) {
+  .th-payout-answer {
+    font-size: 18px;
+  }
+}
+/* The answer's main cell padding lives here (not inline) so the phone step
+   can give some of it back to the sentence. */
+.th-payout-answer-main {
+  padding: 20px 22px;
+}
+@container (max-width: 240px) {
+  .th-payout-answer-main {
+    padding: 16px;
+  }
+}
+.th-payout-answer-amount {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* In-page text link (Payouts "Go to Stripe account"). Strict Swiss: ink,
+   not a link colour; the underline thickens on hover; 44px hit target. */
+.th-payouts-inline-link {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  min-height: 44px;
+  color: var(--color, #211c16);
+  font-weight: 700;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+.th-payouts-inline-link:hover {
+  text-decoration-thickness: 2px;
+}
+.th-payouts-inline-link:focus-visible {
+  outline: var(--focus-width) solid var(--focus-color);
+  outline-offset: var(--focus-offset);
+}
+
+/* ── Save: header button (two columns) vs pinned bar (one) ────
+   Both are in the DOM; exactly one is displayed at any width, and
+   `display: none` also removes the other from the accessibility
+   tree, so the page never exposes two "Save changes" buttons. */
+.th-place-settings-header-save {
+  display: none;
+}
+.th-place-settings-savebar {
+  position: sticky;
+  /* Below 960px the shell pins a fixed bottom nav bar (60px + a
+     max(12px, safe-area) pad, NavigationBottomBar). A bar pinned at
+     bottom: 0 would sit UNDER it (z-index 100), so it pins above it
+     instead; at >=960 there is no bottom bar and 0 is right. */
+  bottom: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  /* No side padding: the bar already sits inside the page's own 16px,
+     and at 320px the shell leaves 206px of content — a second 16px
+     each side squeezed "Save changes" until it clipped (measured). */
+  padding: 12px 0;
+  border-top: 2px solid var(--borderColor, #211c16);
+  background: var(--surface, #fdfaf3);
+}
+@media (max-width: 959.98px) {
+  .th-place-settings-savebar {
+    bottom: calc(60px + max(12px, env(safe-area-inset-bottom)));
+  }
+}
+
+@container (min-width: 708px) {
+  .th-place-settings-cols {
+    grid-template-columns: 196px minmax(0, 1fr);
+    gap: 32px;
+  }
+  .th-place-settings-header-save {
+    display: flex;
+  }
+  .th-place-settings-savebar {
+    display: none;
+  }
+  /* Sticky only in two-column mode — stacked, it is just content. */
+  .th-place-settings-index {
+    position: sticky;
+    top: 16px;
+  }
+  .th-place-settings-index-kicker {
+    display: block;
+    margin: 0 0 10px;
+    font-family: var(--font-mono);
+    font-size: var(--fs-mono-sm, 11px);
+    letter-spacing: var(--tr-mono-sm, 2px);
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--colorMuted, #5c544a);
+  }
+  .th-place-settings-index-list {
+    flex-direction: column;
+    gap: 2px;
+    margin: 0;
+    padding: 0;
+    overflow-x: visible;
+  }
+  .th-place-settings-index-link {
+    display: flex;
+    min-height: 44px;
+    padding: 0 12px;
+    border: none;
+    border-left: 3px solid transparent;
+    background: transparent;
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0;
+    text-transform: none;
+    white-space: normal;
+  }
+  .th-place-settings-index-link:hover {
+    border-left-color: var(--borderColor, #211c16);
+  }
+  .th-place-settings-index-link[aria-current="true"] {
+    border-left-color: var(--accent, #e2481d);
+    background: var(--surfaceRaised, #efe7d6);
+    color: var(--color, #211c16);
+    font-weight: 700;
+  }
+}
+
+/* Text links inside the place editor's aside (owner public pages, the
+   verification workflow surface). Strict Swiss: no colour-coded link
+   ink, a rule that THICKENS on hover rather than a soft tint, and a
+   real focus ring.
+
+   ── TWO elements, on purpose ──────────────────────────────────────
+   `.th-place-edit-link` is the ANCHOR: a 44px-tall hit target. These
+   are STANDALONE links (their own line in a settings rail), so the
+   WCAG 2.5.8 "inline in a block of text" exception does not apply,
+   and below the 800px threshold the aside stacks under the form —
+   i.e. onto exactly the viewports where a ~17px target is worst.
+   `.th-place-edit-link-rule` is an inner span carrying the underline,
+   so the rule sits under the WORDS rather than at the bottom edge of
+   the 44px box.
+
+   ── A BORDER, not `text-decoration` ───────────────────────────────
+   `NextLinkAnchor` (the sanctioned link primitive — see the
+   no-restricted-imports rule on `next/link`) writes
+   `display:flex; align-items:center; text-decoration:none;
+   color:inherit` as INLINE style, and inline style beats any class.
+   So a `text-decoration: underline` rule here would never render, and
+   `display`/`align-items` are NOT re-declared below: the anchor is
+   already a centred flex box because of that inline style, which is
+   what makes `min-height` centre its content. `border-bottom` is a
+   property it does not set, so the class wins cleanly — and
+   `currentColor` inherits the panel's ink, which is exactly what its
+   `color: inherit` establishes.
+
+   The hover trades 1px of padding for 1px of border so the box height
+   does not change and the line below it never jumps.
+
+   `align-self: flex-start` matters: the anchor is a flex ITEM of the
+   aside's column stack, which stretches its children, so without it
+   the rule would run the full width of the panel instead of the width
+   of the label. `max-width: 100%` + `min-width: 0` keep a long owner
+   name (arbitrary user text) inside the panel; the wrapping itself is
+   `overflow-wrap: anywhere` on the label. */
+.th-place-edit-link {
+  align-self: flex-start;
+  max-width: 100%;
+  min-height: 44px;
+}
+.th-place-edit-link-rule {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+  border-bottom: 1px solid currentColor;
+  padding-bottom: 1px;
+}
+.th-place-edit-link:hover .th-place-edit-link-rule {
+  border-bottom-width: 2px;
+  padding-bottom: 0;
+}
+/* Now just the system ring — the `:where()` floor near the top of
+   this file already supplies it, but the anchor is inside a class
+   that sets its own borders, so state it here rather than rely on
+   a zero-specificity rule surviving a future edit. */
+.th-place-edit-link:focus-visible {
+  outline: var(--focus-width) solid var(--focus-color);
+  outline-offset: var(--focus-offset);
+}
+
+/* Suggestion row / list header: a 44px selection gutter next to the
+   content. The checkbox is a SIBLING of the row's role="button", not
+   a child of it — a native checkbox nested inside a button is an ARIA
+   authoring violation, and its label would also be absorbed into the
+   button's computed accessible name (so the row would announce
+   "Select the suggestion for X … button" while Enter actually
+   expands it). Two cells, two controls, two names. */
+.th-suggestion-row {
+  display: grid;
+  /* minmax(0, 1fr), NOT bare 1fr: `1fr` is `minmax(auto, 1fr)`, whose
+     automatic minimum is the track's MIN-CONTENT size — and this cell
+     holds the event title at `white-space: nowrap`. The `minWidth: 0`
+     on the intermediate flex items inside removes THEIR automatic
+     minimum but does not stop the min-content contribution propagating
+     up to the grid track, so a long title would push the row (and the
+     page) past the viewport edge. Same guard as the outer grid above;
+     it matters more here because the 44px gutter + 8px gap already
+     take 52px off a 320px screen. */
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+/* The DS checkbox frame is 20px, under the 44px touch floor. The
+   wrapper stays frame-sized and is CENTRED in the 44px gutter, so the
+   44×44 hit span below lands exactly on that cell — it can never
+   overlap (and so never occlude) the row button in the next column.
+   The frame's trailing label gap overflows this box to the right; it
+   is empty (the accessible name is a visually-hidden label), so there
+   is nothing to clip. */
+.th-suggestion-select {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-self: center;
+  width: 20px;
+  min-height: 44px;
+}
+/* Why a real element and not `::after` on the frame: the frame ships
+   `overflow: hidden` (Tamagui `_ox-hidden`, verified in the rendered
+   markup), which clips any pseudo-element back to 20px — the expander
+   would silently do nothing. The span is an EARLIER sibling and both
+   are positioned with `z-index: auto`, so it paints (and hit-tests)
+   BELOW the frame: presses on the box itself still go to the real
+   control, only the surrounding ring falls through to the span. */
+.th-suggestion-select-hit {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 44px;
+  height: 44px;
+  transform: translate(-50%, -50%);
+}
+
+/* ============================================================
+   AppFooter — the DS v3 `FooterNav`
+   ============================================================
+   Ported from the design-system folder's
+   `components/navigation/FooterNav.jsx` and the `.if-footer*`
+   rules in `components/navigation/navigation.css`. What it
+   replaced was a bordered-cell matrix — a 2px vertical rule
+   between the brand block and the links, plus a 1px rule around
+   every link cell — which read as a table of contents rather
+   than a footer. The DS shape is an open grid: gaps, no interior
+   rules, one hairline above the base row.
+
+   TWO DELIBERATE DIVERGENCES FROM THAT FOLDER. Both are cases
+   where this codebase owns the token VALUES:
+
+     1. Column heads ride the mono ladder's `sm` rung (11px / 2px
+        tracking), not the folder's `2xs` (9.5 / 2.5).
+        `packages/ui/.../tokens/typography.ts` calls `2xs` "tags,
+        badges, stamps" and `sm` "labels, kickers, the meta-line
+        workhorse" — a column head is a label. The Aug-2026 mono
+        label sweep already put every label in the app on 11/2,
+        and the footer renders on EVERY page, so a 9.5px head
+        would make the most-rendered label in the product the one
+        that disagrees with all the others. The heads are drawn by
+        `<Text variant="overline">`, which IS that rung, so the
+        size/tracking pair is not restated here — that component
+        carries both halves of the idiom together.
+     2. Accent-as-text is `--accentText` (#A8300F, 5.98:1 on the
+        cream canvas). `--accent` (#E2481D) as a LABEL is 3.57:1
+        and fails AA in both polarities — design-system-v2.md §3.
+        Same reason applies here as everywhere: fills and rules may
+        sit on `--accent`, ink may not. Set on the component via
+        `$accentText`, not in this file, so the head follows the
+        Tamagui theme.
+        (This rung WAS #B93312 / 5.22:1 when the footer was built,
+        and this note used to argue that the codebase overrode the
+        DS folder's #A8300F. `9e541c75` reconciled the Stub ladder
+        against `tokens/colors.css` and the two now AGREE — the
+        head got more contrast, not less, and needed no edit
+        because it references the token, never the hex.)
+
+   WHY THE LAYOUT IS HERE AND NOT IN THE COMPONENT
+   The old footer switched its grid, its padding and its wordmark
+   size on `useIsMobile()`. That hook flips at 600px while the
+   rest of the shell flips at Tamagui's `$gtSm` (641), and it
+   reports DESKTOP during SSR — so a phone painted the wide
+   four-column layout and snapped narrower on hydration. Media
+   queries have neither problem. The DS breakpoints are 900 and
+   480. `--shell-gutter` (from `.th-shell-band`, which flips at
+   641) still supplies the horizontal padding: that is the
+   shared-edge contract with the navbar and the page body — see
+   `shell-metrics.ts` — and it is a different decision, at a
+   different breakpoint, from the column count.
+
+   THE LINK ANCHORS CANNOT BE COLOURED BY A CLASS
+   `NextLinkAnchor` (what `@th/ui`'s `Link` renders) writes
+   `display:flex; align-items:center; text-decoration:none;
+   color:inherit` as INLINE style, and inline style beats any
+   selector. So every rule below that paints link ink targets an
+   inner span (`.th-footer-link`, `.th-footer-base-link`) rather
+   than the anchor — the same two-element shape
+   `.th-place-edit-link` uses further up this file. `min-height`,
+   `font-size` and `outline` are NOT written inline, so those do
+   stay on the anchor.
+   ============================================================ */
+.th-footer {
+  /* CSS *string* interpolation of the gutter, never `${gutter}px`:
+     `var(--shell-gutter)px` is an invalid declaration the browser
+     silently drops, which reads as "the padding disappeared". */
+  padding: 48px var(--shell-gutter) 24px;
+}
+
+.th-footer-cols {
+  display: grid;
+  /* DS: the brand block earns twice the width of a link column. */
+  grid-template-columns: 2fr 1fr 1fr 1fr;
+  gap: 32px;
+  align-items: start;
+}
+/* Grid items floor at min-content by default. Link labels wrap, so
+   the min-content contribution is one word — but a locale with a
+   long unbroken label ("Nutzungsbedingungen") would otherwise blow
+   its track out past the viewport edge. */
+.th-footer-cols > * {
+  min-width: 0;
+}
+@media (max-width: 900px) {
+  .th-footer-cols {
+    grid-template-columns: 1fr 1fr;
+  }
+  /* The brand block is a measure, not a track: it spans the row so
+     the three link columns pair up beneath it rather than squeezing
+     the wordmark into a half-width cell. */
+  .th-footer-brand {
+    grid-column: 1 / -1;
+  }
+}
+@media (max-width: 480px) {
+  .th-footer-cols {
+    grid-template-columns: 1fr;
+  }
+}
+
+.th-footer-brand {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  /* 38ch, per the DS. A measure, not a column width — on a 1440
+     canvas the 2fr track is wider than a readable line. */
+  max-width: 38ch;
+}
+.th-footer-wordmark {
+  font-family: var(--font-body, Montserrat, sans-serif);
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: -1px;
+  line-height: 1;
+  /* 32px is the `$7` rung of the Tamagui font scale
+     (`packages/ui/src/ui/tamagui/index.ts`) — the size
+     `<Text variant="h3">` renders. The DS folder puts the wordmark
+     on ITS `--fs-h3`, but that ladder's h3 is 21.4px and this
+     repo's is 32; per the intake handoff the codebase wins on token
+     values. Down from the old 40 (`$8`) so the one brand mark in
+     global chrome stops out-scaling the page's own h1.
+
+     Deliberately NOT a heading ELEMENT: global chrome cannot know
+     how deep a page's heading tree runs, so an <h2>/<h3> here would
+     corrupt the outline of every route in the product. */
+  font-size: 32px;
+  color: var(--color, #211c16);
+}
+.th-footer-tagline {
+  font-size: var(--fs-sm, 13.3px);
+  line-height: 1.6;
+  color: var(--colorMuted, #5c544a);
+}
+
+.th-footer-colgroup {
+  display: flex;
+  flex-direction: column;
+  /* Gap, not the DS's `margin-bottom` on the head — DS v2 §4,
+     "gap, never margins, between siblings". Same 12px. */
+  gap: 12px;
+}
+.th-footer-col {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  /* Label-width anchors, not track-width ones: a link whose hit area
+     runs 120px past its last letter is a mystery click zone. */
+  align-items: flex-start;
+}
+.th-footer-link {
+  font-size: var(--fs-sm, 13.3px);
+  /* ~21px tall, under WCAG 2.5.8's 24px target floor — these clear
+     it through the SPACING exception instead: with an 8px gap the
+     distance between adjacent link centres is ~29px, so 24px
+     circles centred on each never intersect. Raising the targets to
+     44px would turn a four-item column into a 176px stack of global
+     chrome on every page; the spacing route keeps the DS rhythm and
+     still passes. */
+  line-height: 1.6;
+  color: var(--colorMuted, #5c544a);
+  transition: color var(--motion-fast, 180ms)
+    var(--motion-ease-standard, ease);
+}
+/* `:focus-visible` on the anchor, mirrored onto the inner span — the
+   imperative onMouseEnter/onMouseLeave this replaced could not do
+   focus at all, so keyboard users got no state change whatsoever.
+   The 3px ring itself comes from the `:where(a, button, …)` floor
+   near the top of this file; this is the colour half. */
+.th-footer-col a:hover .th-footer-link,
+.th-footer-col a:focus-visible .th-footer-link {
+  color: var(--color, #211c16);
+}
+
+.th-footer-base {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+  font-family: var(--font-mono, ui-monospace, monospace);
+  /* The `xs` rung (10 / 2.5), not the folder's `2xs` (9.5 / 2.5).
+     Same call as the column heads: this row carries real links, and
+     9.5px legal text in global chrome is the wrong place to shave
+     half a pixel. Size and tracking travel together. */
+  font-size: var(--fs-mono-xs, 10px);
+  letter-spacing: var(--tr-mono-xs, 2.5px);
+  text-transform: uppercase;
+  color: var(--colorMuted, #5c544a);
+}
+/* These are STANDALONE links, so WCAG 2.5.8's "inline in a block of
+   text" exception does not apply, and at 10px the natural target is
+   ~14px tall. The spacing exception cannot rescue a row that wraps
+   either. So each interactive item takes the 44px floor. The anchors
+   are already `display:flex; align-items:center` from
+   NextLinkAnchor's inline style, so only `min-height` is stated for
+   them; the <button> needs the whole set. At <=480 the row stacks to
+   roughly one item per line — that is the correct outcome of 44px
+   targets on a phone, not a layout bug. */
+.th-footer-base a,
+.th-footer-base-btn {
+  min-height: 44px;
+}
+.th-footer-base-link {
+  color: var(--colorMuted, #5c544a);
+  transition: color var(--motion-fast, 180ms)
+    var(--motion-ease-standard, ease);
+}
+.th-footer-base a:hover .th-footer-base-link,
+.th-footer-base a:focus-visible .th-footer-base-link {
+  color: var(--color, #211c16);
+}
+/* A real <button>, replacing a <span role="button" tabIndex={0}>
+   that hand-rolled its own Enter/Space keydown handler and had no
+   focus ring. `font: inherit` is already global (see the
+   `button, input, textarea, select` reset above) but the shorthand
+   does NOT carry letter-spacing, and UA sheets reset it on form
+   controls — without the explicit inherit this one control would
+   drop the mono row's 2.5px tracking. */
+.th-footer-base-btn {
+  display: inline-flex;
+  align-items: center;
+  background: none;
+  border: 0;
+  padding: 0;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  color: var(--colorMuted, #5c544a);
+  cursor: pointer;
+  transition: color var(--motion-fast, 180ms)
+    var(--motion-ease-standard, ease);
+}
+.th-footer-base-btn:hover,
+.th-footer-base-btn:focus-visible {
+  color: var(--color, #211c16);
+}

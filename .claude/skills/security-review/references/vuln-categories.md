@@ -15,20 +15,17 @@ Load this during Step 4 of the scan workflow.
 - Second-order SQLi: data stored safely, then used unsafely later
 - Stored procedures called with unsanitized input
 
-**Detection signals (all languages):**
-```
-"SELECT ... " + variable
-`SELECT ... ${variable}`
-f"SELECT ... {variable}"
-"SELECT ... %s" % variable   # Only safe with proper driver parameterization
-cursor.execute("... " + input)
-db.raw(`... ${req.params.id}`)
+**Detection signals:**
+```ts
+prisma.$queryRawUnsafe(`SELECT ... ${input}`)      // string-built: injectable
+prisma.$executeRawUnsafe("... " + input)
+Prisma.raw(input)                                   // splices raw text into a tagged query
 ```
 
 **Safe patterns (parameterized):**
-```js
-db.query('SELECT * FROM users WHERE id = ?', [userId])
-User.findOne({ where: { id: userId } })  // ORM safe
+```ts
+prisma.$queryRaw`SELECT * FROM "Event" WHERE id = ${eventId}`  // tagged template binds params
+prisma.event.findUnique({ where: { id: eventId } })
 ```
 
 **Escalation checkers:**
@@ -41,22 +38,16 @@ User.findOne({ where: { id: userId } })  // ORM safe
 **What to look for:**
 - `innerHTML`, `outerHTML`, `document.write()` with user data
 - `dangerouslySetInnerHTML` in React
-- Template engines rendering unescaped: `{{{ var }}}` (Handlebars), `!= var` (Pug)
-- jQuery `.html()`, `.append()` with user data
 - `eval()`, `setTimeout(string)`, `setInterval(string)` with user data
 - DOM-based: `location.hash`, `document.referrer`, `window.name` written to DOM
 - Stored XSS: user input saved to DB, rendered without escaping later
 
-**Detection by framework:**
-- **React**: Safe by default EXCEPT `dangerouslySetInnerHTML`
-- **Angular**: Safe by default EXCEPT `bypassSecurityTrustHtml`
-- **Vue**: Safe by default EXCEPT `v-html`
-- **Vanilla JS**: Every DOM write is suspect
+**In this repo:** React escapes by default; a `dangerouslySetInnerHTML` carrying user-authored HTML must pass through a server-side sanitizer on every path that reaches it (announcements use `sanitizeAnnouncementHtml` at write and again at read in `get-my-page.ts` and the public `get-public-page.ts`); one that injects a static CSS constant is fine. Emails from `@th/ui-email` and href/src values built from user URLs (`javascript:`) are the other paths.
 
 ---
 
 ### Command Injection
-**What to look for (Node.js):**
+**What to look for:**
 ```js
 exec(userInput)
 execSync(`ping ${host}`)
@@ -64,22 +55,7 @@ spawn('sh', ['-c', userInput])
 child_process.exec('ls ' + dir)
 ```
 
-**What to look for (Python):**
-```python
-os.system(user_input)
-subprocess.call(user_input, shell=True)
-eval(user_input)
-```
-
-**What to look for (PHP):**
-```php
-exec($input)
-system($_GET['cmd'])
-passthru($input)
-`$input`  # backtick operator
-```
-
-**Safe alternatives:** Use array form of spawn/subprocess without shell=True; use allowlists for commands.
+**Safe alternatives:** `execFile`/`spawn` with an argument array and no shell; allowlist the command.
 
 ---
 
@@ -113,18 +89,18 @@ http.get(params.webhook)
 - Numeric sequential IDs (easily guessable)
 
 **Example vulnerable pattern:**
-```js
-// VULNERABLE: no ownership check
-app.get('/api/documents/:id', async (req, res) => {
-  const doc = await Document.findById(req.params.id);
-  res.json(doc);
-});
+```ts
+// VULNERABLE: any signed-in human can read any org's members by changing orgId
+export async function listOrgMembers(deps, rawInput) {
+  const input = parseInput(schema, rawInput);
+  return deps.repos.organizations.listMembers({ orgId: input.orgId, limit: input.limit, offset: input.offset });
+}
 
-// SAFE: verify ownership
-app.get('/api/documents/:id', async (req, res) => {
-  const doc = await Document.findOne({ _id: req.params.id, owner: req.user.id });
-  if (!doc) return res.status(403).json({ error: 'Forbidden' });
-  res.json(doc);
+// SAFE: the use case asks AuthZPort before touching the repo
+await deps.authz.requireOrgRole({
+  actorHumanId: input.actorHumanId,
+  orgId: input.orgId,
+  requiredRoles: [...REQUIRED_ROLES],
 });
 ```
 
@@ -148,10 +124,10 @@ jwt.decode(token)  // WARNING: decode does NOT verify signature
 
 ### Missing Authentication / Authorization
 **What to look for:**
-- Admin or sensitive endpoints missing auth middleware
-- Routes defined after `app.use(authMiddleware)` vs before it
-- Feature flags or debug endpoints left exposed in production
-- GraphQL resolvers missing auth checks at field level
+- A sensitive procedure on `publicProcedure` or `optionalProcedure` where it needs `authedProcedure`
+- A use case that trusts an `orgId` / `placeId` / `eventId` from input without an AuthZPort check (`requireOrgRole`, `canEditEvent`, `canManagePlace`, `canFinanceOrg`, `hasStaffRole`)
+- A public event read that skips the transport gate (`ensureFullEventReadAccess*`)
+- Fastify routes outside tRPC (webhooks, `/jobs/*`, e2e helpers) that skip signature or secret checks, or ship enabled in production
 
 ---
 
@@ -211,19 +187,10 @@ Math.random().toString(36)       // weak token generation
 
 // SAFE
 crypto.randomBytes(32)           // Node.js
-secrets.token_urlsafe(32)        // Python
 ```
 
 ### Password Hashing
-```python
-# VULNERABLE
-hashlib.md5(password.encode()).hexdigest()
-hashlib.sha256(password.encode()).hexdigest()
-
-# SAFE
-bcrypt.hashpw(password, bcrypt.gensalt(rounds=12))
-argon2.hash(password)
-```
+Passwords are hashed by Better Auth. Flag any new code that hashes or compares a password or token itself (a plain `sha256`, `===` on secrets instead of `crypto.timingSafeEqual`).
 
 ---
 
@@ -268,14 +235,13 @@ Flag endpoints that:
 ---
 
 ## 7. Path Traversal
-```python
-# VULNERABLE
-filename = request.args.get('file')
-with open(f'/var/uploads/{filename}') as f:  # ../../../../etc/passwd
+```ts
+// VULNERABLE: user value reaches a filesystem path or an R2 object key
+const key = `uploads/${input.filename}`;          // "../other-org/…"
+await fs.readFile(path.join(UPLOAD_DIR, input.file));
 
-# SAFE
-filename = os.path.basename(request.args.get('file'))
-safe_path = os.path.join('/var/uploads', filename)
-if not safe_path.startswith('/var/uploads/'):
-    abort(400)
+// SAFE: server-generated keys; if a user value must appear, basename it and
+// check the resolved path stays under the root
+const safe = path.resolve(UPLOAD_DIR, path.basename(input.file));
+if (!safe.startsWith(UPLOAD_DIR + path.sep)) throw forbidden();
 ```

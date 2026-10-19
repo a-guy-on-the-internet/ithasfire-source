@@ -1,0 +1,173 @@
+## Infracost usage file — realistic estimates for Ithas Fire PRODUCTION.
+## See https://www.infracost.io/docs/features/usage_based_resources/
+##
+## Assumptions (production / moderate traffic):
+##   ~5,000 monthly active users, ~100 events/month, ~2,000 orders/month
+##   ~20,000 tickets sold/month, ~50K API requests/day
+##   min_instances=1 for API + Web (always-on idle cost)
+
+version: 0.1
+resource_usage:
+
+  # ──────────────────────────────────────────────────────
+  # Cloud Run — API (Fastify)
+  # ~50K req/day = 1.5M/mo, avg 200ms @ 1 vCPU, 512 MiB
+  # PLUS idle cost: 1 instance × 1 vCPU × ~2.6M sec/mo
+  # ──────────────────────────────────────────────────────
+  module.api_service[0].google_cloud_run_v2_service.service:
+    monthly_cpu_allocation_time_vcpu_seconds: 2892000   # 300K active + 2.592M idle (1 inst × 30d × 86400s)
+    monthly_memory_allocation_time_gib_seconds: 1446000 # half GiB × same seconds
+    monthly_requests: 1500000
+
+  # ──────────────────────────────────────────────────────
+  # Cloud Run — Web (Next.js SSR)
+  # ~40K req/day = 1.2M/mo, avg 300ms @ 1 vCPU, 512 MiB
+  # PLUS idle cost: 1 instance always warm
+  # ──────────────────────────────────────────────────────
+  module.web_service[0].google_cloud_run_v2_service.service:
+    monthly_cpu_allocation_time_vcpu_seconds: 2952000   # 360K active + 2.592M idle
+    monthly_memory_allocation_time_gib_seconds: 1476000
+    monthly_requests: 1200000
+
+  # ──────────────────────────────────────────────────────
+  # Cloud Run — Jobs (background workers)
+  # ~20K job invocations/mo, avg 500ms @ 1 vCPU, 512 MiB
+  # ──────────────────────────────────────────────────────
+  module.jobs_service[0].google_cloud_run_v2_service.service:
+    monthly_cpu_allocation_time_vcpu_seconds: 10000     # 20K × 0.5s
+    monthly_memory_allocation_time_gib_seconds: 5000
+    monthly_requests: 20000
+
+  # ──────────────────────────────────────────────────────
+  # Cloud Run — Meilisearch
+  # ~20K search req/day = 600K/mo, avg 50ms
+  # ──────────────────────────────────────────────────────
+  module.meilisearch[0].google_cloud_run_v2_service.service:
+    monthly_cpu_allocation_time_vcpu_seconds: 30000     # 600K × 0.05s
+    monthly_memory_allocation_time_gib_seconds: 30000   # 1 GiB
+    monthly_requests: 600000
+
+  # ──────────────────────────────────────────────────────
+  # Cloud Run — Tileserver
+  # ~10K tile req/day = 300K/mo, avg 100ms
+  # ──────────────────────────────────────────────────────
+  module.tileserver[0].module.tileserver.google_cloud_run_v2_service.service:
+    monthly_cpu_allocation_time_vcpu_seconds: 30000     # 300K × 0.1s
+    monthly_memory_allocation_time_gib_seconds: 30000
+    monthly_requests: 300000
+
+  # ──────────────────────────────────────────────────────
+  # GCS — Meilisearch data volume (FUSE)
+  # ~5 GiB index at prod scale, heavier indexing writes
+  # ──────────────────────────────────────────────────────
+  google_storage_bucket.meilisearch_data[0]:
+    storage_gb: 5
+    monthly_class_a_operations: 20000     # writes from indexing
+    monthly_class_b_operations: 200000    # reads from queries
+
+  # ──────────────────────────────────────────────────────
+  # GCS — Tileserver data (mbtiles)
+  # ~10 GiB tile data, heavy reads from map loads
+  # ──────────────────────────────────────────────────────
+  google_storage_bucket.tileserver_data[0]:
+    storage_gb: 10
+    monthly_class_a_operations: 500
+    monthly_class_b_operations: 300000
+
+  # ──────────────────────────────────────────────────────
+  # Artifact Registry — Docker images (keep_last=10)
+  # ~10 images × ~500MB each ≈ 5 GB (same as dev)
+  # ──────────────────────────────────────────────────────
+  google_artifact_registry_repository.services[0]:
+    storage_gb: 5
+
+  # ──────────────────────────────────────────────────────
+  # Pub/Sub Topics — message ingestion (10× dev)
+  # ──────────────────────────────────────────────────────
+  google_pubsub_topic.jobs["tickets.issue"]:
+    monthly_message_data_tb: 0.00001
+  google_pubsub_topic.jobs["tickets.hold"]:
+    monthly_message_data_tb: 0.00001
+  google_pubsub_topic.jobs["tickets.generate-qr"]:
+    monthly_message_data_tb: 0.00001
+  google_pubsub_topic.jobs["tickets.send-reminder"]:
+    monthly_message_data_tb: 0.000005
+  google_pubsub_topic.jobs["emails.order-confirmation"]:
+    monthly_message_data_tb: 0.000005
+  google_pubsub_topic.jobs["settlements.execute-transfer"]:
+    monthly_message_data_tb: 0.000002
+  google_pubsub_topic.jobs["accounts.sync-stripe"]:
+    monthly_message_data_tb: 0.000001
+  google_pubsub_topic.jobs["search.rebuild-event-index"]:
+    monthly_message_data_tb: 0.000005
+
+  # Pub/Sub Subscriptions
+  google_pubsub_subscription.jobs_push["tickets.issue"]:
+    monthly_message_data_tb: 0.00001
+    storage_gb: 0
+  google_pubsub_subscription.jobs_push["tickets.hold"]:
+    monthly_message_data_tb: 0.00001
+    storage_gb: 0
+  google_pubsub_subscription.jobs_push["tickets.generate-qr"]:
+    monthly_message_data_tb: 0.00001
+    storage_gb: 0
+  google_pubsub_subscription.jobs_push["tickets.send-reminder"]:
+    monthly_message_data_tb: 0.000005
+    storage_gb: 0
+  google_pubsub_subscription.jobs_push["emails.order-confirmation"]:
+    monthly_message_data_tb: 0.000005
+    storage_gb: 0
+  google_pubsub_subscription.jobs_push["settlements.execute-transfer"]:
+    monthly_message_data_tb: 0.000002
+    storage_gb: 0
+  google_pubsub_subscription.jobs_push["accounts.sync-stripe"]:
+    monthly_message_data_tb: 0.000001
+    storage_gb: 0
+  google_pubsub_subscription.jobs_push["search.rebuild-event-index"]:
+    monthly_message_data_tb: 0.000005
+    storage_gb: 0
+
+  # ──────────────────────────────────────────────────────
+  # Secret Manager — 9 wallet secrets, 1 version each
+  # ~2K access ops/month (more cold starts in prod)
+  # ──────────────────────────────────────────────────────
+  module.environment.module.gsm.google_secret_manager_secret.secrets["wallet.apple.pass.certificate"]:
+    active_secret_versions: 1
+    monthly_access_operations: 300
+  module.environment.module.gsm.google_secret_manager_secret.secrets["wallet.apple.pass.certificatePassword"]:
+    active_secret_versions: 1
+    monthly_access_operations: 300
+  module.environment.module.gsm.google_secret_manager_secret.secrets["wallet.apple.passTypeIdentifier"]:
+    active_secret_versions: 1
+    monthly_access_operations: 200
+  module.environment.module.gsm.google_secret_manager_secret.secrets["wallet.apple.teamIdentifier"]:
+    active_secret_versions: 1
+    monthly_access_operations: 200
+  module.environment.module.gsm.google_secret_manager_secret.secrets["wallet.google.walletServiceAccount"]:
+    active_secret_versions: 1
+    monthly_access_operations: 200
+  module.environment.module.gsm.google_secret_manager_secret.secrets["wallet.jwt.primaryKeyId"]:
+    active_secret_versions: 1
+    monthly_access_operations: 200
+  module.environment.module.gsm.google_secret_manager_secret.secrets["wallet.jwt.primaryPrivateKey"]:
+    active_secret_versions: 1
+    monthly_access_operations: 200
+  module.environment.module.gsm.google_secret_manager_secret.secrets["wallet.jwt.secondaryKeyId"]:
+    active_secret_versions: 1
+    monthly_access_operations: 50
+  module.environment.module.gsm.google_secret_manager_secret.secrets["wallet.jwt.secondaryPrivateKey"]:
+    active_secret_versions: 1
+    monthly_access_operations: 50
+
+  # ──────────────────────────────────────────────────────
+  # SNS — SMS for 2FA / notifications
+  # ~500 SMS/month at prod scale
+  # ──────────────────────────────────────────────────────
+  module.environment.module.sns[0].aws_sns_topic.sms_inbound:
+    monthly_requests: 1000
+    request_size_kb: 1
+    monthly_http_notifications: 0
+    monthly_email_notifications: 0
+    monthly_kinesis_firehose_notifications: 0
+    monthly_mobile_push_notifications: 0
+    monthly_sms_notifications: 500

@@ -29,6 +29,8 @@ export async function snapshotPayoutTermsForE2eEvent(
   const cloned = await clonePayoutTermsRow(p, {
     sourcePayoutTermsId: sharedPayoutTermsId,
     isDefault: false,
+    // Mirrors production event creation, which resets the snapshot's mode.
+    resetFeeMode: true,
   });
   if (!cloned) {
     throw new Error(
@@ -163,7 +165,7 @@ export async function seedHumanWithAuth(opts: {
  * Create the standard E2E fee-policy. Returns the Prisma record.
  *
  * Spreads `PLATFORM_FEE_POLICY` — the SAME code constant the deploy-time
- * reconciler (`scripts/seed-platform-fee-policy.ts`) materializes and
+ * reconciler (`scripts/reference-data/seed-platform-fee-policy.ts`) materializes and
  * `seed/finance.ts` seeds. It used to hand-copy a flat 50¢ table, which made
  * the money suite green against economics production had stopped running: at
  * $50 face the old flat 50¢ and the new capped 3.33% both yield 50¢, so

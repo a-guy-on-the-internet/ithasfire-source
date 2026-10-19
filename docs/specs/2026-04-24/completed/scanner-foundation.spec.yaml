@@ -1,0 +1,226 @@
+# scanner-foundation.spec.yaml
+#
+# Dedicated staff scanner app shell, distinct from the consumer mobile app.
+
+version: "0.1"
+status: complete
+updated: "2026-04-24"
+related:
+  - docs/specs/2026-04-24/volunteer-scanner-check-in.spec.yaml
+  - docs/specs/platform/architecture-services.md
+  - docs/roles.md
+
+scope_note: >
+  This spec defines the dedicated scanner app shell in `apps/scanner`:
+  operator auth, event selection, mode selection, scan loop framing, and the
+  product boundary between the scanner app and the admin web fallback. It does
+  not redefine ticket-admission or volunteer-check-in business rules; those
+  remain in their feature specs and shared backend use cases.
+
+summary:
+  problem: >
+    Ithas Fire currently has scanning behavior split between an admin web page
+    and incomplete mobile scaffolding. Event-day scanning is camera-first,
+    repetitive, and operationally distinct from consumer mobile flows, so
+    burying it in admin or mixing it into the attendee app creates the wrong UX
+    and slows floor staff down.
+  solution: >
+    Ship a separate, staff-only scanner app under `apps/scanner` with a locked,
+    low-cognitive-load shell: sign in, pick org/event, choose scan mode, then
+    stay in a fast scan loop. Keep the admin web scanner as a rescue/fallback
+    surface, not the primary product.
+  users:
+    - Scanner operators with `SCANNER`, `ADMIN`, or `OWNER` role
+    - Event staffing leads managing multiple door/scanner operators
+    - Admin staff using the web fallback only when mobile is unavailable
+  surfaces:
+    - scanner
+    - web-admin
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        The dedicated scanner app must remain a separate app from the consumer
+        mobile app. It lives in `apps/scanner`, has its own release cadence,
+        navigation shell, app icon/name, and operator-focused onboarding.
+    - id: FR-002
+      description: >
+        Scanner app sign-in must admit only actors with org-scoped roles in
+        {`SCANNER`, `ADMIN`, `OWNER`} for at least one accessible org/event.
+        `VIEWER` and finance-only actors cannot enter scanner mode.
+    - id: FR-003
+      description: >
+        After sign-in, the app must present an event-access picker scoped to the
+        operator's authorized org membership(s). If the operator has exactly one
+        active event in scope, the app may auto-select it and land directly in
+        the mode picker.
+    - id: FR-004
+      description: >
+        The home surface must present scan modes as explicit, large-tap targets:
+          - Ticket admission
+          - Volunteer check-in
+          - Future modes may be added later
+        Mode tiles must be visually distinct and preserve the "one write per
+        explicit operator action" rule.
+    - id: FR-005
+      description: >
+        Each scan mode must open into a dedicated scan loop screen with:
+          - current event context
+          - current mode label
+          - camera viewport
+          - recent result banner/card
+          - a clear switch-mode affordance
+          - a clear switch-event affordance
+        The operator must never need to traverse generic app chrome to continue
+        scanning.
+    - id: FR-006
+      description: >
+        The scanner app must request and manage camera permission natively.
+        Permission denial must route to a purpose-built recovery state, not a
+        broken blank screen.
+    - id: FR-007
+      description: >
+        The scanner app must keep the selected event and last-used mode pinned in
+        local storage so operators can recover quickly after app backgrounding or
+        accidental navigation.
+    - id: FR-008
+      description: >
+        The scanner app must expose a session/settings sheet with:
+          - signed-in operator identity
+          - current org/event
+          - current app version / runtime channel
+          - sign out
+          - "switch event"
+          - "web fallback" link/copy only for support workflows
+    - id: FR-009
+      description: >
+        The admin web scan page remains supported as a fallback surface for
+        desktop rescue flows, debugging, and temporary operational continuity.
+        New scan-first UX should target the scanner app first; admin web gets a
+        reduced fallback variant only when operationally necessary.
+    - id: FR-010
+      description: >
+        The scanner shell must surface network state (`online`, `degraded`,
+        `offline`) globally. v1 may hard-require network for writes, but the app
+        must communicate that state clearly before the operator attempts a scan.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Cold launch to first usable scan screen should be <= 5s p95 on a modern
+        mid-range device after the app is installed and authenticated.
+    - id: NFR-002
+      description: >
+        The shell must be operable one-handed on a phone in portrait. Core scan
+        actions must use large touch targets and avoid dense admin-style tables.
+    - id: NFR-003
+      description: >
+        Auth/session recovery after brief backgrounding should not require a full
+        re-login within the same shift unless explicitly revoked or timed out by
+        policy.
+
+architecture:
+  core:
+    use_cases:
+      - name: listScannerAccessibleEvents
+        description: >
+          Return the events the current operator may scan for, scoped by org role
+          and event status.
+        input: { actorHumanId }
+        output: { events[] }
+        idempotent: true
+        money: false
+      - name: getScannerSessionContext
+        description: >
+          Resolve operator identity, org membership, app-scope flags, and the
+          current event summary for the scanner shell.
+        input: { actorHumanId, eventId? }
+        output: { operator, orgs[], currentEvent? }
+        idempotent: true
+        money: false
+  ports:
+    new: []
+    existing:
+      - Auth / session adapter stack already used by mobile
+      - Existing ticket scan use cases + volunteer scanner use cases
+      - Existing RBAC helpers for `SCANNER` / `ADMIN` / `OWNER`
+  adapters:
+    new: []
+    existing:
+      - Expo camera / barcode scanner adapter in `apps/scanner`
+      - Existing tRPC client / auth client patterns from `apps/mobile`
+  transport:
+    trpc_procedures:
+      - scanner.listAccessibleEvents
+      - scanner.getSessionContext
+    webhooks: []
+  ui:
+    pages:
+      - scanner: Auth gate / bootstrap
+      - scanner: Event picker
+      - scanner: Mode picker
+      - scanner: Session/settings sheet
+    components:
+      - scanner: Scan loop frame
+      - scanner: Event context bar
+      - scanner: Network / degraded-state banner
+      - web-admin: reduced fallback handoff entry
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+
+risks:
+  - risk: >
+      Team keeps adding scan-first workflows to admin web because it is already
+      live, delaying the dedicated scanner product indefinitely.
+    severity: HIGH
+    mitigation: >
+      Explicitly designate admin web scan as fallback-only (FR-009) and route new
+      operator UX to `apps/scanner` by default.
+  - risk: >
+      Scanner auth ends up too broad, letting general staff access event-day
+      operator tools they should not use.
+    severity: HIGH
+    mitigation: >
+      Lock entry to `SCANNER`, `ADMIN`, `OWNER`, and scope event lists by org
+      membership plus event access.
+  - risk: >
+      A consumer-style navigation shell leaks into the scanner app and slows
+      operators down.
+    severity: MEDIUM
+    mitigation: >
+      Keep the shell task-first: auth -> event -> mode -> scan loop. No general
+      feed, no marketplace, no consumer tabs.
+
+open_questions:
+  - id: OQ-1
+    question: >
+      Should scanner operators be allowed to switch between multiple active events
+      during one session, or should the app strongly bias toward one locked event
+      per shift/device?
+  - id: OQ-2
+    question: >
+      Do we support tablet-specific split layouts in v1, or keep phone-first only
+      and let tablets render the phone shell centered?
+
+out_of_scope:
+  - Business rules for ticket admission itself
+  - Business rules for volunteer check-in itself
+  - Internal distribution / store rollout process
+  - Issued-device provisioning and remote revocation policy
+  - Offline write queueing
+
+acceptance_criteria:
+  - >
+    A valid `SCANNER`-role operator can sign into the dedicated scanner app,
+    choose an event, choose a mode, and reach a working scan loop without using
+    the admin web app.
+  - >
+    A non-scanner role cannot enter the scanner shell or see event-day scan
+    surfaces.
+  - >
+    The admin scan page remains available as a documented fallback, but the
+    primary operator path is the dedicated scanner app.

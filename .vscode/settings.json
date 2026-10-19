@@ -5,7 +5,6 @@
     "typescript.tsdk": "node_modules/typescript/lib",
     "cSpell.enabled": false,
     "chat.agent.enabled": true,
-    "chat.agentFilesLocations": [".github/agents"],
     "mcp": {
         "servers": {
             "better-auth": {

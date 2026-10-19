@@ -1,0 +1,184 @@
+spec: featured-items
+version: "1.0"
+status: complete
+implemented: 2026-04-13
+authors:
+  - platform-team
+
+---
+
+# Featured Items — Platform Hero Carousel
+
+## Summary
+
+Platform staff can curate a list of featured items (events, artists, organisations, or places)
+that rotate as a full-width hero carousel on the consumer homepage. Each item is polymorphic:
+a `(itemType, itemId)` pair points at the real entity, with optional display overrides
+(title, subtitle, hero image, CTA link/label).
+
+---
+
+## Business Rules
+
+1. **Staff-only curation** — Only users with the `PLATFORM_STAFF` role may upsert or remove items.
+2. **Polymorphic targets** — Supported types: `EVENT`, `HUMAN`, `ORGANIZATION`, `PLACE`.
+3. **Target must be public** — Upsert is rejected (`invalid_input`) if the referenced entity is not
+   publicly visible at the moment of curation:
+   - `EVENT` → `status === PUBLISHED && visibility === PUBLIC && slug defined`
+   - `HUMAN / ORGANIZATION / PLACE` → published `EntityPage` exists for the entity
+4. **Uniqueness** — `(itemType, itemId)` is unique; re-submitting the same pair updates (upserts).
+5. **Expiry** — `curatedUntil`, when set, gates the active list: items past their expiry are
+   excluded from the public list automatically (no cron required — filtered at query time).
+6. **Sort order** — `sortOrder` (0–9999) controls display sequence; default 0.
+7. **Public list filtering** — `list` procedure returns only items where `active = true` and
+   `curatedUntil IS NULL OR curatedUntil > now()`. CTA URLs are validated to be internal paths
+   (`/…`) before being returned to clients; invalid paths are nulled out.
+8. **Audit** — Every upsert and remove emits an audit log entry via `repos.audit`.
+
+---
+
+## Data Model
+
+```prisma
+model FeaturedItem {
+  id               String           @id @default(uuid())
+  itemType         FeaturedItemType          // EVENT | HUMAN | ORGANIZATION | PLACE
+  itemId           String           @map("item_id")
+
+  title            String?                   // display override — falls back to entity name in UI
+  subtitle         String?
+  heroImageUrl     String?          @map("hero_image_url")   // internal path e.g. /cdn/hero.jpg
+  ctaUrl           String?          @map("cta_url")          // internal path e.g. /events/my-gig
+  ctaLabel         String?          @map("cta_label")
+
+  sortOrder        Int              @default(0)    @map("sort_order")
+  active           Boolean          @default(true)
+  curatedByHumanId String?          @map("curated_by_human_id")
+  curatedAt        DateTime         @default(now()) @map("curated_at")
+  curatedUntil     DateTime?        @map("curated_until")
+  notes            String?          // internal staff notes, never exposed publicly
+
+  @@unique([itemType, itemId])
+  @@index([active, sortOrder])
+  @@index([curatedByHumanId])
+  @@index([curatedUntil])
+  @@map("featured_items")
+}
+```
+
+Migration: `packages/db/prisma/migrations/20260413000001_add_featured_items/`
+
+---
+
+## Use Cases
+
+All use cases live in `packages/core/src/use-cases/platform/featured-items/`.
+
+### `upsertFeaturedItem`
+
+| Field | Notes |
+|---|---|
+| Actor | `actorHumanId` — must hold `PLATFORM_STAFF` role |
+| Input | `itemType`, `itemId` (UUID), optional display overrides, `sortOrder`, `active`, `curatedUntil`, `notes` |
+| Guards | Role check → target-is-public check → upsert |
+| Output | `{ item: FeaturedItemRecord }` |
+| Errors | `not_authorized`, `invalid_input` (unknown type, non-public target) |
+| Audit | `platform.featured_item.upserted` |
+
+### `removeFeaturedItem`
+
+| Field | Notes |
+|---|---|
+| Actor | `actorHumanId` — must hold `PLATFORM_STAFF` role |
+| Input | `itemType`, `itemId` |
+| Guards | Role check → existence check |
+| Output | `{ ok: true }` |
+| Errors | `not_authorized`, `not_found` |
+| Audit | `platform.featured_item.removed` |
+
+### `listFeaturedItems` (public)
+
+| Field | Notes |
+|---|---|
+| Actor | None — unauthenticated |
+| Input | `limit` (1–100, default 20), optional `itemType` filter |
+| Filter | `active = true AND (curatedUntil IS NULL OR curatedUntil > now())` |
+| Output | Enriched `PublicFeaturedItem[]` — `ctaUrl` stripped if not a valid internal path |
+
+### `listFeaturedAdminItems` (staff)
+
+| Field | Notes |
+|---|---|
+| Actor | `actorHumanId` — must hold `PLATFORM_STAFF` role |
+| Input | `limit`, `offset` |
+| Output | Paginated `{ items: FeaturedItemRecord[], total: number }` — all items regardless of active/expiry |
+
+---
+
+## Transport
+
+Router: `packages/transport/trpc/src/routers/featured-items.ts`
+
+| Procedure | Type | Auth |
+|---|---|---|
+| `featuredItems.list` | query | public |
+| `featuredItems.listAdmin` | query | authed + staff |
+| `featuredItems.upsert` | mutation | authed + staff |
+| `featuredItems.remove` | mutation | authed + staff |
+
+---
+
+## UI
+
+### FeaturedHeroCarousel (`apps/web/src/app/_components/home/FeaturedHeroCarousel.tsx`)
+
+- Full-width hero component rendered on the consumer homepage.
+- CSS slide-track animation; auto-advances every 6 s; pauses on hover.
+- Dot navigation; responsive (stacks on mobile).
+- Per-type badge (EVENT / ARTIST / ORGANISATION / PLACE) via i18n keys.
+- Falls back gracefully when `items` array is empty (renders nothing).
+
+### Platform Admin Page (`apps/web/src/app/platform/featured/`)
+
+- Route: `/platform/featured`
+- Staff can create / update / remove featured items via a form + list.
+- `FeaturedItemForm` — item type selector, UUID input, display override fields, CTA URL with
+  per-type placeholder and i18n hint (e.g. *"Use /events/<slug>"*), sort order, active toggle,
+  optional expiry date, notes.
+- `FeaturedItemList` — paginated table; inline remove button with optimistic update.
+- Navigation entry in `ADMIN_SECTIONS` in `apps/web/src/app/platform/[slug]/layout.tsx`.
+
+---
+
+## i18n Keys Added
+
+```
+admin.featuredTypeBadgeEvent
+admin.featuredTypeBadgeHuman
+admin.featuredTypeBadgeOrg
+admin.featuredTypeBadgePlace
+featuredCtaPathHintEvent     — "Use /events/<event-slug>."
+featuredCtaPathHintHuman     — "Use /p/<profile-slug> (or /u/<profile-slug>)."
+featuredCtaPathHintOrg       — "Use /p/<org-page-slug>."
+featuredCtaPathHintPlace     — "Use /p/<place-page-slug>."
+```
+
+---
+
+## Tests
+
+| File | Coverage |
+|---|---|
+| `upsert-featured-item.test.ts` | happy path, non-staff rejection, non-public target rejection |
+| `remove-featured-item.test.ts` | happy path, not-found, non-staff rejection |
+| `list-featured-items.test.ts` | active filter, expiry filter, type filter, ctaUrl sanitisation |
+| `list-featured-admin-items.test.ts` | pagination, staff guard |
+
+---
+
+## Security Notes
+
+- CTA URLs validated as internal paths (`/…`, no `//` prefix) — prevents open-redirect via
+  `ctaUrl`. Invalid paths are silently nulled before returning to public clients.
+- Hero image URLs receive the same internal-path validation.
+- No PII in audit log entries.

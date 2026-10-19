@@ -1,0 +1,346 @@
+# attendee-reviews.spec.yaml
+#
+# Attendee review system: verified (scanned-ticket-only) post-event reviews
+# where ONE submission rolls up to THREE aggregation targets — the event, the
+# venue, and the organizer/series. Aggregates are public (through the shared
+# suppression primitives); review text is private to the organizer. This is
+# the fan-side sibling of the performer place-review system, which stays
+# separate and unchanged.
+#
+# Related specs:
+#   - specs/2026-07-13/completed/place-review-anonymization.spec.yaml (FR-009 shared
+#     aggregate-suppression primitives + snapshot-not-live pattern REUSED here;
+#     performer reviews remain a separate domain with separate constants)
+#   - specs/2026-07-13/completed/booking-review-data-weave.spec.yaml (WS3's PostGigPrompt
+#     outbox — not yet built — MUST generalize to a post-event prompt with
+#     per-audience payloads: performer → review-venue/deal steps, attendee →
+#     this review. Build once, not twice.)
+#   - specs/2026-07-14/completed/booking-conversation-and-event-step.spec.yaml +
+#     lineup-booking-requests.spec.yaml (create-event-from-agreement and
+#     lineups define the organizer/performer entities aggregates attach to)
+#   - specs/2026-07-05/completed/calm-honest-ux.spec.yaml (no review-farming,
+#     no dark-pattern solicitation, neutral score display)
+
+version: "1.0"
+updated: "2026-07-14"
+status: shipped  # 2026-10-08 docs consolidation; was: draft
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Attendees have no feedback channel at all: nothing tells an organizer the
+    sound was bad, nothing tells a fan which venues and organizers reliably
+    put on good shows, and nothing rewards the organizers who do. Open
+    platforms (Google/Yelp) can't verify attendance, so their live-music
+    reviews are noise. We scan tickets — we know exactly who was in the room.
+  solution: >
+    A post-event review from scanned ticket holders only: one short submission
+    (overall rating, a few structured facets, optional text). Scores aggregate
+    publicly through the existing suppression primitives (k-thresholds,
+    coarsening, periodic snapshots) onto the event, the venue page (as an
+    audience-perspective block beside the performer stats), and the
+    organizer/series entity. Text is never public — it goes privately to the
+    organizer, unattributed. Prompt delivery rides the generalized post-event
+    prompt pipeline shared with the performer post-gig prompt (weave WS3).
+  users:
+    - Attendees with scanned tickets (submit; read aggregates when choosing)
+    - Organizers (private text feedback; public reputation as it accrues)
+    - Venue owners (audience-perspective aggregates on their page)
+  surfaces:
+    - web
+    - jobs (prompt dispatch, aggregate snapshot recompute)
+    - mobile (submission via my-tickets, later phase)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        AttendeeReview model: one per (eventId, humanId), enforced unique.
+        Eligibility: the human holds a ticket for that event with status
+        SCANNED (verified attendance) and the event has ended. Submission
+        window: event end + 30 days, then closed. Fields: overallRating
+        (1-5 int), facet ratings (1-5 int, all optional): soundQuality,
+        venueComfort (sightlines/space/facilities), organization
+        (smoothness/timing/communication), valueForMoney; text (optional,
+        <=2000 chars, PRIVATE); denormalized targets stamped at submit:
+        placeId?, ownerType/ownerId (event owner org or human), seriesId?.
+    - id: FR-002
+      description: >
+        Visibility model, enforced in core not UI: facet/overall scores exist
+        ONLY in public aggregates (never per-review on any public surface);
+        text is readable ONLY by the event owner's admin surface and platform
+        staff. Text is shown to the organizer UNATTRIBUTED (no name, no seat,
+        no purchase info); staff can resolve identity for abuse handling,
+        audit-logged (pattern: place-review staff reads).
+    - id: FR-003
+      description: >
+        Aggregation through a new attendee-review policy module built on the
+        SHARED aggregate-suppression primitives (packages/core/src/lib/
+        aggregate-suppression.ts). Domain constants (initial): k >= 5 distinct
+        reviewers per displayed aggregate (higher than performer reviews —
+        attendee identity is known internally, and small-event n=3 is too
+        correlatable to "the three people who came"); scores in 0.5 steps;
+        percentages in 5% steps; review counts banded past 20. Below-threshold
+        aggregates are ABSENT, never zeroed.
+    - id: FR-004
+      description: >
+        Snapshot-not-live publication (same defense as place reviews): a
+        periodic job materializes per-target snapshots into a generic
+        ReviewAggregate table keyed (subjectType: EVENT|PLACE|OWNER|SERIES,
+        subjectId). Public reads serve snapshots only. Weekly cadence to start
+        (constant in the policy module), full recompute, idempotent, per-target
+        failure isolation with guarded reportError.
+    - id: FR-005
+      description: >
+        Display surfaces, all snapshot-fed: (a) past-event pages show the
+        event's aggregate once k clears; (b) venue pages get an
+        audience_stats PLACE block — same server-derived trusted-marker
+        mechanics as venue_stats, seeded into the venue template beside it,
+        labeled "Rated by N verified attendees" and visually distinct from
+        both owner copy and the performer block; (c) organizer/series
+        aggregates render on the ORG/HUMAN entity page (template-integrated
+        block) and on public event pages as a small "organizer rating" line.
+    - id: FR-006
+      description: >
+        Prompt delivery: generalize weave-WS3's PostGigPrompt into a
+        PostEventPrompt outbox with an audience discriminator (PERFORMER |
+        ATTENDEE). Attendee rows enqueue when an event with scanned tickets
+        ends: one prompt per scanned attendee, idempotent per (eventId,
+        humanId, audience), sent once (in-app + email via the notify pipeline
+        with derived per-channel idempotency keys), deep-linking to the review
+        form. No reminders. Performer rows keep the WS3 behavior (review-venue
+        lead + deal-contribution step). Build the pipeline ONCE here or in
+        WS3 — whichever ships first owns it.
+    - id: FR-007
+      description: >
+        Organizer feedback surface: admin event page gains a private
+        "Attendee feedback" tab — aggregate scores (no k-threshold internally;
+        organizers may see their own exact aggregates) plus the unattributed
+        text list, newest first, with a per-item "report abuse" action that
+        flags to platform staff. No reply mechanism (out of scope).
+    - id: FR-008
+      description: >
+        Solicitation rules per calm-honest-ux: one prompt, no reminders, no
+        incentives/discounts for reviewing, no interception of negative
+        reviews ("tell us privately instead" gating is forbidden), identical
+        flow regardless of expected sentiment. Copy states plainly: scores
+        are published in aggregate once enough reviews exist; comments go to
+        the organizer without your name.
+    - id: FR-009
+      description: >
+        Moderation minimum: attendee-review text is organizer-facing, so the
+        surface area is small — staff tooling is a flag queue (from FR-007
+        reports) with hide + identity-resolution (audit-logged) actions.
+        Reuse the platform review moderation UI patterns; no public display
+        means no redaction tooling needed at launch.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        The attendee policy module is pure and table-driven-tested like the
+        place-review one: slice presence pinned at k-1/k, bucket alignment
+        asserted on every emitted number.
+    - id: NFR-002
+      description: >
+        Eligibility is enforced server-side in the submit use case (scanned
+        ticket lookup + window check) — never trusted from the client. Rate
+        limiting on submit mirrors placeReviews.submit.
+    - id: NFR-003
+      description: >
+        All swallow-and-fallback branches (snapshot recompute, prompt
+        dispatch) follow the ReporterPort convention with regression tests.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: submit-attendee-review
+        description: >
+          Validates eligibility (scanned ticket, event ended, within window,
+          no existing review), stamps denormalized targets, writes the review.
+        input: eventId, actorHumanId, ratings, text?
+        output: reviewId
+        idempotent: false (unique-constraint backstop)
+        money: false
+      - name: attendee-review-policy (module)
+        description: >
+          Constants + shaping over the shared aggregate-suppression
+          primitives; one exit producing the public-safe per-target snapshot.
+        input: raw aggregates + reviewer counts
+        output: snapshot or per-slice omissions
+        idempotent: true
+        money: false
+      - name: recompute-review-aggregates
+        description: >
+          Periodic full recompute of ReviewAggregate snapshots for all four
+          subject types; per-target failure isolation + reportError.
+        input: "now (clock), batch size"
+        output: recomputed/failed counts
+        idempotent: true
+        money: false
+      - name: enqueue/dispatch-post-event-prompts (extends WS3)
+        description: >
+          Audience-discriminated outbox; attendee enqueue sweeps ended events
+          with scanned tickets.
+        input: "now (clock)"
+        output: enqueued/dispatched counts
+        idempotent: true
+        money: false
+      - name: list-event-feedback (owner/staff)
+        description: >
+          Owner-scoped private text list, unattributed; staff variant with
+          audit-logged identity resolution.
+        input: eventId, actor
+        output: feedback items + exact aggregates
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - tickets repo (scanned-status lookup)
+      - notify, reporter, audit
+      - entity-pages get-public-page (audience_stats + org block injection)
+
+  adapters:
+    new:
+      - prisma repos for AttendeeReview / ReviewAggregate / PostEventPrompt
+    existing:
+      - entity-page block plumbing (venue_stats precedent)
+
+  transport:
+    trpc_procedures:
+      - "attendeeReviews.submit (authed, rate-limited)"
+      - "attendeeReviews.getEligibility (authed — drives my-tickets CTA)"
+      - "attendeeReviews.getAggregate (public, snapshot-only)"
+      - "attendeeReviews.listEventFeedback (owner-scoped)"
+      - "attendeeReviews.staff* (flag queue, hide, resolve-identity)"
+    webhooks: []
+
+  ui:
+    form_pattern: >
+      REQUIRED: the attendee review form follows the conversational
+      multi-screen pattern established by the place review form
+      (docs/specs/2026-04-08/completed/place-review-form-v3.spec.md "Typeform
+      + TurboTax" philosophy; implementation precedent
+      apps/web/src/app/_components/place-review/PlaceReviewFormOrchestrator.tsx
+      + _screens/): one question per screen, conversational copy,
+      keyboard-first, progress indicator, contextual why-we-ask helper text,
+      warm completion state. Core screens (overall, sound, organization) then
+      optional "keep going" screens (venue comfort, value, text comment).
+      This is the house style for all review-style forms going forward.
+    pages:
+      - "review form page/dialog reached from prompt deep-link + my-tickets"
+      - "admin event 'Attendee feedback' tab"
+    components:
+      - "AudienceStatsBlock (PLACE) + organizer-rating block/line (ORG/HUMAN,
+         event page) — all trusted-marker server-derived"
+      - "my-tickets 'Rate this show' CTA for eligible past events"
+
+  jobs:
+    - "post-event prompt enqueue/dispatch (shared with WS3)"
+    - "review-aggregate snapshot recompute (weekly)"
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - "AttendeeReview (@@unique([eventId, humanId]); denormalized placeId?,
+       ownerType/ownerId, seriesId?; hidden/flagged moderation fields).
+       DELIBERATE: humanId is onDelete Cascade (diverges from PlaceReview's
+       SetNull) — attendee reviews die with the account, private text
+       included; aggregates recompute smaller at the next snapshot, which
+       k-thresholds and batching absorb. Verified attendance requires the
+       identity, so an anonymized orphan row has no integrity value here."
+    - "ReviewAggregate (subjectType, subjectId, snapshot Json, computedAt;
+       @@unique([subjectType, subjectId]))"
+    - "PostEventPrompt (evolves weave-WS3's PostGigPrompt: + audience enum;
+       @@unique([eventId, humanId, audience]))"
+  modified_models: []
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Small scenes: at a 40-cap show the organizer may guess who wrote the
+      2000-char critique even unattributed.
+    severity: MEDIUM
+    mitigation: >
+      Submission copy is explicit that comments are unattributed but the
+      organizer sees the text verbatim; text stays optional; no per-review
+      timestamps shown to organizers (batch by event only). Consider a
+      text-delay batch (release all text N days post-event together) —
+      open question below.
+  - risk: >
+      Review-bombing or organizer self-review via comp tickets they scan
+      themselves.
+    severity: MEDIUM
+    mitigation: >
+      One review per human per event, scanned-only, k>=5 aggregates, count
+      bands; staff flag queue. Comp-ticket self-scanning is auditable
+      (scanner logs) — accept residual risk at launch, revisit with volume.
+  - risk: >
+      Empty-state chicken-and-egg: k>=5 hides everything for small events.
+    severity: LOW
+    mitigation: >
+      Event aggregates roll up to organizer/series and venue targets, which
+      accumulate across events and clear thresholds first — reputation
+      surfaces before per-event scores do, which is the right order anyway.
+  - risk: >
+      Prompt fatigue colliding with WS3's performer prompt and the
+      transparency contribution step.
+    severity: LOW
+    mitigation: >
+      One outbox, one prompt per (human, event, audience); a human who is
+      both performer and attendee gets the performer prompt only (audience
+      precedence rule in the enqueue sweep).
+
+open_questions:
+  - >
+    Scanned-only excludes RSVP/community-listing and unscanned free events
+    entirely. Accepted for v1 (chosen at scoping); revisit whether RSVP'd
+    attendance of ticketless events earns eligibility later.
+  - >
+    Text-release batching (all comments released together N days post-event)
+    to blunt small-show deanonymization — worth the delay?
+  - >
+    Series identity: is seriesId a first-class entity today or derived from
+    recurring-event grouping? Determines whether SERIES aggregates ship in
+    v1 or fold into OWNER.
+  - >
+    Mobile submission (my-tickets is the natural surface) — v1 web-only or
+    hold FR-006 deep links until mobile ships?
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Public review text, named reviews, organizer public replies
+  - Incentivized reviews of any kind
+  - Changes to the performer place-review system
+  - Cross-posting aggregates to external surfaces (Google, socials)
+  - Review editing after submission (delete-and-resubmit within window only)
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A human with an unscanned ticket, or after day 30, cannot submit
+    (server-enforced); a scanned attendee can, exactly once per event.
+  - No public procedure returns any per-review rating, text, or reviewer
+    identity; the organizer surface returns text without attribution;
+    staff identity resolution is audit-logged.
+  - An event/venue/organizer target with 4 distinct reviewers shows nothing
+    public; at 5 it shows bucket-aligned aggregates from the snapshot, and a
+    fresh review changes nothing public until the next recompute.
+  - The venue page renders audience_stats beside venue_stats with distinct
+    provenance labels; a page owner cannot forge either (trusted-marker +
+    strip schema, per the venue_stats tests).
+  - A scanned attendee receives exactly one prompt per event (re-running
+    enqueue+dispatch sends nothing new); a performer on the same event's
+    lineup receives the performer prompt instead, never both.
+  - Policy-module tests pin k boundaries and bucket alignment; eligibility,
+    window, and uniqueness are covered by use-case tests.

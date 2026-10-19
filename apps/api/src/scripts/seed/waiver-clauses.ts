@@ -8,7 +8,7 @@ import type { PrismaClient } from "@prisma/client";
  *   RISK_SPECIFIC: Toggleable by organizer, auto-selected by event properties (12 clauses)
  *
  * Legal basis: Copeland v. HealthSouth (Tenn. 2018) three-factor test.
- * See docs/specs/2026-04-19/waiver-clause-library.spec.md
+ * See docs/specs/2026-04-19/completed/waiver-clause-library.spec.md
  */
 
 export type ClauseSeed = {
@@ -58,7 +58,7 @@ const STRUCTURAL_CLAUSES: ClauseSeed[] = [
   {
     slug: "core-assumption-of-risk",
     title: "Voluntary Assumption of Risk",
-    body: `VOLUNTARY ASSUMPTION OF RISK. I acknowledge that attending this Event involves inherent risks that may result in personal injury, illness, death, or property damage. These risks include but are not limited to: the actions and conduct of other attendees, performers, vendors, and staff; environmental conditions; equipment failure; and hazards of the venue. I understand these risks and voluntarily assume full responsibility for any injuries, damages, or losses that may occur as a result of my attendance, whether or not caused by the ordinary negligence of the Released Parties.`,
+    body: `VOLUNTARY ASSUMPTION OF RISK. I acknowledge that attending this Event involves inherent risks that may result in personal injury, illness, death, or property damage. These risks include but are not limited to: the actions and conduct of other attendees, performers, vendors, and staff; environmental conditions; equipment failure; and hazards of the place. I understand these risks and voluntarily assume full responsibility for any injuries, damages, or losses that may occur as a result of my attendance, whether or not caused by the ordinary negligence of the Released Parties.`,
     category: "STRUCTURAL",
     layer: "STRUCTURAL",
     isRequired: true,
@@ -88,7 +88,7 @@ const STRUCTURAL_CLAUSES: ClauseSeed[] = [
   {
     slug: "governing-law-tn",
     title: "Governing Law (Tennessee)",
-    body: `GOVERNING LAW AND VENUE. This Waiver shall be governed by and construed in accordance with the laws of the State of Tennessee. Any disputes arising from this Waiver or my attendance at the Event shall be resolved exclusively in the state or federal courts located in Davidson County, Tennessee.`,
+    body: `GOVERNING LAW AND FORUM. This Waiver shall be governed by and construed in accordance with the laws of the State of Tennessee. Any disputes arising from this Waiver or my attendance at the Event shall be resolved exclusively in the state or federal courts located in Davidson County, Tennessee.`,
     category: "LEGAL",
     layer: "STRUCTURAL",
     isRequired: true,
@@ -103,7 +103,7 @@ const RISK_SPECIFIC_CLAUSES: ClauseSeed[] = [
   {
     slug: "private-residential",
     title: "Private Residential Property",
-    body: `PRIVATE RESIDENTIAL PROPERTY. I understand that this Event takes place at a private residential property that is not a licensed commercial venue. The property has not been inspected or approved for public assembly by any government authority. I accept the property in its current condition, including any hazards related to: stairs, porches, and decks without code-compliant handrails; uneven floors and thresholds; limited or residential-only lighting; residential electrical systems; absence of commercial fire suppression, sprinklers, or fire alarms; limited egress points and exits; household pets; and general conditions of a private home not designed for public gatherings.`,
+    body: `PRIVATE RESIDENTIAL PROPERTY. I understand that this Event is held at a private residential property that is not licensed commercial premises. The property has not been inspected or approved for public assembly by any government authority. I accept the property in its current condition, including any hazards related to: stairs, porches, and decks without code-compliant handrails; uneven floors and thresholds; limited or residential-only lighting; residential electrical systems; absence of commercial fire suppression, sprinklers, or fire alarms; limited egress points and exits; household pets; and general conditions of a private home not designed for public gatherings.`,
     category: "VENUE",
     layer: "RISK_SPECIFIC",
     isRequired: false,
@@ -128,8 +128,8 @@ const RISK_SPECIFIC_CLAUSES: ClauseSeed[] = [
   },
   {
     slug: "non-traditional-venue",
-    title: "Non-Traditional Venue",
-    body: `NON-TRADITIONAL VENUE. I understand that this Event takes place at a non-traditional venue that may not meet the standards of a licensed commercial event space. The venue may have limited accessibility, non-standard restroom facilities, absence of ADA-compliant features, non-commercial electrical and plumbing systems, and conditions that differ from a professional event environment. I accept these conditions and assume the associated risks.`,
+    title: "Non-Traditional Place",
+    body: `NON-TRADITIONAL PLACE. I understand that this Event is held at a non-traditional place that may not meet the standards of a licensed commercial event space. The place may have limited accessibility, non-standard restroom facilities, absence of ADA-compliant features, non-commercial electrical and plumbing systems, and conditions that differ from a professional event environment. I accept these conditions and assume the associated risks.`,
     category: "VENUE",
     layer: "RISK_SPECIFIC",
     isRequired: false,

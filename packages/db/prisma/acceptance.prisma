@@ -1,0 +1,70 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// AcceptanceRecord — one table for platform-wide, human-keyed, version-gated
+// documents (chargeback terms organizer-side, future master Organizer ToS,
+// buyer ToS, privacy policy, age verification).
+//
+// See docs/specs/2026-05-17/completed/acceptance-records.spec.md. Does NOT replace
+// EventAttestation (per-event typed facts), WaiverAcceptance (per-ticket,
+// joins WaiverTemplate), or Order.* chargeback fields (point-in-time buyer
+// acceptances).
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AcceptanceRecord {
+  id String @id @default(uuid())
+
+  /// Natural person who clicked accept. Never null. The actor — not an
+  /// org membership, not an order — is the source of legal truth.
+  humanId String
+
+  /// Stable enum of platform-wide documents. New documents add a value.
+  documentType AcceptanceDocumentType
+
+  /// e.g. "2026-05-17". Bumping this constant in code invalidates all
+  /// prior acceptances of the same documentType and forces re-accept on
+  /// the next gate check.
+  documentVersion String
+
+  /// Verbatim text the user saw — kept for forensic value. If legal
+  /// rewrites the text, version bumps; this column preserves the exact
+  /// rendering the user agreed to.
+  documentTextSnapshot String
+
+  /// Optional scope discriminator for documents accepted on behalf of
+  /// something else.
+  ///   • GLOBAL  — applies to the human across all activity (privacy
+  ///               policy, age verification, master ToS)
+  ///   • ORGANIZATION — accepted by a human in their capacity as an admin
+  ///                    of a specific org (chargeback terms organizer-side)
+  ///   • EVENT   — reserved for future use (per-event acceptances that
+  ///               aren't typed enough to deserve EventAttestation)
+  scopeType AcceptanceScope @default(GLOBAL)
+  scopeId   String?
+
+  acceptedAt DateTime @default(now())
+  ipAddress  String?
+  userAgent  String?
+
+  /// Optional small blob for document-specific metadata. Use sparingly;
+  /// anything that needs validation belongs in a typed table, not here.
+  metadata Json?
+
+  human Human @relation(fields: [humanId], references: [id], onDelete: Cascade)
+
+  @@index([humanId, documentType, documentVersion])
+  @@index([scopeType, scopeId, documentType])
+  @@index([documentType, documentVersion]) // version-bump invalidation queries
+  // NOTE: a unique index "AcceptanceRecord_human_doc_version_scope_key" on
+  // (humanId, documentType, documentVersion, scopeType, scopeId) NULLS NOT
+  // DISTINCT exists in SQL only (migration
+  // 20260612000000_acceptance_record_unique_key) — Prisma can't express
+  // NULLS NOT DISTINCT, and scopeId is NULL for every GLOBAL-scope row, so a
+  // plain @@unique would not deduplicate the main case. It backstops
+  // recordAcceptance's find-then-create; the adapter inserts via
+  // createMany({ skipDuplicates: true }) (ON CONFLICT DO NOTHING) so a
+  // concurrent duplicate never aborts the surrounding transaction.
+  // ⚠ If `prisma migrate dev` ever proposes DROP INDEX
+  // "AcceptanceRecord_human_doc_version_scope_key", reject it and re-add the
+  // index by hand — losing it silently re-enables duplicates (DO NOTHING
+  // masks the gap). The acceptances integration test asserts the index
+  // exists with NULLS NOT DISTINCT, so CI catches a stray drop.
+}

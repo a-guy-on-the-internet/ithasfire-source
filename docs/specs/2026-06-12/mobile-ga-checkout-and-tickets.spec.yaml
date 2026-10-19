@@ -1,0 +1,274 @@
+# Not built yet (2026-10-08 docs consolidation): actual Payment Sheet invocation, wallet passes (confirm)
+# mobile-ga-checkout-and-tickets.spec.yaml
+#
+# Mobile app Phase 1 "close the money loop": real event detail screen, native
+# GA-only checkout via Stripe Payment Sheet, QR ticket display, wallet passes.
+
+version: "1.0"
+updated: "2026-06-12"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The consumer mobile app can discover events and list owned tickets, but
+    EventDetailScreen is a "Buy flow coming soon" stub and tickets render as
+    text codes only. Users cannot buy in-app or present a scannable ticket at
+    the door, so the app neither earns money nor serves its core
+    attend-the-event job.
+  solution: >
+    Build a real event detail screen and a native GA-only checkout on Stripe
+    Payment Sheet, reusing the existing orders.createCheckout →
+    confirmPayment contract unchanged. Add QR rendering with brightness boost
+    to the tickets surface and Apple/Google wallet passes via the existing
+    walletPasses.generate procedure. Events the native flow can't serve
+    (reserved seating, waivers, password/application gates) deep-link to web
+    checkout.
+  users:
+    - Ticket buyer (signed-in consumer on iOS/Android)
+  surfaces:
+    - mobile
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        EventDetailScreen renders title, date/time, venue, hero image,
+        description (text + image blocks from events.getPublicEventBody), and
+        the ticket type list with prices and sellability from
+        events.listEventTicketTypes.
+    - id: FR-002
+      description: >
+        Native checkout is offered only when ALL hold: features.getFeatureGates
+        returns enableBuyTickets=true; listEventTicketTypes sellability.available
+        is true; placeLayoutId is null (GA); event has no waiver
+        (waivers.getEventWaiver returns none); and the viewer can pass the
+        event gate natively — no gate, viewerCanBypass, viewerIsUnlocked, or a
+        password gate (see FR-011). Application-gated events the viewer hasn't
+        unlocked deep-link to web. Otherwise the CTA deep-links to the web
+        checkout URL for the event.
+    - id: FR-003
+      description: >
+        Ticket selection supports per-type quantity steppers (FIXED pricing)
+        and an amount input respecting minimumCents/suggestedCents for
+        ADJUSTABLE pricing, plus a promo code input (codes passed as
+        promoCodes[] to createCheckout, max 5).
+    - id: FR-004
+      description: >
+        For paid orders, a billing address form (line1, line2, city, state,
+        postalCode, country) is collected before createCheckout; free orders
+        skip it. Terms and refund policy acceptance are explicit checkboxes
+        (links open web policy pages) — createCheckout requires both true.
+    - id: FR-005
+      description: >
+        Checkout calls orders.createCheckout with a per-attempt clientKey
+        (UUID, reused on retry). Paid path: initialize Stripe Payment Sheet in
+        immediate-intent mode with the returned clientSecret, present it, and
+        on success call orders.confirmPayment with the PaymentIntent id. Free
+        path (clientSecret null): go straight to confirmation. Payment Sheet
+        enables Apple Pay (iOS) and Google Pay (Android), gated by a config
+        flag so card-only still works while the Apple merchant ID /
+        certificate setup is pending.
+    - id: FR-006
+      description: >
+        The hold window (holdExpiresAt, 15 min) is shown as a countdown during
+        payment. On expiry the order is treated as dead: dismiss Payment
+        Sheet, show an expiry notice, return to ticket selection. If the user
+        backs out before paying, call orders.releaseCartHold (best-effort).
+    - id: FR-007
+      description: >
+        Confirmation screen shows order summary (qty per ticket type, total
+        breakdown incl. fees, tax, credits applied) via orders.getMyOrder and
+        links to the Tickets tab.
+    - id: FR-008
+      description: >
+        Each ticket in TicketOrdersList expands to a full-screen QR view:
+        QR rendered locally from the ticket code, screen brightness raised to
+        max while visible and restored on dismiss (expo-brightness, same
+        pattern as scanner), keep-awake enabled.
+    - id: FR-009
+      description: >
+        Ticket QR view offers "Add to Apple Wallet" (iOS) / "Add to Google
+        Wallet" (Android) via walletPasses.generate. Apple: write base64
+        .pkpass to cache and open via sharing sheet; Google: open saveUrl.
+        Hide the button if the procedure returns PRECONDITION_FAILED
+        (wallet pass adapter unconfigured).
+    - id: FR-010
+      description: >
+        Pricing display matches web: total = amountGrossCents + buyerFeesCents
+        + taxAmountCents − creditAppliedCents; processorFeeCents is display
+        only and never added.
+    - id: FR-011
+      description: >
+        Password-gated events are handled natively for signed-in users: when
+        getEventGateState returns passwordRequired, show event name + hero via
+        events.getGatedPreview and a password prompt calling
+        events.validatePassword (server persists the unlock to eventUnlocks
+        for signed-in viewers; rate-limited 5/min per event). On success,
+        refetch gate state and proceed to the full detail/checkout. No backend
+        changes — the web cookie path is anonymous-only and not used.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Payment correctness: confirmPayment is called with the exact
+        PaymentIntent id from the Payment Sheet result; webhook finalization
+        remains the fallback, so a crash after payment must not lose the
+        order (it resolves via webhook).
+    - id: NFR-002
+      description: >
+        Checkout is signed-in only in this phase (the app already gates all
+        tabs behind auth); buyer identity comes from the session.
+    - id: NFR-003
+      description: >
+        Stripe publishable key supplied via EXPO_PUBLIC_STRIPE_PUBLISHABLE_KEY
+        and set per EAS channel (dev/preview/production) to match the API
+        environment.
+    - id: NFR-004
+      description: >
+        All money amounts handled as integer cents end-to-end; no client-side
+        price math beyond summing server-returned cents fields.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases: []   # No core changes — reuses create-checkout, confirm-payment,
+                    # release-cart-hold, get-my-order, generate-wallet-pass as-is.
+
+  ports:
+    new: []
+    existing:
+      - payment-processor-port (untouched; PI created server-side with destination charge)
+      - wallet-pass port (ctx.walletPass, untouched)
+
+  adapters:
+    new: []
+    existing: []
+
+  transport:
+    trpc_procedures: []   # None new. Consumes: events.resolveEventBySlug,
+                          # events.listEventTicketTypes, events.getPublicEventBody,
+                          # events.getEventGateState, features.getFeatureGates,
+                          # orders.createCheckout, orders.confirmPayment,
+                          # orders.releaseCartHold, orders.getMyOrder,
+                          # orders.listMyOrders, orders.listMyOrderTickets,
+                          # walletPasses.generate
+    webhooks: []
+
+  ui:
+    pages:
+      - EventDetailScreen (replace stub; apps/mobile/src/screens/EventDetailScreen.tsx)
+      - CheckoutScreen (new, pushed onto Discover stack: selection → details → pay)
+      - OrderConfirmationScreen (new)
+      - TicketQrScreen (new full-screen modal)
+    components:
+      - TicketTypePicker (qty steppers, adjustable-price input)
+      - PromoCodeInput
+      - BillingAddressForm (native, minimal)
+      - HoldCountdownBanner
+      - EventBodyRenderer (minimal: paragraphs + images from body JSON)
+      - WalletPassButton (platform-conditional)
+      - StripeProvider wiring in App root (@stripe/stripe-react-native, new dependency + Expo plugin)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Hold expires while Payment Sheet is open; user pays against a cancelled
+      order.
+    severity: HIGH
+    mitigation: >
+      Mirror web behavior: block presenting the sheet within a safety margin
+      of expiry, dismiss on countdown reaching zero, and rely on server-side
+      PI cancellation in releaseCartHold/expiry sweep. Verify expiry handling
+      in integration testing before release.
+  - risk: >
+      @stripe/stripe-react-native requires a native rebuild (Expo plugin) —
+      no OTA path; checkout ships only via a new EAS build/store release.
+    severity: MEDIUM
+    mitigation: >
+      Land behind the existing enableBuyTickets feature gate so the store
+      binary can ship ahead of enabling purchases.
+  - risk: >
+      Event body JSON renderer scope creep (web supports rich blocks).
+    severity: MEDIUM
+    mitigation: >
+      v1 renders paragraph text and images only; unknown block types are
+      skipped silently. Full parity explicitly out of scope.
+  - risk: >
+      Apple .pkpass handoff via sharing sheet is clunkier than native PassKit
+      "Add to Wallet".
+    severity: LOW
+    mitigation: >
+      Ship sharing-sheet flow first; evaluate a PassKit module later if
+      adoption suffers.
+  - risk: >
+      Apple Pay has an external dependency: Apple merchant ID registered in
+      the developer portal + payment processing certificate uploaded to the
+      Stripe dashboard. Misconfigured Apple Pay can break sheet presentation.
+    severity: MEDIUM
+    mitigation: >
+      Gate wallet buttons behind a config flag defaulting off; enable per EAS
+      channel only after the merchant setup is verified on a physical device.
+
+# Decisions (resolved 2026-06-12):
+# - Apple Pay / Google Pay: IN v1 via Payment Sheet, behind a config flag;
+#   Apple merchant ID + payment-processing cert in Stripe dashboard is an
+#   external prerequisite (card-only works until then).
+# - Payment Sheet mode: immediate intent (createCheckout returns clientSecret,
+#   sheet presents it). Deferred IntentConfiguration rejected — web only uses
+#   deferred Elements to render the form pre-order; mobile gains nothing for
+#   the added complexity, and abandoned PIs are already handled by
+#   releaseCartHold + the existing PI-cleanup job.
+# - Password gates: handled natively (FR-011); application gates still
+#   deep-link to web.
+open_questions: []
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Reserved seating / seat map selection (deep-links to web checkout)
+  - Waiver display and acceptance (deep-links to web)
+  - Application-gate submission flow (deep-links to web)
+  - Guest checkout and public (signed-out) browsing (Phase 2)
+  - Abandoned-cart resume (getActiveCartHolds UI) and cross-device resume
+  - Resale purchase, ticket transfer, refunds
+  - Push notifications
+  - updateOrderItems pre-hold flow (mobile holds once at createCheckout)
+  - Full rich-text parity in event body rendering
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A signed-in user can buy a paid GA ticket end-to-end in the app with a
+    test card and sees the order in the Tickets tab.
+  - A free RSVP event completes without any payment UI.
+  - A promo code reduces the displayed total to match the server-returned
+    amountGrossCents.
+  - A seated, waiver-bearing, or application-gated event shows a CTA that
+    opens web checkout instead of the native flow.
+  - A password-gated event prompts for the password in-app; a correct entry
+    unlocks it persistently (survives app restart) and allows native
+    purchase; a wrong entry shows an error without leaving the app.
+  - With wallet payments enabled, Apple Pay (iOS) / Google Pay (Android)
+    appear in the Payment Sheet and complete a test purchase; with the flag
+    off, card-only checkout still works.
+  - With enableBuyTickets=false, no purchase CTA is shown anywhere.
+  - Letting the hold countdown expire returns the user to ticket selection
+    with a notice; no charge occurs.
+  - A ticket QR renders full-screen, brightness rises while visible and
+    restores after, and the code scans successfully in the scanner app.
+  - "Add to Wallet" produces a working pass on a physical iOS and Android
+    device; the button is absent when the wallet adapter is unconfigured.
+  - Total displayed at payment equals amountGrossCents + buyerFeesCents +
+    taxAmountCents − creditAppliedCents.

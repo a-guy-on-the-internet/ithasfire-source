@@ -1,6 +1,6 @@
 ---
 name: visual-critique
-description: "Get an independent visual-defect critique of rendered UI from Google Antigravity/Gemini (multimodal). Use when you have rendered screens (web at a mobile/desktop viewport, or the Expo app on a simulator) and want a second pair of eyes on OBJECTIVE visual defects — truncation, overflow, misalignment, contrast/a11y, safe-area collisions, broken responsive states. Use when asked to 'check the UI for defects', 'review these screens', 'have Gemini look at the layout', or before shipping a visual change. NOT for subjective taste — Claude owns that."
+description: "Objective visual-defect pass by Gemini over rendered screenshots (web, or the Expo app on a simulator): truncation, overflow, misalignment, contrast, safe-area collisions, broken responsive states. Use before shipping a visual change or when asked to check screens for defects. Taste stays with Claude."
 ---
 
 # Visual Critique (Antigravity / Gemini)
@@ -12,7 +12,7 @@ goes to another model — per the standing split:
 - **Gemini judges rendered screens** for objective defects (its multimodal strength).
 - **Claude owns UI generation, design-system adherence, copy voice, and every
   taste/design decision** — and decides what to *do* with Gemini's findings.
-- **GPT-5.5** is unrelated here (grunt work + code review; see `codex-delegate`).
+- **GPT (Codex)** is unrelated here (grunt work + code review; see `codex-delegate`).
 
 > **Objective defects, not taste.** Ask Gemini for verifiable problems (things
 > that are *wrong*), never "does this look good." If a finding is aesthetic
@@ -26,18 +26,19 @@ hang/crash watchdog). `agy` has no `--image` flag: it reads screenshot **files**
 by path from a directory you expose via `--images-dir`. So:
 
 1. **Capture the screenshots yourself.**
-   - **Web-mobile:** Chrome DevTools MCP — resize to a phone viewport
-     (e.g. 390×844), navigate the route, `take_screenshot` to a PNG.
-   - **Web-desktop:** same, at a desktop width.
-   - **Mobile-mobile (Expo):** boot the app in a simulator, `xcrun simctl io
+   - **Web (phone and desktop):** delegate to the `browser-driver` agent (a
+     subagent drives the same MCP tools itself, by its rules). It saves PNGs under `.playwright-mcp/<subdir>/` (the MCP servers refuse other
+     paths) and uses `emulate` for phone widths, since `resize_page` stops at
+     ~500px. Point `--images-dir` at that subdir.
+   - **Mobile (Expo):** boot the app in a simulator, `xcrun simctl io
      booted screenshot out.png` (iOS) / `adb exec-out screencap` (Android).
    - Drop them all in one folder, one file per screen, descriptively named.
 2. **Run the critique**, referencing the files by path in the prompt:
 
 ```bash
-scripts/agy-headless.sh --images-dir /tmp/ui-shots -- \
+scripts/agy-headless.sh --images-dir .playwright-mcp/ui-shots -- \
   "You are reviewing mobile app screenshots for OBJECTIVE visual defects only,
-   not taste. Files: /tmp/ui-shots/home.png, /tmp/ui-shots/checkout.png, ...
+   not taste. Files: .playwright-mcp/ui-shots/home.png, .playwright-mcp/ui-shots/checkout.png, ...
    For each: flag text truncation/overflow, clipped or overlapping elements,
    misalignment/broken grid, inconsistent spacing between similar elements,
    touch targets under ~44x44pt, likely WCAG-AA contrast failures, content

@@ -1,0 +1,192 @@
+# web-light-dark-theme-mode.spec.yaml
+#
+# Finish + harden the web light/dark (Stub/Ember) theme system so both themes
+# exist cleanly, the existing navbar toggle works on EVERY surface, and the
+# choice syncs to the signed-in account across devices.
+
+version: "1.0"
+updated: "2026-07-20"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    A light/dark theme mode system is ~90% built (th-theme cookie, SSR
+    first-paint var mirroring, <html data-theme>, AppThemeProvider mode state +
+    toggle(), a ThemeToggleButton in AppNavbar, useIsDarkTheme). But three
+    things keep it from working cleanly: (1) the Admin/Platform/Seller shells
+    wrap their content in NavigationShell's own <Theme name={useAppearance()}>,
+    which HARDCODES the base theme and overrides the user's mode — so the toggle
+    is dead everywhere under the app shell (dashboards, event builder, orders);
+    (2) the preference is cookie-only, so it does not follow a signed-in user
+    across devices; (3) the Ember (dark) theme has never had a whole-app QA pass,
+    so dark mode has latent contrast / hardcoded-stub-literal drift.
+  solution: >
+    Make the shells FOLLOW the user's theme mode on web (native stays Ember),
+    add account-synced persistence layered on the existing cookie (a nullable
+    themeMode on the auth user, a self-scoped set-theme-preference use case + a
+    tRPC procedure, reconciled server-side on load), then run a cross-theme QA +
+    fix pass over the whole web app so Stub and Ember both render AA-clean.
+  users:
+    - buyer / attendee (public consumer site)
+    - organiser / operator (admin dashboards, event builder)
+    - platform admin
+  surfaces:
+    - web
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        The navbar ThemeToggleButton flips Stub<->Ember and the change applies
+        to EVERY web surface, including everything under the Admin/Platform/
+        Seller shells (dashboards, event builder, orders, settings). No surface
+        may pin a base theme that ignores the user's mode.
+    - id: FR-002
+      description: >
+        The chosen mode persists across reloads via the existing th-theme cookie
+        AND, for signed-in users, syncs to their account so it follows them to
+        any device/browser. Server resolves initial mode as: account preference
+        (if signed in and set) else cookie else DEFAULT_THEME_MODE (light).
+    - id: FR-003
+      description: >
+        Toggling while signed in writes the preference to the account (fire-and-
+        forget; the cookie + local state already give an instant optimistic
+        flip). Toggling while logged out updates cookie + local state only.
+    - id: FR-004
+      description: >
+        Native (mobile/scanner) is unaffected and continues to render Ember/dark
+        regardless of this web preference.
+    - id: FR-005
+      description: >
+        Every isDark branch (brand lockup swap, map tiles/popups, navbar chrome)
+        resolves from a single detector (useIsDarkTheme, exact key === "ember"),
+        not startsWith("ember"); both branches are visually correct in each mode.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        No dark-mode first-paint flash: SSR paints the resolved theme (data-theme
+        + inline body CSS vars from themeCssVarsForMode) before hydration, in
+        BOTH modes. No hydration mismatch (server and client resolve the same
+        mode from the same inputs).
+    - id: NFR-002
+      description: >
+        WCAG AA (>=4.5:1 text, >=3:1 UI/graphics) holds in BOTH Stub and Ember on
+        every surface. The off-palette colour gate (pnpm lint) stays green.
+    - id: NFR-003
+      description: >
+        theme.*.val reads resolve correctly per active theme (they track the
+        <Theme> context, so they are correct once the split is gone). Canvas /
+        MapLibre / data palettes — which cannot take var() — must select the
+        right per-theme palette by mode, not assume Stub.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: set-theme-preference
+        description: >
+          Persist the authenticated user's light/dark mode preference. Mirrors
+          the update-notification-preferences pattern. Self-scoped: a user may
+          only set their OWN preference.
+        input: "actingUserId, mode: 'light' | 'dark'"
+        output: "{ mode }"
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - user/human repository port (add updateThemePreference / reuse profile update)
+
+  adapters:
+    new: []
+    existing:
+      - prisma user repository adapter (write themeMode column)
+
+  transport:
+    trpc_procedures:
+      - "account.setThemePreference (protected, self) — calls set-theme-preference"
+      - "server-side session/account read in layout.tsx to resolve initial mode when signed in"
+    webhooks: []
+
+  ui:
+    pages: []
+    components:
+      - "AppThemeProvider — already mode-driven; add account persistence call in toggle() when signed in; keep cookie + optimistic local flip"
+      - "NavigationShell (packages/ui) — web must NOT hardcode appearance; follow the app mode (drop the <Theme name> override on web, OR drive it from mode). Native keeps Ember via useAppearance(). REPLACES the interim isWebPlatform()?stub:ember stopgap"
+      - "layout.tsx — resolve initial mode from account-then-cookie; keep SSR inline vars + data-theme for the resolved mode (not just dark)"
+      - "AppNavbar / HomeHero / maps — unify isDark on useIsDarkTheme(); QA both branches"
+      - "Whole-app cross-theme fix pass: hardcoded Stub-only literals, fixed-in-both-themes surfaces (map popups, CAB dock — keep fixed), per-theme canvas/MapLibre palettes"
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models:
+    - "auth user model (auth.prisma) — add nullable `themeMode String?` (or enum-narrowed) alongside the existing `locale String?`. Null = no explicit account preference (fall back to cookie/default)."
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Removing/relaxing the NavigationShell <Theme> override could regress the
+      three shells if any descendant relied on the pinned base. (This is the
+      interim isWebPlatform()?stub:ember change from 2026-07-20 — it must be
+      superseded, not layered on.)
+    severity: MEDIUM
+    mitigation: >
+      Shell content already nests inside AppThemeProvider's mode-driven <Theme>;
+      on web the shell should simply not re-pin. Visually QA all three shells in
+      both modes before/after.
+  - risk: >
+      Ember has hidden contrast failures or Stub-only hardcoded literals that
+      only surface in dark mode across the large whole-app surface.
+    severity: HIGH
+    mitigation: >
+      Systematic cross-theme QA (browser-driver screenshots at both modes across
+      public site, admin, event builder, checkout) + the AA contrast gate; fix
+      fill+foreground as UNITS per the DS rule. Budget this as the largest task.
+  - risk: >
+      Cookie vs account preference conflict on login (device cookie disagrees
+      with stored account pref).
+    severity: LOW
+    mitigation: >
+      Define precedence (recommend: account wins on authenticated load and
+      re-writes the cookie; logged-out uses cookie). State it in the use case.
+  - risk: >
+      Dark first-paint flash if SSR inline vars are only emitted for dark today
+      (layout.tsx currently inlines vars only when mode === "dark").
+    severity: MEDIUM
+    mitigation: >
+      Confirm both modes SSR-paint correctly; Stub is the injector base so light
+      is covered, but verify after the account-read change moves the resolved
+      mode.
+
+open_questions:
+  - "themeMode column on User vs Human (mirror wherever `locale` lives)."
+  - "Precedence on login when cookie != account pref (recommend account wins, rewrites cookie)."
+  - "Enum vs free String for themeMode (recommend narrow: 'light' | 'dark')."
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - "OS prefers-color-scheme auto-detection — mode is explicit (button), default light. (Possible future.)"
+  - "Mobile / scanner theme changes — native stays Ember/dark."
+  - "The platform brand-PRESET system (ActiveThemeInjector / theme-editor) — a separate axis that layers on top of whichever base mode is active."
+  - "The `swiss` theme and any per-org forced theming."
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - "Toggling the navbar theme button flips the ENTIRE web app — public pages AND every admin/platform/seller shell surface — with no surface stuck on the other theme."
+  - "A signed-in user who sets dark on one device sees dark on a fresh session on another device (account sync); logged-out persists per-device via cookie."
+  - "No dark-mode flash on first paint in either mode; no hydration warnings."
+  - "Both Stub and Ember pass the AA contrast gate and render legibly on: home, an event page, /search, admin dashboard, event builder, orders, checkout."
+  - "Native (mobile/scanner) still renders Ember and is untouched by the web preference."
+  - "pnpm lint (incl. the off-palette colour gate) stays green; the interim isWebPlatform()?stub:ember stopgap is removed in favour of mode-following."

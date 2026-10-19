@@ -1,0 +1,9 @@
+{{= it.productName }} verification code
+
+Hi!
+{{= "Use code " + it.code + " " + (({ "email-verification": "to verify your email", "forget-password": "to reset your password", "change-email": "to confirm your new email address" })[it.purpose] || "to sign in") + "." }}
+{{= "It expires in " + it.expiresMinutes + " minutes." }}
+
+{{= it.purpose === "email-verification" ? "If you didn’t sign up for " + it.productName + ", ignore this email and don’t share this code." : "If you didn’t request this, ignore this message." }}
+Thanks,
+The {{= it.productName }} team

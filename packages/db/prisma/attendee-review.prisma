@@ -1,0 +1,74 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Attendee Review — verified (scanned-ticket-only) post-event reviews
+// (attendee-reviews spec, 2026-07-14). One submission per (event, human)
+// rolls up to three aggregation targets denormalized at submit time: the
+// event, the venue (placeId), and the organizer/series (ownerType/ownerId,
+// seriesId). Facet scores are ONLY ever shown publicly as suppressed
+// aggregates (a later loop's ReviewAggregate snapshots); `text` is PRIVATE
+// to the event owner's admin surface and platform staff, always unattributed
+// to the organizer (FR-002). This is the fan-side sibling of PlaceReview,
+// which stays separate and unchanged.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AttendeeReview {
+  id      String @id @default(uuid())
+
+  /// OPTIONAL as of venue-rating-block-and-owner-optin FR-009: the verified
+  /// scanned-ticket path sets both eventId + humanId; the UNVERIFIED
+  /// venue-direct COMMUNITY path anchors to placeId only (eventId null) and may
+  /// carry a null humanId for not-signed-in guests. Postgres treats NULL as
+  /// distinct, so the @@unique([eventId, humanId]) still binds the verified path
+  /// one-review-per-(event,human) while allowing many community rows to coexist.
+  eventId String?
+  humanId String?
+
+  /// Not-signed-in COMMUNITY submitter identity (mirrors PlaceReview's seed
+  /// pattern). anonymousEmail is REQUIRED-but-unverified at the app layer; it is
+  /// PII and MUST ride the same SAR/deletion path as PlaceReview.anonymousEmail.
+  anonymousName  String?
+  anonymousEmail String?
+
+  /// Provenance (FR-009). VERIFIED_TICKET = scanned-ticket path; COMMUNITY =
+  /// venue-direct cold-start path. Aggregated + suppressed SEPARATELY (FR-010).
+  source AttendeeReviewSource @default(VERIFIED_TICKET)
+
+  /// 1-5 integer ratings. `overallRating` is required; facets optional.
+  overallRating Int
+  soundQuality  Int?
+  venueComfort  Int?
+  organization  Int?
+  valueForMoney Int?
+
+  /// PRIVATE free-text feedback for the organizer (never public, never
+  /// attributed). Sanitized plain text, app-enforced <= 2000 chars.
+  text String? @db.VarChar(2000)
+
+  // ── Denormalized aggregation targets (stamped from the event at submit) ──
+  placeId   String?
+  /// "human" | "organization" — the event owner at submit time (app-enforced
+  /// pair: both set or both null, mirroring BookingRequest.performerOwner*).
+  ownerType String?
+  ownerId   String?
+  /// Series the event belonged to (via EventSeriesOccurrence), if any.
+  seriesId  String?
+
+  // ── Moderation (staff flag queue — attendee-reviews FR-009) ──────────────
+  hidden     Boolean @default(false)
+  flagged    Boolean @default(false)
+  flagReason String?
+
+  event Event? @relation("EventAttendeeReviews", fields: [eventId], references: [id], onDelete: Cascade)
+  human Human? @relation("HumanAttendeeReviews", fields: [humanId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// One review per attendee per event (FR-001). The submit use case
+  /// pre-checks; this index is the race backstop (adapter maps P2002 →
+  /// ATTENDEE_REVIEW_ALREADY_SUBMITTED).
+  @@unique([eventId, humanId])
+  @@index([humanId])
+  @@index([placeId])
+  @@index([ownerType, ownerId])
+  @@index([seriesId])
+}

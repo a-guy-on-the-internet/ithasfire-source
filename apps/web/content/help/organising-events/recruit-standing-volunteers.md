@@ -13,7 +13,7 @@ related:
 specs: ["2026-06-29/completed/generic-volunteering-asks"]
 ---
 
-Event volunteering hangs off a single event. A **volunteer ask** is the standing version: a venue recruiting door and bar help across its whole calendar, an organisation running an ongoing street team, or an individual host gathering a few regular hands. You post an ask, share its public link, and organise the people who respond — optionally handing each group to a coordinator who runs it without needing admin access to your organisation.
+Event volunteering hangs off a single event. A **volunteer ask** is the standing version: a place recruiting door and bar help across its whole calendar, an organisation running an ongoing street team, or an individual host gathering a few regular hands. You post an ask, share its public link, and organise the people who respond — optionally handing each group to a coordinator who runs it without needing admin access to your organisation.
 
 For one event's shifts and hours, use [recruit and manage volunteers](/help/organising-events/manage-volunteers) instead. This article is for recruiting that isn't tied to a single event.
 
@@ -25,9 +25,11 @@ Where you start depends on who the ask is for:
 - **A place you manage** — open the place from **Places** in the admin sidebar; the sidebar switches to that place, and **Volunteers** sits in its **Operate** group.
 - **Yourself** — from your own admin area, the same **Volunteers** → **Asks** tab lists asks you host personally.
 
-Give the ask a title and description, pick a **cadence** — **One-time**, **Ongoing**, or **Recurring** (a label that tells volunteers what to expect; ongoing asks simply stay open until you close them) — and optionally set a date window and a capacity. The same knobs you know from event volunteering are here: auto-approve sign-ups, and an SMS reminder opt-in.
+Give the ask a title and description, pick a **cadence** — **One-time**, **Ongoing**, or **Recurring** (a label that tells volunteers what to expect; ongoing asks simply stay open until you close them) — and optionally set a date window and a capacity. Auto-approve sign-ups works the same as in event volunteering. On a **One-time** ask with a start time, approved volunteers get reminders 24 hours and 1 hour before it starts: by email, in the app if they have an account, and by text if they ticked the box. Ongoing and recurring asks get none. The title is the one thing you have to fill in; if you click **Create** without it, the form points you back to the field.
 
-A new ask starts as **Draft**. Set it to **Open** when you're ready to take sign-ups. **Paused** and **Closed** stop new sign-ups but keep everyone already on the roster; **Archived** hides the ask from your dashboards. You can reopen a paused or closed ask, but archiving is final — post a fresh ask instead.
+The window's **Starts** and **Ends** are read in the **Timezone** chosen below them. An ask for a place starts on that place's time zone when the place has one set, and the form says so; otherwise it starts on your device's zone. Changing the zone keeps the times you typed and reads them in the new zone. Volunteers see the window in that zone, with the zone named (for example "Oct 24, 2026, 6:00 – 10:00 PM EDT"), wherever they are reading from.
+
+A new ask starts as **Draft**. Set it to **Open** when you're ready to take sign-ups. **Paused** and **Closed** stop new sign-ups but keep everyone already on the roster; **Archived** hides the ask from your dashboards. You can reopen a paused ask. A closed ask can only be archived, and archiving is final — post a fresh ask instead.
 
 ## Add roles and share the link
 
@@ -49,7 +51,7 @@ Groups are the unit you hand to a coordinator.
 
 ## Hand a group to a coordinator
 
-Each group can have one **coordinator** — a person who reviews, checks in, and manages that group's volunteers **without** holding an admin role in your organisation. On the group, enter a **Coordinator email** and save. If that email already has an account, they become the coordinator immediately; if not, they're sent an invite to finish setting up an account, and they coordinate the moment they do.
+Each group can have one **coordinator** — a person who reviews, checks in, and manages that group's volunteers **without** holding an admin role in your organisation. On the group, enter a **Coordinator email** and save. If that email already has an account, they become the coordinator immediately and get an email and an in-app notification telling them so. If it doesn't, they become the coordinator once they create an account with that address. We don't email addresses that have no account yet, so let them know yourself.
 
 A coordinator can only act within their own group: they review and check in their members, and pull unassigned approved volunteers out of the general pool into their group. They can't edit the ask, create roles or groups, assign other coordinators, or see any other group's volunteers. Read [coordinate a volunteer group](/help/getting-started/coordinate-a-volunteer-group) for the coordinator's side.
 

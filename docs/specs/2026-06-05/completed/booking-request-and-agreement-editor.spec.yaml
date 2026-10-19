@@ -1,0 +1,252 @@
+# booking-request-and-agreement-editor.spec.yaml
+#
+# The performer→venue booking-request lifecycle and the two-party Agreement
+# negotiation editor it feeds into. Builds the use cases / transport / UI on top
+# of the already-existing Agreement + BookingRequest + PayoutTerms schema.
+#
+# Cross-reference 2026-09-25: docs/specs/2026-09-25/booking-the-night.spec.yaml
+# adds a quick "send the night" version of the agreement (N2), makes the act's
+# accept the step that books the night and creates the event (N1), and mounts
+# this editor in the event builder's payout section for booked events (N7).
+# docs/specs/2026-09-25/lineup-booking-requests-v3.spec.yaml shows the bill on
+# the agreement and offers joined acts as payees (FR-011).
+
+version: "1.0"
+updated: "2026-06-10"
+status: complete
+# 2026-06-10 (2): Agreement editor SHIPPED — booking-agreements use cases
+# (header CRUD, line upsert/remove reusing shared validation, DRAFT⇄PROPOSED,
+# respond accept/decline, finalize → Event.payoutTermsId with in-tx confirmation
+# gate + idempotency), legacy PayoutTerms engine + update-event-splits +
+# set-event-fee-mode fenced off Agreement-owned terms, /agreements editor UI +
+# index + entry links. Deferred (sanctioned by open-question answers): per-line
+# COUNTER/DECLINE (schema-ready, confirmPayoutLine throws not_implemented),
+# org-payee picker in the editor UI, agreement expiry job.
+# 2026-06-10 (1): BookingRequest lifecycle SHIPPED — polymorphic-sender migration,
+# create/list/markViewed/respond/withdraw/expire use cases (+ partial unique
+# index backstop, write-time CAS transitions), accept → Agreement DRAFT with
+# cloned place-default PayoutTerms, daily auto-expire job, bookingRequests +
+# performers tRPC, RequestToPlay block wiring, venue bookings inbox, performer
+# sent-requests list. REMAINING: the Agreement editor (FR-004/FR-005 — header
+# CRUD, per-line confirm/counter, finalize → Event.payoutTermsId).
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The Agreement + BookingRequest models (agreement.prisma) and the PayoutTerms
+    split engine (finance.prisma + packages/core/src/use-cases/agreements/,
+    which authors PayoutTerms lines) all exist, but there are ZERO use cases for
+    the two-party booking Agreement and no negotiation UI. A performer can't
+    pitch a venue, a venue can't review/accept, and there's no editor to shape
+    the deal terms once accepted.
+  solution: >
+    Build the BookingRequest lifecycle (create / list / respond / withdraw) and
+    an Agreement editor that drives the Agreement header (parties, date,
+    guarantee, waiver, expiry) and REUSES the existing
+    lines/upsert-agreement-lines engine for the money splits. Multi-party is
+    expressed through PayoutTermsLine[] + the per-line confirm/counter/decline
+    lifecycle that already exists — no new parties table for v1. Accepting a
+    BookingRequest creates an Agreement DRAFT; finalizing stamps
+    Event.payoutTermsId.
+  users:
+    - Performer (performer mode) — sends the pitch
+    - Venue owner — reviews inbox, accepts/declines, negotiates terms
+    - Additional payees (humans/orgs) — confirm/counter their split line
+  surfaces:
+    - web (public venue page CTA → form; admin venue booking inbox; agreement editor)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        create-booking-request: a performer-mode entity (Human OR Org — the
+        sender is polymorphic, mirroring Agreement.proposerType/Id and EntityPage
+        owners) submits message, preferredDates, expectedDraw, genre (prefilled
+        from genreTags per 2026-04-14 FR-006), links. The caller must control the
+        sender entity (self for Human, org-admin for Org) and that entity must be
+        in performer mode (spec (b)). Validates the Place is VERIFIED and has
+        acceptsBookingRequests (spec (a)). One open PENDING per (performer, place).
+    - id: FR-002
+      description: >
+        list-booking-requests: venue owner sees the incoming inbox for their
+        place(s); performer sees their sent requests + status. Ownership mirrors
+        get-venue-calendar's admin check. Opening one stamps VIEWED.
+    - id: FR-003
+      description: >
+        respond-to-booking-request: venue owner ACCEPTS (creates an Agreement
+        DRAFT, cloning the place's default PayoutTerms into a new instance) or
+        DECLINES (with reason). Performer may WITHDRAW. Auto-EXPIRE after a TTL
+        (default 14d) via a scheduled job. Statuses already enumerated:
+        PENDING/VIEWED/ACCEPTED/DECLINED/WITHDRAWN/EXPIRED.
+    - id: FR-004
+      description: >
+        Agreement editor use cases over the Agreement model: update header
+        (title, proposedDate, proposedEndDate, guaranteeCents, waiver, expiry);
+        upsert/remove payout lines via the EXISTING lines/upsert-agreement-lines
+        engine; send for review (DRAFT→PROPOSED); respond (accept / counter /
+        decline) at the whole-agreement level; finalize (→ stamp
+        Event.payoutTermsId). NOTE the naming collision below.
+    - id: FR-005
+      description: >
+        Multi-party: any number of humans/orgs on the platform can be added as
+        PayoutTermsLine payees. Each non-owner line carries requiresConfirmation
+        + confirmationStatus (PENDING/CONFIRMED/COUNTERED/DECLINED), already in
+        schema. The agreement is only finalizable when all required lines are
+        CONFIRMED. sum(line percents) invariants reuse the existing PayoutTerms
+        validation.
+  non_functional:
+    - id: NFR-001
+      description: >
+        Money-adjacent. Finalization writes payout structure; it must be
+        idempotent (idempotency key per agreementId) and run exactly one
+        repos.tx() per mutation with audit logs, per engineering-standards.
+    - id: NFR-002
+      description: >
+        Splits are integer-cents / integer-percent only. Reuse existing
+        PayoutTerms rounding (FLOOR) and sum-to-basis invariants; no floats.
+    - id: NFR-003
+      description: >
+        RBAC: only the venue owner (or the agreement's counterparty org role)
+        may respond; only a payee may confirm/counter their own line.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: create-booking-request
+        description: Performer (Human or Org) pitches a verified, opted-in place. Creates PENDING.
+        input: "{ performerOwnerType: 'human'|'org', performerOwnerId, actorHumanId, placeId, message, preferredDates, expectedDraw?, genre?, links? }"
+        output: "{ bookingRequestId }"
+        idempotent: false
+        money: false
+      - name: list-booking-requests
+        description: Venue inbox (by place ownership) + performer's sent list.
+        input: "{ actorHumanId, scope: 'venue'|'performer', placeId? }"
+        output: "{ requests: BookingRequestSummary[] }"
+        idempotent: true
+        money: false
+      - name: respond-to-booking-request
+        description: Accept (→ Agreement DRAFT + cloned PayoutTerms) or decline.
+        input: "{ actorHumanId, bookingRequestId, action: 'accept'|'decline', declineReason? }"
+        output: "{ status, agreementId? }"
+        idempotent: false
+        money: false
+      - name: withdraw-booking-request
+        description: Performer pulls back a PENDING/VIEWED request (caller must control the sender entity).
+        input: "{ actorHumanId, bookingRequestId }"
+        output: "{ status }"
+        idempotent: true
+        money: false
+      - name: create/update-booking-agreement
+        description: >
+          Header CRUD over the Agreement model + payout lines via the existing
+          upsert-agreement-lines engine. (See naming-collision risk.)
+        input: "{ actorHumanId, agreementId, header, lines[] }"
+        output: "{ agreement }"
+        idempotent: true
+        money: false
+      - name: respond-to-booking-agreement
+        description: Whole-agreement accept / counter / decline; per-line confirm.
+        input: "{ actorHumanId, agreementId, action, ... }"
+        output: "{ status }"
+        idempotent: false
+        money: false
+      - name: finalize-booking-agreement
+        description: ACCEPTED + all lines CONFIRMED → stamp Event.payoutTermsId.
+        input: "{ actorHumanId, agreementId, eventId }"
+        output: "{ eventId, payoutTermsId }"
+        idempotent: true
+        money: true
+  ports:
+    new:
+      - BookingRequestsRepo
+      - AgreementsRepo (two-party Agreement model — distinct from PayoutTermsRepo)
+    existing:
+      - PayoutTermsRepo / the agreements (payout-lines) use cases
+      - PlacesRepo, EventsRepo, PayeesRepo, IdempotencyPort, ClockPort
+  adapters:
+    new:
+      - packages/adapters/src/db/prisma/booking-requests.ts
+      - packages/adapters/src/db/prisma/agreements.ts
+    existing: []
+  transport:
+    trpc_procedures:
+      - bookingRequests.create / list / respond / withdraw
+      - bookingAgreements.upsert / respond / finalize
+    webhooks: []
+  ui:
+    pages:
+      - public venue page → RequestToPlay form (hosted by spec (a)'s block)
+      - apps/web/src/app/admin/[slug]/places/[placeId]/bookings (inbox)
+      - the agreement editor (header form + payout-line table reusing existing split UI)
+    components:
+      - BookingRequestForm, BookingInbox, AgreementEditor, PayoutLineTable (reuse existing split components if present)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []   # Agreement, BookingRequest, PayoutTerms, PayoutTermsLine all already exist
+  modified_models:
+    - >
+      BookingRequest: replace the Human-only artistHumanId FK with a polymorphic
+      sender (performerOwnerType human|org + performerOwnerId, app-enforced like
+      PayoutTermsLine payees / EntityPage owners / Agreement.proposerType-Id).
+      Drops the Human FK; add index (performerOwnerType, performerOwnerId, status).
+    - "Agreement: possibly + tour link / metadata only if needed; header is sufficient for v1"
+  migrations_needed: true   # BookingRequest sender goes polymorphic; otherwise schema already supports the flow
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      NAMING COLLISION: packages/core/src/use-cases/agreements/ already exists
+      but operates on PayoutTerms (upsert-agreement-for-event/org/human), NOT the
+      two-party Agreement model. Putting new Agreement use cases there will
+      confuse. Mitigation: house the booking Agreement editor in a distinct
+      folder (e.g. use-cases/booking-agreements/ or /deals/) and reuse the
+      payout-line engine by import, not by colocation.
+    severity: MEDIUM
+    mitigation: Separate folder + explicit naming (booking-agreement / deal).
+  - risk: >
+      Finalize double-writes payout structure on retry. Mitigation: idempotency
+      key per agreementId; one tx; mirror finalize-from-payment-intent discipline.
+    severity: HIGH
+    mitigation: IdempotencyPort + single repos.tx() + audit log.
+  - risk: >
+      Multi-party finalize when a payee never responds. Mitigation: block
+      finalize until all requiresConfirmation lines are CONFIRMED; surface
+      pending payees in the editor.
+    severity: MEDIUM
+    mitigation: Gate finalize on confirmation completeness.
+
+open_questions:
+  - Editor depth for v1 — full per-line counter-offer (COUNTERED + counterNote, already in schema) or v1 = author + single accept/decline, counters as v2? (Recommend v1 = accept/decline + per-line confirm; defer counters.)
+    Answer: Just make the editor page. The way this inherently will work is there will exist a draft version that performers or venues have to create no matter what after clicking on the request to book that will either include the performer's EPK.
+    There should be a negotation path that shows what agreement this on, which the draft negotiation editor component should be shared with.
+  - Entry points — only downstream of an accepted BookingRequest, or also standalone (a venue/org drafts an agreement and invites a performer)? (Recommend booking-request-driven first.)
+    Answer: Standalone, the accepted bookrequesting will just redirect to it. 
+  - Does accepting a request create the Event immediately (DRAFT) or only the Agreement, with the event created at finalize? (Recommend Agreement-first; event link at finalize.)
+    Answer: Agreement-first; event link at finalize. This is because the agreement is really the core of the deal, and it can exist without an event until it's finalized. It also allows for more flexibility in the negotiation process.
+    Additionally, events should have an agreement tied to them and allowed to be swappable. An Event simply just has a slot for an agreement (it defaults to our default, which is defined by revenue splits and things -- the point of the agreement is to autofill event payouts and things)
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - The venue toggle + block (spec (a)) and performer-mode gate (spec (b)) — consumed, not built here.
+  - Tour routing integration (2026-04-15/artist-tour-routing.spec.md).
+  - Venue→performer "Book Me" reverse initiation (2026-03-18/artist-epk-book-me.spec.yaml) beyond reusing the same model.
+  - Payout consolidation/batching (2026-03-05 spec) — settlement math unchanged.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A performer-mode entity can send a booking request from a verified, opted-in venue page; duplicate open PENDING requests are rejected.
+  - A band registered as an Org (performer mode on) can be the SENDER of a booking request, not just a solo Human — the sender reference is polymorphic.
+  - A venue owner sees the request in an inbox, and accept creates an Agreement DRAFT with a cloned PayoutTerms; decline records a reason.
+  - The agreement editor can add ≥3 payees as payout lines; each non-owner line tracks its own confirm/counter status.
+  - Finalize is blocked until all required lines are CONFIRMED, is idempotent, runs in one tx with audit logs, and stamps Event.payoutTermsId.
+  - New Agreement use cases live OUTSIDE the existing PayoutTerms `agreements/` folder to avoid the naming collision.

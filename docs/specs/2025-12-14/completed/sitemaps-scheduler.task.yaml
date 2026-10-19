@@ -1,0 +1,29 @@
+# Copilot Task: Wire sitemap scheduler & delta triggers
+context:
+  references:
+    - ../platform/sitemaps-architecture.spec.yaml
+    - sitemaps-generator.task.yaml
+  packages:
+    - apps/api (Fastify background jobs bootstrap)
+  - apps/jobs
+    - packages/ports
+    - infra/ (optional for cron definitions)
+goal: |
+  Schedule full nightly sitemap regeneration and hook into domain events so we can run
+  targeted shard refreshes after event/organizer updates.
+requirements:
+  - Register a recurring job (01:30 UTC) using existing job runner (`apps/jobs` queue).
+  - Introduce event listeners (e.g., in `packages/core` use cases or relevant transports) that enqueue delta rebuilds.
+  - Ensure deduplication: use Redis or queue idempotency to collapse duplicate triggers per shard.
+  - Provide configuration via `@th/config` for enabling/disabling trigger sources.
+  - Emit metrics for queued vs executed jobs (`sitemaps.scheduler.enqueued_total`).
+  - Update infra docs if Terraform/cron entries change.
+implementation_notes:
+  - Check existing job runner patterns (settlements, comms) for structure.
+  - For delta triggers, pass `shard_scope` to generator task.
+  - Include feature flag guard `feature.sitemaps` around all scheduling logic.
+validation:
+  - Unit tests covering dedupe + enqueue paths.
+  - Integration smoke test that triggers mock event update and confirms job invocation via spy.
+handoff:
+  - Update `docs/specs/platform/sitemaps-architecture.spec.yaml` rollout phase checkboxes when done.

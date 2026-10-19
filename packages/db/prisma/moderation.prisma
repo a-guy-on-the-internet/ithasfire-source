@@ -1,0 +1,164 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Image moderation — key-based moderation record + async drain outbox.
+//
+// Every public-facing uploaded object (event heroes today; avatars/banners/
+// page-media in later phases) gets ONE row here, keyed by its R2 storage key —
+// independent of WHERE the object's url is stored (Image row, EntityPage column,
+// or a url embedded in PageBlock.data JSON). The row is BOTH the moderation
+// verdict record AND its own drain outbox: `status = "PENDING"` is the to-do
+// state a jobs-service worker claims (nextAttemptAt <= now), calls the Azure
+// Content Safety adapter, and flips to APPROVED/FLAGGED. Read-time gating hides
+// any object whose record is not APPROVED; the ABSENCE of a record (legacy /
+// pre-existing objects) is treated as APPROVED so nothing already-live vanishes.
+//
+// `status` is a plain String validated in app code (union in @th/types), NOT a
+// Prisma enum — same house style as PendingObjectDeletion.status and
+// Settlement.status (avoids enum-migration churn for a lifecycle string).
+// ─────────────────────────────────────────────────────────────────────────────
+
+model ImageModerationRecord {
+  id String @id @default(uuid())
+
+  // The R2 object key — the join key to any moderated image, and the natural
+  // idempotency key (one record per stored object).
+  storageKey String @unique @map("storage_key")
+
+  // Which public surface the object serves. Validated in app code:
+  // "EVENT_HERO" | "AVATAR" | "BANNER" | "PAGE_MEDIA".
+  kind String
+
+  // Lifecycle. Validated in app code (not a Prisma enum — see
+  // PendingObjectDeletion.status / Settlement.status house style):
+  // "PENDING" → due for the drain worker (hidden on public surfaces).
+  // "APPROVED" → clean; publicly visible.
+  // "FLAGGED"  → at/above threshold OR fail-closed degraded; held for a human.
+  // "REJECTED" → a moderator rejected it; object enqueued for deletion.
+  // "ORPHANED" → the record outlived its object (storage says not_found); no
+  //   bytes to score, nothing to show. Terminal, hidden, and never queued for a
+  //   human. Added 2026-09 with NO migration — status is an app-validated
+  //   String precisely so a new lifecycle value costs nothing here.
+  status String @default("PENDING")
+
+  // The owning entity, for the review queue's deep link + gating joins.
+  // Validated in app code: "EVENT" | "HUMAN" | "ORGANIZATION" | "PLACE".
+  subjectType String? @map("subject_type")
+  subjectId   String? @map("subject_id")
+
+  // Preview url for the moderation queue.
+  publicUrl   String? @map("public_url")
+  contentType String? @map("content_type")
+
+  // Uploader, for hold/reject/approve-after-hold notifications. Detached
+  // (SetNull) on account deletion — mirrors Image.createdByHuman.
+  createdByHumanId String? @map("created_by_human_id")
+
+  // Verdict fields, written by moderate-image after the provider call.
+  maxSeverity Int?      @map("max_severity")
+  categories  Json? // [{ category, severity }]
+  provider    String?
+  degraded    Boolean   @default(false)
+  moderatedAt DateTime? @map("moderated_at")
+
+  // Human-review fields, written by review-flagged-image.
+  reviewedByHumanId String?   @map("reviewed_by_human_id")
+  reviewedAt        DateTime? @map("reviewed_at")
+  reviewNote        String?   @map("review_note")
+
+  // Drain retry bookkeeping. `nextAttemptAt` defaults to now so a freshly
+  // enqueued row is immediately due.
+  attempts      Int      @default(0)
+  lastError     String?  @map("last_error")
+  nextAttemptAt DateTime @default(now()) @map("next_attempt_at")
+
+  // How many times the degraded-requeue has sent this row back to PENDING after
+  // it dead-lettered. Bounds a real churn loop: a row whose object no longer
+  // exists in R2 can NEVER succeed, so an unbounded requeue would reset it,
+  // burn the whole retry window, dead-letter, and reset again forever. Once
+  // this hits the requeue job's cap the row stays FLAGGED for a human, which is
+  // the correct terminal state for "we tried for days and could not scan it".
+  //
+  // Deliberately NOT reset when the requeue clears `attempts` — `attempts`
+  // measures one window, this measures how many windows we have spent.
+  requeues Int @default(0)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  createdByHuman Human? @relation("ImageModerationCreatedBy", fields: [createdByHumanId], references: [id], onDelete: SetNull)
+
+  // Drain claim hot path: "status = 'PENDING' AND next_attempt_at <= now
+  // ORDER BY next_attempt_at ASC".
+  @@index([status, nextAttemptAt])
+  // Flagged queue, newest-first by moderatedAt.
+  @@index([status, moderatedAt])
+  // Owning-entity lookups + gating joins.
+  @@index([subjectType, subjectId])
+  // FK index so the SetNull cascade on account deletion doesn't seq-scan
+  // (mirrors event_images / audio_uploads / EventTemplate creator-FK indexes).
+  @@index([createdByHumanId])
+  @@map("image_moderation_records")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Entity reports — signed-in visitors flag a public listing (venue / human /
+// org page) for moderator review. See
+// docs/specs/2026-08-17/completed/entity-report-intake.spec.yaml.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// User-submitted report against a public listing. PENDING → a
+/// COMMUNITY_MODERATOR resolves or dismisses with an optional note; the
+/// verdict never auto-modifies the subject (takedown stays ADMIN-only).
+/// Mirrors the EventEditSuggestion request → PENDING → review pattern (Prisma
+/// enums, reviewer/reporter human ids as plain strings, no FK). The
+/// subjectType + subjectId pair is a polymorphic pointer with no relation to
+/// Place/Human/Organization — same posture as ImageModerationRecord's
+/// subjectType/subjectId, so reports survive subject deletion and the queue
+/// renders "subject no longer exists". Prisma enums (unlike
+/// ImageModerationRecord's app-validated strings above) are deliberate here:
+/// subject/reason/status are closed, small, review-lifecycle sets that won't
+/// churn, so enum-migration cost never materializes.
+///
+/// SQL-only partial unique index (not expressible in the Prisma schema):
+/// "EntityReport_open_reporter_subject_key" ON (reporterHumanId, subjectType,
+/// subjectId) WHERE status = 'PENDING' — the concurrency backstop for the
+/// FR-003 one-PENDING-report-per-(reporter, subject) rule; the adapter maps
+/// its P2002 to REPORT_ALREADY_OPEN. See migration
+/// 20260817130000_add_entity_reports.
+model EntityReport {
+  id          String                  @id @default(uuid())
+  subjectType EntityReportSubjectType
+  subjectId   String
+
+  /// Plain string, no FK — house style (mirrors EventEditSuggestion.submitterHumanId).
+  reporterHumanId String
+
+  /// Per-subject-type allowed subsets are enforced in core (submit-entity-report).
+  reason EntityReportReason
+
+  /// Optional free text; required in core when reason = OTHER (spec FR-002).
+  details String?
+
+  /// What the reporter saw, kept so a moderator can judge the report after
+  /// the subject is edited or deleted. Set for ARRIVAL_AREA (arrival-areas
+  /// FR-011: label, kind, cost, geometry, parent id); null for the listing
+  /// subjects, which are read live. Shown only to platform staff.
+  subjectSnapshot Json?
+
+  status EntityReportStatus @default(PENDING)
+
+  // Review fields, written by review-entity-report (CAS on PENDING).
+  reviewedByHumanId String?
+  reviewedAt        DateTime?
+  reviewNote        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Moderation queue, oldest/newest by createdAt within a status.
+  @@index([status, createdAt])
+  // Per-subject lookups (future pending-cap / auto-collapse — spec risks).
+  @@index([subjectType, subjectId, status])
+  // Per-reporter listings ("my reports" surface, future). The PENDING dedupe
+  // itself is owned by the SQL-only partial unique index (see model comment).
+  @@index([reporterHumanId, status])
+}

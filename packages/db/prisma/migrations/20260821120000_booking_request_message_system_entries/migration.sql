@@ -1,0 +1,41 @@
+-- Booking-request SYSTEM entries — the thread becomes the booking's LEDGER
+-- (step 1 of the booking-timeline work: schema + contract only; nothing emits
+-- entries yet).
+--
+-- "BookingRequestMessage"."authorSide" has carried a SYSTEM member since the
+-- table was created, documented as "platform-generated notices (status changes
+-- etc.)", and nothing has ever written one. These two columns fill that slot
+-- with something renderable: a machine-readable KIND plus the PARAMS its copy
+-- interpolates.
+--
+-- Why not an English sentence in "body": this app ships a dual en/es catalog
+-- behind an argument-parity gate, so a hardcoded sentence at rest is
+-- unlocalizable — and an entry has to render as rich content (links to the
+-- agreement/event, locale-formatted dates), which a flat string cannot carry.
+-- SYSTEM rows therefore keep "body" = '' and render from kind + params.
+--
+-- "systemKind" is TEXT, not a Postgres enum, matching the house style already
+-- stated on "ImageModerationRecord"."kind" / ."status" and
+-- "PendingObjectDeletion"."status": the taxonomy lives in app code
+-- (packages/types/src/repos/booking-request-messages.ts + the zod schema map in
+-- packages/core/src/use-cases/booking-requests/messages/_shared/system-entries.ts).
+-- A Postgres enum would make every new entry type a migration AND a
+-- deploy-ordering hazard (the label must exist before code can write it, and a
+-- code rollback strands the label). The deferred hold layer (spec
+-- docs/specs/2026-08-18/venue-hierarchy-and-holds.spec.yaml — NO hold model
+-- exists) is the concrete case: adding "booking_hold.*" kinds later must be a
+-- pure data addition, and with TEXT it is.
+--
+-- NO INDEX on "systemKind" — the timeline renders a whole thread in chat order
+-- and never filters by kind, so the existing
+-- "BookingRequestMessage_bookingRequestId_createdAt_idx" serves every read; an
+-- index here would be write cost with no reader. An at-most-once emitter would
+-- want a PARTIAL UNIQUE index on (bookingRequestId, systemKind), which is an
+-- idempotency constraint for whichever kind needs it, not a lookup index.
+--
+-- Fully additive and NULLABLE — every existing row is a human message and stays
+-- untouched, so there is no backfill.
+
+-- AlterTable
+ALTER TABLE "BookingRequestMessage" ADD COLUMN     "systemData" JSONB,
+ADD COLUMN     "systemKind" TEXT;

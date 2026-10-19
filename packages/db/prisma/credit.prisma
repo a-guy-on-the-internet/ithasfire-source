@@ -1,0 +1,78 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Credit — Platform-funded account credit (UserCredit + redemptions).
+//
+// A UserCredit is a dollar amount granted to a specific Human, redeemable
+// against any future order. The credit comes out of platform margin, never
+// out of organiser payout. Buyers see a discount; organisers are paid in full;
+// the platform absorbs the cost. See docs/specs/2026-05-16/user-credit.spec.md.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model UserCredit {
+  id          String @id @default(uuid())
+  humanId     String
+  amountCents Int // Always positive; redemption tracked separately.
+  currency    String @default("usd") @db.VarChar(3)
+
+  /// Residual balance. Decremented by UserCreditRedemption rows below.
+  balanceCents Int
+
+  /// Why was this granted? Human-readable, surfaced in account UI.
+  reason String // e.g. "Welcome to Ithas Fire"
+
+  /// Source classification for analytics / anti-abuse limits.
+  sourceType UserCreditSourceType
+
+  /// Optional: who granted it. NULL = system-issued (signup bonus, etc.).
+  grantedByHumanId String?
+
+  /// Optional: groups credits issued in the same campaign / refund event /
+  /// referral pair. Useful for reporting and bulk-revoke, plus the velocity
+  /// guard (same sourceType+sourceRef can't grant the same human twice).
+  sourceRef String?
+
+  status    UserCreditStatus @default(ACTIVE)
+  expiresAt DateTime?
+
+  redemptions UserCreditRedemption[]
+  human       Human                  @relation("UserCreditHuman", fields: [humanId], references: [id], onDelete: Cascade)
+  grantedBy   Human?                 @relation("UserCreditGrantor", fields: [grantedByHumanId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([humanId, status])
+  @@index([expiresAt])
+  @@index([sourceType, sourceRef])
+  // NOTE: a partial UNIQUE index on (humanId, sourceType, sourceRef)
+  // WHERE "sourceRef" IS NOT NULL is created via raw SQL in the
+  // 20260601020000_user_credit migration. Prisma cannot express a partial
+  // unique index in the schema, so it is not declared here. It is the
+  // race-safe velocity guard for grantCredit (duplicate sourced grants
+  // collide on P2002 instead of double-inserting).
+}
+
+model UserCreditRedemption {
+  id          String   @id @default(uuid())
+  creditId    String
+  orderId     String
+  amountCents Int // Always positive; how much of THIS credit was applied
+  redeemedAt  DateTime @default(now())
+
+  /// If the order is later refunded, this gets set and amountCents is added
+  /// back to UserCredit.balanceCents (status returns to ACTIVE if needed).
+  refundedAt DateTime?
+
+  /// Set when the PENDING order this was applied to died unpaid (card decline
+  /// then retry, cart expiry, buyer release, stale cart cancelled after a
+  /// sibling succeeded). amountCents goes back to UserCredit.balanceCents and
+  /// status returns to ACTIVE unless the credit has expired in the meantime.
+  /// A released row is inert: skipped by a second release and by refund
+  /// reversal. Never set together with refundedAt.
+  releasedAt DateTime?
+
+  credit UserCredit @relation(fields: [creditId], references: [id], onDelete: Cascade)
+  order  Order      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([creditId, orderId]) // Idempotent — same order can't redeem same credit twice
+  @@index([orderId])
+}

@@ -1,0 +1,346 @@
+# error-contract-and-logging.spec.yaml
+#
+# A shared, typed error-code contract across backend + clients, one resolver
+# for user-facing copy, and a clean split between server logging and client
+# messaging. Replaces today's stringly-typed snake_case-in-message convention
+# and the per-client duplicated error mapping.
+
+version: "1.0"
+updated: "2026-06-23"
+
+# ── Decisions (resolved 2026-06-23) ───────────────────────────────────────────
+# These were open questions; the user has decided. Recorded here so the
+# implementation plan doesn't reopen them.
+
+decisions:
+  package_home: >
+    NEW dedicated leaf package @th/errors. Not folded into @th/types/@th/locale
+    — clients must not pull in unrelated type/locale surface, and the package
+    must build for Next-server, Next-client, and Expo targets independently.
+  code_casing: >
+    SCREAMING_SNAKE for all AppErrorCode values (e.g. EVENT_NOT_FOUND). Chosen
+    to align with the only already-structured codes in the system — Better Auth
+    (EMAIL_NOT_VERIFIED, USER_ALREADY_EXISTS) and tRPC transport codes
+    (NOT_FOUND, BAD_REQUEST) — and because it reads unambiguously as a constant.
+    A single toKey() maps a code → its camelCase errors.* i18n key.
+  casing_reality: >
+    AUDIT (2026-06-23): the codebase is NOT consistent today. Our own domain
+    error `code` fields (packages/ports, packages/core) are overwhelmingly
+    snake_case (listing_not_found, event_already_has_agreement, internal_error,
+    forbidden, not_found); tRPC `message` strings are snake_case (38/41); i18n
+    keys are camelCase; Better Auth + tRPC transport codes are SCREAMING_SNAKE.
+    Three casings in play. This spec makes SCREAMING_SNAKE the single canonical
+    AppErrorCode and uses BOUNDARY NORMALIZATION (the errorFormatter upcases a
+    snake_case domain code → SCREAMING_SNAKE) so we get consistency on day one
+    WITHOUT a 40+-file rename. Domain factories are re-typed to AppErrorCode
+    incrementally afterward; until then the boundary mapping covers them.
+  scope: >
+    FULL coverage in this pass — tRPC request/response AND Better Auth AND the
+    jobs runtime AND webhook handlers all adopt the contract (the user chose
+    "all of it"). Still shipped incrementally (package + boundary first), but the
+    spec's acceptance criteria require jobs + webhooks, not just the HTTP path.
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Error handling is convention-only and duplicated. The backend stuffs a
+    machine code into the free-text TRPCError `message` as snake_case
+    (e.g. "event_not_found", "email_verification_required") and the web client
+    recovers it with regex + camelCase in normalizeError, mapping to an
+    `errors.*` i18n catalog. Better Auth errors are a SECOND, parallel system
+    handled by ad-hoc string rewrites (routeUnverifiedEmailToCard,
+    isAccountAlreadyExistsError, network-message detection). normalizeError is
+    web-only, so scanner and (future) mobile reinvent the mapping. Nothing
+    enforces that a thrown code has a matching i18n key, so drift silently
+    degrades to a humanized "X. Please try again or contact support." And raw
+    provider/network strings have leaked to users (e.g. "Load failed
+    (api-dev.ithasfire.com)") because the code never separated internal detail
+    from user copy.
+  solution: >
+    Define error codes ONCE in a dependency-light, isomorphic shared package
+    (@th/errors): a typed AppErrorCode union, an AppError factory, and a single
+    normalizeError resolver. The tRPC errorFormatter attaches a structured
+    `data.appCode` (derived from the domain error's code) alongside the existing
+    `data.meta`/`data.zodError`, so clients read a stable field instead of
+    parsing message strings. Domain error factories adopt the typed union.
+    Better Auth + network/fetch failures are mapped into the SAME union by the
+    resolver. Web/scanner/mobile all consume the one resolver; a build-time test
+    asserts every code has an i18n key. Server-side structured logging keeps its
+    rich context (logAndReport/Sentry) but is explicitly decoupled from the safe
+    localized copy sent to clients.
+  users:
+    - buyer (web, mobile)
+    - organiser / admin (web)
+    - scanner operator (scanner)
+    - developers (DX: typed codes, no drift)
+  surfaces:
+    - api
+    - web
+    - mobile
+    - scanner
+    - jobs
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        A new shared package @th/errors exports: (a) AppErrorCode — a typed
+        union/enum of domain error codes (camelCase or SCREAMING_SNAKE, pick one
+        and standardize), (b) AppError(code, { message?, meta?, cause? }) factory
+        and an isAppError type guard, (c) normalizeError(error, t?) returning
+        { fieldErrors, formError, code }. The package has ZERO server-only and
+        ZERO RN-only runtime deps so web, mobile, scanner, api, jobs, core, and
+        ports can all import it.
+    - id: FR-002
+      description: >
+        The tRPC errorFormatter (apps/api/src/plugins/trpc.ts) attaches
+        `data.appCode: AppErrorCode | null` to every error shape. SHIPPED: the
+        domain code is resolved MESSAGE-FIRST then code (the use-case `code` is a
+        transport CATEGORY like `not_found` and would mask the specific domain
+        code in `message` like `event_not_found`); resolution happens in
+        `toTrpcError` (packages/transport/trpc/src/utils.ts), is stashed on
+        `error.meta.appCode` (NOT `cause.meta`, to preserve the Sentry cause
+        chain), and a shared `resolveAppCode` helper keeps the errorFormatter
+        and onError log line in sync. Existing `data.meta`, `data.code`
+        (transport HTTP code), and `data.zodError` are preserved unchanged.
+    - id: FR-003
+      description: >
+        Domain error factories currently defined per-port (packages/ports/src/*
+        e.g. file-storage, routing, quota) type their `code` field against
+        AppErrorCode instead of a free string. Existing factories keep their
+        runtime shape ({ code, message, meta }) so no transport behavior breaks.
+    - id: FR-004
+      description: >
+        normalizeError resolves codes to copy via the existing `errors.*` i18n
+        catalog (@th/locale / app message catalogs) using the injected `t`. The
+        resolution order is: structured appCode (preferred) → tRPC zodError
+        (field-level) → auth-shape rewrites → network detection → humanized
+        fallback. The network branch and auth rewrites that currently live in
+        apps/web are moved into the shared resolver.
+    - id: FR-005
+      description: >
+        Better Auth error shapes are mapped into AppErrorCode inside the shared
+        layer: EMAIL_NOT_VERIFIED, USER_ALREADY_EXISTS, invalid-credentials,
+        WebAuthn NotAllowedError (user cancel → no toast), and network/fetch
+        failures ("Load failed"/"Failed to fetch"/status 0). The bespoke
+        detectors in LoginCard (routeUnverifiedEmailToCard), SignUpCard
+        (isAccountAlreadyExistsError), and auth-helpers (isWebAuthnCancel,
+        network detection) are replaced by reading the resolved code.
+    - id: FR-006
+      description: >
+        web, scanner, and mobile import the single normalizeError /
+        formatAuthErrorMessage from @th/errors. apps/web/src/lib/errors/
+        normalize-error.ts becomes a thin re-export (or is deleted and call
+        sites repointed). The scanner's ad-hoc sign-in error handling
+        (apps/scanner/src/screens/sign-in-screen.tsx) is migrated.
+    - id: FR-007
+      description: >
+        A build-time/unit test asserts exhaustiveness: every AppErrorCode has a
+        matching key in the `errors.*` catalog for each shipped locale (en, es),
+        failing CI on drift.
+    - id: FR-008
+      description: >
+        Server logging stays rich and separate: logAndReport / Sentry continue
+        to receive trpcPath, errorCode, cause, zodErrors, meta. No internal
+        detail (raw provider strings, hostnames, stack, cause message) is ever
+        placed in the client-facing copy returned by normalizeError.
+    - id: FR-009
+      description: >
+        Canonical casing is SCREAMING_SNAKE. @th/errors exports a `toKey(code)`
+        that maps a code to its camelCase errors.* i18n key, and the
+        errorFormatter normalizes legacy snake_case domain codes to
+        SCREAMING_SNAKE at the boundary so day-one consistency does not require
+        renaming the ~40 existing domain `code` fields. Domain factories in
+        packages/ports + packages/core are re-typed to AppErrorCode
+        incrementally (tracked, not blocking).
+    - id: FR-010
+      description: >
+        Jobs runtime: the jobs service maps failures to AppErrorCode for both
+        structured logging and any operator-facing surfaces (e.g. job-diagnostics
+        / job-queue errors already defined in packages/ports). Job error logging
+        carries the same code field as the request path.
+    - id: FR-011
+      description: >
+        Webhook handlers (Stripe, Resend bounce/complaint, SNS SMS, etc.) adopt
+        AppError for internal failures and emit the structured code into logs.
+        Webhooks remain provider-contract-compliant on the wire (HTTP status +
+        provider-expected body) — the contract governs INTERNAL representation
+        and logging, not the provider response shape.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Backwards compatible at the wire level: clients that have not yet
+        migrated keep working because `message` (snake_case) and `data.zodError`
+        remain. Migration is incremental, package-by-package.
+    - id: NFR-002
+      description: >
+        Security: client copy is allow-listed (catalog lookup or hardcoded safe
+        fallback), never the raw error string. Prevents host/provider/internal
+        leakage (the "Load failed (api-dev.ithasfire.com)" class of bug).
+    - id: NFR-003
+      description: >
+        Isomorphic & tree-shakeable: @th/errors must build for Next server,
+        Next client, and React Native (Expo) targets. No `DOMException`/`window`
+        access without typeof guards.
+    - id: NFR-004
+      description: >
+        i18n parity: codes resolve identically across web (next-intl) and RN.
+        The `t` function is injected, not imported, so the resolver stays
+        platform-agnostic.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+# Map to hexagonal layers: core → ports → adapters → transport → UI
+
+architecture:
+  core:
+    use_cases: []   # No use-case behavior changes; this is a cross-cutting
+                    # contract + plumbing change, not a feature.
+
+  ports:
+    new: []
+    existing:
+      - packages/ports/src/*.ts   # per-port error factories adopt AppErrorCode
+                                  # (file-storage, routing, geo, job-queue,
+                                  # transcoder, wallet-pass, job-diagnostics, …)
+
+  adapters:
+    new: []
+    existing:
+      - "@th/adapters/infra/discord-alerts (logAndReport) — unchanged, confirm
+        it stays decoupled from client copy"
+
+  transport:
+    trpc_procedures: []
+    webhooks: []
+    other:
+      - apps/api/src/plugins/trpc.ts   # errorFormatter attaches data.appCode;
+                                       # onError logging unchanged
+      - apps/api/src/auth/better-auth.ts  # ensure EMAIL_NOT_VERIFIED /
+                                          # USER_ALREADY_EXISTS carry a stable
+                                          # code/body the resolver can read
+      - "webhook handlers (Stripe, Resend bounce/complaint, SNS SMS) — adopt
+        AppError internally; keep provider-expected response shape on the wire
+        (FR-011)"
+      - "jobs runtime / jobs service — map failures to AppErrorCode for logging
+        + operator surfaces (FR-010)"
+
+  ui:
+    pages: []
+    components:
+      - apps/web/src/components/auth/{LoginCard,SignUpCard}.tsx  # drop bespoke
+        # detectors; read resolved code
+      - apps/web/src/lib/errors/normalize-error.ts  # re-export from @th/errors
+      - apps/web/src/components/auth/auth-helpers.ts # formatAuthErrorMessage
+        # delegates to shared resolver
+      - apps/scanner/src/screens/sign-in-screen.tsx # migrate to shared resolver
+
+  new_packages:
+    - name: "@th/errors (packages/errors)"
+      description: >
+        Leaf package. Exports AppErrorCode union, AppError factory + isAppError
+        guard, and normalizeError(error, t?) resolver (incl. tRPC/Zod/auth/
+        network handling). No server or RN runtime deps.
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false   # No DB schema change. "Migration" here = code
+                             # adoption of the typed contract, not Prisma.
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Large adoption surface — 60+ TRPCError throws, ~40 snake_case domain
+      codes, plus jobs + webhooks (full scope chosen). A big-bang rewrite is
+      risky.
+    severity: MEDIUM
+    mitigation: >
+      Keep `message` (snake_case) + zodError on the wire so nothing breaks until
+      a call site is migrated. Boundary normalization (FR-009) gives day-one
+      SCREAMING_SNAKE consistency without renaming factories. Ship the package +
+      errorFormatter field + boundary mapping FIRST; migrate domain factories,
+      clients, jobs, and webhooks incrementally behind the stable contract.
+  - risk: >
+      Better Auth runs its own fetch/error pipeline OUTSIDE the tRPC
+      errorFormatter, so it can't emit data.appCode. Its errors must be mapped
+      client-side in the resolver.
+    severity: MEDIUM
+    mitigation: >
+      Resolver maps Better Auth shapes (code/body/message) to AppErrorCode as a
+      dedicated branch; better-auth.ts after-hooks keep attaching stable codes
+      (EMAIL_NOT_VERIFIED already does) so mapping is code-based, not regex.
+  - risk: >
+      i18n drift between codes and catalog keys reintroduces the humanized
+      fallback silently.
+    severity: LOW
+    mitigation: >
+      FR-007 exhaustiveness test fails CI when a code lacks a key in any locale.
+  - risk: >
+      RN/Expo bundling of a package that also serves the Next server could pull
+      in incompatible APIs (DOMException, window).
+    severity: LOW
+    mitigation: >
+      NFR-003 — typeof guards, no platform globals at module scope; add a RN
+      smoke import to the scanner/mobile build in CI.
+
+open_questions:
+  # RESOLVED — see the `decisions` block at the top of this spec:
+  #   • Code casing → SCREAMING_SNAKE + toKey() mapper (FR-009)
+  #   • Package home → dedicated @th/errors leaf (FR-001)
+  #   • Scope → all of it: tRPC + auth + jobs + webhooks (FR-010, FR-011)
+  - >
+    STILL OPEN: Should `meta`-bearing codes (quota_exceeded carries
+    kind/limitValue/currentUsage) get typed meta payloads per code
+    (discriminated union AppErrorCode → meta)? Strong DX win but expands scope;
+    propose as a fast-follow once the union + boundary land. I think the AppErrorCode likely should just support an arbitrary `meta` object for now, and we can add discriminated unions later if we find a strong need for it.
+  - >
+    STILL OPEN: Naming sweep cadence — re-type all ~40 domain factories to
+    AppErrorCode in one mechanical PR, or alias opportunistically as files are
+    touched? Boundary normalization (FR-009) means either works; decide based on
+    review-load appetite. Answer: Retype all factories.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Changing the SEMANTICS of transport-level codes (UNAUTHORIZED/FORBIDDEN/…).
+  - A full Sentry/observability overhaul — logging stays as-is, only decoupled.
+  - Per-code typed `meta` discriminated unions (possible follow-up).
+  - New user-facing copy/redesign of error UIs beyond routing through toasts
+    (already shipped for auth cards).
+  - DB/Prisma changes.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - "@th/errors exists, builds for Next-server, Next-client, and Expo targets,
+    and exports AppErrorCode, AppError, isAppError, normalizeError."
+  - "tRPC error responses include a structured data.appCode; existing data.meta
+    / data.zodError / data.code are unchanged and pre-migration clients still
+    function."
+  - "A single normalizeError resolver is the only place that maps errors to
+    copy; apps/web/src/lib/errors/normalize-error.ts no longer contains its own
+    logic (re-export or deleted)."
+  - "LoginCard/SignUpCard no longer contain bespoke string/regex error
+    detection (routeUnverifiedEmailToCard, isAccountAlreadyExistsError, network
+    detection); they read the resolved AppErrorCode."
+  - "Scanner sign-in uses the shared resolver."
+  - "A CI test fails when any AppErrorCode lacks an errors.* key in en or es."
+  - "No raw provider/network/host string can reach user-facing copy (covered by
+    a unit test asserting network + unknown errors resolve to safe catalog
+    copy)."
+  - "Server logs still capture trpcPath, errorCode, cause, zodErrors, meta for
+    INTERNAL_SERVER_ERROR; client copy contains none of it."
+  - "All AppErrorCode values are SCREAMING_SNAKE; toKey() resolves each to its
+    camelCase errors.* key; the errorFormatter normalizes a legacy snake_case
+    domain code to SCREAMING_SNAKE so no existing factory rename is required to
+    ship."
+  - "Jobs runtime and webhook handlers emit the structured AppErrorCode into
+    logs; webhook provider response shapes/status codes are unchanged on the
+    wire."

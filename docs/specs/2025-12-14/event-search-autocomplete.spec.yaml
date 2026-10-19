@@ -1,0 +1,84 @@
+# Not built yet (2026-10-08 docs consolidation): Web uses SpotlightSearch + unifiedSearch router, not EventSearchAutocomplete; telemetry hook useSearchTelemetry not found; no events.autocomplete router (AUDIT said BUILT)
+# Spec: Event Search Autocomplete + Results UI
+meta:
+  owner: web
+  status: draft
+  reviewers:
+    - design-system
+    - transport-trpc
+    - analytics
+  last_updated: 2025-11-25
+summary: |
+  Define the UX + component contracts for Google-style event search across the Next.js app (navbar, hero search,
+  `/events/search` results). Ensures consistent suggestion rendering, direct routing, helper prompts, and telemetry hooks.
+objectives:
+  - Provide a fast autocomplete overlay (sub-100 ms client render) with keyboard + touch parity.
+  - Route suggestions directly to event detail when slug available; otherwise push to filtered list view.
+  - Blend live search responses with curated helper prompts and “recent searches”.
+  - Instrument query + selection telemetry for ranking feedback.
+scope:
+  in_scope:
+  - `EventSearchAutocomplete` component enhancements (`@th/ui`).
+    - Navbar, hero card, and dedicated search page surfaces within `apps/web`.
+    - UI states: idle, loading, empty, error, suggestion with match badges.
+    - Telemetry hooks (`useSearchTelemetry`) capturing impression + click events.
+  out_of_scope:
+    - Mobile or scanner-specific flows (separate specs).
+    - Admin-only filters (handled later once RBAC defined).
+
+component_contracts:
+  EventSearchAutocomplete props additions:
+    - `suggestions: EventSearchSuggestion[]` (now includes `slug?: string`, `matchReason?: string`, `confidence: number`).
+    - `prompts?: Array<{ id: string; title: string; subtitle?: string; helper?: string }>` shown when `suggestions.length < minSuggestions`.
+  - `recentQueries?: string[]` sourced from local storage history only (no server persistence) unless future analytics indicates value.
+    - `onTelemetry?: (event: SearchTelemetryEvent) => void` fired on query change, suggestion impression, selection.
+    - `renderSuggestionBadge?: (matchReason: string | undefined) => ReactNode` to customize label (e.g., “Artist match”).
+  Visual updates:
+    - Suggestion rows display badge + helper on right, truncated to 2 lines total.
+    - Loading shimmer for first 3 rows.
+    - Empty state differentiates “No matches” vs “Type more characters”.
+
+navbar_behavior (`AppNavbar.tsx`):
+  - On mount, fetch featured suggestions (org-scope) and store as idle list.
+  - When user types ≥2 chars: call `events.autocomplete`, show spinner if request >80 ms.
+  - Selection flow:
+  * If suggestion.slug -> `router.push(/events/[slug])`.
+  * Else -> `router.push(/events/search?search=query)`.
+  - When no featured events + no query: display prompts from transport (tips like “Search by venue”). Organizer-specific “pinned prompts” are simply curated prompt entries returned by the new prompts endpoint; there is no client-side authoring UI in scope.
+  - Provide `aria-live="polite"` updates for screen readers announcing counts.
+
+hero_behavior (`HomeClient.tsx`):
+  - Share same component but with larger max suggestions (8) and show hero-specific prompts (“Discover near Austin”).
+  - Use `recentQueries` from local storage to prefill suggestions for logged-out visitors.
+
+results_page (`/events/search/page.tsx`):
+  - Server component fetches `events.search` for initial query; streaming updates allowed for filter changes via client component.
+  - Display filters (facets) for city, date bucket, tags; chips show counts per spec.
+  - Each result card uses snippet field, badges for matchReasons, CTA linking to slug, and surfaces `ticketAvailability` summary (status + remaining) provided by the transport without issuing extra queries.
+
+telemetry:
+  - Hook `useSearchTelemetry` publishes events via TRPC mutation `telemetry.recordSearch`. Payload: { query, suggestionId, eventId, action, rank, latencyMs }.
+  - Autocomplete impressions fire once per render cycle with top N suggestion IDs.
+  - Click events fire immediately before navigation (use `router.prefetch` on slug suggestions).
+
+accessibility:
+  - Input + listbox follow WAI-ARIA combobox pattern; `aria-activedescendant` ties to highlighted row.
+  - Keyboard shortcuts: Arrow up/down, Tab cycles, Enter selects, Cmd+K to focus search.
+  - High-contrast mode: ensure badges + helper text meet 4.5:1 contrast.
+
+state_machine:
+  states:
+    - idle: show featured suggestions or prompts.
+    - typing: show spinner until response, else show `activeSuggestions`.
+    - error: banner with retry CTA, log to telemetry.
+    - empty: show prompts + “Try venue/artist” copy.
+  transitions documented for deterministic behavior.
+
+analytics:
+  - Capture query string (hashed), suggestion ID, rank, latency, page context (navbar/hero/results) via `search_interaction` event.
+  - Log zero-result queries with raw string (redacted) for ops follow-up.
+
+open_questions:
+  - recent_search_storage: ✅ Decided — browser local storage history only unless analytics later justifies server storage.
+  - organizer_prompts: ✅ Clarified — prompts originate from backend curation/analytics; UI just renders what `events.searchPrompts` returns.
+  - ticket_availability: ✅ Use search transport’s `ticketAvailability` payload; no additional fetch per card.

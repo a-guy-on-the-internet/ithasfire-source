@@ -271,3 +271,38 @@ describe("SESSION_COOKIE_PREFIX", () => {
     expect(mod.env.SESSION_COOKIE_PREFIX).toBeUndefined();
   });
 });
+
+describe("env TRPC_GLOBAL_RATE_LIMIT_MODE", () => {
+  afterEach(() => {
+    process.env = ORIGINAL_ENV;
+    vi.resetModules();
+  });
+
+  it("defaults to shadow when unset (measure before it can 429 anyone)", async () => {
+    const mod = await loadEnv({
+      NODE_ENV: "test",
+      TRPC_GLOBAL_RATE_LIMIT_MODE: undefined,
+    });
+    expect(mod.env.TRPC_GLOBAL_RATE_LIMIT_MODE).toBe("shadow");
+  });
+
+  it("rejects an EMPTY value at boot (a blank CI var is not 'unset')", async () => {
+    await expect(
+      loadEnv({ NODE_ENV: "test", TRPC_GLOBAL_RATE_LIMIT_MODE: "" }),
+    ).rejects.toThrowError();
+  });
+
+  it.each(["enforce", "shadow", "off"] as const)("accepts %s", async (mode) => {
+    const mod = await loadEnv({
+      NODE_ENV: "test",
+      TRPC_GLOBAL_RATE_LIMIT_MODE: mode,
+    });
+    expect(mod.env.TRPC_GLOBAL_RATE_LIMIT_MODE).toBe(mode);
+  });
+
+  it("rejects an unknown mode at boot rather than guessing", async () => {
+    await expect(
+      loadEnv({ NODE_ENV: "test", TRPC_GLOBAL_RATE_LIMIT_MODE: "Shadow" }),
+    ).rejects.toThrowError();
+  });
+});

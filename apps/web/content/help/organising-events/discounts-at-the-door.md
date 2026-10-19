@@ -36,15 +36,15 @@ You can apply up to four codes to one sale, but only if every code is marked as 
 Change the cart after applying a code and the discount recalculates automatically. This matters for percentage codes and for codes with a minimum spend — adding or removing a ticket can change what the code is worth, or stop it applying at all.
 :::
 
-## Door prices and discounts
+## What a code is worked out on
 
-If a ticket type has a separate door price, the discount is calculated against that door price, not the online price. A 50% code on a ticket that's $20 online and $30 at the door takes off $15, not $10. The total shown on the Sell tab is always what the buyer actually pays.
+A code is worked out on the same ticket price the event page shows, because the door charges that price too. A 50% code on a $20 ticket takes off $10, whether the buyer pays online or at the door.
 
 ## Cash, comps, and $0 totals
 
-Cash sales let you type the amount you actually collected, so you can still negotiate or round down after a code is applied — the code's discount and the cash you took are recorded separately.
+The till works out the cash total after a code is applied, tax included. Type what the buyer hands you and it shows the change; an amount below the total is refused, so a lower price needs a code, not a smaller number.
 
-A code that brings the total to $0 has to go through **Cash**, not **Tap to Pay**. Card readers can't charge $0. Record it as a cash sale with $0 collected and it's logged as a comp, with the ticket admitted straight away.
+A code that brings the total to $0 has to go through **Cash**, not **Tap to Pay**. Card readers can't charge $0. Record it as a cash sale with $0 collected: it counts as a sale with that code, not a comp, and the ticket is admitted straight away. A comp is only what the **Comp** button gives.
 
 ## Refunds
 

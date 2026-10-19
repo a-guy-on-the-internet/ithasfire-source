@@ -127,6 +127,50 @@ describe("origin-guard plugin", () => {
     expect(response.json()).toEqual({ error: "origin_secret_mismatch" });
   });
 
+  it("matches a header carrying the trimmed value when the env secret has a trailing newline", async () => {
+    envMock.ORIGIN_SHARED_SECRET = `${SECRET}\n`;
+    envMock.ENFORCE_ORIGIN_SECRET = true;
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/protected",
+      headers: { "x-origin-secret": SECRET },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it("still blocks a wrong header when the env secret has a trailing newline", async () => {
+    envMock.ORIGIN_SHARED_SECRET = `${SECRET}\n`;
+    envMock.ENFORCE_ORIGIN_SECRET = true;
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/protected",
+      headers: { "x-origin-secret": "b".repeat(32) },
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(logger.warn).toHaveBeenCalledWith(
+      "origin_secret_mismatch",
+      expect.objectContaining({ path: "/protected" }),
+    );
+  });
+
+  it("treats an all-whitespace env secret as unset (mismatch, never a match)", async () => {
+    envMock.ORIGIN_SHARED_SECRET = "  \n";
+    envMock.ENFORCE_ORIGIN_SECRET = true;
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/protected",
+      headers: { "x-origin-secret": "" },
+    });
+
+    expect(response.statusCode).toBe(403);
+  });
+
   it("exempts /health regardless of query string (routeOptions, not raw request.url)", async () => {
     envMock.ENFORCE_ORIGIN_SECRET = true;
 

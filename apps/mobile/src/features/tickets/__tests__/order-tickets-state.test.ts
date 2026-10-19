@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  applyCacheRead,
   buildCacheFingerprint,
   resolveOrderTicketsState,
+  shouldWriteCache,
   toCacheableTickets,
   toIsoOrNull,
   type OrderTicketsQueryState,
@@ -26,6 +28,37 @@ const base: OrderTicketsQueryState = {
 };
 
 describe("resolveOrderTicketsState", () => {
+  it("shows no tickets behind the verify-your-email gate, live or cached", () => {
+    // B2: the server answered and refused, so this is not the offline case.
+    // A cached copy (possibly a squatter's, written before the gate) and any
+    // live data still held from an earlier answer both stay hidden.
+    const state = resolveOrderTicketsState({
+      ...base,
+      liveTickets: LIVE,
+      cached: CACHED,
+      cacheChecked: true,
+      isQueryLoading: false,
+      isQueryError: true,
+      queryErrorMessage: "email_verification_required",
+      isVerificationRequired: true,
+    });
+
+    expect(state.verificationRequired).toBe(true);
+    expect(state.tickets).toEqual([]);
+    expect(state.source).toBe("none");
+    expect(state.errorMessage).toBeNull();
+    expect(state.isLoading).toBe(false);
+  });
+
+  it("is not gated by default", () => {
+    const state = resolveOrderTicketsState({
+      ...base,
+      cached: CACHED,
+      cacheChecked: true,
+    });
+    expect(state.verificationRequired).toBe(false);
+  });
+
   it("prefers live data over a cached copy", () => {
     const state = resolveOrderTicketsState({
       ...base,
@@ -236,5 +269,45 @@ describe("buildCacheFingerprint", () => {
         null,
       ),
     );
+  });
+});
+
+describe("applyCacheRead", () => {
+  it("keeps the entry when not gated", () => {
+    expect(applyCacheRead(CACHED, false)).toBe(CACHED);
+  });
+
+  it("drops an entry whose read settled after the gate answered", () => {
+    expect(applyCacheRead(CACHED, true)).toBeNull();
+  });
+});
+
+describe("shouldWriteCache", () => {
+  const input = {
+    hasLiveTickets: true,
+    gated: false,
+    fingerprint: "o1||[]",
+    lastWritten: null,
+  };
+
+  it("writes new live tickets", () => {
+    expect(shouldWriteCache(input)).toBe(true);
+  });
+
+  it("never writes behind the verify-your-email gate", () => {
+    expect(shouldWriteCache({ ...input, gated: true })).toBe(false);
+  });
+
+  it("skips a payload already written, and has nothing to write without live tickets", () => {
+    expect(shouldWriteCache({ ...input, lastWritten: input.fingerprint })).toBe(
+      false,
+    );
+    expect(shouldWriteCache({ ...input, hasLiveTickets: false })).toBe(false);
+  });
+
+  it("writes the same payload again after the gate reset lastWritten", () => {
+    // The gate effect nulls lastWritten; after a verify the unchanged payload
+    // must land in the cache again.
+    expect(shouldWriteCache({ ...input, lastWritten: null })).toBe(true);
   });
 });

@@ -1,0 +1,706 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Auth — Human (domain user), Better Auth core models, API keys, push devices.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Human is the domain entity for a user. Identity fields (email, phone, username)
+// live on AuthUser (Better Auth). Human holds domain-specific state only.
+model Human {
+  id     String      @id @default(uuid())
+  name   String?
+  status HumanStatus @default(ACTIVE)
+  // local site roles (a human can have multiple roles).
+  // @default([]) matters: the column was originally created with no DEFAULT
+  // and no NOT NULL, so create paths that omitted `roles` stored SQL NULL —
+  // and Postgres array operators return NULL (not TRUE) against a NULL
+  // array, which silently broke authz.grantHumanRole's idempotency guard
+  // (FR-010 approvals never granted the role for real users). Backfilled +
+  // pinned NOT NULL DEFAULT '{}' in 20260702120000_human_roles_not_null_default.
+  roles  HumanRole[] @default([])
+  locale String?
+  // Web light/dark appearance preference ('light' | 'dark'). Null = no explicit
+  // account preference (fall back to the th-theme cookie, then DEFAULT_THEME_MODE).
+  // Plain String? (mirrors `locale`) rather than a DB enum so the value stays a
+  // simple, migration-free string the web layer narrows on read.
+  themeMode String? @map("theme_mode")
+
+  /// How this Human row was created. WEB = self-signup via auth flow,
+  /// POS_WALKUP = phantom row minted by an in-person POS sale (may
+  /// have null contact fields), IMPORT = bulk imported by an admin.
+  /// Used by audit/refund views and to exclude walk-ups from
+  /// marketing audiences by default.
+  source HumanSource @default(WEB)
+
+  // Saved contact details for faster checkout
+  phone               String?
+  billingAddressLine1 String?
+  billingAddressLine2 String?
+  billingCity         String?
+  billingState        String?
+  billingPostalCode   String?
+  billingCountry      String?
+
+  // ── Trust / Reputation ──────────────────────────────────────────────
+  // Reuses the same OrgTrustTier enum so both org and solo-human organizers
+  // share the same tier system and admin override behaviour.
+  trustTier       OrgTrustTier @default(NEW) @map("trust_tier")
+  trustBadgeLabel String?      @map("trust_badge_label")
+  trustBadgeIcon  String?      @map("trust_badge_icon")
+
+  chargebackTermsVersion    String?
+  chargebackTermsAcceptedAt DateTime?
+
+  scannerTermsAckAt        DateTime?
+  scannerTermsAckVersion   String?
+  scannerTermsAckIp        String?
+  scannerTermsAckUserAgent String?
+
+  // ── Default payout terms ──────────────────────────────────────────
+  // Direct FKs to the human-level default PayoutTerms.
+  // When a solo human creates an event without an org or explicit agreement,
+  // these are copied to Event.payoutTermsId / Event.resalePayoutTermsId.
+  defaultPrimaryPayoutTermsId String? @map("default_primary_payout_terms_id")
+  defaultResalePayoutTermsId  String? @map("default_resale_payout_terms_id")
+
+  defaultPrimaryPayoutTerms PayoutTerms? @relation("HumanDefaultPrimaryPayoutTerms", fields: [defaultPrimaryPayoutTermsId], references: [id], onDelete: SetNull)
+  defaultResalePayoutTerms  PayoutTerms? @relation("HumanDefaultResalePayoutTerms", fields: [defaultResalePayoutTermsId], references: [id], onDelete: SetNull)
+
+  // Better Auth linkage (incremental migration)
+  authUser AuthUser?
+
+  orgMembers                     OrgMember[]
+  Events                         Event[]
+  delegatesGranted               HumanDelegate[]                  @relation("DelegatesOf")
+  delegatesReceived              HumanDelegate[]                  @relation("DelegatingFor")
+  ticketsOwned                   Ticket[]                         @relation("TicketOwner")
+  orders                         Order[]                          @relation("BuyerOrders")
+  resaleListings                 ResaleListing[]                  @relation("SellerResaleListings")
+  transfersFrom                  TicketTransfer[]                 @relation("TransferFrom")
+  transfersTo                    TicketTransfer[]                 @relation("TransferTo")
+  // ── Entity Pages (replaces old Profile/ProfileTheme/ProfileModule) ─────
+  // EntityPage uses a polymorphic (ownerType, ownerId) FK pattern
+  // instead of a direct relation. Look up via ownerType=HUMAN, ownerId=id.
+  embedsCreated                  Embed[]                          @relation("EmbedCreator")
+  resaleListingHolds             ResaleListingHold[]
+  placeOwnershipReviews          PlaceOwnership[]
+  placeReviewsAuthored           PlaceReview[]                    @relation("PlaceReviewAuthor")
+  placeReviewResponses           PlaceReview[]                    @relation("PlaceReviewResponder")
+  placeReviewSessions            PlaceReviewSession[]             @relation("PlaceReviewSessions")
+  apiKeys                        ApiKey[]                         @relation("ApiKeyHolder")
+  apiKeysRevoked                 ApiKey[]                         @relation("ApiKeyRevokedBy")
+  apiKeyRequests                 ApiKeyRequest[]                  @relation("ApiKeyRequestRequester")
+  apiKeyRequestsDecided          ApiKeyRequest[]                  @relation("ApiKeyRequestDecidedBy")
+  pushDevices                    PushDevice[]
+  ticketScans                    TicketScan[]                     @relation("TicketScanActor")
+  eventTemplatesCreated          EventTemplate[]                  @relation("EventTemplateCreatedBy")
+  eventTemplatesUpdated          EventTemplate[]                  @relation("EventTemplateUpdatedBy")
+  // freeze-the-deal (2026-10-14): who froze an event's deal, and who changed one while frozen.
+  eventDealsFrozen               Event[]                          @relation("EventDealFrozenBy")
+  dealChanges                    DealChange[]                     @relation("DealChangeActor")
+  ticketTypeTemplatesCreated     TicketTypeTemplate[]             @relation("TicketTypeTemplateCreatedBy")
+  eventSeriesCreated             EventSeries[]                    @relation("EventSeriesCreatedBy")
+  eventSeriesUpdated             EventSeries[]                    @relation("EventSeriesUpdatedBy")
+  eventApplicationFormsUpdated   EventApplicationForm[]           @relation("ApplicationFormUpdatedBy")
+  applicationFormTemplatesCreated ApplicationFormTemplate[]       @relation("ApplicationFormTemplateCreatedBy")
+  eventApplicationSubmissions    EventApplicationSubmission[]     @relation("ApplicationSubmissionHuman")
+  eventApplicationReviews        EventApplicationSubmission[]     @relation("ApplicationSubmissionReviewer")
+  eventApplicationFormsClosed    EventApplicationForm[]           @relation("ApplicationFormClosedBy")
+  eventApplicationFormsPosted    EventApplicationForm[]           @relation("ApplicationFormPostedBy")
+  applicationVotes               ApplicationVote[]                @relation("ApplicationVoteHuman")
+  applicationNotes               ApplicationNote[]                @relation("ApplicationNoteAuthor")
+  waitlistEntries                EventWaitlistEntry[]             @relation("WaitlistEntryHuman")
+  inviteListEntries              InviteListEntry[]                @relation("InviteListEntryHuman")
+  contactImportsCreated          ContactImport[]                  @relation("ContactImportCreatedBy")
+  feedbackRequests               FeedbackRequest[]
+  imagesCreated                  Image[]                          @relation("ImageCreatedBy")
+  imageModerationRecordsCreated  ImageModerationRecord[]          @relation("ImageModerationCreatedBy")
+  digestSubscriptions            NotificationDigestSubscription[]
+  digestLogs                     NotificationDigestLog[]
+  notifications                  Notification[]
+  notificationPreferences        NotificationPreference[]
+  placeLayoutsCreated            PlaceLayout[]                    @relation("PlaceLayoutCreatedBy")
+  featuredEventSelections        FeaturedEvent[]                  @relation("FeaturedEventCurator")
+  featuredItemSelections         FeaturedItem[]                   @relation("FeaturedItemCurator")
+  volunteerPacksCurated          VolunteerPack[]                  @relation("VolunteerPackCurator")
+  ticketPacksCurated             TicketPack[]                     @relation("TicketPackCurator")
+  eventUnlocks                   EventUnlock[]                    @relation("EventUnlockHuman")
+  eventRsvps                     EventRsvp[]                      @relation("EventRsvps")
+  eventDateRsvps                 EventDateRsvp[]                  @relation("EventDateRsvps")
+  eventInvitesCreated            EventInvite[]                    @relation("EventInviteCreator")
+  eventInviteOptOuts             EventInviteOptOut[]              @relation("EventInviteOptOutOwner")
+  eventInviteComplaints          EventInviteComplaint[]           @relation("EventInviteComplaintOwner")
+  eventInvitePauses              EventInvitePause[]               @relation("EventInvitePauseOwner")
+  eventInvitePausesDecided       EventInvitePause[]               @relation("EventInvitePauseDecider")
+  audioUploadsCreated            AudioUpload[]                    @relation("AudioUploadCreatedBy")
+  claimsAsBuyer                  Claim[]                          @relation("ClaimClaimant")
+  claimsAsSeller                 Claim[]                          @relation("ClaimRespondent")
+  claimsResolved                 Claim[]                          @relation("ClaimResolver")
+  eventHumans                    EventHuman[]                     @relation("EventHumans")
+  artistAttributions             TicketAttribution[]              @relation("AttributedArtist")
+  fanAttributions                TicketAttribution[]              @relation("TicketFan")
+  pendingTransfersInitiated      PendingTicketTransfer[]          @relation("PendingTransferFrom")
+  pendingTransfersClaimed        PendingTicketTransfer[]          @relation("PendingTransferClaimedBy")
+  posReadersPaired               PosReader[]
+  verificationsSubmitted         PlaceVerificationRequest[]       @relation("submittedVerifications")
+  verificationsReviewed          PlaceVerificationRequest[]       @relation("reviewedVerifications")
+  verificationsAcknowledged      PlaceVerificationRequest[]       @relation("acknowledgedVerifications")
+  orgInvitationsSent             OrgInvitation[]                  @relation("OrgInvitationInviter")
+  orgInvitationsAccepted         OrgInvitation[]                  @relation("OrgInvitationAcceptor")
+  chargebackTermsAcceptedForOrgs Organization[]                   @relation("OrganizationChargebackTermsAcceptedBy")
+  announcementsSent              Announcement[]                   @relation("AnnouncementSender")
+  volunteerSignups               VolunteerSignup[]                @relation("VolunteerSignupHuman")
+  volunteerSignupReviews         VolunteerSignup[]                @relation("VolunteerSignupReviewer")
+  coordinatingGroups             VolunteerGroup[]                 @relation("VolunteerGroupCoordinator")
+  volunteerBroadcasts            VolunteerBroadcast[]             @relation("VolunteerBroadcastSender")
+  volunteerRewardGrants          VolunteerRewardGrant[]           @relation("VolunteerRewardGrantHuman")
+  /// Lazily minted token for the "my volunteering" .ics feed (set on first
+  /// subscribe; token-authenticates the aggregate calendar feed).
+  volunteerIcsFeedToken          String?                          @unique
+  waiverAcceptances              WaiverAcceptance[]
+  volunteerWaiverAcceptances     VolunteerWaiverAcceptance[]
+  eventAttestations              EventAttestation[]               @relation("EventAttestations")
+  waiverTemplatesOwned           WaiverTemplate[]                 @relation("HumanWaiverTemplates")
+  following                      EntityFollow[]                   @relation("HumanFollowing")
+  savedEvents                    EventSave[]                      @relation("HumanSavedEvents")
+  rsvpNotices                    RsvpNotice[]                     @relation("HumanRsvpNotices")
+  rsvpReminders                  RsvpReminder[]                   @relation("HumanRsvpReminders")
+  postEventPrompts               PostEventPrompt[]                @relation("HumanPostEventPrompts")
+  attendeeReviews                AttendeeReview[]                 @relation("HumanAttendeeReviews")
+  disputes                       Dispute[]                        @relation("HumanDisputes")
+  membershipTiers                MembershipTier[]                 @relation("HumanMembershipTiers")
+  membershipStanding             MembershipStanding?              @relation("HumanMembershipStanding")
+  /// Memberships this human holds as a MEMBER (distinct from tiers they own).
+  memberships                    Membership[]                     @relation("HumanMemberships")
+  stats                          HumanStats?
+  consentRecords                 ConsentRecord[]
+  acceptanceRecords              AcceptanceRecord[]
+  supportThreads                 SupportThread[]                  @relation("SupportThreadHuman")
+  /// Booking terms this human sent for the sender to agree (booking-the-night
+  /// FR-002 / N10: the event mint runs as this person).
+  agreementsSentForReview        Agreement[]                      @relation("AgreementSentForReviewBy")
+  /// Arrival areas this human drew (arrival-areas spec). SetNull on human delete.
+  arrivalAreasCreated            ArrivalArea[]                    @relation("ArrivalAreaCreatedBy")
+
+  // ── Trust & safety (see trust-safety.prisma) ────────────────────────
+  networkSightings               NetworkSighting[]
+  bannedIdentities               BannedIdentity[]                 @relation("BannedIdentitySource")
+
+  // ── Platform-funded account credit (see credit.prisma) ──────────────
+  userCredits                    UserCredit[]                     @relation("UserCreditHuman")
+  userCreditsGranted             UserCredit[]                     @relation("UserCreditGrantor")
+
+  // ── Industry identity ──────────────────────────────────────────────
+  jobs                HumanJob[] @default([])
+  genreTags           String[]   @default([])
+  otherJobDescription String?       @db.VarChar(200) @map("other_job_description")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------- Better Auth Core Models ----------------
+// We keep these separate from `Human` so we can adopt Better Auth incrementally.
+// The Better Auth `user` model maps to `AuthUser` here.
+//
+// Core fields (from Better Auth schema generation snapshots/docs):
+// - user: id, name, email (unique), emailVerified (boolean), image?, createdAt, updatedAt
+// - account: providerId+accountId, tokens, optional password, timestamps
+// - session: token (unique), expiresAt, ipAddress?, userAgent?, timestamps
+// - verification: identifier indexed, value, expiresAt, timestamps
+
+model AuthUser {
+  id      String  @id @default(uuid())
+  // 1:1 link to your domain user.
+  humanId String? @unique @map("human_id")
+
+  name                   String
+  email                  String               @unique
+  emailVerified          Boolean              @default(false) @map("email_verified")
+  emailDeliveryStatus    EmailDeliveryStatus? @map("email_delivery_status")
+  emailDeliveryStatusAt  DateTime?            @map("email_delivery_status_at")
+  emailDeliveryStatusRef String?              @map("email_delivery_status_ref")
+  image                  String?
+  phoneNumber            String?              @unique @map("phone_number")
+  phoneNumberVerified    Boolean              @default(false) @map("phone_number_verified")
+  // Username plugin fields (for username-based login)
+  username               String?              @unique
+  displayUsername        String?              @map("display_username")
+  // 2FA status
+  twoFactorEnabled       Boolean              @default(false) @map("two_factor_enabled")
+  createdAt              DateTime             @default(now()) @map("created_at")
+  updatedAt              DateTime             @updatedAt @map("updated_at")
+  // Set once at the account's first sign-in (session.create.after hook in
+  // apps/api/src/auth/better-auth.ts), never cleared. Null = never signed in
+  // (e.g. a guest-checkout shadow row). Dates "new account" for invite limits.
+  firstSignedInAt        DateTime?            @map("first_signed_in_at")
+
+  human               Human?               @relation(fields: [humanId], references: [id], onDelete: Cascade)
+  accounts            AuthAccount[]
+  sessions            AuthSession[]
+  twoFactor           AuthTwoFactor?
+  passkeys            Passkey[]
+  emailDeliveryEvents EmailDeliveryEvent[]
+  networkSightings    NetworkSighting[]
+
+  @@map("auth_user")
+}
+
+enum EmailDeliveryStatus {
+  DELIVERABLE
+  BOUNCED
+  COMPLAINED
+}
+
+model EmailDeliveryEvent {
+  id              String              @id @default(uuid())
+  provider        String
+  providerEventId String              @map("provider_event_id")
+  eventType       String              @map("event_type")
+  email           String
+  status          EmailDeliveryStatus
+  occurredAt      DateTime            @map("occurred_at")
+  processedAt     DateTime            @default(now()) @map("processed_at")
+  authUserId      String?             @map("auth_user_id")
+  payload         Json
+
+  authUser AuthUser? @relation(fields: [authUserId], references: [id], onDelete: SetNull)
+
+  @@unique([provider, providerEventId])
+  @@index([email])
+  @@index([authUserId])
+  @@index([provider, eventType])
+  @@index([status, occurredAt])
+  @@map("email_delivery_event")
+}
+
+model AuthAccount {
+  id String @id @default(uuid())
+
+  accountId  String @map("account_id")
+  providerId String @map("provider_id")
+
+  userId String   @map("user_id")
+  user   AuthUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // OAuth tokens (nullable)
+  accessToken  String? @map("access_token")
+  refreshToken String? @map("refresh_token")
+  idToken      String? @map("id_token")
+  scope        String?
+
+  accessTokenExpiresAt  DateTime? @map("access_token_expires_at")
+  refreshTokenExpiresAt DateTime? @map("refresh_token_expires_at")
+
+  // Credential-based auth may store a password hash on the account record.
+  // (Better Auth email/password uses this; for pure OAuth, it stays null.)
+  password String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([providerId, accountId])
+  @@index([userId])
+  @@map("auth_account")
+}
+
+model AuthSession {
+  id        String   @id @default(uuid())
+  expiresAt DateTime @map("expires_at")
+  token     String   @unique
+
+  ipAddress String? @map("ip_address")
+  userAgent String? @map("user_agent")
+
+  userId String   @map("user_id")
+  user   AuthUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([userId])
+  @@map("auth_session")
+}
+
+model AuthVerification {
+  id         String   @id @default(uuid())
+  identifier String
+  value      String
+  expiresAt  DateTime @map("expires_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([identifier])
+  @@map("auth_verification")
+}
+
+// Better Auth passkey (WebAuthn) plugin model.
+// Stores public keys for hardware authenticators / platform passkeys.
+model Passkey {
+  id           String   @id @default(uuid())
+  name         String?
+  publicKey    String   @map("public_key")
+  userId       String   @map("user_id")
+  credentialID String   @unique @map("credential_id")
+  counter      Int
+  deviceType   String   @map("device_type")
+  backedUp     Boolean  @map("backed_up")
+  transports   String?
+  // Authenticator Attestation GUID, written by Better Auth's passkey plugin.
+  aaguid       String?  @map("aaguid")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  user AuthUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("passkey")
+}
+
+// Better Auth 2FA plugin model for storing TOTP secrets and backup codes.
+// `verified` is required by Better Auth's twoFactor plugin (>=1.6) — it
+// writes it on enable() and reads it back on subsequent calls. Defaults to
+// true; flipped to false only when `skipVerificationOnEnable` is configured.
+model AuthTwoFactor {
+  id          String  @id @default(uuid())
+  secret      String
+  backupCodes String  @map("backup_codes")
+  userId      String  @unique @map("user_id")
+  verified    Boolean @default(true)
+
+  user AuthUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([secret])
+  @@map("auth_two_factor")
+}
+
+// Better Auth JWT plugin requires this model to store JWKS keys
+model Jwks {
+  id         String   @id @default(uuid())
+  publicKey  String   @map("public_key")
+  privateKey String   @map("private_key")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@map("jwks")
+}
+
+/// An API key: held by one human, covering one key scope (subject + access),
+/// minted only when the holder collects an approved key request
+/// (scoped-api-keys spec 2026-10-08, FR-005). Only the SHA-256 hash is stored.
+///
+/// Legacy rows (minted by the removed `apiKeys.create`) have no subject,
+/// access or request. subject / access / requestId stay NULLABLE for good
+/// (orchestrator decision, 2026-10-13): the cutover (FR-013) revokes every
+/// legacy row, adds CHECK (subject IS NOT NULL OR revokedAt IS NOT NULL), and
+/// makes api_keys_guard reject inserts without a request. Legacy rows are
+/// kept, revoked, for the audit trail. (Migration 20261012120000's header
+/// still says NOT NULL; it is applied and cannot be edited.)
+///
+/// Revoke is a soft remove (revokedAt, revokedByHumanId, revokeReason); rows
+/// are kept for the audit trail. Hard delete only by CASCADE with the holder,
+/// the org, or the request.
+///
+/// The key's scope is bound to its request by two composite FKs (modelled
+/// below as `request` and `requestOrgScope`): (requestId, humanId, subject,
+/// access) and (requestId, orgId) must match the request row. MATCH SIMPLE,
+/// so legacy rows (requestId NULL) and non-ORG keys (orgId NULL) skip the
+/// check they cannot take part in.
+///
+/// SQL-only CHECKs; each passes for legacy rows whose subject is NULL.
+/// Migration 20261012120000_scoped_api_keys:
+///  - "api_keys_scope_shape": subject, access and requestId are all set or
+///    all NULL (legacy).
+///  - "api_keys_org_shape": orgId is set exactly when subject = ORG.
+///  - "api_keys_platform_wide_read_only": PLATFORM_WIDE ⇒ access = READ (R19).
+///  - "api_keys_revoke_shape": revokeReason / revokedByHumanId only on a
+///    revoked key.
+///  - "api_keys_key_last4_length": keyLast4 is NULL or exactly 4 characters.
+///  - "api_keys_not_renewed_from_self": renewedFromKeyId <> id.
+/// Migration 20261012120100_scoped_api_keys_guards:
+///  - "api_keys_expiry_cap": STAFF / PLATFORM_WIDE expire within 30 days of
+///    createdAt; ORG / PERSONAL never or within 90 days (R6). No slack:
+///    createdAt is stamped from the clock by api_keys_guard (v2), so the
+///    writer computes expiresAt from the same statement's NOW().
+///  - "api_keys_key_last4_required": a scoped key has keyLast4 (R25).
+///  - "api_keys_one_collect_per_request": partial UNIQUE (requestId) WHERE
+///    renewedFromKeyId IS NULL — one collect per approval; renewals are the
+///    only other keys a request may have.
+/// Migrations 20261012120200_scoped_api_keys_guards_v2 (replaces the v1
+/// triggers) and 20261012120300_scoped_api_keys_guards_v3 (replaces the
+/// trigger functions). These guards stop a BUGGY writer; a role that owns
+/// the tables can disable triggers. Clock stamps use LOCALTIMESTAMP inside
+/// functions pinned to TimeZone UTC, whatever the session's TimeZone.
+///  - "api_keys_renewal_has_request": renewedFromKeyId ⇒ requestId (no legacy
+///    row in a renewal slot).
+///  - FK renewedFromKeyId is ON DELETE NO ACTION: a renewed key cannot be
+///    deleted on its own, only together with its renewal (CASCADE paths).
+///  - trigger "api_keys_guard" (BEFORE INSERT, BEFORE UPDATE OF the guarded
+///    columns; lastUsedAt and expiryNotifiedAt are NOT guarded, so the
+///    per-call lastUsedAt write never fires it).
+///    INSERT: createdAt := the clock (always, legacy included); revokedAt,
+///    revokedByHumanId, revokeReason, expiryNotifiedAt and lastUsedAt must
+///    be NULL (no key is born revoked, notified or used). With a request,
+///    locked FOR UPDATE (lock order everywhere: request, then key):
+///    the request is APPROVED and not withdrawn; expiresAt is NULL exactly
+///    when the request's expiryDays is, after createdAt, and within the term;
+///    autoRenew only if the request allows it.
+///    - Collect (no renewedFromKeyId): refused if the request was already
+///      collected or was decided 7+ days ago (FR-005); then the trigger
+///      writes the request's collectedAt. THE TRIGGER IS THE ONLY WRITER OF
+///      collectedAt; the collect use case must not write it.
+///    - Renewal (FR-009): the request and the parent key both allow
+///      auto-renew; the parent has the same request, holder and label, is
+///      not revoked, and expires within the next 7 days (not already
+///      expired); the request has NO other live key besides the parent, so
+///      an approval has at most 2 live keys (the parent in its overlap and
+///      its renewal) and each key renews at most once — a term of 7 days or
+///      less is born inside its window, and this is what stops it chaining
+///      (v3). Auto-renew needs a term of 2+ days (v4, owner 10-13; see
+///      ApiKeyRequest), so a renewed key always gets a window of 24h or more
+///      after its parent's overlap ends.
+///      Then the trigger cuts the parent's expiresAt to
+///      LEAST(expiresAt, now + 24h). THE TRIGGER IS THE ONLY WRITER OF THAT
+///      CUT; the renew use case must not write it.
+///    UPDATE: keyHash, humanId, requestId, subject, access, orgId, label,
+///    keyLast4, createdAt and renewedFromKeyId never change; the first
+///    revoke stamps revokedAt from the clock, after which revokedAt and
+///    revokeReason are final and revokedByHumanId changes only to NULL, and
+///    only by its FK's SET NULL: the clear is allowed only once the
+///    referenced Human row is gone (v4; an app UPDATE that clears it is
+///    refused); expiresAt only moves earlier; autoRenew
+///    switches on only if the request allows it.
+///
+/// Auto-renew has two switches. The holder's is ApiKey.autoRenew. The
+/// approver's switch-off is written to the REQUEST (ApiKeyRequest.autoRenew,
+/// which can only go off) by set-api-key-auto-renew (step 3), so the holder
+/// cannot switch it back on. The renewal guard and the lifecycle sweep treat
+/// auto-renew as on only when BOTH the key and its request are on.
+model ApiKey {
+  id         String    @id @default(uuid())
+  humanId    String    @map("human_id")
+  keyHash    String    @map("key_hash")
+  label      String?
+  createdAt  DateTime  @default(now()) @map("created_at")
+  lastUsedAt DateTime? @map("last_used_at")
+  revokedAt  DateTime? @map("revoked_at")
+
+  /// The approved key request this key was collected from. A renewal
+  /// (FR-009) reuses its predecessor's request, so several keys may share
+  /// one request over time: NOT unique (one COLLECT per request is the
+  /// SQL-only partial unique above).
+  requestId        String?        @map("request_id")
+  subject          ApiKeySubject?
+  /// Set exactly when subject = ORG.
+  orgId            String?        @map("org_id")
+  access           ApiKeyAccess?
+  /// NULL = never expires (ORG and PERSONAL only, R6).
+  expiresAt        DateTime?      @map("expires_at")
+  /// Renews itself in its last 7 days (FR-009) while on.
+  autoRenew        Boolean        @default(false) @map("auto_renew")
+  /// The key this one replaced by self-renewal. Unique: a key renews at
+  /// most once.
+  renewedFromKeyId String?        @unique @map("renewed_from_key_id")
+  revokedByHumanId String?        @map("revoked_by_human_id")
+  /// Optional reason shown to the holder (FR-010).
+  revokeReason     String?        @map("revoke_reason")
+  /// Last 4 characters of the plaintext key, so rows can be told apart
+  /// ("thk_…ab12", R25).
+  keyLast4         String?        @map("key_last4")
+  /// When the 7-day expiry notice (FR-012) was sent; NULL = not sent. A
+  /// record of a send, not a derived status (precedent
+  /// Event.addressRevealNotifiedAt).
+  expiryNotifiedAt DateTime?      @map("expiry_notified_at")
+
+  human           Human          @relation("ApiKeyHolder", fields: [humanId], references: [id], onDelete: Cascade)
+  request         ApiKeyRequest? @relation("ApiKeyRequestScope", fields: [requestId, humanId, subject, access], references: [id, requesterHumanId, subject, access], onDelete: Cascade, onUpdate: NoAction, map: "api_keys_request_scope_fkey")
+  requestOrgScope ApiKeyRequest? @relation("ApiKeyRequestOrgScope", fields: [requestId, orgId], references: [id, orgId], onDelete: Cascade, onUpdate: NoAction, map: "api_keys_request_org_fkey")
+  org             Organization?  @relation("ApiKeyOrg", fields: [orgId], references: [id], onDelete: Cascade)
+  renewedFrom     ApiKey?        @relation("ApiKeyRenewal", fields: [renewedFromKeyId], references: [id], onDelete: NoAction)
+  renewedTo       ApiKey?        @relation("ApiKeyRenewal")
+  revokedBy       Human?         @relation("ApiKeyRevokedBy", fields: [revokedByHumanId], references: [id], onDelete: SetNull)
+
+  @@unique([keyHash])
+  @@index([humanId])
+  // Org settings "API keys" list + FK maintenance on org delete.
+  @@index([orgId])
+  // Keys collected from / renewed under one request + FK maintenance.
+  @@index([requestId])
+  // FK maintenance (SetNull) on human delete.
+  @@index([revokedByHumanId])
+  @@map("api_keys")
+}
+
+/// A key request: a human asks for an API key with one key scope; someone
+/// other than the requester decides it (scoped-api-keys spec 2026-10-08,
+/// FR-001..FR-005). Append-only: label, purpose, scope and expiry are fixed
+/// once sent; the row moves only by decide, withdraw, collect and the
+/// account-security close (revokeAllForHuman, R31). Removed only by CASCADE
+/// with the requester or the org.
+///
+/// State is DERIVED from timestamps, never stored:
+///  - pending      = decidedAt IS NULL AND withdrawnAt IS NULL, within 14 days of createdAt
+///  - lapsed       = pending past 14 days (FR-004)
+///  - uncollected  = APPROVED, collectedAt IS NULL, withdrawnAt IS NULL, within 7 days of decidedAt
+///  - collect lapsed = APPROVED, collectedAt IS NULL, withdrawnAt IS NULL, past 7 days (FR-005)
+///  - withdrawn    = withdrawnAt set, withdrawalReason = REQUESTER (only while pending)
+///  - closed for account security = withdrawnAt set, withdrawalReason = ACCOUNT_SECURITY,
+///                   on a pending or an APPROVED-uncollected request (R31)
+///
+/// SQL-only CHECKs, migration 20261012120000_scoped_api_keys:
+///  - "api_key_requests_org_shape": orgId is set exactly when subject = ORG.
+///  - "api_key_requests_platform_wide_read_only": PLATFORM_WIDE ⇒ access = READ (R19).
+///  - "api_key_requests_expiry_days_cap": expiryDays NULL (never) or 1..90;
+///    STAFF and PLATFORM_WIDE must be 1..30 (R6).
+///  - "api_key_requests_decision_shape": decision and decidedAt are both set
+///    or both NULL.
+///  - "api_key_requests_denial_reason_shape": denialReason is set exactly
+///    when decision = DENIED (FR-004).
+///  - "api_key_requests_self_approved_shape": selfApproved ⇒ APPROVED STAFF
+///    request (FR-003, the platform owner's break-glass).
+///  - "api_key_requests_withdrawn_shape": replaced by R31 (see below).
+///  - "api_key_requests_collected_shape": collectedAt only on an APPROVED request.
+/// Migrations 20261012120200_scoped_api_keys_guards_v2 (replaces v1's
+/// self-approval CHECK and trigger) and 20261012120300_scoped_api_keys_guards_v3
+/// (replaces the trigger function). These guards stop a BUGGY writer; a role
+/// that owns the tables can disable triggers. Clock stamps use
+/// LOCALTIMESTAMP inside functions pinned to TimeZone UTC.
+///  - "api_key_requests_self_approved_is_self": while a decider is recorded,
+///    selfApproved is true exactly when the decider is the requester
+///    (FR-003). A decider cleared by its FK's SET NULL passes, whichever FK
+///    action fires first when a human is deleted.
+///  - trigger "api_key_requests_guard" (BEFORE INSERT, BEFORE UPDATE OF the
+///    guarded columns; lapseNotifiedAt is not guarded on update).
+///    INSERT: must be pending (decision, decidedAt, decidedByHumanId,
+///    denialReason, withdrawnAt, collectedAt, lapseNotifiedAt NULL;
+///    selfApproved false), else check_violation; createdAt := the clock.
+///    UPDATE: requester, subject, org, access, label, purpose, expiryDays
+///    and createdAt never change; autoRenew may only be switched OFF (so an
+///    approver's "no auto-renew" sticks); an undecided request has no
+///    decider; deciding needs a decider and stamps decidedAt from the clock;
+///    APPROVED is refused once the request is 14+ days old (FR-004 lapse;
+///    DENIED still allowed); decision, decidedAt, selfApproved and
+///    denialReason are final once decided and decidedByHumanId then changes
+///    only to NULL, and only by its FK's SET NULL: the clear is allowed only
+///    once the referenced Human row is gone (v4).
+///    Withdrawing stamps withdrawnAt from the clock and is final.
+///    collectedAt is written once, only by api_keys_guard (checked with
+///    pg_trigger_depth() > 1 — a buggy-writer guard only: a role with TEMP
+///    can fake the depth with a pg_temp trigger).
+/// Migration 20261012120400_scoped_api_keys_guards_v4:
+///  - "api_key_requests_auto_renew_min_term": auto-renew needs a term of 2+
+///    days (owner 10-13: "Auto-renew needs 2+ days"), and is refused on a
+///    never-expiring term, which has nothing to renew. A 1-day or
+///    never-expiring key can still be requested, without auto-renew.
+/// Migration 20261013120000_scoped_api_keys_closed_for_security (R31, owner
+/// 2026-10-13, "Close them, say why"):
+///  - "api_key_requests_withdrawal_reason_shape": withdrawalReason is set
+///    exactly when withdrawnAt is.
+///  - "api_key_requests_withdrawn_shape" (replaced): REQUESTER only on an
+///    undecided request; ACCOUNT_SECURITY on an undecided or an
+///    APPROVED-and-uncollected one.
+///  - api_key_requests_guard: withdrawalReason is final once set; a
+///    withdrawn request cannot be decided; inserts carry no reason.
+///  - api_keys_guard: no key (collect or renewal) under a withdrawn or
+///    closed request.
+model ApiKeyRequest {
+  id               String                 @id @default(uuid())
+  /// Always the future holder; nobody requests on someone else's behalf.
+  requesterHumanId String                 @map("requester_human_id")
+  subject          ApiKeySubject
+  /// Set exactly when subject = ORG.
+  orgId            String?                @map("org_id")
+  access           ApiKeyAccess
+  label            String
+  /// Required, 10–500 chars (bounded in core).
+  purpose          String
+  /// NULL = the key never expires (ORG and PERSONAL only, R6). Auto-renew
+  /// needs 2+ days (owner 10-13, R30) and a term (FR-009: nothing to renew).
+  expiryDays       Int?                   @map("expiry_days")
+  autoRenew        Boolean                @default(false) @map("auto_renew")
+  createdAt        DateTime               @default(now()) @map("created_at")
+  decidedAt        DateTime?              @map("decided_at")
+  decision         ApiKeyRequestDecision?
+  decidedByHumanId String?                @map("decided_by_human_id")
+  /// Required on DENIED, 10–500 chars (bounded in core); the requester sees it.
+  denialReason     String?                @map("denial_reason")
+  /// The platform owner approved their own STAFF request (FR-003); shown on
+  /// every screen that lists the request or its keys.
+  selfApproved     Boolean                @default(false) @map("self_approved")
+  withdrawnAt      DateTime?              @map("withdrawn_at")
+  /// Who or what withdrew the request; set exactly when withdrawnAt is (R31,
+  /// migration 20261013120000_scoped_api_keys_closed_for_security). REQUESTER
+  /// only on an undecided request; ACCOUNT_SECURITY (password reset or ban)
+  /// on an undecided or an approved-but-uncollected one. Final once set.
+  withdrawalReason ApiKeyRequestWithdrawal? @map("withdrawal_reason")
+  /// When the holder collected the key (FR-005). Written only by the
+  /// api_keys_guard trigger on the collect insert; renewals do not touch it.
+  collectedAt      DateTime?              @map("collected_at")
+  /// When the lapse notice (14-day pending lapse or 7-day collect lapse,
+  /// FR-004 / FR-005) was sent; NULL = not sent. A record of a send, not a
+  /// derived status (precedent Event.addressRevealNotifiedAt).
+  lapseNotifiedAt  DateTime?              @map("lapse_notified_at")
+
+  requester       Human         @relation("ApiKeyRequestRequester", fields: [requesterHumanId], references: [id], onDelete: Cascade)
+  org             Organization? @relation("ApiKeyRequestOrg", fields: [orgId], references: [id], onDelete: Cascade)
+  decidedBy       Human?        @relation("ApiKeyRequestDecidedBy", fields: [decidedByHumanId], references: [id], onDelete: SetNull)
+  apiKeys         ApiKey[]      @relation("ApiKeyRequestScope")
+  apiKeysOrgScope ApiKey[]      @relation("ApiKeyRequestOrgScope")
+
+  // Targets of the two composite scope FKs from api_keys.
+  @@unique([id, requesterHumanId, subject, access])
+  @@unique([id, orgId])
+  // "My requests" list (newest first) + the per-holder cap count (FR-011).
+  @@index([requesterHumanId, createdAt])
+  // Org approval queue (orgId, decidedAt IS NULL) + FK maintenance on org delete.
+  @@index([orgId, decidedAt])
+  // Platform queue: undecided requests by subject (PERSONAL / STAFF /
+  // PLATFORM_WIDE, plus ORG fallbacks found through the org index).
+  @@index([subject, decidedAt])
+  // FK maintenance (SetNull) on human delete.
+  @@index([decidedByHumanId])
+  @@map("api_key_requests")
+}
+
+model PushDevice {
+  id         String       @id @default(uuid())
+  humanId    String
+  provider   PushProvider
+  token      String
+  platform   PushPlatform
+  appId      String?
+  enabled    Boolean      @default(true)
+  lastSeenAt DateTime?
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  human    Human         @relation(fields: [humanId], references: [id], onDelete: Cascade)
+  receipts PushReceipt[]
+
+  @@unique([provider, token])
+  @@index([humanId])
+}
+
+/// Outbox of Expo push *tickets* awaiting their delivery receipt. Expo reports
+/// many dead installs (DeviceNotRegistered) only in the receipt phase ~15min
+/// after the send ticket returns ok, so the send path persists one row per
+/// ok-ticket and the scheduled `push.drain-receipts` job polls
+/// getPushNotificationReceiptsAsync for due rows: invalid-token receipts
+/// disable the device, every resolved (or expired — Expo prunes receipts
+/// after ~24h) row is deleted, so the table drains to empty.
+model PushReceipt {
+  id           String   @id @default(uuid())
+  /// Expo push ticket id (the receipt id). Unique so overlapping sends /
+  /// createMany retries can skipDuplicates.
+  ticketId     String
+  pushDeviceId String
+  /// Receipt-poll attempts that found NO receipt yet; the drain gives up and
+  /// deletes the row after a small budget (Expo prunes receipts after ~24h).
+  attempts     Int      @default(0)
+  /// Do not poll before this time (send + ~15min, pushed back on each miss).
+  checkAfter   DateTime
+  createdAt    DateTime @default(now())
+
+  device PushDevice @relation(fields: [pushDeviceId], references: [id], onDelete: Cascade)
+
+  @@unique([ticketId])
+  @@index([checkAfter])
+  @@index([pushDeviceId])
+}

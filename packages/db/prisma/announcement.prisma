@@ -1,0 +1,44 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Announcement — Broadcast messaging sent by humans on behalf of an org/event.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Announcement {
+  id           String                   @id @default(uuid())
+  orgId        String
+  eventId      String?
+  subject      String
+  bodyDoc      Json                     // ProseMirror JSON document
+  bodyHtml     String                   // Pre-rendered HTML for email delivery
+  /// Explicit opt-in for rendering announcement content on public entity pages.
+  publicOnEntityPage Boolean            @default(false)
+  audienceType AnnouncementAudienceType
+  audienceRef  String?                  // eventId or contactListId depending on audienceType
+
+  /// JSON filter for advanced audience targeting.
+  /// Shape varies by audienceType:
+  ///   EVENT_TICKET_TIER: { eventId: string, tierIds: string[] }
+  ///   MULTIPLE_EVENTS:   { eventIds: string[] }
+  audienceFilter Json?
+
+  /// Optional contact list to exclude from the audience.
+  excludedContactListId String?
+
+  /// Number of recipients at the time of sending (null for legacy rows).
+  recipientCount Int?
+
+  sentAt       DateTime?
+  sentBy       String                   // humanId of the sender
+
+  org   Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  event Event?       @relation(fields: [eventId], references: [id], onDelete: SetNull)
+  human Human        @relation("AnnouncementSender", fields: [sentBy], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([orgId, createdAt])
+  @@index([orgId, publicOnEntityPage, sentAt])
+  @@index([eventId])
+  @@index([sentBy])
+  @@index([sentBy, publicOnEntityPage, sentAt])
+}

@@ -1,0 +1,1191 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Event — Categories, tags, events, templates, series, images, audio,
+//         featured, slugs, unlocks, magic links, event-human associations.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Platform-curated taxonomy. Organizers pick exactly one per event.
+model Category {
+  id        String   @id @default(uuid())
+  slug      String   @unique
+  name      String   @unique
+  active    Boolean  @default(true)
+  sortOrder Int      @default(0)
+  /// schema.org Event `@type` emitted in event JSON-LD for events in this
+  /// category (e.g. "MusicEvent"). Plain string (NOT a Prisma enum) so the
+  /// supported set can evolve in code; the code-side allowlist
+  /// (EVENT_SCHEMA_TYPES in @th/types) is the only validation gate, and the
+  /// SEO builder falls back to "Event" for any value it doesn't recognise.
+  seoType   String   @default("Event")
+  /// Non-English names keyed by locale, e.g. {"es":"Música"}. English lives
+  /// in `name` (and stays the slug source); an absent key means no
+  /// translation and readers fall back to `name`. Values are validated and
+  /// kept unique per locale (case-insensitive) by the category use cases
+  /// inside `categories.lockNaming()`; there is no DB index on them.
+  nameTranslations Json @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  events Event[]
+  /// Calendars using this category as their event-creation default
+  /// (venue-hierarchy FR-002).
+  defaultForCalendars Calendar[] @relation("CalendarDefaultCategory")
+  /// URL slugs per locale, current and old (spanish-seo FR-007). `slug`
+  /// above stays as a read copy of the current `en` row during that build.
+  slugs CategorySlug[]
+
+  @@index([active])
+  @@index([sortOrder])
+}
+
+/// One URL slug of a category in one locale (spanish-seo FR-007, R14–R20).
+/// A slug is unique per locale across all categories, current or old, so an
+/// old URL can never be taken by another category. Exactly one row per
+/// (categoryId, locale) has `isCurrent = true`; the category use cases
+/// enforce that inside `categories.lockNaming()`. There is deliberately no
+/// partial unique index for it (owner KISS ruling; Prisma cannot model one
+/// and it would show as migration drift). Rows with `isCurrent = false` are
+/// kept so old URLs 308 to the current slug; they are never removed one by
+/// one. Deleting the category cascades and frees all its slugs (R19).
+/// `Category.slug` stays as a read copy of the current `en` slug for now.
+model CategorySlug {
+  id         String   @id @default(uuid())
+  categoryId String
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  /// Locale code, e.g. "en" or "es".
+  locale     String
+  /// ASCII slug (deriveCategorySlug / categorySlugIssue rules).
+  slug       String
+  isCurrent  Boolean
+  createdAt  DateTime @default(now())
+
+  @@unique([locale, slug])
+  @@index([categoryId, locale])
+}
+
+enum EventCategoryRequestKind {
+  CATEGORY
+}
+
+enum EventCategoryRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model EventCategoryRequest {
+  id                  String                     @id @default(uuid())
+  kind                EventCategoryRequestKind
+  status              EventCategoryRequestStatus @default(PENDING)
+  name                String
+  slug                String
+  categoryId          String?
+  categorySlug        String?
+  categoryName        String?
+  eventId             String?
+  requesterHumanId    String
+  reviewedByHumanId   String?
+  reviewNote          String?
+  resolvedCategoryId  String?
+  /// The requester's UI locale when they asked ("en" | "es"), so the
+  /// approval form can put `name` under that language. Null = English
+  /// (and every row older than category translations).
+  locale              String?
+  createdAt           DateTime                   @default(now())
+  updatedAt           DateTime                   @updatedAt
+  reviewedAt          DateTime?
+
+  @@index([status, createdAt])
+  @@index([kind, slug])
+  @@index([categoryId, status])
+}
+
+/// Community edit-suggestion queue for COMMUNITY listings. Anyone (anonymous
+/// allowed) proposes a whitelisted field diff; a COMMUNITY_MODERATOR reviews.
+/// APPROVE atomically applies non-conflicting fields + writes an AuditLog row.
+/// Mirrors the EventCategoryRequest request → PENDING → review pattern
+/// (reviewer/submitter human ids are plain strings, no FK, like that model).
+model EventEditSuggestion {
+  id                String                    @id @default(uuid())
+  eventId           String
+  /// Null = anonymous submission.
+  submitterHumanId  String?
+  /// DEPRECATED — always NULL. Held the raw submitter IP until migration
+  /// 20260929160000 nulled it; no code reads or writes it. Dropped by a later
+  /// contract migration once every deploy runs the hash-only code.
+  submitterIp       String?
+  /// Keyed HMAC of the submitter's IP (never the IP itself), for the soft
+  /// per-IP flood cap. Its own HKDF key (lib/security/network-identity.ts), so
+  /// it cannot be joined to sign-in sightings. Cleared after ~30 days by
+  /// `security.purge-network-sightings`. Null = no IP / cleared.
+  submitterIpHash   String?
+  /// Whitelisted proposed values keyed by field name.
+  fields            Json
+  /// Snapshot of the whitelisted fields at draft time (conflict detection, FR-009).
+  baseVersion       Json
+  note              String?
+  status            EventEditSuggestionStatus @default(PENDING)
+  reviewedByHumanId String?
+  reviewedAt        DateTime?
+  reviewNote        String?
+  /// Fields actually applied on APPROVE (non-conflicting subset).
+  appliedFields     Json?
+  /// Fields skipped on APPROVE because the event changed since baseVersion.
+  conflictedFields  Json?
+  createdAt         DateTime                  @default(now())
+  updatedAt         DateTime                  @updatedAt
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@index([status, createdAt])
+  @@index([eventId, status])
+  @@index([submitterIpHash, createdAt])
+}
+
+/// Application to become a COMMUNITY_MODERATOR. Platform ADMIN reviews;
+/// APPROVE grants the HumanRole + audits. Mirrors EventCategoryRequest shape
+/// (applicant/reviewer human ids as plain strings, no FK).
+model CommunityModeratorApplication {
+  id                String                              @id @default(uuid())
+  applicantHumanId  String
+  statement         String?
+  status            CommunityModeratorApplicationStatus @default(PENDING)
+  reviewedByHumanId String?
+  reviewedAt        DateTime?
+  reviewNote        String?
+  createdAt         DateTime                            @default(now())
+  updatedAt         DateTime                            @updatedAt
+
+  @@index([status, createdAt])
+  @@index([applicantHumanId, status])
+}
+
+/// Personal "I'm going" marker for RSVP events. Idempotent per
+/// (eventId, humanId), reversible, and never exposed as a public count.
+model EventRsvp {
+  id        String   @id @default(uuid())
+  eventId   String
+  humanId   String
+  createdAt DateTime @default(now())
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  human Human @relation("EventRsvps", fields: [humanId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, humanId])
+  @@index([humanId])
+}
+
+/// A single expanded occurrence of a recurring event. Populated for events
+/// with a `recurrenceSchedule` (currently community listings). Single-date
+/// events have NO rows and use `Event.startsAt` directly. `ordinal` is a
+/// per-event insertion-order identity (stable across re-expansions); dates
+/// carry their own start/end so DST + duration are preserved per occurrence.
+model EventDate {
+  id        String          @id @default(uuid())
+  eventId   String
+  ordinal   Int
+  startsAt  DateTime
+  endsAt    DateTime?
+  status    EventDateStatus @default(SCHEDULED)
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  event       Event           @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  rsvps         EventDateRsvp[]
+  rsvpNotices   RsvpNotice[]    @relation("EventDateRsvpNotices")
+  rsvpReminders RsvpReminder[]  @relation("EventDateRsvpReminders")
+  openCallDateChoices OpenCallDateChoice[]
+
+  @@unique([eventId, ordinal])
+  @@index([eventId, startsAt])
+  @@index([startsAt])
+}
+
+/// Personal "I'm going" marker for ONE date of a recurring event. Idempotent
+/// per (eventDateId, humanId), reversible, never exposed as a public count.
+/// Table created ahead of the per-date RSVP use-cases (later slice); mirrors
+/// EventRsvp but keyed to an EventDate instead of the parent Event.
+model EventDateRsvp {
+  id          String   @id @default(uuid())
+  eventDateId String
+  humanId     String
+  createdAt   DateTime @default(now())
+
+  eventDate EventDate @relation(fields: [eventDateId], references: [id], onDelete: Cascade)
+  human     Human     @relation("EventDateRsvps", fields: [humanId], references: [id], onDelete: Cascade)
+
+  @@unique([eventDateId, humanId])
+  @@index([humanId])
+}
+
+/// Organizer-created hashtags. Lowercased, alphanumeric + hyphens.
+/// Auto-created on first use; shared across events for discoverability.
+model Tag {
+  id        String     @id @default(uuid())
+  slug      String     @unique /// Canonical form: lowercase, alphanumeric + hyphens.
+  name      String     /// Display form supplied at creation time (e.g. "Live Music").
+  createdAt DateTime   @default(now())
+
+  eventTags EventTag[]
+}
+
+/// Many-to-many join between Event and Tag.
+model EventTag {
+  id        String   @id @default(uuid())
+  eventId   String
+  tagId     String
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  tag   Tag   @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, tagId])
+  @@index([tagId])
+  @@index([eventId, sortOrder])
+}
+
+/// One row on an event's lineup. Identity (SQL-only CHECK
+/// "EventHuman_identity_check", migration 20261001120000_lineup_v3): AT MOST
+/// ONE of humanId / orgId — a person or a group, never both (lineup v3 L18 /
+/// FR-015). A linked row MAY also carry externalName as its displayed stage
+/// name (`linkHuman`, the pre-bill headliner fallback), so this is not
+/// "exactly one of three"; "names someone" stays app-enforced
+/// (attachEventHuman) — see the migration for why.
+model EventHuman {
+  id           String         @id @default(uuid())
+  eventId      String
+  /// When linked to a registered human. Null for free-text entries.
+  humanId      String?
+  /// When the row is a group (Organization) — lineup v3 FR-015. Never set
+  /// together with humanId.
+  orgId        String?
+  /// Free-text name for unregistered humans.
+  externalName String?
+  /// Free-text URL (social, website) for unregistered humans.
+  externalUrl  String?
+  /// Role on this event. Constrained enum with OTHER escape hatch.
+  role         EventHumanRole @default(PERFORMER)
+  /// Free-text label when role is OTHER (e.g., "Stage Manager").
+  customRoleLabel String?
+  /// Display order (0 = headliner/primary, ascending = supporting).
+  sortOrder    Int            @default(0)
+
+  event Event  @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  human Human? @relation("EventHumans", fields: [humanId], references: [id], onDelete: Cascade)
+  org   Organization? @relation("EventHumanOrg", fields: [orgId], references: [id], onDelete: Cascade)
+
+  ticketAttributions TicketAttribution[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// One link per registered human per event; free-text duplicates are allowed.
+  @@unique([eventId, humanId])
+  /// One link per group per event (NULLs distinct, like the human key).
+  @@unique([eventId, orgId])
+  @@index([humanId])
+  @@index([orgId])
+  @@index([eventId, sortOrder])
+}
+
+model EventTemplate {
+  id               String             @id @default(uuid())
+  ownerScope       TemplateOwnerScope
+  ownerId          String
+  name             String
+  description      String?
+  active           Boolean            @default(true)
+  defaults         Json?
+  /// Nullable: creator reference is detached (SetNull) on account deletion.
+  createdByHumanId String?
+  updatedByHumanId String?
+  archivedAt       DateTime?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  createdByHuman Human?        @relation("EventTemplateCreatedBy", fields: [createdByHumanId], references: [id], onDelete: SetNull)
+  updatedByHuman Human?        @relation("EventTemplateUpdatedBy", fields: [updatedByHumanId], references: [id], onDelete: SetNull)
+  eventSeries    EventSeries[] @relation("SeriesTemplate")
+
+  @@index([ownerScope, ownerId, active])
+  @@index([ownerScope, ownerId, name])
+  @@index([createdByHumanId])
+  @@index([updatedByHumanId])
+}
+
+model EventSeries {
+  id               String                @id @default(uuid())
+  ownerScope       EventSeriesOwnerScope
+  ownerId          String
+  name             String
+  nameNormalized   String
+  description      String?
+  active           Boolean               @default(true)
+  timezone         String
+  schedule         Json
+  templateId       String?
+  defaults         Json?
+  /// Nullable: creator reference is detached (SetNull) on account deletion.
+  createdByHumanId String?
+  updatedByHumanId String?
+  archivedAt       DateTime?
+  createdAt        DateTime              @default(now())
+  updatedAt        DateTime              @updatedAt
+
+  template       EventTemplate?          @relation("SeriesTemplate", fields: [templateId], references: [id], onDelete: SetNull)
+  createdByHuman Human?                  @relation("EventSeriesCreatedBy", fields: [createdByHumanId], references: [id], onDelete: SetNull)
+  updatedByHuman Human?                  @relation("EventSeriesUpdatedBy", fields: [updatedByHumanId], references: [id], onDelete: SetNull)
+  occurrences    EventSeriesOccurrence[]
+  applicationForms EventApplicationForm[]
+
+  @@unique([ownerScope, ownerId, nameNormalized])
+  @@index([ownerScope, ownerId, active])
+  @@index([ownerScope, ownerId, name])
+  @@index([templateId])
+  @@index([createdByHumanId])
+  @@index([updatedByHumanId])
+}
+
+model EventSeriesOccurrence {
+  id        String                      @id @default(uuid())
+  seriesId  String
+  ordinal   Int
+  startsAt  DateTime
+  endsAt    DateTime?
+  status    EventSeriesOccurrenceStatus @default(PLANNED)
+  eventId   String?                     @unique
+  overrides Json?
+  createdAt DateTime                    @default(now())
+  updatedAt DateTime                    @updatedAt
+
+  series EventSeries @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+  event  Event?      @relation("SeriesOccurrenceEvent", fields: [eventId], references: [id], onDelete: SetNull)
+  openCallDateChoices OpenCallDateChoice[]
+
+  @@unique([seriesId, ordinal])
+  @@index([seriesId, startsAt])
+  @@index([status])
+}
+
+model Event {
+  id                  String          @id @default(uuid())
+  humanId             String? // optional direct human owner (e.g. for personal events)
+  orgId               String?
+  placeId             String?
+  savedLocationId     String?
+  categoryId          String?
+  addressText         String?
+  countryCode         String?
+  region              String?
+  locality            String?
+  postalCode          String?
+  lat                 Float?
+  lng                 Float?
+  geohash6            String? // coarse spatial index (geohash length 6 ~ ~1km x 0.6km) for bucketing/search
+  geohash8            String? // finer spatial index (geohash length 8 ~ ~150m x 150m)
+  title               String
+  startsAt            DateTime
+  endsAt              DateTime
+  status              EventStatus     @default(DRAFT)
+  visibility          EventVisibility @default(PUBLIC)
+  /// TICKETED (default) = full checkout/tax/payout pipeline. RSVP = free
+  /// attendance ("I'm going") with no ticket types, orders, or money paths.
+  attendanceMode      EventAttendanceMode @default(TICKETED) @map("attendance_mode")
+  /// OWNED (default) = humanId/orgId owner. COMMUNITY = ownerless listing
+  /// maintained via the edit-suggestion queue. A one-directional DB check
+  /// ("event_community_ownerless_rsvp_check") enforces COMMUNITY => ownerless
+  /// AND RSVP (FR-002). OWNED => has-owner is a use-case invariant only:
+  /// humanId is onDelete SetNull, so human deletion may orphan OWNED events.
+  stewardship         EventStewardship @default(OWNED)
+  gateType            EventGateType   @default(NONE)
+  locationMode        EventLocationMode @default(EXACT)
+  /// Public pre-reveal precision for OBSCURED events: non-null = obfuscated
+  /// circle of this radius; NULL = FULLY HIDDEN (no public map/coordinates at
+  /// all — documented sentinel). Ignored for EXACT events.
+  locationRadiusMeters Int?             @default(500)
+  locationLabel       String?
+  /// When the exact address is revealed to ticket holders. REQUIRED (non-null)
+  /// for OBSCURED events — there is no 'never reveal' state; null only for
+  /// EXACT events (backfilled by migration 20260707100000).
+  addressRevealAt     DateTime?         @map("address_reveal_at")
+  /// Preset that produced `addressRevealAt`. Stored so the edit UI can show a
+  /// labeled choice (e.g. "24 hours before") rather than a raw datetime.
+  addressRevealPreset AddressRevealPreset? @map("address_reveal_preset")
+  /// Cursor for the scheduled address-reveal notification job (Step B of the
+  /// location-visibility-reveal spec): stamped when the reveal fan-out for
+  /// this event has been dispatched; NULL = not yet fanned out. Backfilled to
+  /// now() for events whose reveal already passed so the job never retro-spams
+  /// historical events.
+  addressRevealNotifiedAt DateTime?     @map("address_reveal_notified_at") @db.Timestamptz(6)
+  slug                String?         @unique
+  shortId             String?         @unique
+  regionCode          String?
+  publishedAt         DateTime?
+  /// The status the event had at the moment it was cancelled: stamped by
+  /// `EventsRepo.cancel` from the row itself, in the same transaction as the
+  /// flip to CANCELLED. NULL = not cancelled, or cancelled before this column
+  /// existed (2026-10-17). The public calendar feeds list a cancelled event
+  /// only when this is PUBLISHED (NULL is excluded): `publishedAt` is never
+  /// cleared by unpublish, so it cannot tell a show cancelled while public
+  /// from one unpublished, edited, then cancelled.
+  cancelledFromStatus EventStatus?
+  defaultLocale       String?         @map("default_locale")
+  /// IANA timezone identifier (e.g. "America/Chicago") for this event.
+  /// Used to format dates/times (including address-reveal time) consistently
+  /// regardless of the viewer's locale. Stamped at creation from the linked
+  /// EventSeries, or defaults to "America/Chicago".
+  timezone            String          @default("America/Chicago")
+  listingPriority     Int?            @map("listing_priority")
+  passwordHash        String?
+  passwordUpdatedAt   DateTime?
+  waitlistStatus      WaitlistStatus  @default(DISABLED)
+  waitlistPublishAt   DateTime?
+  waitlistDescription String?
+  waitlistCap         Int?
+
+  /// Whether a confirmation email is sent when someone joins the waitlist.
+  waitlistEmailEnabled  Boolean  @default(false) @map("waitlist_email_enabled")
+  /// Custom subject line for the waitlist confirmation email.
+  waitlistEmailSubject  String?  @map("waitlist_email_subject")
+  /// Rich-text body (ProseMirror JSON) for the waitlist confirmation email.
+  waitlistEmailBody     Json?    @map("waitlist_email_body")
+
+  /// Whether volunteering is enabled for this event.
+  volunteeringEnabled   Boolean  @default(false)
+  /// Event-level default for auto-approve of volunteer signups.
+  volunteerAutoApprove  Boolean  @default(false)
+  /// When true AND the event has an assigned waiver, volunteer signups
+  /// require waiver acceptance (recorded as VolunteerWaiverAcceptance).
+  volunteerWaiverRequired Boolean @default(false)
+  /// Optional intro text shown on the volunteer signup page.
+  volunteerIntroText    String?
+
+  /// Minimum age required for attendees. Null means no age restriction.
+  ageLimit              Int?       @map("age_limit")
+
+  /// ISO 4217 currency code for this event's pricing (e.g. "usd", "eur").
+  /// Stamped automatically at publish time from the organizer's Stripe Connect
+  /// account `defaultCurrency`. Null while the event is still a draft.
+  currency            String?         @db.VarChar(3)
+
+  /// Deadline for self-serve refund requests. When null, defaults to startsAt.
+  /// Organizers can set this earlier than event start to stop refunds sooner.
+  refundCutoffAt      DateTime?
+
+  /// Optional override of the reseller payout release window in whole days.
+  /// Only honored when the platform capability allowlist permits it.
+  resalePayoutReleaseDaysOverride Int?
+
+  // ── Tax rate (stamped from SavedLocation / Place at publish time) ──────────
+  /// Admission tax rate in basis points (e.g. 975 = 9.75%). Null = tax-free or
+  /// not yet resolved. Used at checkout for simple integer multiplication
+  /// instead of calling an external tax API per transaction.
+  admissionTaxRateBps Int?       @map("admission_tax_rate_bps")
+  taxRateSource       String?    @map("tax_rate_source") // "ziptax" | "manual" | "exempt" | "exempt:tn-instruction"
+  /// Organizer-attested: this event's admission is for INSTRUCTION only
+  /// (classes / lessons / courses / teaching), not recreation. Tennessee
+  /// exempts instructional admission charges from sales/amusement tax, so when
+  /// this is true AND the frozen tax situs is US/TN the admission rate resolves
+  /// to 0 with source "exempt:tn-instruction". The flag alone does NOT exempt
+  /// outside TN — the normal rate still applies (see
+  /// packages/core/src/lib/tax/instruction-exemption.ts).
+  instructionalAdmission Boolean @default(false) @map("instructional_admission")
+
+  // Event builder draft JSON (ProseMirror + structured blocks)
+  body                Json?
+
+  /// Recurrence definition (an `EventSeriesSchedule` payload — RRULE or
+  /// FIXED_DATES) for events that repeat as ONE listing (currently community
+  /// listings, e.g. a weekly open mic). Null = single-date event (unchanged
+  /// behavior). When set, the expanded occurrences live in `EventDate` rows
+  /// and `Event.startsAt`/`endsAt` mirror the FIRST upcoming date so existing
+  /// discovery/sorting/SEO queries treat it as one upcoming card. Timezone is
+  /// reused from `Event.timezone` (no separate recurrence timezone column).
+  recurrenceSchedule  Json?           @map("recurrence_schedule")
+
+  /// The primary/hero image displayed on event cards, listings, and social shares.
+  /// References an Image record that belongs to this event.
+  heroImageId         String?         @unique @map("hero_image_id")
+
+  // ── Venue hierarchy (venue-hierarchy FR-005) ───────────────────────────────
+  /// Physical space this event occupies. Space = physical blocking (conflict
+  /// detection keys on this). SetNull — deleting a space never deletes events.
+  /// Null for freeform-address events (no placeId), which stay outside the
+  /// space system.
+  spaceId    String?         @map("space_id")
+  /// Named programming stream ("calendar") this event shows on. Calendar
+  /// rendering filters on THIS column — never via the space join (a shared
+  /// space must not bleed one stream's events onto another's calendar).
+  /// SetNull — deleting a calendar never deletes events.
+  calendarId String?         @map("calendar_id")
+
+  // ── Venue confirmation (venue-confirmation-and-booking-intents spec,
+  // docs/specs/2026-08-27) ───────────────────────────────────────────────────
+  // Trust is PER EVENT: the venue vouches for THIS event at THIS place.
+  //
+  // Derived, never stored:
+  //   isVenueConfirmed = (venueConfirmedAt != null && venueConfirmationWithdrawnAt == null)
+  //                      OR the event owner (orgId / humanId) is a verified,
+  //                      unrevoked PlaceOwnership owner of placeId.
+  // Public rendering (venue name + link vs address-only) and availability /
+  // conflict blocking read that derivation ONLY. `placeId` is ALWAYS retained
+  // regardless of confirmation — withdrawal drops the event to address-only,
+  // it never detaches the place.
+  /// When the venue confirmed this event (or the migration stamped it for a
+  /// venue-owned event). Never cleared by withdrawal — see the derivation.
+  venueConfirmedAt               DateTime?
+  /// Staff human who confirmed. Plain id, no FK (house style).
+  venueConfirmedByHumanId        String?
+  /// The place the venue vouched for. The stamp is live ONLY while
+  /// `placeId === venueConfirmedPlaceId` — moving the event to another place
+  /// voids it WITHOUT a write (the derivation and every confirmed-only read
+  /// bind the stamp to the place, so a stamp can never travel with the row).
+  /// Plain id, no FK.
+  venueConfirmedPlaceId          String?
+  /// The BookingRequest that produced the confirmation, when one did. Plain
+  /// id, deliberately NOT a Prisma relation: BookingRequest.originEvent
+  /// already points Event ← BookingRequest, and a second FK back would form
+  /// a relation cycle Prisma's SetNull ordering can't resolve. Nullable;
+  /// dangling after the request is deleted (no FK to SetNull it).
+  venueConfirmationRequestId     String?
+  /// Set when the venue withdrew confirmation. Non-null = NOT confirmed even
+  /// though `venueConfirmedAt` is still stamped. Re-confirming clears it.
+  venueConfirmationWithdrawnAt   DateTime?
+  venueConfirmationWithdrawnReason String?  @db.VarChar(1000)
+  /// The event's `startsAt` AT THE MOMENT the venue stamped it — the date the
+  /// venue actually vouched for. Written by the stamp write itself
+  /// (`EventsRepo.setVenueConfirmation` copies the row's own `startsAt` in the
+  /// same transaction), so no stamp writer can forget it; cleared by
+  /// withdrawal. Read by ONE rule: a withheld venue's address reaches a
+  /// stamped third party's holders no earlier than
+  /// `max(startsAt, venueConfirmedStartsAt) − 24h`
+  /// (core `holderRevealSchedule`). Without it the floor tracked the LIVE
+  /// start, which the third party edits: confirm a show three months out,
+  /// move it to tomorrow, collect the reveal, move it back.
+  venueConfirmedStartsAt         DateTime?
+  /// freeze-the-deal FR-001: when the event's whole deal (PRIMARY and RESALE
+  /// terms, their lines, payees, costs off the top, payout schedule and the
+  /// resale clause) froze. Null = not frozen. Set on first publish or by the
+  /// organiser; never cleared (a frozen change keeps it, ruling F3).
+  dealFrozenAt                   DateTime?
+  /// Who froze it. Null with `dealFrozenAt` set = frozen automatically (first
+  /// publish or the one-time backfill). SET NULL when the human is deleted.
+  dealFrozenByHumanId            String?
+
+  payoutTermsId      String?         @map("payout_terms_id")
+  resalePayoutTermsId String?        @map("resale_payout_terms_id")
+  /// FK to merch-revenue payout terms. Null until POS goes live and the
+  /// organizer composes a merch split. Schema-only in v1.
+  merchPayoutTermsId  String?        @map("merch_payout_terms_id")
+  placeLayoutId      String?         @map("place_layout_id")
+  waiverTemplateId   String?         @map("waiver_template_id")
+  currentAttestationId String?       @unique @map("current_attestation_id")
+  /// One shared note (holds-without-a-request FR-012): plain text, read and
+  /// edited by anyone with admin access to the event, last-write-wins with
+  /// who and when. noteUpdatedByHumanId is a plain id, no FK (house style).
+  note                 String?   @db.VarChar(2000)
+  noteUpdatedByHumanId String?
+  noteUpdatedAt        DateTime?
+
+  human            Human?         @relation(fields: [humanId], references: [id], onDelete: SetNull)
+  org              Organization?  @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  place            Place?         @relation(fields: [placeId], references: [id], onDelete: SetNull)
+  space            Space?         @relation("EventSpace", fields: [spaceId], references: [id], onDelete: SetNull)
+  calendar         Calendar?      @relation("EventCalendar", fields: [calendarId], references: [id], onDelete: SetNull)
+  savedLocation    SavedLocation? @relation("SavedLocationEvents", fields: [savedLocationId], references: [id], onDelete: SetNull)
+  category         Category?      @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  payoutTerms      PayoutTerms?   @relation("EventPrimaryPayoutTerms", fields: [payoutTermsId], references: [id])
+  resalePayoutTerms PayoutTerms?  @relation("EventResalePayoutTerms", fields: [resalePayoutTermsId], references: [id])
+  merchPayoutTerms  PayoutTerms?  @relation("EventMerchPayoutTerms", fields: [merchPayoutTermsId], references: [id])
+  heroImage        Image?         @relation("EventHeroImage", fields: [heroImageId], references: [id], onDelete: SetNull)
+  placeLayout      PlaceLayout?   @relation("EventPlaceLayout", fields: [placeLayoutId], references: [id], onDelete: SetNull)
+  waiverTemplate   WaiverTemplate? @relation(fields: [waiverTemplateId], references: [id], onDelete: SetNull)
+  currentAttestation EventAttestation? @relation("EventCurrentAttestation", fields: [currentAttestationId], references: [id], onDelete: SetNull)
+  dealFrozenByHuman  Human?          @relation("EventDealFrozenBy", fields: [dealFrozenByHumanId], references: [id], onDelete: SetNull)
+
+  ticketTypes            TicketType[]
+  orders                 Order[]
+  tickets                Ticket[]
+  ticketScans            TicketScan[]
+  seatSections           SeatSection[]
+  seriesOccurrence       EventSeriesOccurrence?       @relation("SeriesOccurrenceEvent")
+  feedbackRequests       FeedbackRequest[]
+  digestLogs             NotificationDigestLog[]
+  slugHistory            EventSlugHistory[]
+  featuredPlacement      FeaturedEvent?               @relation("EventFeaturedPlacement")
+  applicationForms       EventApplicationForm[]
+  openCallDateChoices    OpenCallDateChoice[]
+  applicationSubmissions EventApplicationSubmission[]
+  waitlistEntries        EventWaitlistEntry[]
+  inviteLists            EventInviteList[]
+  images                 Image[]
+  audioUploads           AudioUpload[]
+  settlements            Settlement[]
+  // ── P4b (deal terms) ──
+  settlementSheet        SettlementSheet?
+  // freeze-the-deal FR-005: every change made to the deal while frozen.
+  dealChanges            DealChange[]
+  claims                 Claim[]
+  resaleListings         ResaleListing[]
+  unlocks                EventUnlock[]
+  invites                EventInvite[]
+  inviteComplaints       EventInviteComplaint[]
+  attestations           EventAttestation[] @relation("EventAttestationHistory")
+  dailyStats             EventDailyStats[]
+  resalePriceSnapshots   ResalePriceSnapshot[]
+  eventHumans            EventHuman[]
+  eventTags              EventTag[]
+  ticketAttributions     TicketAttribution[]
+  postEventPrompts       PostEventPrompt[]        @relation("EventPostEventPrompts")
+  attendeeReviews        AttendeeReview[]         @relation("EventAttendeeReviews")
+  agreement              Agreement?               @relation("AgreementEvent")
+  draftOfAgreement       Agreement?               @relation("AgreementDraftEvent")
+  // Organizer booking requests that attached this event (TO_PERFORMER).
+  attachedBookingRequests BookingRequest[]        @relation("BookingRequestAttachedEvent")
+  // The event-first booking request this event's save created (at most one:
+  // BookingRequest.originEventId is @unique). Singular optional, the house
+  // shape for a unique FK back-relation (see `agreement` / `draftOfAgreement`).
+  bookingRequestOriginating BookingRequest?       @relation("BookingRequestOriginEvent")
+  // Request-less holds booked into this event (holds-without-a-request FR-008).
+  bookingHolds           BookingHold[]            @relation("BookingHoldEvent")
+  announcements          Announcement[]
+  volunteerRoles         EventVolunteerRole[]
+  volunteerSignups       VolunteerSignup[]
+  placeReviews           PlaceReview[]        @relation("PlaceReviewEvent")
+  supportThreads         SupportThread[]      @relation("SupportThreadEvent")
+  editSuggestions        EventEditSuggestion[]
+  rsvps                  EventRsvp[]
+  saves                  EventSave[]          @relation("EventSaves")
+  changeNotices          EventChangeNotice[]
+  rsvpNotices            RsvpNotice[]         @relation("EventRsvpNotices")
+  rsvpReminders          RsvpReminder[]       @relation("EventRsvpReminders")
+  dates                  EventDate[]
+  arrivalAreas           ArrivalArea[]          @relation("ArrivalAreaEvent")
+  arrivalAreaHides       EventArrivalAreaHide[] @relation("EventArrivalAreaHides")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  // NOTE: enforce (placeId is not null) XOR (savedLocationId is not null OR addressText/lat/lng present) in application or DB check migration.
+
+  @@index([placeId])
+  // Calendar/availability confirmed-only reads at a place
+  // (venue-confirmation-and-booking-intents spec).
+  @@index([placeId, venueConfirmedAt])
+  // Backs the "a PUBLISHED event at this place ENDED since lastCalculatedAt"
+  // arm of PlaceStatsRepo.listStalePlaceIds (venue-track-record FR-008 /
+  // NFR-005): per place, a bounded range scan on endsAt instead of walking
+  // every event at the place.
+  @@index([placeId, endsAt])
+  // Space-scoped conflict detection: confirmed events on one space in a time
+  // window (venue-hierarchy FR-006).
+  @@index([spaceId, startsAt])
+  // Calendar-surface rendering + embeds filter on calendarId (FR-005/FR-010).
+  @@index([calendarId, startsAt])
+  @@index([geohash6])
+  @@index([geohash8])
+  @@index([categoryId])
+  // Backs the geo×category SEO landing page fetch: narrows to a category then
+  // range-scans upcoming events before the (unindexed) slug-folded locality
+  // match. See EventsRepo.listPublishedByCategoryAndCity.
+  @@index([categoryId, startsAt])
+  @@index([orgId, listingPriority])
+  @@index([humanId, listingPriority])
+  // Backs EventsRepo.discoverActiveCities: filters PUBLISHED + PUBLIC upcoming
+  // events then groups by locality for the home-page "city by city" marquee.
+  @@index([status, visibility, startsAt])
+  // freeze-the-deal: the SET NULL on a human's delete finds their freezes.
+  @@index([dealFrozenByHumanId])
+}
+
+/// Private keep-for-later bookmark for ANY event (ticketed or community);
+/// doubles as WATCHING for change notifications (savers ∪ RSVPers).
+/// Idempotent per (eventId, humanId), reversible, and never exposed as a
+/// public count. Parallel primitive to EventRsvp (attendance intent) and
+/// distinct from EntityFollow (page-level follows, not events).
+model EventSave {
+  id        String   @id @default(uuid())
+  eventId   String
+  humanId   String
+  createdAt DateTime @default(now())
+
+  event Event @relation("EventSaves", fields: [eventId], references: [id], onDelete: Cascade)
+  human Human @relation("HumanSavedEvents", fields: [humanId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, humanId])
+  @@index([humanId, createdAt])
+}
+
+/// Transactional outbox for event-change notifications. A use-case that
+/// cancels/reschedules/archives an event writes one row in the SAME
+/// repos.tx as the mutation; a scheduled jobs-service task drains
+/// undispatched rows (dispatchedAt IS NULL, oldest first) and fans out to
+/// watchers. The payload is denormalized JSON — the job layer types it.
+model EventChangeNotice {
+  id           String          @id @default(uuid())
+  eventId      String
+  changeType   EventChangeType
+  payload      Json
+  createdAt    DateTime        @default(now())
+  dispatchedAt DateTime?
+  attempts     Int             @default(0)
+  // Durable per-recipient dedup: humanIds already `notify()`d for THIS notice.
+  // The drain subtracts these before fanning out, so a partial fan-out that
+  // retries on the next tick only targets the still-un-notified remainder —
+  // no recipient is ever notified twice (survives the notify idempotency TTL).
+  notifiedHumanIds String[] @default([])
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@index([dispatchedAt, createdAt])
+  @@index([eventId])
+}
+
+/// Single-recipient outbox for RSVP confirmation notifications. rsvp-to-event
+/// enqueues one row per NEWLY-created RSVP (best-effort sequential write — the
+/// RSVP upsert deliberately runs outside any transaction, see the event-rsvps
+/// adapter docstring). A scheduled jobs-service task drains undispatched rows
+/// (dispatchedAt IS NULL, oldest first) and sends one in-app + email
+/// confirmation per row. No payload column: event details are resolved at
+/// dispatch time; a notice whose event vanished/unpublished or whose RSVP was
+/// cancelled before dispatch is dispatched away without sending.
+///
+/// It carries a SECOND kind now (see RsvpNoticeKind): `cancelEventDate` writes
+/// one DATE_CANCELLED row per LIVE per-date RSVP, in the same transaction as
+/// the SCHEDULED -> CANCELLED flip, so "that night is off" rides the same
+/// drain, retry, dead-letter and retention machinery as the confirmation.
+model RsvpNotice {
+  id           String    @id @default(uuid())
+  eventId      String
+  /// NULL for an event-level RSVP confirmation; set for a per-date RSVP on a
+  /// recurring listing — the drain then resolves the DATE's startsAt/endsAt
+  /// (and skips if the date vanished / was called off / was un-RSVP'd).
+  eventDateId  String?
+  humanId      String
+  /// What this row is FOR - see RsvpNoticeKind. Defaults to CONFIRMATION so
+  /// every row written before the call-off feature keeps its meaning.
+  kind         RsvpNoticeKind @default(CONFIRMATION)
+  createdAt    DateTime  @default(now())
+  dispatchedAt DateTime?
+  attempts     Int       @default(0)
+
+  event     Event      @relation("EventRsvpNotices", fields: [eventId], references: [id], onDelete: Cascade)
+  eventDate EventDate? @relation("EventDateRsvpNotices", fields: [eventDateId], references: [id], onDelete: Cascade)
+  human     Human      @relation("HumanRsvpNotices", fields: [humanId], references: [id], onDelete: Cascade)
+
+  @@index([dispatchedAt, createdAt])
+  @@index([eventId])
+  @@index([eventDateId])
+  @@index([humanId])
+}
+
+/// Durable send-ledger for the 24h-before RSVP reminder
+/// (community.rsvp-reminders-24h). One row per
+/// (RSVP subject x human x CHANNEL) the job has claimed, and the unique
+/// indexes ARE the idempotency guarantee: an overlapping cron tick, a re-run,
+/// or a scheduler retry loses the insert race and sends nothing. Mirrors
+/// VolunteerShiftNotification (`@@unique([signupId, kind, channel])`,
+/// claim-then-send, claim released on a failed send) rather than RsvpNotice's
+/// outbox shape: there is no enqueue site, the due set is derived from the
+/// RSVP rows every tick.
+///
+/// PER CHANNEL, not per reminder. `notify` fans one reminder out to in-app /
+/// push / email / sms and reports each channel's outcome SEPARATELY - a
+/// mailer outage comes back as `email: { status: "failed" }` while the in-app
+/// row is already persisted. A subject-level row could only record "the whole
+/// thing happened", so the failed email was indistinguishable from a delivered
+/// one and was never retried. With a row per channel the delivered in-app
+/// stays settled (no duplicate nudge) while the email is retried on the next
+/// tick, for as long as the date is still inside the catch-up window.
+///
+/// EXACTLY ONE of `eventDateId` / `eventId` is set:
+///   - `eventDateId` - a per-date RSVP on a recurring listing
+///     (EventDateRsvp). `eventId` is NULL; the event is reachable via the date.
+///   - `eventId` - an event-level RSVP on a single-date listing (EventRsvp).
+///     `eventDateId` is NULL.
+///
+/// Split that way ON PURPOSE. Postgres treats NULLs as distinct in a unique
+/// index, so a single (eventId, eventDateId, humanId, channel) index could not
+/// enforce the event-level case at all, while one (eventId, humanId, channel)
+/// index would wrongly collapse "RSVP'd to three Wednesdays" into a single
+/// reminder. Two single-subject indexes each constrain exactly the rows whose
+/// subject column is non-null. The one-of-two invariant is enforced by the
+/// "RsvpReminder_exactly_one_subject" CHECK added in the same migration.
+///
+/// ROW STATES (`claimedAt` / `sentAt` are deliberately two columns):
+///   - `sentAt` NOT NULL      - settled. Delivered, or declined by the channel
+///     itself (no push device, no email identity). Never retried.
+///   - `sentAt` NULL and `claimedAt` recent - IN FLIGHT. A tick owns it.
+///   - `sentAt` NULL and `claimedAt` stale  - outstanding: the send failed and
+///     released its claim, or the worker was evicted between the claim and the
+///     send. Re-claimable, which is what makes the job self-healing inside the
+///     2h catch-up tail instead of losing the reminder to a Cloud Run
+///     eviction. A single `sentAt DEFAULT now()` written at CLAIM time (the
+///     shape this table shipped with in review) made a claimed-never-sent row
+///     byte-identical to a delivered one: unqueryable, unalertable, and
+///     permanently excluded from the due set.
+/// `claimedAt` is set to the UNIX EPOCH by an explicit release, so a failed
+/// send is retried by the very next tick rather than waiting out the staleness
+/// window.
+///
+/// LEAK METRIC (alertable), stated so it can actually work:
+///   count(*) FROM "RsvpReminder"
+///   WHERE "sentAt" IS NULL
+///     AND "claimedAt" > to_timestamp(0)
+///     AND "claimedAt" < now() - interval '1 hour'
+/// The `> to_timestamp(0)` term is load bearing and was MISSING from the
+/// version this table shipped with (it still reads the old way in
+/// 20260912130000_rsvp_reminder_ledger, which is applied and must not be
+/// edited). A released claim is parked AT the epoch on purpose, so it is older
+/// than an hour the instant it is written: the naive form counts every healthy
+/// retry, never returns to zero, and is useless as an alert. What the
+/// corrected form counts is the real leak — a row a worker claimed and then
+/// died holding. A released row that is never retried (the 2h catch-up tail
+/// closed first) is also a lost reminder, but telling it apart from a pending
+/// one needs the subject's `startsAt`, so that check is a join, not a column
+/// scan, and is deliberately not this metric.
+///
+/// No retention purge job: a row is ~100 bytes and is deleted by the FK
+/// cascade when its event/date/human goes away - same posture as
+/// VolunteerShiftNotification.
+model RsvpReminder {
+  id          String    @id @default(uuid())
+  eventDateId String?
+  eventId     String?
+  humanId     String
+  /// "in_app" | "push" | "email" | "sms" - the comms channel keys, kept as
+  /// text (not an enum) to match VolunteerShiftNotification.channel and to
+  /// avoid a migration every time the channel set moves.
+  channel     String
+  claimedAt   DateTime  @default(now())
+  sentAt      DateTime?
+
+  eventDate EventDate? @relation("EventDateRsvpReminders", fields: [eventDateId], references: [id], onDelete: Cascade)
+  event     Event?     @relation("EventRsvpReminders", fields: [eventId], references: [id], onDelete: Cascade)
+  human     Human      @relation("HumanRsvpReminders", fields: [humanId], references: [id], onDelete: Cascade)
+
+  @@unique([eventDateId, humanId, channel])
+  @@unique([eventId, humanId, channel])
+  @@index([humanId])
+  /// Serves both the leak metric and the stale-claim scan.
+  @@index([sentAt, claimedAt])
+}
+
+model EventAttestation {
+  id                       String   @id @default(cuid())
+  eventId                  String
+  event                    Event    @relation("EventAttestationHistory", fields: [eventId], references: [id])
+  /// Nullable: attester reference is detached (SetNull) on account deletion —
+  /// the attestation record itself (policy snapshot, timestamps) is retained.
+  attestedByHumanId        String?
+  attestedBy               Human?   @relation("EventAttestations", fields: [attestedByHumanId], references: [id], onDelete: SetNull)
+  attestedAt               DateTime @default(now())
+  ipAddress                String?
+  userAgent                String?  @db.VarChar(1024)
+  policyVersion            String
+  policyTextSnapshot       Json
+  legalRightToHost         Boolean
+  zoningAndNoiseCompliance Boolean
+  alcoholCompliance        Boolean
+  taxResponsibility        Boolean
+  organizerFaqReviewed     Boolean
+  metadata                 Json?
+  createdAt                DateTime @default(now())
+  currentForEvent          Event?   @relation("EventCurrentAttestation")
+
+  @@index([eventId, attestedAt])
+  @@index([attestedByHumanId, attestedAt])
+}
+
+/// Tracks which humans have been granted access to gated events.
+/// A single source of truth for "can this person access this event" regardless of unlock method.
+model EventUnlock {
+  id        String            @id @default(uuid())
+  eventId   String
+  humanId   String
+  source    EventUnlockSource
+  /// Optional reference to the application submission that triggered approval
+  applicationSubmissionId String?
+  /// The invite link this unlock was redeemed through (source MAGIC_LINK).
+  /// Revoking a personal invite revokes every unlock it granted
+  /// (`revokeByInvite`); a SHARED link reset deliberately does not (R5).
+  /// SetNull: deleting an invite row never deletes the access it recorded.
+  inviteId  String?
+  /// Optional metadata (e.g., which admin unlocked, which invite list matched)
+  metadata  Json              @default("{}")
+  expiresAt DateTime?
+  revokedAt DateTime?
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  event  Event        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  human  Human        @relation("EventUnlockHuman", fields: [humanId], references: [id], onDelete: Cascade)
+  invite EventInvite? @relation(fields: [inviteId], references: [id], onDelete: SetNull)
+
+  @@unique([eventId, humanId])
+  @@index([humanId])
+  @@index([eventId, revokedAt])
+  // Indexes the rescind-time `revokeBySubmission` updateMany.
+  @@index([applicationSubmissionId])
+  // Indexes the revoke-time `revokeByInvite` updateMany.
+  @@index([inviteId])
+}
+
+/// An invite link into a gated event (spec 2026-10-02 gated-event-invite-links).
+/// Replaces the old single-use EventMagicLink (renamed in migration
+/// 20261003120000_event_invites; no link had ever been made outside e2e seeds).
+///
+/// - SHARED: one link per event that anyone holding it can redeem, any number
+///   of times. "Reset" revokes it and mints a new one; people already let in
+///   stay in (R5).
+/// - PERSONAL: one live per invitee email per event, emailed to that guest.
+///   Works on any number of devices; revoking it revokes every unlock it
+///   granted, and a later re-invite gets a fresh row and token.
+///
+/// Only the SHA-256 of the token is stored (`tokenHash`); the raw token exists
+/// in the link and the invite email, never in the database or mailer metadata.
+/// Links die at event end — there is no per-link expiry column.
+model EventInvite {
+  id                String          @id @default(uuid())
+  eventId           String
+  kind              EventInviteKind
+  /// PERSONAL only: the guest's name as the organizer typed it.
+  inviteeName       String?
+  /// PERSONAL only: the guest's email, always lowercase. The CHECK below
+  /// rejects any mixed-case write, so plain equality against a lowercased
+  /// input is exact.
+  inviteeEmail      String?
+  /// SHA-256 hex of the raw token. Redemption hashes the presented token and
+  /// looks it up here.
+  tokenHash         String          @unique
+  /// Who created the invite (organizer). Null once that Human is deleted:
+  /// the invite and every grant pointing at it survive (revoke-by-invite and
+  /// the cap exclusion key on inviteId).
+  createdByHumanId  String?
+  /// Set when the invite came from a contact-list send; SetNull if the entry
+  /// is deleted.
+  inviteListEntryId String?
+  /// Optional metadata.
+  metadata          Json            @default("{}")
+  /// Set = the link no longer works (shared reset, or personal revoke).
+  revokedAt         DateTime?
+  /// First successful redemption (drives the "Used" status, FR-002).
+  firstRedeemedAt   DateTime?
+  /// Count of successful NEW redemptions (a grant created: unlock, submission
+  /// or `th_ei_` cookie). Re-redeeming an existing grant does not count.
+  /// Signed-out SHARED holders leave no other row, so this is the only source
+  /// for the panel's "used" count.
+  redemptionCount   Int             @default(0)
+  /// PERSONAL: when the invite email was last sent (drives "Sent"; Resend
+  /// updates it).
+  sentAt            DateTime?
+  /// SHARED only: set by "Reset and remove everyone". From then on the
+  /// grants this link handed out (th_ei_ cookies, unlocks, approvals) stop
+  /// holding. A plain reset leaves it null, so its holders stay in (R5).
+  /// PERSONAL grants follow revokedAt instead and never set this.
+  grantsRevokedAt   DateTime?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  event           Event            @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  createdByHuman  Human?           @relation("EventInviteCreator", fields: [createdByHumanId], references: [id], onDelete: SetNull)
+  inviteListEntry InviteListEntry? @relation(fields: [inviteListEntryId], references: [id], onDelete: SetNull)
+
+  unlocks     EventUnlock[]
+  submissions EventApplicationSubmission[]
+
+  @@index([eventId, kind])
+  @@index([inviteListEntryId])
+  // NOTE: two partial unique indexes and a CHECK exist in SQL only — Prisma
+  // can't express partial or expression indexes or CHECK constraints:
+  //   "EventInvite_live_shared_key" on (eventId)
+  //     WHERE kind = 'SHARED' AND revokedAt IS NULL
+  //     — at most one live shared link per event; a reset revokes the old row
+  //     and inserts the new one in the same transaction.
+  //   "EventInvite_personal_email_key" on (eventId, lower(inviteeEmail))
+  //     WHERE kind = 'PERSONAL' AND revokedAt IS NULL
+  //     — at most one LIVE personal invite per guest email per event. FR-003
+  //     dedupe means "a live invite exists for this email" → reuse it. A
+  //     re-invite after a revoke INSERTS a fresh row (new id, new token); the
+  //     revoked row stays as history, and its token and `th_ei_` cookies
+  //     (keyed on inviteId) stay dead.
+  //   "EventInvite_kind_invitee_check" CHECK
+  //     (kind = 'PERSONAL' AND inviteeEmail IS NOT NULL
+  //       AND inviteeEmail = lower(inviteeEmail))
+  //     OR (kind = 'SHARED' AND inviteeEmail IS NULL AND inviteeName IS NULL)
+  // (migration 20261003120000_event_invites). The adapter maps the indexes'
+  // P2002; use-case pre-checks race, these are the backstop.
+}
+
+/// "Stop invites from this organiser": an email address that asked one
+/// organiser (an org, or the human owning person-owned events) to send it no
+/// more event invites. Every invite send filters against it. At most one
+/// owner column is set (CHECK "EventInviteOptOut_at_most_one_owner_check");
+/// a row with NEITHER is "Stop all event invites", for every organiser.
+model EventInviteOptOut {
+  id           String   @id @default(uuid())
+  /// Keyed hash of the canonical address (core `hashInviteOptOutEmail`):
+  /// 43 base64url chars (CHECK "EventInviteOptOut_email_hash_check"). The
+  /// address itself is never stored.
+  emailHash    String
+  orgId        String?
+  humanOwnerId String?
+  createdAt    DateTime @default(now())
+
+  org        Organization? @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  humanOwner Human?        @relation("EventInviteOptOutOwner", fields: [humanOwnerId], references: [id], onDelete: Cascade)
+
+  @@index([humanOwnerId])
+  // NOTE: SQL-only (migrations 20261005200000_event_invite_optout_and_removal,
+  // 20261006090000_event_invite_optout_email_hash and
+  // 20261007150000_event_invite_optout_all):
+  //   "EventInviteOptOut_org_email_key" UNIQUE (orgId, emailHash)
+  //     WHERE orgId IS NOT NULL
+  //   "EventInviteOptOut_human_email_key" UNIQUE (humanOwnerId, emailHash)
+  //     WHERE humanOwnerId IS NOT NULL
+  //   "EventInviteOptOut_all_email_key" UNIQUE (emailHash)
+  //     WHERE orgId IS NULL AND humanOwnerId IS NULL
+  //   "EventInviteOptOut_at_most_one_owner_check" CHECK (not both owners set)
+  //   "EventInviteOptOut_email_hash_check" CHECK (emailHash ~ '^[A-Za-z0-9_-]{43}$')
+}
+
+model Image {
+  id        String @id @default(uuid())
+
+  /// Polymorphic owner: what entity this image belongs to.
+  ownerType ImageOwnerType
+  ownerId   String
+
+  /// Optional FK kept for Event images so cascade-delete still works.
+  eventId   String?
+
+  key       String
+  publicUrl String
+
+  contentType String?
+  sizeBytes   BigInt?
+
+  /// Intrinsic pixel size as the browser displays it (EXIF orientation
+  /// applied), read from the file's header at finalize. Null when unknown:
+  /// rows from before 2026-10, or a header the parser could not read. Lets the
+  /// event poster `<img>` reserve its box before the bytes arrive (cold-load
+  /// CLS 0.48 at 320px without it).
+  width  Int?
+  height Int?
+
+  uploadedAt DateTime?
+
+  attached    Boolean  @default(false)
+  attachedAt  DateTime?
+  detachedAt  DateTime?
+
+  deletedAt DateTime?
+
+  /// Nullable: creator reference is detached (SetNull) on account deletion.
+  createdByHumanId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  event          Event?  @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  heroForEvent   Event?  @relation("EventHeroImage")
+  createdByHuman Human?  @relation("ImageCreatedBy", fields: [createdByHumanId], references: [id], onDelete: SetNull)
+
+  @@unique([ownerId, key])
+  @@index([ownerType, ownerId])
+  @@index([eventId])
+  @@index([eventId, attached])
+  @@index([createdByHumanId])
+  /// Backs the storage GC's paged candidate scan
+  /// (`images.listSweepCandidates`): `WHERE deletedAt IS NULL AND createdAt <
+  /// cutoff ORDER BY createdAt, id`. The scan runs once PER PAGE, so without an
+  /// index a nightly run is up to `maxPagesPerRun` seq scans of this table.
+  /// Column order matches the keyset exactly so the cursor is an index seek.
+  /// Also serves the hard-delete stage's `listSoftDeleted` (deletedAt IS NOT
+  /// NULL, ORDER BY deletedAt) — `deletedAt` is this index's leading column, so
+  /// a separate single-column index would only add write amplification.
+  @@index([deletedAt, createdAt, id])
+  @@map("event_images")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AudioUpload - Audio files uploaded for events (e.g., event audio, DJ sets)
+// Similar pattern to Image but for audio with HLS transcoding
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AudioUpload {
+  id        String @id @default(uuid())
+  eventId   String
+  
+  // Source file info
+  sourceKey       String   // R2 key for original upload (e.g., "uploads/audio/{id}.mp3")
+  sourceUrl       String   // Public URL to source file
+  sourceContentType String?
+  sourceSizeBytes BigInt?
+  
+  // HLS output (populated after transcoding)
+  hlsPlaylistKey  String?  // R2 key for .m3u8 playlist
+  hlsPlaylistUrl  String?  // Public URL to HLS playlist
+  segmentCount    Int?     // Number of HLS segments
+  durationSeconds Float?   // Total audio duration
+  waveformPeaks   Json?    @db.JsonB // Normalized amplitude peaks (200 floats 0.0–1.0)
+  
+  // Status tracking
+  status          AudioUploadStatus @default(PENDING)
+  uploadedAt      DateTime?
+  transcodedAt    DateTime?
+  failedAt        DateTime?
+  failureReason   String?
+  
+  // Attachment tracking (similar to Image)
+  attached    Boolean  @default(false)
+  attachedAt  DateTime?
+  detachedAt  DateTime?
+  deletedAt   DateTime?
+  
+  // Ownership
+  /// Nullable: creator reference is detached (SetNull) on account deletion.
+  createdByHumanId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  event          Event  @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  createdByHuman Human? @relation("AudioUploadCreatedBy", fields: [createdByHumanId], references: [id], onDelete: SetNull)
+  
+  @@unique([eventId, sourceKey])
+  @@index([eventId])
+  @@index([eventId, status])
+  @@index([status])
+  @@index([createdByHumanId])
+  @@map("audio_uploads")
+}
+
+model FeaturedEvent {
+  id               String    @id @default(uuid())
+  eventId          String    @map("event_id")
+  curatedByHumanId String?   @map("curated_by_human_id")
+  curatedAt        DateTime  @default(now()) @map("curated_at")
+  curatedUntil     DateTime? @map("curated_until")
+  notes            String?
+
+  event   Event  @relation("EventFeaturedPlacement", fields: [eventId], references: [id], onDelete: Cascade)
+  curator Human? @relation("FeaturedEventCurator", fields: [curatedByHumanId], references: [id], onDelete: SetNull)
+
+  @@unique([eventId])
+  @@index([curatedByHumanId])
+  @@index([curatedUntil])
+  @@map("featured_events")
+}
+
+model EventSlugHistory {
+  id         String   @id @default(uuid())
+  eventId    String
+  slug       String   @unique
+  recordedAt DateTime @default(now())
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([eventId, recordedAt])
+}

@@ -1,0 +1,23 @@
+{
+  "extends": "../../config/tsconfig/base.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "baseUrl": ".",
+    "paths": {
+      "@th/core/*": ["../../core/src/*"],
+      "@th/adapters/*": ["../../adapters/src/*"],
+      "@th/schema": ["../../schema/src/index.ts"],
+      "@th/schema/*": ["../../schema/src/*"],
+      "@th/types": ["../../types/src/index.ts"],
+      "@th/types/*": ["../../types/src/*"],
+      "@th/ports": ["../../ports/src/index.ts"],
+      "@th/ports/*": ["../../ports/src/*"],
+      "@th/test-utils": ["../../test-utils/src/index.ts"],
+      "@th/test-utils/*": ["../../test-utils/src/*"],
+      "@th/trpc/*": ["./src/*"]
+    }
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
+}

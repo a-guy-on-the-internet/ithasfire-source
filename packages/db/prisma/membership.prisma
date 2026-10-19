@@ -1,0 +1,259 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Membership — recurring support tiers offered by an org or a human.
+//
+// Money model, in one place so it is not re-derived from the use cases:
+//   * 0% platform fee, charged on the ORDER (feesPlatformCents = 0), never on
+//     the Stripe subscription. The subscription carries NO
+//     `transfer_data.destination` and NO `application_fee_percent` — charges
+//     settle on the platform account and the owner is paid through the
+//     Orders/Settlement pipeline, which is what preserves payout timing
+//     control and the dispute-hold machinery (and avoids paying the owner
+//     twice). A future non-zero fee is a config change on the Order path.
+//   * The Stripe Customer is PLATFORM-owned, so a member supporting three
+//     venues enters their card once. A Customer created on the connected
+//     account would silo the card per owner and break that.
+//   * Membership invoices are materialised as Orders (`Order.kind =
+//     MEMBERSHIP`, `eventId = null`) so settlement, refunds, the ledger and
+//     dispute holds all work unchanged.
+//   * Tax is DESTINATION-sourced — the member's billing address, not the
+//     owner's and not a venue's. Tickets are the opposite (admissions source to
+//     where the event happens), which is why there are two rules in one system.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A named recurring support tier offered by an org or a human.
+model MembershipTier {
+  id String @id @default(uuid())
+
+  /// Exactly one of ownerOrgId / ownerHumanId is set — enforced in core, since
+  /// Prisma cannot express a XOR constraint.
+  ownerOrgId   String?
+  ownerOrg     Organization? @relation("OrganizationMembershipTiers", fields: [ownerOrgId], references: [id], onDelete: Cascade)
+  ownerHumanId String?
+  ownerHuman   Human?        @relation("HumanMembershipTiers", fields: [ownerHumanId], references: [id], onDelete: Cascade)
+
+  name        String /// "Sustaining Member"
+  description String?
+  /// Integer cents, never floats. Immutable once the tier has a subscriber:
+  /// Stripe Prices are immutable, so a price change is archive-and-replace.
+  priceCents  Int
+  currency    String             @default("usd") @db.VarChar(3)
+  interval    MembershipInterval @default(MONTH)
+
+  /// The OWNER'S claim about what members get, in their words. Plain text,
+  /// rendered on the join card, the entity tab and the embed. Never ours, and
+  /// never deductibility language (AB 488): a membership is not a donation and
+  /// we do not characterise it as one.
+  benefitsDescription String? @db.VarChar(500)
+
+  /// Stripe Billing objects, created lazily on first publish.
+  stripeProductId String?
+  stripePriceId   String? @unique
+
+  status    MembershipTierStatus @default(DRAFT)
+  sortOrder Int                  @default(0)
+
+  memberships Membership[]
+  benefits    MembershipBenefit[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerOrgId, status])
+  @@index([ownerHumanId, status])
+}
+
+/// One member's active (or lapsed) subscription to a tier.
+model Membership {
+  id     String         @id @default(uuid())
+  tierId String
+  tier   MembershipTier @relation(fields: [tierId], references: [id], onDelete: Cascade)
+
+  memberHumanId String
+  memberHuman   Human  @relation("HumanMemberships", fields: [memberHumanId], references: [id], onDelete: Cascade)
+
+  stripeSubscriptionId String @unique
+  /// PLATFORM-owned customer — one card across every owner a member supports.
+  stripeCustomerId     String
+
+  /// Mirrors Stripe's subscription status rather than a closed enum of ours:
+  /// Stripe can introduce values (it has before), and failing to persist a
+  /// real subscription state is worse than storing a string we do not yet
+  /// branch on. Validated in core, not at the DB layer.
+  status String
+
+  /// Which jurisdiction's rate this subscription is billed at. Re-resolved when
+  /// the member's billing address changes — usually with no ZipTax call, since
+  /// the postal code is normally already cached.
+  taxJurisdictionId  String?
+  taxJurisdiction    MembershipTaxJurisdiction? @relation(fields: [taxJurisdictionId], references: [id], onDelete: SetNull)
+  billingPostalCode  String?
+  billingCountryCode String?                    @db.VarChar(2)
+
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+  cancelAtPeriodEnd  Boolean   @default(false)
+  canceledAt         DateTime?
+  startedAt          DateTime  @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([tierId, memberHumanId])
+  @@index([memberHumanId, status])
+  @@index([tierId, status])
+  @@index([status, currentPeriodEnd])
+}
+
+/// A benefit granted by a tier, auto-applied at ticket checkout.
+///
+/// FIRST-CLASS, not a pointer at a Promo (2026-08-17 spec). A promo is a
+/// bounded CAMPAIGN — unique public code, start/end window, redemption caps,
+/// status — and a benefit is an ongoing ENTITLEMENT whose validity window and
+/// cap ARE the membership. Pointing one at the other meant an owner could
+/// attach a promo that expired next month and silently gut their tier, a
+/// revoked promo nulled the benefit's teeth via `onDelete: SetNull`, and the
+/// promo's mandatory `code` was a live leak risk (the typed-code path checks
+/// no membership entitlement, so echoing it turned an entitlement into a
+/// public discount code).
+///
+/// A benefit therefore has NO code — not in the DB, not in any API response,
+/// not derivable. That leak class is structurally dead.
+///
+/// What did NOT change: there is still exactly ONE discount computation
+/// (`evaluatePromoApplications`) and ONE ledger (PromoHold / PromoRedemption).
+/// Membership is a second eligibility SOURCE feeding both, never a second
+/// implementation of either.
+model MembershipBenefit {
+  id     String         @id @default(uuid())
+  tierId String
+  tier   MembershipTier @relation(fields: [tierId], references: [id], onDelete: Cascade)
+
+  kind MembershipBenefitKind
+
+  /// Discount terms, owned by the benefit. MANDATORY, not merely conventional:
+  /// with `PRESALE_ACCESS` gone there is no term-less kind, so the invariant
+  /// the adapter used to defend with a `{ not: null }` filter is now the
+  /// column definition. AMOUNT = cents off the order's eligible amount;
+  /// PERCENT = 1–100. Semantics are identical to the Promo fields they
+  /// replace, which is what lets both sources share one clamp.
+  discountKind     MembershipDiscountKind
+  discountValue    Int
+  /// Optional clamp, integer cents. Same semantics as Promo.maxDiscountCents.
+  maxDiscountCents Int?
+
+  /// Optional narrowing: only applies to events matching these.
+  categoryId String?
+  placeId    String?
+
+  /// Owner-facing override for the checkout line ("Member discount — {tier}")
+  /// and the tier card. Null = the generated label.
+  label String? @db.VarChar(80)
+
+  /// RETIRED, never deleted. `removeTierBenefit` sets this instead of issuing
+  /// a DELETE, because the PromoRedemption rows a benefit produced are the
+  /// platform's record of granted margin and must outlive the entitlement.
+  /// A retired benefit grants nothing and is invisible to the admin surface —
+  /// externally identical to the hard delete it replaced.
+  archivedAt DateTime?
+
+  /// The ONE ledger, widened rather than duplicated. See PromoHold /
+  /// PromoRedemption in ticket.prisma for the source CHECKs.
+  promoHolds       PromoHold[]
+  promoRedemptions PromoRedemption[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// (tierId, archivedAt) only — a tierId-only lookup rides the leading
+  /// column, so a separate single-column index would be pure write cost.
+  @@index([tierId, archivedAt])
+}
+
+/// Risk state for an owner's memberships.
+///
+/// NOT an unlock gate. Memberships are open to any payee: Connect bills $2 only
+/// in months an account actually receives a payout, and deducting that from the
+/// membership payout makes them self-funding from the first member. This exists
+/// purely so a bad actor can be stopped.
+model MembershipStanding {
+  id String @id @default(uuid())
+
+  ownerOrgId   String?       @unique
+  ownerOrg     Organization? @relation("OrganizationMembershipStanding", fields: [ownerOrgId], references: [id], onDelete: Cascade)
+  ownerHumanId String?       @unique
+  ownerHuman   Human?        @relation("HumanMembershipStanding", fields: [ownerHumanId], references: [id], onDelete: Cascade)
+
+  /// Circuit breaker — suspends new signups and holds MEMBERSHIP payouts when
+  /// dispute losses cross a threshold. Payout enforcement lives in the payout
+  /// batch (run-batch step 4b-2): any settlement group containing
+  /// membership-classified lines is held while suspended (settlements stay
+  /// pending and pay after unsuspension); the owner's pure-ticketing payouts
+  /// are deliberately unaffected — this is a membership circuit breaker, not
+  /// a business-wide freeze.
+  suspended       Boolean   @default(false)
+  suspendedAt     DateTime?
+  suspendedReason String?
+
+  /// Rolling reserve on membership payouts, seasoning DOWN as the payee builds
+  /// history. It must apply to NEW payees from day one: the real abuse vector
+  /// is self-dealing cash-out (stolen cards subscribed to your own tier,
+  /// collected before the chargebacks land), and a brand-new payee has no
+  /// dispute history precisely when the risk is highest.
+  reserveBps         Int @default(0)
+  reserveReleaseDays Int @default(90)
+
+  overriddenBy   String?
+  overrideReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// Cached sales-tax rate for ONE jurisdiction, shared by every member in it.
+///
+/// Membership tax is destination-sourced, so the rate is a property of the
+/// PLACE, not the person — 80 Nashville members share one row rather than
+/// holding 80 copies that can drift apart. This also collapses ZipTax call
+/// volume to one lookup per distinct postal code per refresh window regardless
+/// of member count, which is what keeps us inside the flat-rate tier.
+///
+/// Maps 1:1 onto a Stripe TaxRate referenced by many subscriptions via
+/// `default_tax_rates`, which keeps Stripe's immutable-`percentage` problem
+/// bounded: a rate change archives one TaxRate, creates one replacement, and
+/// migrates the subscriptions pointing at it.
+model MembershipTaxJurisdiction {
+  id          String @id @default(uuid())
+  countryCode String @db.VarChar(2)
+  postalCode  String
+  rateBps     Int
+  /// "ziptax:general" | "static-ca" | "manual:general" | "exempt:*" —
+  /// free-form for the same reason Order.taxRateSource is: it records
+  /// provenance for audit, and new sources appear faster than migrations.
+  ///
+  /// NOTHING BRANCHES ON THIS. Its only consumer is a human reading the row
+  /// later, which is exactly why the `:general` suffix matters: memberships
+  /// are billed the postal code's GENERAL rate having made no category
+  /// determination at all. Without the suffix these rows would imply a
+  /// judgment nobody made.
+  rateSource  String
+
+  stripeTaxRateId String? @unique
+
+  /// Freshness, and NOT member-initiated. Jurisdictions change rates on
+  /// quarterly boundaries with no signal from the member, so an invalidation
+  /// keyed only on address or tier changes would bill a stale rate forever.
+  /// `refreshTaxJurisdictions` is the only thing that can catch this.
+  checkedAt     DateTime
+  effectiveFrom DateTime?
+  /// Set when superseded. Archived rows are retained because subscriptions may
+  /// still reference them until migrated.
+  archivedAt    DateTime?
+
+  memberships Membership[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([countryCode, postalCode, archivedAt])
+  @@index([checkedAt])
+}

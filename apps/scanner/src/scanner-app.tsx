@@ -12,6 +12,8 @@ import {
   applyScanFeedbackToggle,
   scanFeedbackEnabled,
 } from "./lib/scan-feedback-plan";
+import { useAccessRevocation } from "./lib/use-access-revocation";
+import { useDenialHeldForSale } from "./lib/use-denial-held-for-sale";
 import { useLocalSync } from "./lib/use-local-sync";
 import { useScanQueue } from "./lib/use-scan-queue";
 import {
@@ -23,6 +25,9 @@ import {
   UnifiedScanScreen,
 } from "./screens";
 import { SettingsScreen } from "./screens/settings-screen";
+import { ClearSaleDialog } from "./features/pos/clear-sale-dialog";
+import { SaleGuardProvider, useSaleGuardHost } from "./features/pos/sale-guard";
+import { useSaleEventPin } from "./features/pos/use-sale-event-pin";
 import { SellTabScreen } from "./features/pos/sell-tab-screen";
 import { trpc } from "./trpc";
 import { AppShell, type NavTab } from "./ui/app-shell";
@@ -72,7 +77,27 @@ export const ScannerApp = () => {
     sessionContext,
   } = useScannerSession();
   const [activeScreen, setActiveScreen] = useState<ActiveScreen>("home");
-  const authed = !!user && !accessDenied;
+  // While a door sale is at risk a refusal waits: no denied screen, no wipe,
+  // until the risk is gone, or 3 minutes (`use-denial-held-for-sale.ts`). At
+  // 3 minutes the sale is cleared on purpose first: an open card sale gets
+  // its cancel and the "don't take cash" notice, which the denied screen
+  // shows. (`saleGuard` is declared below; this only runs after render.)
+  const { denied, saleAtRisk, saleIdle, riskChanged } = useDenialHeldForSale(
+    accessDenied,
+    {
+      onCapReached: () => saleGuard.clearNow(),
+      // What the cap cleared belongs to that refusal, not the next one.
+      onDenialEnded: () => saleGuard.forgetCleared(),
+    },
+  );
+  const authed = !!user && !denied;
+  // Scan access removed on the server: noticed on launch, on each return to
+  // the foreground or to the network, and when the event list is refused. The
+  // attendee data cached for this person is then wiped.
+  const { deniedReason, checkAgain } = useAccessRevocation({
+    userId: user?.id,
+    accessDenied: denied,
+  });
 
   // True for the duration of the post-sign-in passkey-enrollment prompt.
   // Set to true when the operator signs in via password or OAuth (and they
@@ -148,7 +173,15 @@ export const ScannerApp = () => {
 
   const { accessibleEvents, refresh: refreshManifests } = useLocalSync(authed);
   // `failedCount` is FR-010's terminal drops — admits the server never recorded.
-  const { queueDepth, failedCount, refreshDepth } = useScanQueue(authed);
+  //
+  // The queue drains for anyone SIGNED IN, not only while the scanner shell is
+  // open to them: `tickets.scanTicket` accepts roles the shell refuses
+  // (EDITOR), so admits made before a role change must still be sent. One the
+  // server refuses lands in the failed list with its report, as ever.
+  const { queueDepth, failedCount, refreshDepth } = useScanQueue(
+    !!user,
+    user?.id ?? null,
+  );
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
 
   // Keep the screen awake only while authenticated — operators run
@@ -238,6 +271,33 @@ export const ScannerApp = () => {
   const hasSellableItems = (sellableData?.ticketTypes?.length ?? 0) > 0;
   const sellTabHidden = !eventId || !hasSellableItems;
 
+  // A tab press unmounts the Sell tab, an event switch resets it, and Android
+  // back can finish the activity. Each would drop an open card sale or a key
+  // that may hold a sale, so each asks first while the Sell screen reports
+  // one (see `sale-guard.ts`).
+  //
+  // The event is PINNED while a sale is at risk and released once the till
+  // is idle again (`use-sale-event-pin.ts`): with nothing picked, `eventId`
+  // follows `defaultEventId`, which can move on its own.
+  const eventPin = useSaleEventPin({
+    eventId,
+    selectedEventId,
+    setSelectedEventId,
+  });
+  const saleGuard = useSaleGuardHost({
+    onSaleAtRisk: () => {
+      eventPin.pin();
+      saleAtRisk();
+    },
+    onSaleIdle: () => {
+      eventPin.release();
+      saleIdle();
+    },
+    onRiskChange: riskChanged,
+    // A card-cleared notice belongs to the operator who cleared the sale.
+    userId: user?.id ?? null,
+  });
+
   if (isBootstrapping || !preferences) {
     // Continuation of the splash — same white flame on black bg as the
     // native splash and App.tsx font-load splash, so the operator sees
@@ -273,11 +333,20 @@ export const ScannerApp = () => {
     );
   }
 
-  if (accessDenied) {
+  if (denied) {
     return (
       <FadeRoot key="denied">
         <BypassShell>
-          <AccessDeniedScreen userEmail={user.email} onSignOut={signOut} />
+          <AccessDeniedScreen
+            userEmail={user.email}
+            onSignOut={signOut}
+            onCheckAgain={checkAgain}
+            reason={deniedReason ?? undefined}
+            unsentScans={queueDepth}
+            failedScans={failedCount}
+            cardCleared={saleGuard.cardCleared}
+            clearedSale={saleGuard.clearedByApp}
+          />
         </BypassShell>
       </FadeRoot>
     );
@@ -305,15 +374,14 @@ export const ScannerApp = () => {
   }
 
   const handleTabPress = (tab: NavTab) => {
-    if (tab === "home") {
-      setActiveScreen("home");
-    } else if (tab === "sell") {
-      setActiveScreen("sell");
-    } else if (tab === "scan") {
-      setActiveScreen("scan");
-    } else if (tab === "settings") {
-      setActiveScreen("settings");
-    }
+    const next: ActiveScreen = tab;
+    if (next === activeScreen) return;
+    saleGuard.guard(() => setActiveScreen(next));
+  };
+
+  const handleSelectEvent = (nextEventId: string) => {
+    if (nextEventId === eventId) return;
+    saleGuard.guard(() => eventPin.pick(nextEventId));
   };
 
   const renderScreen = () => {
@@ -394,7 +462,7 @@ export const ScannerApp = () => {
             failedCount={failedCount}
             selectableEvents={selectableEvents}
             selectedEventId={eventId}
-            onSelectEvent={setSelectedEventId}
+            onSelectEvent={handleSelectEvent}
             onOpenUnifiedScan={() => setActiveScreen("scan")}
             onOpenLookup={() => setActiveScreen("lookup")}
             onOpenSettings={() => setActiveScreen("settings")}
@@ -406,18 +474,38 @@ export const ScannerApp = () => {
 
   return (
     <FadeRoot key="app">
-      <AppShell
-        activeTab={screenToTab(activeScreen)}
-        onTabPress={handleTabPress}
-        hiddenTabs={sellTabHidden ? ["sell"] : undefined}
-        platformAdminOverride={!!sessionContext?.viaPlatformAdmin}
-        selectableEvents={selectableEvents}
-        selectedEventId={eventId}
-        onSelectEvent={setSelectedEventId}
-        testID="scanner-app-shell"
+      <View
+        style={{ flex: 1 }}
+        // While the confirm is up, screen readers stay in the confirm.
+        importantForAccessibility={
+          saleGuard.pending ? "no-hide-descendants" : "auto"
+        }
       >
-        <SlideScreen key={activeScreen}>{renderScreen()}</SlideScreen>
-      </AppShell>
+        <AppShell
+          activeTab={screenToTab(activeScreen)}
+          onTabPress={handleTabPress}
+          hiddenTabs={sellTabHidden ? ["sell"] : undefined}
+          platformAdminOverride={!!sessionContext?.viaPlatformAdmin}
+          selectableEvents={selectableEvents}
+          selectedEventId={eventId}
+          onSelectEvent={handleSelectEvent}
+          testID="scanner-app-shell"
+        >
+          <SaleGuardProvider
+            registry={saleGuard.registry}
+            cardCleared={saleGuard.cardCleared}
+          >
+            <SlideScreen key={activeScreen}>{renderScreen()}</SlideScreen>
+          </SaleGuardProvider>
+        </AppShell>
+      </View>
+      {saleGuard.pending && (
+        <ClearSaleDialog
+          risk={saleGuard.pending.risk}
+          onKeep={saleGuard.pending.keep}
+          onClear={saleGuard.pending.clearAnyway}
+        />
+      )}
     </FadeRoot>
   );
 };

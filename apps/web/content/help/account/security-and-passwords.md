@@ -44,6 +44,14 @@ Accounts that signed up with Google or Apple only (no password set) can't enable
 
 **To disable or regenerate backup codes**, return to the same page.
 
+### Signing in with two-factor on
+
+Sign in with your password, then enter the code from your authenticator app. Without your app, choose **Email code** (shown as **Email / SMS code** when texts are offered) under **Other verification methods** and click **Send code**. The code goes to your verified phone number by text if you have one (US numbers only), otherwise by email. If the text can't be sent, the code comes by email. Or choose **Backup code**.
+
+A passkey signs you in on its own when your device asks for your PIN, fingerprint or face. A security key that doesn't ask for a PIN can't sign you in.
+
+Signing in without your password, with Google, Apple, or an emailed sign-in code or link, doesn't work for an account with two-factor on. Try Google or Apple and you land back on the sign-in page, asked to use your password or a passkey.
+
 ## Account deletion
 
 Open [Settings → Delete account](/account/settings/danger) — pinned to the bottom of the settings navigation — then click **Delete account** and confirm by typing your account email; if your account has a password, you'll also re-enter it. Deletion is immediate. Accounts with purchase or ticket history can't be deleted self-serve — those records are retained for accounting, so contact support if that applies to you.

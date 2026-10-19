@@ -1,0 +1,215 @@
+# place-admin-rail-context.spec.yaml
+#
+# Place editing moves onto the shared admin side rail, the same way the event
+# builder did (docs/specs/2026-07-27/event-builder-regroup.spec.yaml, slice 2).
+# Entering /admin/{slug}/places/{placeId} swaps the workspace rail to place
+# context instead of rendering the hand-rolled 6-tab bar.
+#
+# Source of the problem: apps/web/src/app/admin/[slug]/places/[placeId]/
+# layout.tsx is a hand-rolled horizontal tab bar (PLACE_TABS const + styled
+# TabBarContainer/TabLink + manual prefix matching + inline feature-flag
+# filter) — a third independent copy of the shell pattern alongside
+# AccountShell.tsx and NavigationShell. It re-implements in miniature exactly
+# what NavigationSection already models (id, label, icon, active matching,
+# featureFlag), with none of the rail's mobile/compact/drawer behaviour.
+# Inside it, edit/page.tsx is a single ~740-line scroll form whose last three
+# "cards" are just links to the other tabs.
+#
+# Related:
+#   - Admin nav regroup + event-context rail: NavigationShell organism
+#     (packages/ui/src/ui/shell/NavigationShell.tsx) already has THREE section
+#     consumers — AdminShell, PlatformShell, SellerShell. REUSE, DO NOT FORK
+#     (directive carried over from event-builder-regroup.spec.yaml:16-18).
+#   - The context-swap mechanism this spec generalizes: AdminShell.tsx:299-397
+#     (parseEventAdminPath → eventSections ?? contextAwareSections).
+#   - Place admin history: docs/specs/2026-04-26/completed/places-admin-v2.spec.md
+#   - Companion spec (same date): application-driven-events.spec.md — its
+#     organizer surfaces ride the event-context rail; this registry work is
+#     what keeps a third and fourth context cheap.
+
+version: "1.0"
+updated: "2026-08-10"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Editing a place lives in a bespoke tab bar + long-scroll form that shares
+    no chrome with the rest of the admin. Organizers get a different
+    navigation idiom (horizontal tabs, no mobile bottom bar, no compact rail,
+    no drawer) the moment they step from an event into a venue. Meanwhile
+    AdminShell's context swap is a hard-coded binary (event context or org
+    context), so every new nested context means another ?? branch, another
+    title query, another prefetch list.
+  solution: >
+    Slice 1 turns AdminShell's context swap into a small registry of context
+    descriptors and re-registers the existing event context on it (pure
+    refactor, no visible change). Slice 2 registers a place context: a
+    place-nav-sections.tsx builder, a light places.getPlaceTitle query, a
+    PlaceRailContextHeader (name + verification chip), "← All places" back
+    slot, per-place collapse persistence. The hand-rolled tab bar dies.
+    Slice 3 regroups the edit surface itself: the three link-out cards die,
+    verification becomes its own rail item, and hard-coded EN strings get
+    i18n keys.
+  users:
+    - Venue owner / org member — edits place details, hours, page, bookings
+    - Door crew & volunteers coordinators — reach Calendar/Bookings/Volunteers
+      without authoring noise
+  surfaces:
+    - web
+
+# ── Decisions ────────────────────────────────────────────────────────────────
+
+decisions:
+  - id: D1
+    call: >
+      Extend NavigationShell; do not fork and do not keep the tab bar. The
+      rail organism already handles desktop/compact/mobile, RBAC filtering,
+      feature flags, badges, and collapse persistence — the place scope gets
+      all of it for the price of a sections array.
+  - id: D2
+    call: >
+      The AdminShell context swap becomes a registry: an ordered list of
+      { id, match(pathname), useContext(matched) } descriptors where
+      useContext returns { sections, contextHeader, backSlot, persistKey,
+      prefetchRoutes }. Event context is migrated onto the registry FIRST as
+      a no-op refactor; place context is the second entry. Route parsing
+      stays regex-per-descriptor (no framework magic).
+  - id: D3
+    call: >
+      Place rail groups mirror the event rail's Build/Manage split —
+      "Venue" (Details, Public page, Seat layout) and "Operate" (Calendar,
+      Bookings, Volunteers). All items are routes (activeMatch prefix where
+      a tab owns sub-routes); no scroll-spy anchors in v1, because the place
+      edit form is one page per tab already.
+  - id: D4
+    call: >
+      RBAC on place items stays OUT of NavigationItem.rbac. Place access is
+      boolean (PlaceOwnership human/org membership — any role qualifies,
+      get-place-for-edit.ts:86-104), which NavRole cannot express.
+      Verification-gated surfaces (Public page editor) render enabled and
+      keep their existing in-page verification gate; Seat layout keeps its
+      seatingLayouts featureFlag on the item.
+  - id: D5
+    call: >
+      A purpose-built light endpoint places.getPlaceTitle (name, slug,
+      verification, status) feeds the rail context header — parallel to
+      events.getEventTitle. getPlaceForEdit stays the heavy edit payload and
+      is NOT called by the shell.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    # ── Slice 1 — context registry (no visible change) ──
+    - id: FR-101
+      description: >
+        Extract AdminShell's event-context branch (AdminShell.tsx:299-397,
+        the parseEventAdminPath call, effectiveSections swap, railBack,
+        railContextHeader, per-event persistence key, prefetch list, and the
+        edit?section= interception in onRouteSelect) into a context-registry
+        module under admin/[slug]/_components/. The registry is an ordered
+        array; first match wins; no match → org workspace sections.
+    - id: FR-102
+      description: >
+        Event context re-registers on the registry with byte-identical
+        behaviour. AdminShell.test.tsx and event-nav-sections tests pass
+        unchanged. The three hand-copied RBAC role-set mirrors
+        (event-nav-sections.tsx:25-45, AdminShell.tsx:342-356,
+        EventAdminPageShell.tsx:96-136) consolidate into one exported
+        constant set imported by all three — behaviour unchanged, drift
+        hazard removed.
+
+    # ── Slice 2 — place context on the rail ──
+    - id: FR-201
+      description: >
+        New place-nav-sections.tsx exporting buildPlaceNavSections({ placeId,
+        verification, flags, t }) with groups per D3. Routes are the six
+        existing surfaces: details (edit), page, layout (flag seatingLayouts),
+        calendar, bookings, volunteers. Bookings carries the existing
+        countOpen badge mechanism where a per-place count endpoint exists;
+        otherwise no badge (do not add a new endpoint just for this — same
+        posture as FR-208 in the event regroup spec).
+    - id: FR-202
+      description: >
+        Register place context: match /admin/{slug}/places/{placeId} (but not
+        /places, /places/new). Context header renders place name +
+        verification chip fed by places.getPlaceTitle (new light procedure +
+        use case, output: id, name, slug, status, verification). Back slot
+        "← All places" → /admin/{slug}/places. Collapse persistence keyed
+        per place. Prefetch the six route segments on context entry.
+    - id: FR-203
+      description: >
+        Delete the hand-rolled tab bar from places/[placeId]/layout.tsx. The
+        layout keeps the owner-resolution/access gate and page container
+        only. The back-arrow + name + verification header moves into the
+        rail context header; the in-content page header shrinks to the
+        per-surface title. Mobile: place context flattens into the existing
+        bottom-bar mechanism (Details · Page · Calendar · Bookings · More),
+        inheriting hideInBottomBar semantics; verify the SCAN center action
+        is NOT rendered in place context.
+    - id: FR-204
+      description: >
+        useDocumentTitle behaviour currently in the tab layout is preserved
+        per surface ("{Tab} · {Place name}" — matching AdminShell's
+        "Section · Workspace" title convention).
+
+    # ── Slice 3 — edit-surface cleanup (follows, independently shippable) ──
+    - id: FR-301
+      description: >
+        Remove the three link-out cards (Public page, Seat Layout, Calendar —
+        edit/page.tsx:615,670,704); the rail now owns cross-navigation.
+    - id: FR-302
+      description: >
+        Verification moves from an inline section of the details form to its
+        own surface reachable from the rail ("Venue" group, item appears with
+        tone danger + badge when verification is UNVERIFIED/REJECTED), OR
+        stays in-form with a rail note — decide in build against real content
+        height; either way the details form drops below ~500 lines.
+    - id: FR-303
+      description: >
+        i18n sweep of the place edit surfaces: hard-coded EN strings at
+        edit/page.tsx:551-583 ("Contact & directory", "LISTED IN DIRECTORY",
+        "Phone", "Website") and PlaceProfileEditor.tsx:148-177 get catalog
+        keys in BOTH en and es (dual-catalog rule).
+
+  non_functional:
+    - id: NFR-1
+      description: >
+        No new heavy queries on shell mount: the shell calls only
+        getPlaceTitle in place context; getPlaceForEdit remains
+        surface-local.
+    - id: NFR-2
+      description: >
+        The registry refactor must not regress event-context render count —
+        the actions/state context split in event-nav-context.tsx (scroll-spy
+        churn isolation) survives as-is.
+    - id: NFR-3
+      description: >
+        320px viewport check on every place surface post-swap (rail context
+        is where the admin-rail-breaks-viewport-media-queries trap bites:
+        content width is not monotonic in viewport width — use @container,
+        never @media, for content-area responsive styles).
+
+# ── Out of scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Reworking the place edit form's field-level UX (10-useState dirty
+    tracking, geocode-on-save) beyond the slice-3 regroup.
+  - AccountShell migration onto NavigationShell (same disease, separate
+    decision — noted as follow-up, not blocked on this).
+  - A PlaceAdminPageShell RBAC gate paralleling EventAdminPageShell —
+    today's per-route inline gating stays; revisit when place roles grow
+    beyond boolean ownership.
+  - Suggest-edit UI for places (SuggestedEdit already allows subject PLACE;
+    no UI exists; separate feature).
+
+# ── Open questions ───────────────────────────────────────────────────────────
+
+open_questions:
+  - Should platform staff (PlatformShell) get the same place context when
+    editing via /platform/places? Deferred — staff edit through the detail
+    panel today; the registry makes it cheap later.
+  - Bookings badge per place: reuse of bookingRequests.countOpen is
+    org-scoped; a place-scoped count needs a filter param, not a new
+    endpoint. Confirm during build.

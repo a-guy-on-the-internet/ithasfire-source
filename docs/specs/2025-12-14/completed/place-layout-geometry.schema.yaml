@@ -1,0 +1,105 @@
+# Spec: Place Layout Geometry Schema Migration
+meta:
+  owner: db
+  status: completed
+  reviewers:
+    - core
+    - adapters
+    - ops
+  last_updated: 2025-11-14
+summary: |
+  Introduce structured geometry support for seats, sections, and a single
+  canonical place layout per venue. Persist stage metadata, seat geometry, and a
+  prebuilt R-tree for hit detection while removing the legacy embedded
+  `seatMap` JSON blobs and the previously proposed versioning tables.
+
+  Implemented directly in the baseline Prisma schema for this greenfield phase;
+  no standalone migration file is tracked yet.
+
+changes:
+  place_layouts:
+    action: create_table
+    columns:
+      - id UUID PK default uuid_generate_v4()
+      - place_id UUID not null references Place(id) on delete cascade
+      - checksum TEXT not null
+      - glyph_snapshot_key TEXT not null # path in object storage
+      - metadata JSONB not null default '{}' # defaultViewport, zoom bounds, editor hints
+      - seat_index JSONB not null default '{}' # serialized R-tree (RBush) for hit detection
+      - stage JSONB not null default '{}' # { polygon?: [...], center: { x, y }, lookAt?: { x, y }, label?: string }
+      - issues JSONB not null default '[]'
+      - created_by UUID not null references Human(id)
+      - created_at TIMESTAMPTZ not null default now()
+      - updated_at TIMESTAMPTZ not null default now()
+      - notes TEXT
+    indexes:
+      - unique (place_id)
+
+  seats:
+    action: alter_table
+    additions:
+      - geometry JSONB null # { x, y, radius?, width?, height?, rotation?, facingAngle? }
+    indexes:
+      - gin index on geometry jsonb_path_ops (optional for spatial queries)
+  seat_sections:
+    action: alter_table
+    additions:
+      - geometry JSONB null # { polygons: Array<Array<{ x, y }>>, origin: { x, y }, rotation, scale }
+      - stage_anchor JSONB null # { point: { x, y }, facingAngle?: number }
+    drops:
+      - seatMap
+
+migration_plan:
+  - During greenfield development, rely on the baseline Prisma schema instead of
+    a generated migration; create a formal migration only once persistent data exists.
+  - Create `place_layouts` table and new geometry columns with nullable defaults.
+  - Backfill existing seats/sections with placeholder geometry (derive `radius`
+    from section density if needed, default to 1).
+  - For venues with legacy `seat_sections.seatMap`, parse to populate geometry + stage,
+    then drop the column.
+  - Seed a `place_layouts` row per place using current seat data; compute checksum,
+    stage JSON, and R-tree.
+  - Place layout updates are destructive writes: delete seats/sections for the place and
+    insert the new snapshot within a transaction.
+  - Update Prisma schema and regenerate client.
+
+prisma_updates:
+  models:
+    PlaceLayout:
+      fields: id, placeId @unique, checksum, glyphSnapshotKey, metadata,
+        seatIndex, stage, issues, createdBy, createdAt, updatedAt, notes
+    Seat:
+      add field geometry Json?
+    SeatSection:
+      add field geometry Json?
+      add field stageAnchor Json?
+      drop field seatMap
+    StageLayout:
+      remove proposed model (stage stored on PlaceLayout)
+
+rollout:
+  1. Apply schema in staging; run backfill script to seed geometry
+     placeholders (x=0,y=0,radius=1) for existing records.
+  2. Update adapters to write geometry during import publish and persist the
+     snapshot into `place_layouts` (metadata + seat_index + stage).
+  3. Switch admin wizard write path to use destructive layout regeneration per place.
+  4. After production parity, drop old `seatMap` field from SeatSection.
+
+derived_indexes:
+  place_layout_rtree:
+    storage: place_layouts.seat_index (JSONB column)
+    builder:
+      - Generate 2D R-tree (RBush) from seat glyph centers + radius/width/height at publish time.
+      - Persist serialized tree within dedicated `seat_index` column for deterministic retrieval.
+    use_cases:
+      - Admin wizard hit detection while editing layouts.
+      - Buyer UI hover/select, especially for point-only seats relying on radius.
+    fallback: Rebuild on cache miss from glyph snapshot stored in PlaceLayoutBlobRepo.
+    notes:
+      - R-tree stored with the canonical place layout; regenerate only when a new layout snapshot is imported.
+      - Optional in-memory caches may still hydrate from metadata for runtime perf.
+
+open_questions:
+  - Should geometry become NOT NULL post-backfill?
+  - Do we need event-specific overrides, or is place-level sufficient?
+  - Is a dedicated PostGIS geometry type warranted later?

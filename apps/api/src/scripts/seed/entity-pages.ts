@@ -1,6 +1,9 @@
 import type { PrismaClient } from "@prisma/client";
 
+import { buildPageSlug } from "@th/core/use-cases/places/_shared/page-slug";
+
 import { DEMO_IDS } from "./ids.js";
+import { slugify } from "./utils.js";
 
 /**
  * Seeds EntityPage records for every org, place, and (additional) human in
@@ -406,7 +409,10 @@ const upsertEntityPage = async (prisma: PrismaClient, page: SeedablePage) => {
     },
     update: {
       // Don't clobber a slug that may have been customized (e.g. by the
-      // identity seed for the dev-login user).
+      // identity seed for the dev-login user). Consequence worth knowing: a
+      // database seeded BEFORE the place-page-slug fix keeps its unreachable
+      // multi-segment PLACE slugs across a re-seed — only a fresh
+      // `migrate reset` or `backfill-place-page-slug.ts` repairs those.
       displayName: page.displayName,
       bio: page.bio,
       avatarUrl: page.avatarUrl,
@@ -1170,11 +1176,99 @@ const deriveFallbackVenueContent = (place: {
   };
 };
 
+/** The Place columns the venue page seeder reads. */
+export type SeedablePlaceForPage = {
+  id: string;
+  name: string;
+  city: string | null;
+  region: string | null;
+  capacity: number | null;
+};
+
+/**
+ * Seed (or re-seed) the PLACE:venue EntityPage for ONE place. `index` only
+ * drives the avatar / banner / theme rotation, so a caller outside the
+ * all-places loop (a standalone fixture) passes any small integer.
+ *
+ * Extracted from `seedPlaceEntityPages` so a fixture that mints its own venue
+ * can give it a page byte-identical to every other seeded venue's — same
+ * `buildPageSlug`, same full template, same fallback content — instead of a
+ * second, drifting copy of this routine.
+ */
+export const seedPlaceEntityPage = async (
+  prisma: PrismaClient,
+  place: SeedablePlaceForPage,
+  index: number,
+) => {
+  const i = index;
+
+  // THE PAGE SLUG AND THE CONTENT KEY ARE TWO DIFFERENT THINGS. Keeping
+  // them as one variable is what made this seed write unreachable pages.
+  //
+  // pageSlug — the PUBLIC URL segment. Must come from `buildPageSlug`, the
+  //   same helper `upsertPlace` uses, so a seeded venue is byte-identical
+  //   to one the create path minted. Copying `Place.slug` here (the old
+  //   behaviour) wrote multi-segment values like `us/tn/x--a1b2c3d4e5` into
+  //   `EntityPage.slug`, and `/places/[slug]` is a SINGLE non-catch-all
+  //   segment, so every one of those venues 404'd. It only ever looked
+  //   right because the ~16 fixture venues in seed/places.ts happened to
+  //   carry a flat `Place.slug`; every OTHER place in the database — every
+  //   bulk-imported one — got an unreachable page, which masked the
+  //   matching production defect in `bulkImportPlaces`. `Place.slug` is now
+  //   deprecated and no longer written at all.
+  //
+  // contentKey — the lookup key for the hand-authored VENUE_BIOS /
+  //   VENUE_CONTENT maps and the grid holdout. Those are keyed by
+  //   `slugify(name-city)`, the value `seed/places.ts` computes for its ~16
+  //   fixture venues — NOT by the page slug, which carries an id suffix.
+  //   Re-keying them to `pageSlug` would silently drop every venue to
+  //   fallback copy. Derived here rather than read back off the row: it used
+  //   to come from `Place.slug`, which held exactly this value for the
+  //   fixtures. Keep this derivation in lockstep with `seed/places.ts`.
+  const pageSlug = buildPageSlug(place.name, place.id);
+  const contentKey = slugify(`${place.name}-${place.city ?? ""}`);
+
+  const fallbackBio = `${place.name} — ${place.city}, ${place.region}. Capacity ${place.capacity ?? "—"}.`;
+  const bio = VENUE_BIOS[contentKey] ?? fallbackBio;
+
+  // EVERY venue gets the FULL PLACE:venue template. Tailored content comes
+  // from VENUE_CONTENT keyed by contentKey; any venue without an entry falls
+  // back to DB-derived content so the template is still complete.
+  const content =
+    VENUE_CONTENT[contentKey] ?? deriveFallbackVenueContent(place);
+  const blocks = buildVenueBlocks({
+    // Label only — this feeds the capacity-mismatch error message, where the
+    // hand-authored content key is the useful identifier to name.
+    slug: contentKey,
+    bio,
+    totalCapacity: place.capacity,
+    content,
+  });
+
+  await upsertEntityPage(prisma, {
+    ownerType: "PLACE",
+    ownerId: place.id,
+    slug: pageSlug,
+    displayName: place.name,
+    bio,
+    avatarUrl: PLACE_AVATARS[i % PLACE_AVATARS.length]!,
+    bannerUrl: PLACE_BANNERS[i % PLACE_BANNERS.length]!,
+    // Preset rotation unchanged; SOMA Warehouse is the deliberate venue grid
+    // holdout (freeform canvas stays exercised — see THEMES comment).
+    theme: {
+      ...(i % 2 === 0 ? THEMES.swissAccent! : THEMES.warmDark!),
+      ...(contentKey === GRID_HOLDOUT_VENUE_SLUG
+        ? { layoutKey: "grid" }
+        : {}),
+    },
+    blocks,
+  });
+};
+
 export const seedPlaceEntityPages = async (prisma: PrismaClient) => {
   const places = await prisma.place.findMany({
     select: {
       id: true,
-      slug: true,
       name: true,
       city: true,
       region: true,
@@ -1184,45 +1278,7 @@ export const seedPlaceEntityPages = async (prisma: PrismaClient) => {
 
   let count = 0;
   for (let i = 0; i < places.length; i++) {
-    const place = places[i]!;
-    // Place.slug can be null in the schema; fall back to a derived slug so
-    // the EntityPage row always has a usable URL fragment.
-    const slug =
-      place.slug ??
-      place.name
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-|-$/g, "");
-    const fallbackBio = `${place.name} — ${place.city}, ${place.region}. Capacity ${place.capacity ?? "—"}.`;
-    const bio = VENUE_BIOS[slug] ?? fallbackBio;
-
-    // EVERY venue gets the FULL PLACE:venue template. Tailored content comes
-    // from VENUE_CONTENT keyed by slug; any venue without an entry falls back to
-    // DB-derived content so the template is still complete.
-    const content = VENUE_CONTENT[slug] ?? deriveFallbackVenueContent(place);
-    const blocks = buildVenueBlocks({
-      slug,
-      bio,
-      totalCapacity: place.capacity,
-      content,
-    });
-
-    await upsertEntityPage(prisma, {
-      ownerType: "PLACE",
-      ownerId: place.id,
-      slug,
-      displayName: place.name,
-      bio,
-      avatarUrl: PLACE_AVATARS[i % PLACE_AVATARS.length]!,
-      bannerUrl: PLACE_BANNERS[i % PLACE_BANNERS.length]!,
-      // Preset rotation unchanged; SOMA Warehouse is the deliberate venue grid
-      // holdout (freeform canvas stays exercised — see THEMES comment).
-      theme: {
-        ...(i % 2 === 0 ? THEMES.swissAccent! : THEMES.warmDark!),
-        ...(slug === GRID_HOLDOUT_VENUE_SLUG ? { layoutKey: "grid" } : {}),
-      },
-      blocks,
-    });
+    await seedPlaceEntityPage(prisma, places[i]!, i);
     count++;
   }
   return count;

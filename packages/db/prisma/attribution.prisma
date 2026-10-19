@@ -1,0 +1,52 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Attribution — Tracks which performer/artist drove each ticket sale.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model TicketAttribution {
+  id              String    @id @default(uuid())
+  eventId         String
+  orderId         String
+
+  /// Stable dedupe key: ticket-attribution:v1:{eventId}:{orderId}
+  idempotencyKey  String
+
+  /// FK to EventHuman (the performer who gets credit)
+  attributedToEventHumanId  String?
+  /// FK to Human record of the attributed performer (denormalized for query speed)
+  attributedToHumanId       String?
+
+  source          TicketAttributionSource
+  trackingConsent AttributionConsentStatus  @default(UNKNOWN)
+
+  refRaw          String?
+  refEventHumanId String?
+  utmSource       String?
+  utmMedium       String?
+  utmCampaign     String?
+
+  /// Null when consent is denied or data has been deleted/redacted
+  fanHumanId      String?
+  fanCity          String?
+  fanState         String?
+  fanCountry       String?    @db.VarChar(2)
+
+  checkoutArtistSelection   String?
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  order           Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  event           Event       @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  attributedToEventHuman EventHuman? @relation(fields: [attributedToEventHumanId], references: [id], onDelete: SetNull)
+  attributedToHuman      Human?      @relation("AttributedArtist", fields: [attributedToHumanId], references: [id], onDelete: SetNull)
+  fan             Human?      @relation("TicketFan", fields: [fanHumanId], references: [id], onDelete: SetNull)
+
+  @@unique([eventId, orderId])
+  @@unique([idempotencyKey])
+  @@index([eventId])
+  @@index([attributedToHumanId])
+  @@index([attributedToEventHumanId])
+  @@index([fanHumanId])
+  @@index([eventId, attributedToHumanId])
+  @@index([fanHumanId, eventId])
+}

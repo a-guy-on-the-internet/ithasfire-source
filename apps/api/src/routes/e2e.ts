@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { mintApplicationFormPublicId } from "@th/core/lib/application-form-public-id";
 import fp from "fastify-plugin";
 import type { FastifyPluginAsync } from "fastify";
 import { hashPassword } from "better-auth/crypto";
@@ -13,6 +14,7 @@ import { createCreditsFromOrder } from "@th/core/use-cases/settlements/create-cr
 import { getSettlement } from "@th/core/use-cases/settlements/get-settlement";
 import { quoteFullRefund } from "@th/core/use-cases/orders/quote-full-refund";
 import { refundFullOrder } from "@th/core/use-cases/orders/refund-full-order";
+import { stripeRefundReasonSchema } from "@th/schema";
 import { CURRENT_CHARGEBACK_TERMS_VERSION } from "@th/core/lib/payments";
 import { hashEventPassword } from "@th/core/lib/security/event-password";
 import type { PaymentProcessorPort } from "@th/ports/payment-processor-port";
@@ -122,6 +124,9 @@ const plugin: FastifyPluginAsync = async (app) => {
       await prisma.promoHold.deleteMany({}).catch(() => undefined);
       await prisma.promo.deleteMany({}).catch(() => undefined);
 
+      // ── P4b (deal terms) ── settlement sheets name payees (Restrict): they
+      // go before the payees below. Deductions cascade with their terms.
+      await prisma.settlementSheet.deleteMany({}).catch(() => undefined);
       await prisma.payoutTermsLine.deleteMany({}).catch(() => undefined);
       await prisma.payoutTerms.deleteMany({}).catch(() => undefined);
       await prisma.feePolicy.deleteMany({}).catch(() => undefined);
@@ -133,7 +138,6 @@ const plugin: FastifyPluginAsync = async (app) => {
 
       // Place-related tables (ownership must go before places).
       await prisma.placeOwnership.deleteMany({}).catch(() => undefined);
-      await prisma.placeSlugHistory.deleteMany({}).catch(() => undefined);
       await prisma.placeLayout.deleteMany({}).catch(() => undefined);
       await prisma.place.deleteMany({}).catch(() => undefined);
 
@@ -797,6 +801,7 @@ const plugin: FastifyPluginAsync = async (app) => {
             repos: app.deps.trpc.repos,
             search: multiSearch,
             clock: app.deps.trpc.clock,
+            reportError: app.deps.trpc.reportError ?? undefined,
           },
           { fullReindex: true },
         );
@@ -816,6 +821,7 @@ const plugin: FastifyPluginAsync = async (app) => {
             repos: app.deps.trpc.repos,
             search: multiSearch,
             clock: app.deps.trpc.clock,
+            reportError: app.deps.trpc.reportError ?? undefined,
           },
           { fullReindex: true },
         );
@@ -942,7 +948,7 @@ const plugin: FastifyPluginAsync = async (app) => {
     // help section of their own order page, mirroring sendTicketIssuedEmail.
     const supportUrl = `${publicAppUrl.replace(/\/+$/, "")}/my-tickets/${order.id}#get-help`;
     const venueName =
-      orderEvent.place?.name ?? orderEvent.addressText ?? "Venue TBA";
+      orderEvent.place?.name ?? orderEvent.addressText ?? "Place TBA";
     const qrBaseUrl = `${publicAppUrl.replace(/\/+$/, "")}/tickets/qr`;
     const ticketAssets = tickets.map((ticket) => ({
       code: ticket.code,
@@ -1177,6 +1183,9 @@ const plugin: FastifyPluginAsync = async (app) => {
             // No prior reversals: with unbounded capacity above, the
             // recovery path in reverseTransfersForItems is never entered.
             listTransferReversals: async () => [],
+            // The stub processor moves no money, so no prior refund can
+            // exist for the retry pre-flight to reuse.
+            listRefundsForPaymentIntent: async () => [],
             createTerminalConnectionToken: async () => ({
               secret: `pst_e2e_${Date.now()}`,
             }),
@@ -1202,6 +1211,22 @@ const plugin: FastifyPluginAsync = async (app) => {
             },
             cancelReaderAction: async () => {
               throw new Error("e2e stub: terminal readers unsupported");
+            },
+            // Dispute ops are out of scope for the e2e checkout stub.
+            retrieveDispute: async () => {
+              throw new Error("e2e stub: disputes unsupported");
+            },
+            updateDisputeEvidence: async () => {
+              throw new Error("e2e stub: disputes unsupported");
+            },
+            uploadDisputeEvidenceFile: async () => {
+              throw new Error("e2e stub: disputes unsupported");
+            },
+            // Reporting-only on the port (never a payout gate), so an e2e
+            // checkout never reads it; the composition root's unconfigured
+            // processor fails it the same way.
+            getPlatformBalance: async () => {
+              throw new Error("e2e stub: platform balance unsupported");
             },
           }
         : app.deps.trpc.payments;
@@ -1489,15 +1514,18 @@ const plugin: FastifyPluginAsync = async (app) => {
         .send({ ok: false, error: "missing_actor_human_id" });
     }
 
+    const parsedReason = stripeRefundReasonSchema
+      .optional()
+      .safeParse(body.reason);
+    if (!parsedReason.success) {
+      return reply.status(400).send({ ok: false, error: "invalid_reason" });
+    }
+
     try {
       const result = await refundFullOrder(app.deps.trpc, {
         actorHumanId: body.actorHumanId,
         orderId,
-        reason: body.reason as
-          | "requested_by_customer"
-          | "fraudulent"
-          | "other"
-          | undefined,
+        reason: parsedReason.data,
       });
       return reply.send({
         ok: true,
@@ -2120,6 +2148,8 @@ const plugin: FastifyPluginAsync = async (app) => {
         const form = await prisma.eventApplicationForm.create({
           data: {
             eventId: event.id,
+            purpose: "ATTEND",
+            publicId: mintApplicationFormPublicId(),
           },
         });
         applicationFormId = form.id;
@@ -2174,11 +2204,15 @@ const plugin: FastifyPluginAsync = async (app) => {
   app.post("/e2e/seed/magic-link", async (request, reply) => {
     if (!assertE2eAuthorized(request, reply)) return;
 
+    // Gated-event invite links (docs/specs/2026-10-02/completed/gated-event-invite-
+    // links.spec.yaml): mints the event's SHARED invite. Only the SHA-256 of
+    // the token is stored; the raw token is handed back once, here. Any live
+    // SHARED invite is revoked first (one live per event, DB-enforced).
+    // `targetHumanId` / `expiresInDays` from the old magic-link contract are
+    // ignored: invites have no target and no timer.
     const body = (request.body ?? {}) as {
       eventId: string;
       creatorHumanId: string;
-      targetHumanId?: string;
-      expiresInDays?: number;
       metadata?: Record<string, unknown>;
     };
 
@@ -2190,43 +2224,43 @@ const plugin: FastifyPluginAsync = async (app) => {
       });
     }
 
-    const now = new Date();
-    const expiresInDays = body.expiresInDays ?? 7;
-    const expiresAt = new Date(
-      now.getTime() + expiresInDays * 24 * 60 * 60 * 1000,
-    );
-
     try {
-      // Generate a magic link token (same format as use case)
-      const token = `ml_${randomUUID().replace(/-/g, "")}${randomUUID().replace(/-/g, "")}`;
+      const token = randomBytes(32).toString("base64url");
+      const tokenHash = createHash("sha256").update(token).digest("hex");
 
-      const magicLink = await prisma.eventMagicLink.create({
-        data: {
-          eventId: body.eventId,
-          token,
-          targetHumanId: body.targetHumanId ?? null,
-          createdByHumanId: body.creatorHumanId,
-          expiresAt,
-          metadata: (body.metadata ?? {}) as object,
-        },
+      const invite = await prisma.$transaction(async (tx) => {
+        await tx.eventInvite.updateMany({
+          where: { eventId: body.eventId, kind: "SHARED", revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
+        return tx.eventInvite.create({
+          data: {
+            eventId: body.eventId,
+            kind: "SHARED",
+            tokenHash,
+            createdByHumanId: body.creatorHumanId,
+            metadata: (body.metadata ?? {}) as object,
+          },
+        });
       });
 
       return reply.send({
         ok: true,
         magicLink: {
-          id: magicLink.id,
-          token: magicLink.token,
-          eventId: magicLink.eventId,
-          targetHumanId: magicLink.targetHumanId,
-          expiresAt: magicLink.expiresAt?.toISOString() ?? null,
+          id: invite.id,
+          token,
+          eventId: invite.eventId,
+          kind: invite.kind,
         },
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       app.log.error({ err }, "e2e_seed_magic_link_failed");
-      return reply
-        .status(500)
-        .send({ ok: false, error: "e2e_seed_magic_link_failed", message });
+      return reply.status(500).send({
+        ok: false,
+        error: "e2e_seed_magic_link_failed",
+        message,
+      });
     }
   });
 
@@ -2404,7 +2438,6 @@ const plugin: FastifyPluginAsync = async (app) => {
       const placeActive = await prisma.place.create({
         data: {
           name: "E2E Main Venue",
-          slug: `e2e-main-venue-${Date.now()}`,
           address: "123 Main St, Testville, TS 00001",
           addrLine1: "123 Main St",
           city: "Testville",
@@ -2422,7 +2455,6 @@ const plugin: FastifyPluginAsync = async (app) => {
       const placeArchived = await prisma.place.create({
         data: {
           name: "E2E Old Hall",
-          slug: `e2e-old-hall-${Date.now()}`,
           address: "456 Archive Ave, Testville, TS 00002",
           addrLine1: "456 Archive Ave",
           city: "Testville",
@@ -2524,7 +2556,11 @@ const plugin: FastifyPluginAsync = async (app) => {
       });
 
       const appForm = await prisma.eventApplicationForm.create({
-        data: { eventId: eventAppGated.id },
+        data: {
+          eventId: eventAppGated.id,
+          purpose: "ATTEND",
+          publicId: mintApplicationFormPublicId(),
+        },
       });
 
       await prisma.eventApplicationQuestion.createMany({
@@ -2841,7 +2877,6 @@ const plugin: FastifyPluginAsync = async (app) => {
       const placePending = await prisma.place.create({
         data: {
           name: "E2E Pending Venue",
-          slug: `e2e-pending-venue-${Date.now()}`,
           address: "100 Pending Ave, Testville, TS 00010",
           addrLine1: "100 Pending Ave",
           city: "Testville",
@@ -2859,7 +2894,6 @@ const plugin: FastifyPluginAsync = async (app) => {
       const placeVerified = await prisma.place.create({
         data: {
           name: "E2E Verified Hall",
-          slug: `e2e-verified-hall-${Date.now()}`,
           address: "200 Verified Blvd, Testville, TS 00020",
           addrLine1: "200 Verified Blvd",
           city: "Testville",
@@ -3303,11 +3337,9 @@ const plugin: FastifyPluginAsync = async (app) => {
       });
 
       // ── Place ──────────────────────────────────────────────────────
-      const placeSlug = `e2e-venue-${Date.now()}`;
       const place = await prisma.place.create({
         data: {
           name: "E2E Test Venue",
-          slug: placeSlug,
           address: "100 Calendar St, Test City, TS 00001",
           city: "Test City",
           region: "TS",
@@ -3519,7 +3551,6 @@ const plugin: FastifyPluginAsync = async (app) => {
           orgId: org.id,
           orgSlug,
           placeId: place.id,
-          placeSlug,
           eventTodayId: eventToday.id,
           eventTodayTitle: eventToday.title,
           eventTomorrowId: eventTomorrow.id,
@@ -3647,11 +3678,9 @@ const plugin: FastifyPluginAsync = async (app) => {
       });
 
       // ── Place ──────────────────────────────────────────────────────
-      const placeSlug = `e2e-venue-${Date.now()}`;
       const place = await prisma.place.create({
         data: {
           name: "E2E Test Venue",
-          slug: placeSlug,
           address: "100 E2E Blvd",
           city: "Testville",
           region: "TX",
@@ -3680,7 +3709,6 @@ const plugin: FastifyPluginAsync = async (app) => {
           orgId: org.id,
           orgSlug,
           placeId: place.id,
-          placeSlug,
         },
       });
     } catch (err) {

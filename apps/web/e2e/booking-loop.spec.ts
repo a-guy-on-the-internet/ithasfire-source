@@ -80,8 +80,10 @@ test.describe("Booking loop — owned path", () => {
   ) {
     await performerPage.goto(`/p/${seed.pageSlug}`);
 
+    // "Play here" is the PERFORM intent's CTA (venue-confirmation spec); the
+    // dialog it opens is still titled "Request to book".
     const heroCta = performerPage
-      .getByRole("button", { name: "Request to book" })
+      .getByRole("button", { name: "Play here" })
       .first();
     await expect(heroCta).toBeVisible({ timeout: 20_000 });
     await heroCta.click();
@@ -89,12 +91,15 @@ test.describe("Booking loop — owned path", () => {
     const dialog = performerPage.getByRole("dialog");
     await expect(dialog).toBeVisible();
 
-    // One-click performer-mode gate (first pitch only; later pitches skip it).
+    // One-click performer-mode enable (first pitch only). Since the bill
+    // (lineup v3, board F1) it sits beside "I'm on the bill" INSIDE the form,
+    // so the button and the message field can both be visible — `.first()`
+    // keeps the wait strict-mode safe.
     const enableButton = dialog.getByRole("button", {
       name: "Turn on performer mode",
     });
     const messageField = dialog.getByLabel("Message");
-    await expect(enableButton.or(messageField)).toBeVisible({
+    await expect(enableButton.or(messageField).first()).toBeVisible({
       timeout: 15_000,
     });
     if (await enableButton.isVisible().catch(() => false)) {
@@ -403,7 +408,14 @@ test.describe("Booking loop — owned path", () => {
         confirmationStatus: string | null;
       }) =>
         line.requiresConfirmation && line.confirmationStatus !== "CONFIRMED",
-    );
+    ) as
+      | {
+          id: string;
+          percent: number;
+          floorCents: number;
+          capPercent: number | null;
+        }
+      | undefined;
     expect(pendingLine, "Expected an unconfirmed third-party line").toBeTruthy();
 
     const thirdApiCtx = await pwRequest.newContext();
@@ -416,8 +428,14 @@ test.describe("Booking loop — owned path", () => {
       bearerToken: thirdToken,
     });
     await thirdTrpc.payoutTerms.confirmPayoutLine.mutate({
-      payoutTermsLineId: (pendingLine as { id: string }).id,
+      payoutTermsLineId: pendingLine!.id,
       decision: "CONFIRM",
+      // The answer is to the share the payee was shown.
+      answered: {
+        percent: pendingLine!.percent,
+        floorCents: pendingLine!.floorCents,
+        capPercent: pendingLine!.capPercent,
+      },
     });
 
     // ── Venue re-clicks create → CONVERGE (alreadyLinked, NO redirect) ───

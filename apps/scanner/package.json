@@ -24,7 +24,7 @@
     "@th/ui-native": "workspace:*",
     "@trpc/client": "^11.5.1",
     "@trpc/react-query": "^11.5.1",
-    "better-auth": "^1.6.9",
+    "better-auth": "1.6.9",
     "burnt": "^0.13.0",
     "expo": "~54.0.34",
     "expo-application": "^7.0.8",
@@ -56,10 +56,12 @@
   },
   "devDependencies": {
     "@babel/core": "^7.26.0",
+    "@testing-library/react": "^16.3.0",
     "@types/node": "^20.19.14",
     "@types/react": "~19.1.0",
     "babel-plugin-module-resolver": "^5.0.2",
     "eas-cli": "^18.8.1",
+    "jsdom": "^26.1.0",
     "typescript": "~5.9.2",
     "vitest": "^3.2.4"
   },

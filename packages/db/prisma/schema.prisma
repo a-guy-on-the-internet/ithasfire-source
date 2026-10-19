@@ -1,0 +1,15 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Generator & Datasource — the only blocks that MUST live in schema.prisma.
+// All models and enums are split into domain-specific files in this directory.
+// See docs/decisions/prisma-multi-file-schema.md for rationale.
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  extensions = [pg_trgm, unaccent, cube, earthdistance]
+}

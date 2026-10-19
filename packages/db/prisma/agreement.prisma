@@ -1,0 +1,771 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Agreement — Agreements, booking requests, place waivers, place availability.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Agreement {
+  id                String          @id @default(uuid())
+  type              AgreementType
+  status            AgreementStatus @default(DRAFT)
+
+  // Parties
+  proposerType      String          // "human" | "organization"
+  proposerId        String
+  counterpartyType  String          // "human" | "organization"
+  counterpartyId    String
+
+  // Links
+  placeId           String?
+  eventId           String?         @unique // one agreement per event at most
+  // DRAFT event minted by createEventFromAgreement BEFORE finalize stamps
+  // eventId (booking-conversation-and-event-step FR-006). Idempotency anchor:
+  // a repeat create returns this event instead of minting another. Kept
+  // separate from eventId ON PURPOSE — eventId-set still means "finalized"
+  // everywhere (reopen fence, FinalizeDialog); SetNull on event deletion lets
+  // a venue discard the draft and mint a fresh one.
+  draftEventId      String?         @unique
+  payoutTermsId     String?
+
+  // Deal details
+  title             String
+  description       String?
+  proposedDate      DateTime?
+  proposedEndDate   DateTime?
+  guaranteeCents    Int?            // artist minimum — a RECORDED term only. Never mapped to a PayoutTermsLine and never settled by the platform (2026-08: deals are recorded, not executed).
+
+  // Lifecycle
+  proposedAt        DateTime?
+  acceptedAt        DateTime?
+  declinedAt        DateTime?
+  declinedReason    String?
+  expiresAt         DateTime?
+  fulfilledAt       DateTime?
+
+  // Waiver
+  waiverAccepted    Boolean         @default(false)
+  waiverAcceptedAt  DateTime?
+  waiverVersion     Int?
+
+  metadata          Json            @default("{}")
+
+  /// The venue person who last sent these terms for the sender to agree
+  /// (DRAFT → PROPOSED; booking-the-night FR-002). When the sender agrees,
+  /// the draft event is created AS THIS PERSON, with their canCreateEvents
+  /// authority re-checked at that moment (N10). Stamped by the same guarded
+  /// status write as the send; overwritten by each later send. Null on rows
+  /// sent before the column existed, and SetNull if the human is deleted —
+  /// the mint then fails its authority check and the venue retries with
+  /// "Create event", as for any failed mint.
+  sentForReviewByHumanId String?
+
+  place             Place?          @relation("AgreementPlace", fields: [placeId], references: [id], onDelete: SetNull)
+  event             Event?          @relation("AgreementEvent", fields: [eventId], references: [id], onDelete: SetNull)
+  draftEvent        Event?          @relation("AgreementDraftEvent", fields: [draftEventId], references: [id], onDelete: SetNull)
+  payoutTerms       PayoutTerms?    @relation("AgreementPayoutTerms", fields: [payoutTermsId], references: [id], onDelete: SetNull)
+  sentForReviewBy   Human?          @relation("AgreementSentForReviewBy", fields: [sentForReviewByHumanId], references: [id], onDelete: SetNull)
+
+  bookingRequest    BookingRequest?
+
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  @@index([proposerType, proposerId, status])
+  @@index([counterpartyType, counterpartyId, status])
+  @@index([placeId, status])
+  // FK maintenance on human deletion (SetNull scans by sentForReviewByHumanId).
+  @@index([sentForReviewByHumanId])
+}
+
+model BookingRequest {
+  id              String                @id @default(uuid())
+
+  // ── Direction (organizer-booking-requests, 2026-07-21) ─────────────────────
+  // TO_VENUE: performer → venue (placeId required, organizerOrgId null).
+  // TO_PERFORMER: organizer org → act (placeId null, organizerOrgId required,
+  // performer owner pair required). The owner pair is the SENDER in TO_VENUE
+  // and the TARGET act in TO_PERFORMER (lineup v2 D3b — see the pair below).
+  // DB-enforced by the SQL-only CHECK
+  // "BookingRequest_direction_shape_check" (migration 20260721).
+  direction       BookingRequestDirection @default(TO_VENUE)
+
+  // Venue side. Required for TO_VENUE, always NULL for TO_PERFORMER (an
+  // attached event's venue feeds the minted Agreement, never this column).
+  placeId         String?
+
+  // Sender org for TO_PERFORMER requests; always NULL for TO_VENUE.
+  organizerOrgId  String?
+
+  // ── Calendar routing (venue-hierarchy FR-008, 2026-08-18) ──────────────────
+  // The named Calendar this request routes to. Required app-side for TO_VENUE
+  // requests (defaulted when the place has one calendar); nullable in the
+  // schema for TO_PERFORMER rows and pre-hierarchy data. SetNull — deleting a
+  // calendar never deletes requests.
+  calendarId      String?
+
+  // Optional existing-event attach (TO_PERFORMER only): the show the
+  // organizer wants the act for. Stored as an id only — title/date render
+  // live; deleting the event detaches (SetNull), never deletes the request.
+  attachedEventId String?
+
+  // ── Intent + the room + the window (venue-confirmation-and-booking-intents
+  // spec, docs/specs/2026-08-27) ─────────────────────────────────────────────
+  // What the request asks for. Existing rows backfill to PERFORM (the column
+  // default). Picks the form variant and the default event owner at accept.
+  intent            BookingIntent  @default(PERFORM)
+  // The Space the request wants, if the sender named one. OPTIONAL for every
+  // intent (owner ruling 2026-09-22, migration
+  // 20260922120000_booking_request_space_optional: a request routes to a
+  // CALENDAR and a window; the room is chosen at accept/confirm, on the draft
+  // event). A supplied room is still asserted onto the routed calendar by the
+  // use case. SetNull — deleting a room never deletes the request, so a null
+  // here means EITHER "no room asked" OR "the room was deleted"; the two are
+  // not distinguishable.
+  spaceId           String?
+  // RENT/USE booking window (one date per booking). PERFORM keeps using
+  // `preferredDates`. Required for RENT/USE by the same CHECK.
+  requestedStartsAt DateTime?
+  requestedEndsAt   DateTime?
+  // "What is it" — the one-line description a RENT/USE request carries in
+  // place of the performer pitch.
+  purpose           String?        @db.VarChar(200)
+  expectedAttendance Int?
+  /// Event-first: the event that created this request (the builder named a
+  /// place + calendar that accepts the intent, so saving the event auto-
+  /// created the request). Nullable; SetNull — deleting the event leaves the
+  /// request. Unique: one origin request per event.
+  originEventId     String?        @unique
+  /// Unclaimed venue at request time — the request is parked until the place
+  /// is claimed (a claim invite fires). Null once the venue can respond.
+  parkedUnclaimedAt DateTime?
+  /// The request was created with a BILL (lineup-booking-requests v3, L12):
+  /// its act rows — possibly none — ARE the proposed lineup. TRUE for every
+  /// request created through a path that records a bill (the signed-in
+  /// PERFORM create, the embed inquiry); FALSE for rows that predate bills
+  /// and for paths that never carry one (RENT/USE, event-first, TO_PERFORMER).
+  /// The event mint reads it: only a FALSE request with no act rows gets the
+  /// pre-bill "sender headlines" fallback; a TRUE request with no live acts
+  /// mints an EMPTY lineup. Migration
+  /// 20261001130000_booking_request_bill_recorded backfilled TRUE for every
+  /// request that already had an act row.
+  billRecorded      Boolean        @default(false)
+
+  // Polymorphic owner pair — "human" | "organization" (app-enforced, mirrors
+  // Agreement.proposerType/Id). The column NAMES are historical (lineup-
+  // booking-requests v2, decision D3b, 2026-09-25): in TO_VENUE this pair is
+  // the SENDER — the organizer of the ask, who may or may not be on the bill.
+  // The act(s) live in BookingRequestAct (a SELF row carries this same pair
+  // when the sender is on the bill). In TO_PERFORMER the pair is still the
+  // TARGET act (the sender there is `organizerOrgId`; bills do not exist in
+  // that direction). The accepted Agreement is always minted with this pair.
+  // Names, the sender-identity CHECK, the direction CHECK and the open-pair
+  // uniqueness indexes are unchanged. NULL only for anonymous TO_VENUE embed
+  // inquiries (booking-request-embed-button FR-005) until the submitter
+  // claims the request; contactName/contactEmail identify the sender then.
+  performerOwnerType String?
+  performerOwnerId   String?
+
+  // ── Anonymous sender (embed inquiries, 2026-07-13) ─────────────────────────
+  // Required (app-enforced) when performerOwnerType/Id are NULL. contactEmail
+  // is stored LOWERCASED app-side — the anonymous open-pair dedupe index
+  // ("BookingRequest_open_anon_pair_key", SQL-only) matches on lower(email).
+  contactName        String?
+  contactEmail       String?
+  // Where the request came from; EMBED rows may carry the originating embed.
+  source             BookingRequestSource @default(PLATFORM)
+  embedId            String?
+  // Invite-to-claim (FR-007): single-use token, hashed at rest; raw token
+  // only ever appears in the invite email link. Cleared/rotated app-side.
+  claimTokenHash      String?              @unique
+  claimTokenExpiresAt DateTime?
+  claimedAt           DateTime?
+
+  // ── Venue → inquirer outreach (booking-inquirer-outreach, 2026-09-05) ─────
+  /// RFC 5322 Message-ID of the FIRST venue→inquirer thread email for this
+  /// request; later sends quote it in In-Reply-To + References so the booking
+  /// reads as ONE chain in the inquirer's mailbox. Deliberately NOT unique:
+  /// the value is minted by us, and a unique index would add a P2002 path to a
+  /// best-effort post-commit send.
+  inquirerEmailMessageId String?
+  /// Bounce/complaint stamp for `contactEmail`, ingested by the Resend
+  /// webhook. Exists because AuthUser.emailDeliveryStatus is deliberately
+  /// never flagged for an UNVERIFIED account, and every inquirer shadow is
+  /// unverified by construction — so without this a bounced venue reply would
+  /// leave no trace the venue could ever see.
+  inquirerEmailUndeliverableAt     DateTime?
+  inquirerEmailUndeliverableStatus EmailDeliveryStatus?
+
+  // The pitch
+  message         String
+  preferredDates  Json                  @default("[]")
+  expectedDraw    Int?
+  genre           String?
+  // LEGACY: generic pitch links. Superseded on the create path by the typed
+  // link* columns below (linkMusic/linkVideo/linkSocial/linkEpk). Retained
+  // (not dropped) so pre-expansion rows keep their data; no new writes.
+  links           Json                  @default("[]")
+
+  // ── Expanded pitch fields (2026-07-11) ─────────────────────────────────────
+  // All additive + nullable. `feeAmountCents` is integer cents interpreted in
+  // `feeCurrency` (venue-level currency isn't modeled — the platform base
+  // "usd" is snapshotted at create time; see create-booking-request.ts).
+  actName          String?
+  lineupSize       Int?
+  setLengthMinutes Int?
+  contactPhone     String?
+  techNeeds        String?
+  feeType          BookingFeeType?
+  feeAmountCents   Int?
+  feeCurrency      String?              @db.VarChar(3)
+  linkMusic        String?
+  linkVideo        String?
+  linkSocial       String?
+  linkEpk          String?
+
+  /// LEGACY venue-side labels (venue-hierarchy FR-008). Superseded by the
+  /// org-scoped BookingTag + BookingRequestTag join (booking-holds spec
+  /// 2026-08-25, FR-017). Retained so pre-existing rows keep their data; no
+  /// new code writes it.
+  tags            String[]              @default([])
+
+  /// Venue-internal assignee (booking-holds FR-015): the staff human working
+  /// this request; notification target for challenge answers and expiries.
+  /// Plain id, no FK (house style — mirrors BookingRequestMessage.authorHumanId).
+  /// Null = unassigned (human-owned venues: the owner is implicitly assigned).
+  assigneeHumanId String?
+
+  /// One shared note (holds-without-a-request FR-012): plain text, read and
+  /// edited by the sender side and place staff, last-write-wins with who and
+  /// when. noteUpdatedByHumanId is a plain id, no FK (house style).
+  note                 String?   @db.VarChar(2000)
+  noteUpdatedByHumanId String?
+  noteUpdatedAt        DateTime?
+
+  // Tax-form paperwork FLAG only (venue-hierarchy FR-008) — never any
+  // TIN/identity storage; identity collection stays deferred to Stripe
+  // Connect onboarding.
+  taxFormStatus   BookingTaxFormStatus  @default(NONE)
+
+  // Denormalized from BookingRequestMessage for inbox recency ordering
+  // (booking-conversation FR-001; mirrors SupportThread.lastMessageAt).
+  lastMessageAt   DateTime?
+
+  status          BookingRequestStatus  @default(PENDING)
+  viewedAt        DateTime?
+  respondedAt     DateTime?
+  declineReason   String?
+
+  // If accepted, the resulting agreement
+  agreementId     String?               @unique
+
+  // Point-in-time, server-sourced snapshot of the sender's whitelisted
+  // HumanStats (musician-epk FR-009). Null unless a HUMAN sender opted in AND
+  // met the eligibility threshold at create time. Carries the source
+  // aggregate's computedAt (ISO string) — never a live number, never
+  // client-supplied.
+  verifiedStatsSnapshot Json?
+
+  expiresAt       DateTime?
+
+  place           Place?                @relation("BookingRequestPlace", fields: [placeId], references: [id], onDelete: Cascade)
+  organizerOrg    Organization?         @relation("BookingRequestOrganizerOrg", fields: [organizerOrgId], references: [id], onDelete: Cascade)
+  attachedEvent   Event?                @relation("BookingRequestAttachedEvent", fields: [attachedEventId], references: [id], onDelete: SetNull)
+  calendar        Calendar?             @relation("BookingRequestCalendar", fields: [calendarId], references: [id], onDelete: SetNull)
+  space           Space?                @relation("BookingRequestSpace", fields: [spaceId], references: [id], onDelete: SetNull)
+  originEvent     Event?                @relation("BookingRequestOriginEvent", fields: [originEventId], references: [id], onDelete: SetNull)
+  agreement       Agreement?            @relation(fields: [agreementId], references: [id], onDelete: SetNull)
+
+  messages        BookingRequestMessage[]
+  attachments     BookingRequestAttachment[]
+  // ── P3b (asks) ── venue-booking-standards v1.1 FR-009b
+  asks            BookingRequestAsk[]
+  acts            BookingRequestAct[]
+  holds          BookingHold[]
+  requestTags     BookingRequestTag[]
+
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @updatedAt
+
+  @@index([placeId, status])
+  // Inbox "Assigned to" column / Unassigned filter (booking-holds FR-015).
+  @@index([assigneeHumanId, status])
+  // Calendar-routed inbox filter + FK maintenance on calendar deletion.
+  @@index([calendarId, status])
+  @@index([performerOwnerType, performerOwnerId, status])
+  // Organizer "sent to acts" list (scope: "organizer").
+  @@index([organizerOrgId, status])
+  // FK maintenance on event deletion (SetNull scans by attachedEventId).
+  @@index([attachedEventId])
+  // Inbox/dedupe lookups for anonymous inquiries (contactEmail is lowercased
+  // app-side, so plain equality matches lower(email)).
+  @@index([placeId, contactEmail])
+  // Bounce/complaint fan-in: the Resend webhook only knows the ADDRESS, so it
+  // marks undeliverable inquiries by contactEmail alone — the (placeId,
+  // contactEmail) composite above cannot serve that lookup.
+  @@index([contactEmail])
+  // Intent-filtered inbox tabs (RENT/USE vs PERFORM).
+  @@index([intent, status])
+  // FK maintenance on space deletion (SetNull scans by spaceId).
+  @@index([spaceId])
+  // NOTE: a partial unique index "BookingRequest_open_pair_key" on
+  // (performerOwnerType, performerOwnerId, placeId) WHERE status IN
+  // ('PENDING','VIEWED') exists in SQL only (migration
+  // 20260610120000_booking_request_open_pair_unique) — Prisma can't express
+  // partial indexes. It backstops the one-open-request rule; the adapter
+  // maps its P2002 to `duplicate_open_request`.
+  // Its anonymous analogue "BookingRequest_open_anon_pair_key" on
+  // (placeId, lower(contactEmail)) WHERE status IN ('PENDING','VIEWED') AND
+  // performerOwnerId IS NULL (migration
+  // 20260713120000_booking_request_anonymous_sender) is likewise SQL-only and
+  // maps to the same `duplicate_open_request`. That migration also adds the
+  // SQL-only CHECK "BookingRequest_sender_identity_check": owner pair is
+  // all-or-nothing, and ownerless rows must carry BOTH contact fields.
+  // The TO_PERFORMER analogue "BookingRequest_open_organizer_pair_key" on
+  // (organizerOrgId, performerOwnerType, performerOwnerId) WHERE status IN
+  // ('PENDING','VIEWED') AND direction = 'TO_PERFORMER' (migration
+  // 20260721) backstops one open organizer request per (org, act) and maps
+  // to the same `duplicate_open_request`. That migration also adds the
+  // SQL-only CHECK "BookingRequest_direction_shape_check" (see `direction`).
+  // Migration 20260902120000_venue_confirmation_and_booking_intents adds the
+  // SQL-only CHECK "BookingRequest_intent_shape_check", RELAXED by migration
+  // 20260922120000_booking_request_space_optional to: intent IN
+  // ('RENT','USE') ⇒ requestedStartsAt IS NOT NULL AND requestedEndsAt IS
+  // NOT NULL. (The dropped `spaceId IS NOT NULL` conjunct is the 2026-09-22
+  // ruling — see `spaceId` above.) Vacuous for every pre-existing row (all
+  // backfill to PERFORM). The use case enforces the same shape; the adapter
+  // surfaces a violation as a raw P2010/23514, never a typed error.
+}
+
+/// File attached to a booking request (rider, stage plot, tech spec —
+/// venue-hierarchy FR-008). References the stored object by `storageKey`,
+/// mirroring PlaceVerificationDocument (place.prisma): there is no stored-
+/// object row table — object bytes are GC'd via the PendingObjectDeletion
+/// outbox (storage.prisma) when rows are removed.
+model BookingRequestAttachment {
+  id               String    @id @default(uuid())
+  bookingRequestId String
+  storageKey       String
+  fileName         String
+  contentType      String
+  sizeBytes        Int
+
+  /// Which thread side uploaded the file (uploader-or-venue delete posture).
+  /// Reuses the 3-value BookingMessageAuthorSide enum, but SYSTEM never
+  /// uploads — app code only ever writes VENUE | PERFORMER (the adapter maps
+  /// an out-of-contract SYSTEM to null on read). Null on rows created before
+  /// migration booking_request_attachment_uploader; those are treated as
+  /// venue-managed.
+  uploadedBySide    BookingMessageAuthorSide?
+  /// Uploader human, when known. Plain id, no FK (mirrors
+  /// BookingRequestMessage.authorHumanId).
+  uploadedByHumanId String?
+
+  // ── P3b (asks) ── venue-booking-standards v1.1 FR-009a
+  /// The ask this file was uploaded to answer, when it was. Null = a loose
+  /// "Attach a file" upload. SetNull: an ask is never hard-deleted on its own
+  /// (only with its request, which cascades this row too).
+  askId            String?
+
+  deletedAt        DateTime?
+
+  bookingRequest BookingRequest @relation(fields: [bookingRequestId], references: [id], onDelete: Cascade)
+  ask            BookingRequestAsk?  @relation("BookingRequestAttachmentAsk", fields: [askId], references: [id], onDelete: SetNull)
+  /// Asks whose saved answer is this file (IMAGE / FILE kinds).
+  answeringAsks  BookingRequestAsk[] @relation("BookingRequestAskAnswerAttachment")
+
+  createdAt DateTime @default(now())
+
+  @@index([bookingRequestId])
+  @@index([askId])
+}
+
+// ── P3b (asks) ───────────────────────────────────────────────────────────────
+
+/// What an ask asks for — and so which answer column it takes
+/// (venue-booking-standards v1.1 V9 / FR-009b).
+enum BookingRequestAskKind {
+  IMAGE      // answered by an image attachment (jpeg / png / webp)
+  FILE       // answered by an attachment (pdf / jpeg / png / webp)
+  LINK       // answered by an http(s) URL
+  TEXT       // answered by plain text, ≤ 2000
+  SET_LENGTH // answered by minutes, 5–600
+}
+
+enum BookingRequestAskStatus {
+  OPEN      // waiting for the sender
+  ANSWERED  // the sender saved an answer (it may be replaced while ANSWERED)
+  WITHDRAWN // the venue took the ask back before it was answered
+}
+
+/// A venue's ask on a booking thread (venue-booking-standards v1.1, V9–V11,
+/// FR-009b): a typed request for one thing the night needs, with a saved
+/// answer. Only the VENUE side asks; only the PERFORMER side answers.
+///
+/// Answer columns are exclusive per kind — SQL-only CHECK
+/// "BookingRequestAsk_answer_shape_check" (migration
+/// 20261002130000_booking_request_asks): IMAGE / FILE carry only
+/// `answerAttachmentId`, LINK only `answerUrl`, TEXT only `answerText`,
+/// SET_LENGTH only `answerMinutes` (5–600). The CHECK does not require the
+/// attachment column to be non-null on ANSWERED rows, because the FK below is
+/// SetNull; the use case is what guarantees an answer is present.
+/// "BookingRequestAsk_use_as_event_image_check": only IMAGE may set
+/// `useAsEventImage`.
+///
+/// `answerRevision` is the optimistic version of the answer: every answer
+/// (first or replacement) is a CAS on (status IN OPEN|ANSWERED, revision),
+/// so two concurrent answers, or an answer racing a withdraw, have exactly
+/// one winner.
+///
+/// `eventImageEventId` / `eventImageId` record the V10 mapping: the event the
+/// IMAGE answer was copied into, and the Image row it became. The pair is the
+/// idempotency key of that copy (one copy per (ask, event)); plain ids, no FK
+/// — the Image row may be swept, the event deleted, and the ask stays.
+model BookingRequestAsk {
+  id                 String                  @id @default(uuid())
+  bookingRequestId   String
+  kind               BookingRequestAskKind
+  label              String                  @db.VarChar(80)
+  note               String?                 @db.VarChar(240)
+  /// The standard the ask came from ("Ask for…" suggestions), if any.
+  standardField      BookingStandardField?
+  useAsEventImage    Boolean                 @default(false)
+  status             BookingRequestAskStatus @default(OPEN)
+  /// Plain ids, no FK (house style — mirrors BookingRequestMessage.authorHumanId).
+  askedByHumanId     String
+  askedAt            DateTime                @default(now())
+
+  answerAttachmentId String?
+  answerUrl          String?                 @db.VarChar(2048)
+  answerText         String?                 @db.VarChar(2000)
+  answerMinutes      Int?
+  answeredByHumanId  String?
+  answeredAt         DateTime?
+  answerRevision     Int                     @default(0)
+
+  withdrawnByHumanId String?
+  withdrawnAt        DateTime?
+
+  eventImageEventId  String?
+  eventImageId       String?
+
+  createdAt          DateTime                @default(now())
+  updatedAt          DateTime                @updatedAt
+
+  bookingRequest     BookingRequest            @relation(fields: [bookingRequestId], references: [id], onDelete: Cascade)
+  answerAttachment   BookingRequestAttachment? @relation("BookingRequestAskAnswerAttachment", fields: [answerAttachmentId], references: [id], onDelete: SetNull)
+  attachments        BookingRequestAttachment[] @relation("BookingRequestAttachmentAsk")
+
+  @@index([bookingRequestId, askedAt])
+  @@index([answerAttachmentId])
+}
+
+/// One act on a booking request's BILL (lineup-booking-requests v2 FR-001,
+/// docs/specs/2026-09-25). Junction, mirrors EventHuman: the request's owner
+/// pair is the SENDER (see BookingRequest.performerOwnerType); the acts live
+/// here, ordered by `sortOrder` (0 = headliner).
+///
+/// Shape by `source` (SQL-only CHECK "BookingRequestAct_source_shape_check",
+/// migration 20260925120000_booking_request_acts, relaxed by
+/// 20261001120000_lineup_v3):
+///   SELF     — actOwnerType/Id = the sender pair ("human" | "organization");
+///              externalName NULL; never PENDING (CONFIRMED at insert).
+///   TAGGED   — actOwnerType "human" | "organization" (v3 L17: a group can be
+///              tagged), actOwnerId set; externalName NULL; PENDING until the
+///              tagged act joins or passes.
+///   EXTERNAL — externalName set (externalUrl optional); actOwner* NULL;
+///              never PENDING.
+/// DECLINED is terminal on a request: the unique below means a declined
+/// act cannot be re-tagged on it (their row still occupies the key).
+///
+/// REMOVED (v3 FR-001): the sender's remove is a SOFT delete — `removedAt`
+/// set, row kept. The row keeps its unique key, so the same identity cannot
+/// be INSERTED again on that request (a re-add is a restore of this row, see
+/// `BookingRequestsRepo.restoreAct`), and the ledger can still name what was
+/// removed. Every bill reader filters `removedAt IS NULL` unless it asks for
+/// removed rows explicitly.
+model BookingRequestAct {
+  id               String                        @id @default(uuid())
+  bookingRequestId String
+  source           BookingRequestActSource
+  /// "human" | "organization" (app-enforced, same vocabulary as the request's
+  /// owner pair). Plain id, no FK (mirrors BookingRequestMessage.authorHumanId).
+  actOwnerType     String?
+  actOwnerId       String?
+  externalName     String?                       @db.VarChar(120)
+  externalUrl      String?
+  role             EventHumanRole                @default(PERFORMER)
+  /// Free-text label when `role` is OTHER — EventHuman's own column, so it
+  /// flows onto the lineup as is (v3 L13). SQL CHECK
+  /// "BookingRequestAct_custom_role_label_check": NULL unless role = OTHER.
+  customRoleLabel  String?                       @db.VarChar(60)
+  sortOrder        Int                           @default(0)
+  confirmation     BookingRequestActConfirmation @default(PENDING)
+  /// When the tag notification went out (TAGGED only).
+  invitedAt        DateTime?
+  /// When the tagged human confirmed or declined.
+  respondedAt      DateTime?
+  declineReason    String?                       @db.VarChar(240)
+  /// Soft remove by the sender (v3 FR-001, L5). NULL = on the bill.
+  removedAt        DateTime?
+
+  bookingRequest BookingRequest @relation(fields: [bookingRequestId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Platform acts are unique per request. EXTERNAL rows carry NULL owner
+  // columns, and NULLs are distinct in a Postgres unique, so any number of
+  // free-text acts may share a request. REMOVED rows still hold their key.
+  @@unique([bookingRequestId, actOwnerType, actOwnerId])
+  @@index([bookingRequestId, sortOrder])
+  // "Requests I'm tagged on" (the tagged artist's view + the daily budget).
+  @@index([actOwnerType, actOwnerId])
+}
+
+/// A venue calendar hold on a booking request (booking-holds spec
+/// 2026-08-25, FR-001): one row per (request, calendar, date), forming an
+/// ordered line per (calendar, date) that the venue controls.
+///
+/// NOT the POS / PromoHold / ResaleListingHold "hold" — those are short-TTL
+/// inventory reservations. This is a days-long lifecycle
+/// (ACTIVE → CHALLENGED → ACTIVE | RELEASED, or → CONFIRMED) that never blocks
+/// anything the public sees; only a confirmed Event blocks a date.
+///
+/// `position` is 1-based within the LIVE line (ACTIVE | CHALLENGED) for
+/// calendarId + date; RELEASED / CONFIRMED rows keep their last position for
+/// history and are excluded from renumbering. Positions are always rewritten
+/// wholesale from one ordered read inside the caller's transaction
+/// (`BookingHoldsRepo.renumberLine`) — never arithmetic.
+model BookingHold {
+  id               String                    @id @default(uuid())
+  /// Whose hold this is (holds-without-a-request FR-001). Every hold placed
+  /// before that spec is REQUEST (the default). The column shape per kind is
+  /// the SQL-only CHECK "BookingHold_owner_kind_shape" (see the NOTE below).
+  ownerKind        BookingHoldOwnerKind      @default(REQUEST)
+  /// Set exactly when ownerKind = REQUEST.
+  bookingRequestId String?
+  /// The booking grant a BOOKER hold rides on; set exactly when ownerKind =
+  /// BOOKER. NoAction (not SetNull, which would break the shape CHECK):
+  /// grants are revoked, never deleted by the app. NoAction rather than
+  /// Restrict because Restrict is checked per row at once, so an org delete
+  /// would fail or pass on cascade order (holderOrgId Cascade drops the hold,
+  /// granteeOrgId Cascade drops the grant); NoAction checks at the end of the
+  /// statement, after both cascades (migration 20261015170000).
+  grantId          String?
+  /// The holder. BOOKER: the grantee, exactly one of the pair. PLACE: the
+  /// named party, or both null (an unassigned place hold). REQUEST: both
+  /// null (the request carries the party).
+  /// holderOrgId is an FK (Cascade, like every org-owned row; orgs are
+  /// archived, never row-deleted, by the app). holderHumanId is a plain id,
+  /// no FK (house style, mirrors PlaceBookingGrant.granteeHumanId): every FK
+  /// action breaks something on account deletion (SetNull violates the
+  /// BOOKER shape, Cascade drops line rows without renumbering, Restrict
+  /// blocks the delete).
+  holderOrgId      String?
+  holderHumanId    String?
+  /// The event a request-less hold was booked into (FR-008). SetNull —
+  /// deleting the event never deletes the hold.
+  eventId          String?
+  /// One shared note (FR-012): plain text, last-write-wins, with who and
+  /// when. noteUpdatedByHumanId is a plain id, no FK (house style).
+  note                 String?   @db.VarChar(2000)
+  noteUpdatedByHumanId String?
+  noteUpdatedAt        DateTime?
+  calendarId       String
+  /// Optional physical room; SetNull — deleting a space never deletes holds.
+  spaceId          String?
+  /// Place-local calendar day (no time; the Place's timezone applies).
+  date             DateTime                  @db.Date
+  position         Int
+  status           BookingHoldStatus         @default(ACTIVE)
+  /// Staff human who placed the hold. Plain id, no FK (house style).
+  placedByHumanId  String
+  challengedAt     DateTime?
+  /// Keep-or-release deadline; set ONLY while CHALLENGED (cleared on keep).
+  respondBy        DateTime?
+  releasedAt       DateTime?
+  releasedReason   BookingHoldReleaseReason?
+  confirmedAt      DateTime?
+
+  bookingRequest BookingRequest? @relation(fields: [bookingRequestId], references: [id], onDelete: Cascade)
+  grant          PlaceBookingGrant? @relation("BookingHoldGrant", fields: [grantId], references: [id], onDelete: NoAction)
+  holderOrg      Organization?  @relation("BookingHoldHolderOrg", fields: [holderOrgId], references: [id], onDelete: Cascade)
+  event          Event?         @relation("BookingHoldEvent", fields: [eventId], references: [id], onDelete: SetNull)
+  /// Restrict (not Cascade): no calendar-delete path exists today; when one
+  /// is built it must decide what happens to LIVE holds explicitly rather
+  /// than have the DB silently drop an act's place in line.
+  calendar       Calendar       @relation("BookingHoldCalendar", fields: [calendarId], references: [id], onDelete: Restrict)
+  space          Space?         @relation("BookingHoldSpace", fields: [spaceId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // The line read (listLine) + admin calendar overlay range scans.
+  @@index([calendarId, date, status])
+  // Per-request hold strip + inbox live-hold projection.
+  @@index([bookingRequestId, status])
+  // FK maintenance on space deletion (SetNull scans by spaceId).
+  @@index([spaceId])
+  // A holder's live holds (booker calendar, named party's holds panel) —
+  // holds-without-a-request FR-010 / FR-014; also FK maintenance on org delete.
+  @@index([holderOrgId, status])
+  @@index([holderHumanId, status])
+  // Holds riding a grant (revoke preview, GRANT_ENDED release) + FK
+  // maintenance (NoAction check on grant delete).
+  @@index([grantId])
+  // FK maintenance on event deletion (SetNull scans by eventId).
+  @@index([eventId])
+  // NOTE: three more SQL-only constraints live in migration
+  // 20261015140000_holds_without_a_request (holds-without-a-request spec):
+  //  - "BookingHold_owner_kind_shape" CHECK (FR-001): REQUEST ⇒ request set,
+  //    no grant, no holder; BOOKER ⇒ no request, grant set, exactly one of
+  //    holderOrgId / holderHumanId; PLACE ⇒ no request, no grant, at most
+  //    one holder column.
+  //  - "BookingHold_live_holder_org_line_key" UNIQUE (calendarId, date,
+  //    holderOrgId) and "BookingHold_live_holder_human_line_key" UNIQUE
+  //    (calendarId, date, holderHumanId), each WHERE the holder column IS
+  //    NOT NULL AND status IN ('ACTIVE','CHALLENGED') — one live hold per
+  //    holder per line for BOOKER and named PLACE holds (FR-001). REQUEST
+  //    holds have no holder so they fall outside; unassigned PLACE holds are
+  //    unlimited.
+  // NOTE: three SQL-only constraints live in migration
+  // 20260825130000_booking_holds_constraints — Prisma can't express partial
+  // uniques or CHECKs (same pattern as "BookingRequest_open_pair_key" above):
+  //  - "BookingHold_live_request_date_key" UNIQUE (bookingRequestId,
+  //    calendarId, date) WHERE status IN ('ACTIVE','CHALLENGED') — one LIVE
+  //    hold per request per calendar-day; a released date can be re-held.
+  //    The adapter maps its P2002 to `booking_hold_exists`.
+  //  - "BookingHold_confirmed_line_key" UNIQUE (calendarId, date) WHERE
+  //    status = 'CONFIRMED' — one winner per line (NFR-002 at LINE level,
+  //    backstopping the per-row CAS). The adapter maps its P2002 on
+  //    updateStatus to `booking_hold_line_confirmed`.
+  //  - "BookingHold_respondBy_challenged_check" CHECK ((respondBy IS NULL) =
+  //    (status <> 'CHALLENGED')) — the deadline exists exactly while
+  //    challenged, both directions (biconditional form since migration
+  //    20260825140000_booking_holds_challenge_check).
+}
+
+/// Org-scoped, venue-internal label for booking requests (booking-holds
+/// FR-017). Never shown to the act. `color` is a design-token NAME (e.g.
+/// "accent" | "info" | "success" | "warning" | "danger" | "neutral"), never a
+/// hex value — validated in core, stored as a plain string here.
+model BookingTag {
+  id        String @id @default(uuid())
+  orgId     String
+  name      String
+  /// Lowercased slug of `name`, unique per org — the type-to-create input
+  /// dedupes on it.
+  slug      String
+  color     String
+  sortOrder Int    @default(0)
+
+  org      Organization        @relation("BookingTagOrg", fields: [orgId], references: [id], onDelete: Cascade)
+  requests BookingRequestTag[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([orgId, slug])
+  @@index([orgId, sortOrder])
+}
+
+/// M:N join BookingRequest ↔ BookingTag (booking-holds FR-017). Deleting a
+/// tag detaches (Cascade on the join row only).
+model BookingRequestTag {
+  bookingRequestId String
+  tagId            String
+
+  bookingRequest BookingRequest @relation(fields: [bookingRequestId], references: [id], onDelete: Cascade)
+  tag            BookingTag     @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@id([bookingRequestId, tagId])
+  // Inbox filter-by-tag + FK maintenance on tag deletion.
+  @@index([tagId])
+}
+
+/// A short piece of text an owner keeps to reuse (booking-the-night FR-013,
+/// decision N18): today the reasons a venue or sender gives when a booking is
+/// declined, closed, cancelled or passed on (kind DECLINE_REASON). Kind ASK is
+/// reserved for the deferred ask templates and has no writer yet.
+///
+/// OWNER: a polymorphic pair with no FK (house style for owner-scoped
+/// templates — mirrors EventTemplate.ownerScope/ownerId). `ownerType` uses
+/// the HUMAN | ORGANIZATION vocabulary of the other owner enums; the venue's
+/// owning org (or owning human, for a human-owned place) keeps one list, and a
+/// sender keeps their own. Deleting the owner leaves its rows behind; nothing
+/// reads them without the owner pair.
+///
+/// STARTERS: platform default reasons live in the i18n catalog and are copied
+/// into an owner's list on first use (`isStarter` true), then edited or
+/// removed like any other row. The flag records where a row came from; it
+/// never locks it.
+///
+/// LIMITS (enforced in core, not here): at most 30 rows per (owner, kind);
+/// `label` and `body` are plain text, sanitized at the use case's boundary.
+/// The VarChar bounds below are the DB's own backstop.
+model SavedSnippet {
+  id        String                @id @default(uuid())
+  ownerType SavedSnippetOwnerType
+  ownerId   String
+  kind      SavedSnippetKind
+  label     String                @db.VarChar(60)
+  body      String                @db.VarChar(500)
+  /// Position in the owner's list for this kind, 0-based. Rewritten wholesale
+  /// by `SavedSnippetsRepo.reorder`, never by arithmetic.
+  sortOrder Int                   @default(0)
+  isStarter Boolean               @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // The owner's list for one kind, in order (the picker's only read).
+  @@index([ownerType, ownerId, kind, sortOrder])
+  // NOTE: SQL-only CHECK "SavedSnippet_nonempty_check" (migration
+  // 20261001140000_booking_the_night): label and body are non-empty.
+}
+
+/// One owner's list of SavedSnippets for one kind (booking-the-night FR-013).
+/// Holds no text; it exists for two jobs:
+///   1. `startersCopiedAt` records that the platform defaults were copied into
+///      this list, so deleting every snippet never brings them back.
+///   2. Its row is the LOCK that create, copy-starters and reorder take
+///      (`SavedSnippetsRepo.lockList`, `SELECT … FOR UPDATE`), so the
+///      30-per-list cap and the starter copy cannot race.
+/// Written lazily by `lockList` (INSERT … ON CONFLICT DO NOTHING). No FK on
+/// the owner pair, like SavedSnippet.
+model SavedSnippetList {
+  id               String                @id @default(uuid())
+  ownerType        SavedSnippetOwnerType
+  ownerId          String
+  kind             SavedSnippetKind
+  startersCopiedAt DateTime?
+  createdAt        DateTime              @default(now())
+
+  @@unique([ownerType, ownerId, kind])
+}
+
+model PlaceWaiver {
+  id        String   @id @default(uuid())
+  placeId   String
+  title     String
+  content   String   @db.Text
+  version   Int      @default(1)
+  isActive  Boolean  @default(true)
+
+  place     Place    @relation("PlaceWaiverPlace", fields: [placeId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([placeId, isActive])
+}
+
+// `PlaceAvailability` (Place-level hours/blackouts) was REMOVED on 2026-08-21
+// by migration 20260821140000_drop_place_availability. It was superseded by the
+// calendar-scoped `CalendarAvailability` model (venue.prisma) per
+// docs/specs/2026-08-18/completed/venue-hierarchy-and-holds.spec.yaml — venue hours and
+// blackouts live THERE, including the place-wide "All calendars" scope
+// (calendarId NULL), which is the exact equivalent of the old Place-level rows.
+// Legacy data was moved by
+// apps/api/src/scripts/backfill/done/backfill-venue-defaults.ts
+// before the drop. Do NOT re-add a Place-level availability model.

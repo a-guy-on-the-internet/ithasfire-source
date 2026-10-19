@@ -1,0 +1,344 @@
+# gated-event-invite-links.spec.yaml
+#
+# Invite links that take the holder past an event's gate: one shared link per
+# event, plus personal links for named guests. On an application event an
+# invite counts as approval.
+
+version: "1.0"
+updated: "2026-10-02"
+
+# ── Rulings (owner, 2026-10-02, scoping rounds 1–3) ──────────────────────────
+# R1  Both kinds: one SHARED link per event and PERSONAL links per guest.
+# R2  No timer. A link works until reset / revoked / turned off, and dies when
+#     the event ends.
+# R3  Signed-out holders get in straight from the link (cookie). Signed-in
+#     holders get a durable EventUnlock.
+# R4  Application event: an invite counts as APPROVAL. A signed-in holder gets
+#     an APPROVED submission (no answers, "via invite") in the review queue,
+#     rescindable. A signed-out holder of the SHARED link leaves no row.
+# R5  Resetting or turning off the SHARED link stops NEW entries only; anyone
+#     already in stays in. (Owner overruled my "evict" recommendation.)
+# R6  Organizer UI lives in builder → Settings → Access Gate, both gate types,
+#     off by default: Copy link / Reset link / Turn off.
+# R7  Personal invite = name + email; WE send the email; each row also has
+#     Copy link.
+# R8  A personal link is reusable by its holder until revoked or the event ends.
+# R9  Revoking one personal invite REMOVES that guest (= rescind on an
+#     application event).
+# R10 A signed-out guest's cookie from the SHARED link lasts until the event
+#     ends, unless the organiser resets the link and removes everyone (R14).
+# R11 Invites do NOT count against "Maximum applications".
+# R12 Personal invites are sent from the Access Gate panel (one by one, or pick
+#     a contact list) AND from announcements. The announcements side is its own
+#     handoff (announcements need a wider rework); this spec builds the shared
+#     send use case it will call.
+# R13 A hand-added guest is emailed unless that person has stopped invites
+#     from this organiser (then: not sent, and the organiser is told). A
+#     contact-list send skips unsubscribed / suppressed / opted-out contacts
+#     and reports a count, never names. Sends draw on a daily invite allowance
+#     (50/day; 1,000/day once the organiser has a track record). Owner 10-05.
+# R14 Shared-link guest cookies die at event end or cancellation, or when the
+#     organiser resets the link and picks "Remove them too" in the Reset
+#     confirmation (Keep is preselected; no separate button). Named guests with
+#     a live personal invite keep access; tickets are untouched. No staff kill
+#     switch. Owner rulings 10-05 (cookie concern) and 10-06 (board option B).
+# R16 The stop page (/invites/stop) also offers "Stop all event invites", a
+#     second, smaller choice that needs no account: no organiser may send that
+#     address a new invite. Like the per-organiser stop, it blocks SENDING
+#     only (invites already sent keep working), and sends count it in the same
+#     opted-out number, so an organiser never learns which "no" it was. The
+#     mail client's one-click Unsubscribe stays per-organiser. Owner 10-06, 3(b).
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Gated events have no way to let a chosen person straight in. Organizers
+    paste the password into messages, or make invitees fill in an application
+    the organizer already means to approve. An EventMagicLink table and a
+    redeemer exist, but the link is single-use, requires sign-in, expires in
+    7 days, and nothing in the product creates one.
+  solution: >
+    Rework EventMagicLink into an event invite with two kinds: SHARED (one live
+    per event, reset/turn off) and PERSONAL (named guest + email, emailed,
+    revocable). Redeeming lifts the gate: a cookie for a signed-out holder, an
+    EventUnlock for a signed-in one, and on an application event an APPROVED
+    submission marked as coming from the invite.
+  users:
+    - organizer (creates, copies, resets, revokes, sends)
+    - invited guest, signed in or not
+  surfaces:
+    - web (Access Gate panel, gated event page redeem)
+    - api
+    - email
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Access Gate panel shows an "Invite link" row on PASSWORD and
+        APPLICATION events. Off by default. Turning it on mints the SHARED
+        link; Copy link copies the full URL; Reset link revokes it and mints a
+        new one; Turn off revokes it with none live. At most one live SHARED
+        invite per event (DB-enforced).
+    - id: FR-002
+      description: >
+        Access Gate panel has an "Invited guests" list: add a guest (name +
+        email) or pick a contact list; each guest gets a PERSONAL invite and an
+        email with their link. Each row shows name, email, status (Sent / Used
+        / Revoked) and actions Copy link, Resend, Revoke.
+    - id: FR-003
+      description: >
+        A contact-list send skips entries with unsubscribedAt set and emails on
+        the org suppression list, and reports how many were skipped. A
+        hand-added guest is sent unless they opted out of this organiser or of all
+        event invites (R13, R16). An email already invited to the
+        event is not invited twice; the existing invite is reused.
+    - id: FR-004
+      description: >
+        Redeeming any live link on a PASSWORD event: signed-in → EventUnlock
+        (source MAGIC_LINK, inviteId set); signed-out → invite grant cookie
+        `th_ei_<eventId>` on the web host, valid until the event ends.
+    - id: FR-005
+      description: >
+        Redeeming on an APPLICATION event approves the holder (R4).
+        Signed-in: their open submission (PENDING / WAITLISTED) is approved;
+        otherwise an APPROVED submission is created (humanId, no answers,
+        inviteId set). It goes through the existing approve path, so the
+        EventUnlock carries applicationSubmissionId and rescind works.
+        Signed-out PERSONAL: an APPROVED guest submission at the invitee's
+        email, and the existing `th_ea_` grant cookie. It attaches to the
+        account when they sign in with that email, as today. Signed-out SHARED:
+        `th_ei_` cookie only, no row (R4). No approval email is sent for an
+        invite redemption; they're already looking at the event.
+    - id: FR-006
+      description: >
+        Revoking a PERSONAL invite removes everyone it let in (R9): on an
+        application event it rescinds the invite's submission (existing rescind
+        path, which revokes unlocks by submission); on a password event it
+        revokes EventUnlocks carrying that inviteId. `th_ei_` cookies from a
+        personal invite are re-checked against revokedAt on every read.
+    - id: FR-007
+      description: >
+        Resetting or turning off the SHARED link stops new redemptions only
+        (R5). `th_ei_` cookies and EventUnlocks it already granted stay valid
+        until the event ends.
+    - id: FR-008
+      description: >
+        A link stops working when the event has ended or is cancelled (R2),
+        derived from the event's end time at check time, never stored. Grant
+        cookies carry the same expiry.
+    - id: FR-009
+      description: >
+        Submissions with inviteId set are excluded from the maxSubmissions cap
+        count (R11) and are shown in the review queue with a "Via invite" label.
+    - id: FR-010
+      description: >
+        A dead link (revoked, ended, unknown) lands on the normal gate with one
+        direct line above it: "This invite link doesn't work anymore." The
+        password or application gate is still usable.
+    - id: FR-011
+      description: >
+        The old sign-in-first redeemer (EventMagicLinkRedeemer's signed-out
+        prompt) is removed; redemption needs no account.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Tokens: ≥256-bit, from a CSPRNG; the DB stores only a hash (SHA-256);
+        the organizer can re-copy a link because the token is re-derived as
+        HMAC(secret, inviteId) rather than read back. Revocation is a row
+        state, never a secret rotation.
+    - id: NFR-002
+      description: >
+        The gated event document stays identity-free and edge-cacheable.
+        Redemption is a POST to a web `/api` route (sets host cookies,
+        `Cache-Control: private, no-store`). The landing strips `?invite=` from
+        the address bar in place (history.replaceState) before any fetch, so
+        the visible URL and the history entry's URL are clean. Accepted
+        residual: the token stays inside that entry's history.state, because
+        Next keys the page segment by its search params and that state is kept
+        for Back to work; it is local to the browser and never sent over the
+        network. The landing also keeps the token in sessionStorage
+        (`th:invite:<eventId>`) until redeem, a dead verdict, an already-through
+        viewer or give-up, so a reload before the tap keeps the invite; this
+        adds no exposure (same tab, same origin, never sent to the server),
+        and analytics stays off while it is held. The server reads only
+        whether a non-empty `invite` param is present (never its value) to
+        render the landing veiled; that variant is private, no-store. The
+        `?invite=` landing sends `Referrer-Policy: no-referrer` so the token
+        never leaks to third parties.
+    - id: NFR-003
+      description: >
+        Redemption is rate limited per IP like password unlock; a guessed token
+        must be infeasible regardless (NFR-001).
+    - id: NFR-004
+      description: >
+        Send: organizer edit role + verified email, as announcements. One
+        Access Gate send is capped at 500 recipients; larger lists go through
+        announcements. Any catch-and-fallback in send or redeem reports via
+        ReporterPort.
+    - id: NFR-005
+      description: >
+        Organizer row and guest list pass a 320px viewport with no overflow
+        and no new console errors; copy follows the direct-not-soft ruling.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: setEventSharedInvite
+        description: >
+          Turn on / reset / turn off the SHARED invite. Reset and turn-off set
+          revokedAt on the live row; on / reset insert a new one.
+        input: eventId, action (ENABLE | RESET | DISABLE), actorHumanId
+        output: invite { id, url | null }
+        idempotent: true (ENABLE on an already-live link returns it)
+        money: false
+      - name: createEventGuestInvites
+        description: >
+          Create PERSONAL invites for hand-added guests or a contact list and
+          send each its email. Dedupes by lowercased email per event; applies
+          R13 suppression for list sends.
+        input: eventId, guests[{name, email}] | contactListId, actorHumanId
+        output: created, reused, skippedUnsubscribed
+        idempotent: true (per event + email)
+        money: false
+      - name: revokeEventGuestInvite
+        description: Revoke a PERSONAL invite and remove what it granted (FR-006).
+        input: eventId, inviteId, actorHumanId
+        output: revoked
+        idempotent: true
+        money: false
+      - name: listEventInvites
+        description: Organizer view of the shared link state and the guest list.
+        input: eventId, actorHumanId
+        output: shared, guests[]
+        idempotent: true
+        money: false
+      - name: redeemEventInvite
+        description: >
+          Replaces redeemMagicLink. Verify token → live, event not ended → apply
+          FR-004 / FR-005 in one transaction (row lock on the submission, as
+          record-application-grant-unlock does). Returns which cookie the web
+          route must set.
+        input: token, viewerHumanId | null
+        output: eventId, grant (UNLOCK | APPLICATION_GRANT | INVITE_GRANT), submissionId?, inviteId, expiresAt
+        idempotent: true (re-redeeming is a no-op that returns the same grant)
+        money: false
+      - name: getEventGateState (modified)
+        description: >
+          Accepts a verified `inviteGrant` { inviteId, expMs }, like
+          applicationGrant: counts if the invite belongs to this event, the
+          event hasn't ended, and (PERSONAL only) it isn't revoked.
+        input: + inviteGrant
+        output: + viewerHasInviteGrant
+        idempotent: true
+        money: false
+  ports:
+    new: []
+    existing:
+      - Repos.eventMagicLinks (renamed eventInvites)
+      - Repos.eventUnlocks (+ revokeByInvite)
+      - Repos.eventApplications
+      - MailerPort
+      - ReporterPort
+  adapters:
+    new: []
+    existing:
+      - prisma eventMagicLinks repo → eventInvites
+      - prisma eventUnlocks repo (revokeByInvite)
+  transport:
+    trpc_procedures:
+      - events.setSharedInvite
+      - events.createGuestInvites
+      - events.revokeGuestInvite
+      - events.listInvites
+      - events.redeemInvite (replaces redeemMagicLink; createMagicLink removed)
+    webhooks: []
+  ui:
+    pages:
+      - "apps/web: POST /api/events/[eventId]/invite (redeem, sets th_ei_ / th_ea_)"
+    components:
+      - EventGateSettings.tsx → Invite link row + Invited guests list
+      - gated event page `?invite=` landing (replaces EventMagicLinkRedeemer)
+      - "ui-email: event.invite template (Printed direction)"
+      - help article restrict-event-access.md
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models:
+    - "EventMagicLink → EventInvite: + kind (SHARED | PERSONAL), inviteeName,
+      inviteeEmail (lowercased), tokenHash (replaces token), revokedAt,
+      firstRedeemedAt, sentAt, inviteListEntryId?; drop expiresAt, redeemedAt,
+      redeemedByHumanId, targetHumanId (single-use semantics gone; no link was
+      ever created outside e2e seeds). Partial unique: one live SHARED per
+      event; unique (eventId, inviteeEmail) for PERSONAL."
+    - "EventUnlock: + inviteId (indexed) for revokeByInvite."
+    - "EventApplicationSubmission: + inviteId (FK, nullable) — drives the cap
+      exclusion and the queue label."
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      The shared link is forwarded far wider than meant, and R5 means a reset
+      can't pull back anyone already in.
+    severity: MEDIUM
+    mitigation: >
+      Ruled by the owner. The panel says so next to Reset ("People who already
+      used it stay in"). Ticket purchase still requires sign-in.
+  - risk: >
+      A personal guest on an application event forwards the link; the
+      redeemer's access hangs off the invitee's submission.
+    severity: LOW
+    mitigation: >
+      Ruled (R8). Revoking the invite removes everyone it let in (FR-006).
+  - risk: >
+      Events without an end time make "dies at event end" ambiguous.
+    severity: MEDIUM
+    mitigation: >
+      Use the same end-of-event rule transfers already use (09-28 round:
+      transfers close at event end); confirm the helper during planning.
+  - risk: >
+      Token leakage via Referer, logs or ESP metadata.
+    severity: HIGH
+    mitigation: >
+      NFR-001/002; the token never goes into mailer metadata (the 09-30 claim
+      link fix). security-review runs once built.
+
+open_questions: []
+# R15 (owner, 10-02): someone previously DECLINED who uses the shared link is
+#     let in; a new APPROVED "via invite" submission is created.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Announcements "include a personal invite link" toggle and the announcements
+    rework (separate handoff, R12); it will call createEventGuestInvites.
+  - SMS delivery of invites.
+  - Invites on events with no gate.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A signed-out browser opening the shared link on a password event sees the
+    unlocked event; after Reset, a fresh browser with the old link sees the
+    gate with "This invite link doesn't work anymore", while the first browser
+    is still in.
+  - A signed-in user redeeming the shared link on an application event appears
+    as APPROVED "Via invite" in the review queue; rescinding puts them back at
+    the gate.
+  - A personal invite emails the guest; their link works on two devices;
+    revoking it puts both back at the gate.
+  - A contact-list send skips unsubscribed entries and reports the count.
+  - Invite approvals don't consume maxSubmissions.
+  - A link on an ended event lands on the gate.
+  - The gated document's response headers are unchanged (shared-cacheable),
+    and the redeem route answers private, no-store.

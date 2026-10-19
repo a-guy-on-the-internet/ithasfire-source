@@ -1,0 +1,65 @@
+# Spec: BullMQ Queue Testing & DLQ Handling
+meta:
+  owner: platform-eng
+  status: draft
+  reviewers:
+    - qa
+    - sre
+summary: |
+  Establish the testing strategy, tooling, and dead-letter queue (DLQ) procedures
+  for BullMQ-based workers within `apps/jobs`.
+scope:
+  included:
+    - Local sandbox for queue jobs.
+    - CI coverage requirements for queue handlers.
+    - DLQ replay and triage workflow.
+    - Observability hooks to support testing.
+  excluded:
+    - Business-specific validation (covered in job specs).
+requirements:
+  sandbox:
+    stack:
+      redis: docker-compose service `jobs-redis`
+  worker_runner: pnpm -C apps/jobs run worker --queue=<name>
+      fixtures: packages/test-utils/src/queues
+    scripts:
+  - pnpm -C apps/jobs run sandbox:seed (loads sample payloads)
+  - pnpm -C apps/jobs run sandbox:drain (cleans queues)
+    docs: README section `Local queue sandbox`
+  ci:
+    pipeline:
+  - turbo run test --filter=apps/jobs#queue
+    coverage:
+      - unit tests: use vitest + BullMQ TestDouble adapter
+      - integration: dockerized Redis + actual worker process
+    required_checks:
+      - lint queue handlers for `await queue.close()` on shutdown
+      - ensure message schema validated via Zod schemas in ports layer
+  dlq:
+    storage: BullMQ dead-letter queue per worker (suffix `:dlq`)
+    retention: 7 days
+    tooling:
+  - pnpm -C apps/jobs run dlq --action=peek --queue=<name> --max=50
+  - pnpm -C apps/jobs run dlq --action=get --queue=<name> --job-id=<id>
+  - pnpm -C apps/jobs run dlq --action=requeue --queue=<name> --job-id=<id>
+  - pnpm -C apps/jobs run dlq --action=delete --queue=<name> --job-id=<id>
+    workflow:
+      triage_steps:
+        1. Inspect error + payload via CLI or Grafana logs.
+        2. Identify regression vs. transient service issue.
+        3. Replay small batch after fix; monitor metrics.
+      audit:
+        - log replay actions in Incident.io timeline
+        - create retro ticket if >100 messages impacted
+observability:
+  metrics:
+    - bullmq.queue_depth, bullmq.dlq_depth exported via Prometheus exporter
+    - vitest integration asserts metrics instrumentation via mock registry
+  logging:
+    - worker logs include `traceId`, `jobId`, `attempt`
+    - sandbox mode enables verbose logging for payload diffs
+acceptance_criteria:
+  - Developers can run workers locally with seeded payloads via sandbox script.
+  - CI enforces unit + integration coverage for queue handlers, failing on missing instrumentation.
+  - DLQ replay CLI supports list, inspect, replay with auditing hooks.
+  - Documentation describes triage workflow and metrics expectations.

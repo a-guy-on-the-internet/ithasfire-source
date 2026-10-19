@@ -4,10 +4,6 @@
       "type": "http",
       "url": "https://mcp.sentry.dev/mcp"
     },
-    "appium": {
-      "type": "stdio",
-      "command": "/Users/somehuman/.nvm/versions/node/v24.8.0/bin/appium-mcp"
-    },
     "context7": {
       "type": "stdio",
       "command": "npx",

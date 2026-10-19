@@ -60,7 +60,15 @@ export async function getAuthToken(): Promise<string | null> {
   if (cachedJwt && Date.now() - cachedJwt.mintedAtMs < TOKEN_TTL_MS) {
     return cachedJwt.token;
   }
+  // The session can change while the mint is in flight: a sign-out clears it,
+  // a new operator replaces it. Caching the old session's JWT then would hand
+  // the departing operator's credentials to the next request for up to 10
+  // minutes (the stale fallback below). Start over against the current one.
+  const mintedFor = sessionToken;
   const jwt = await mintJwt();
+  if (sessionToken !== mintedFor) {
+    return getAuthToken();
+  }
   if (jwt) {
     cachedJwt = { token: jwt, mintedAtMs: Date.now() };
     return jwt;

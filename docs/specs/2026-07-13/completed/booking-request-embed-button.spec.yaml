@@ -1,0 +1,359 @@
+# booking-request-embed-button.spec.yaml
+#
+# Embeddable "Request to book" button/widget venues paste on their own websites;
+# anonymous-first submission into the existing BookingInbox, with invite-to-claim
+# on accept and venue notifications on arrival.
+
+version: "1.0"
+updated: "2026-07-13"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Venues that opted into booking requests can only receive them from signed-in,
+    performer-mode users browsing ithasfire.com/p/[slug]. A venue's own website —
+    where most booking inquiries actually originate — has no way to funnel bands
+    into the BookingInbox. Venues also get zero notification when a request
+    arrives, so even on-platform requests sit unseen.
+  solution: >
+    A new embed widget (reusing the existing Embed domain-allowlist + iframe
+    infrastructure) that renders a "Request to book" button on the venue's site,
+    opening a modal booking form. Submission is anonymous-first (name + email +
+    pitch, Turnstile-protected, mirroring embed guest checkout); signed-in
+    submission is a progressive enhancement via a popup sign-in with token
+    handoff — never third-party cookies. Anonymous requests land in the inbox as
+    contactable inquiries; accepting one sends an invite-to-claim email, and the
+    Agreement is created when the performer claims. New-request notifications
+    (in-app + email + push) go to the venue owner for ALL booking requests.
+  users:
+    - Anonymous performer/band visiting a venue's website (submitter)
+    - Signed-in performer clicking the embed (enhanced submitter)
+    - Venue owner / org staff with edit roles (inbox, accept/decline, embed setup)
+  surfaces:
+    - embed
+    - web
+    - jobs (notification dispatch via existing pipeline)
+
+# ── Cookie / auth reality check (answers the "can logins persist?" question) ──
+#
+# The widget iframe is a cross-site frame of ithasfire.com, so the Better Auth
+# session cookie is a THIRD-PARTY cookie there. It is SameSite=Lax today (not
+# sent cross-site), and even with SameSite=None, Safari (ITP) blocks third-party
+# cookies outright and Chrome requires Storage Access API grants. So "already
+# logged into ithasfire.com → automatically logged in inside the embed" is NOT
+# reliably achievable and must not be the design basis. The reliable pattern is:
+# iframe opens a POPUP to ithasfire.com (first-party context, cookies work),
+# user signs in (or is already signed in and it resolves instantly), the popup
+# postMessages a short-lived one-time token back to the iframe, which exchanges
+# it for a bearer JWT for tRPC calls (the /token JWT path already exists).
+# The popup handoff ships with the initial release (FR-010) — the form shows a
+# "Log in" affordance so returning performers get prefilled, owned requests.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Extend the Embed model usage to subjectType "place" (column is already a
+        String; extend ALLOWED_SUBJECT_TYPES and upsert RBAC to
+        requirePlaceOwnership with ORG_EDIT_ROLES for org-owned places).
+        Existing fail-closed assertEmbedOriginAllowed applies unchanged.
+    - id: FR-002
+      description: >
+        New iframe route /embed/book/[embedId] (pattern: /embed/calendar/...)
+        rendering a booking-request form for the place: act name, contact name,
+        contact email, preferred dates (≤3), pitch message, optional links/fee
+        fields — the anonymous subset of the existing pitch schema. Gated on
+        place VERIFIED + acceptsBookingRequests; shows a calm "not accepting
+        requests" state otherwise. noindex, light color-scheme, embed theming
+        via existing theme-override query params.
+    - id: FR-003
+      description: >
+        hf-embed.js modal mode drives the button: HF.createWidget gains a
+        widget: "booking" option that points the iframe at /embed/book/[embedId]
+        with default triggerText "Request to book". Existing hf:resize /
+        hf:ready bridge messages reused.
+    - id: FR-004
+      description: >
+        New public tRPC procedures on the embeds router, both taking hostOrigin
+        and calling assertEmbedOriginAllowed: embeds.getBookingWidget (place
+        display info + accepting flag) and embeds.createBookingInquiry
+        (anonymous create). createBookingInquiry is Turnstile-verified and
+        IP-rate-limited (mirror embeds.createGuestCheckout: keyed
+        embed:bookingInquiry:${clientIp}, 5/60s).
+    - id: FR-005
+      description: >
+        BookingRequest supports anonymous senders: performerOwnerType/Id become
+        nullable; new fields contactName, contactEmail (required when performer
+        owner is null), source (PLATFORM | EMBED), embedId?. Anonymous dedupe:
+        partial unique index on (placeId, lower(contactEmail)) WHERE status IN
+        ('PENDING','VIEWED') AND performerOwnerId IS NULL — the anonymous
+        analogue of BookingRequest_open_pair_key, surfaced as
+        duplicate_open_request.
+    - id: FR-006
+      description: >
+        Inbox renders anonymous inquiries: submitter shown as contactName with a
+        visible mailto contactEmail so the venue can reply off-platform
+        ("inbox-only inquiry" path). Performer-mode badges/verified-stats simply
+        absent. markViewed / decline / expire work unchanged.
+    - id: FR-007
+      description: >
+        Accepting an anonymous request triggers invite-to-claim instead of
+        immediate Agreement creation: stamps ACCEPTED, generates a single-use
+        claim token (hashed at rest, 30-day expiry), emails the submitter a
+        claim link. A new claim use case lets the (new or existing) signed-in
+        user with performer mode attach their identity to the request
+        (backfills performerOwnerType/Id), then runs the existing
+        accept→Agreement creation path idempotently. Signed-in submissions keep
+        today's immediate-Agreement accept flow.
+    - id: FR-008
+      description: >
+        New-booking-request notification for ALL sources (embed + platform):
+        notify the place owner (direct human owner, or owning-org members with
+        edit roles) via existing notify() pipeline — in-app + email + push —
+        with derived per-channel idempotency keys ({key}:email etc. per the
+        notify-channel convention). Email template added to @th/ui-email
+        (remember the dist rebuild).
+    - id: FR-009
+      description: >
+        Embed management + snippet generation for the booking button lives on
+        the place admin (places/[placeId] settings, near BookingAcceptanceToggle):
+        add/revoke allowed domains for subjectType "place", copy-paste snippet
+        (SDK modal variant), live preview. Reuses EmbedsView patterns; gated on
+        place ownership edit roles.
+    - id: FR-010
+      description: >
+        Signed-in path (ships with initial release): the embed form shows a
+        "Log in" button ("Booked with Ithas Fire before?") that opens a popup
+        to a first-party sign-in/handoff page; on success the popup
+        postMessages a short-lived one-time token to the iframe (origin-checked
+        both directions), which exchanges it for a JWT and submits via the
+        authenticated bookingRequests.create path (performer-owned request,
+        prefilled from performers.getBookingDefaults, normal Agreement flow on
+        accept). If the popup resolves an already-active session, no
+        credentials are re-entered — one click and the form switches to
+        signed-in mode with identity + defaults prefilled.
+    - id: FR-011
+      description: >
+        Signed-in sender selection: after log-in the form lets the performer
+        submit as themselves OR as any org they hold edit roles in (gear setup
+        and booking-related profile data live on those sender profiles).
+        Default sender = their last-selected admin context when resolvable,
+        falling back to the sender of their most recent booking request, then
+        to self. Booking-defaults prefill follows the selected sender.
+        Ownership of the chosen sender is re-verified server-side by the
+        existing createBookingRequest requireOwnerAccess check.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Anonymous submission is fail-closed on origin: null/unparseable
+        hostOrigin or non-allowlisted domain → FORBIDDEN, no partial writes.
+    - id: NFR-002
+      description: >
+        Spam resistance: Turnstile + per-IP rate limit + per-(place,email) open
+        dedupe + server-side sanitization of all free-text (reuse existing
+        sanitizer used by createBookingRequest). Contact email syntactically
+        validated; no verification email sent at submit time (calm UX).
+    - id: NFR-003
+      description: >
+        Claim tokens stored hashed; raw token appears only in the invite email
+        link. Single use, expiring, revoked if the request leaves ACCEPTED.
+    - id: NFR-004
+      description: >
+        Notification failures never fail the submission — swallow branches use
+        ReporterPort (reportError) per the Sentry convention, with regression
+        tests for the report.
+    - id: NFR-005
+      description: >
+        Widget page stays lightweight and keyboard/screen-reader accessible;
+        form errors are inline and specific (mapCreateBookingRequestError
+        pattern).
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: create-booking-inquiry (embeds/)
+        description: >
+          Anonymous booking request via embed. Validates origin
+          (assertEmbedOriginAllowed), place VERIFIED + accepting, anonymous
+          dedupe, sanitizes pitch, writes BookingRequest
+          (source=EMBED, performer owner null), enqueues venue notification.
+        input: embedId, hostOrigin, contactName, contactEmail, actName, message, preferredDates, optional pitch fields
+        output: bookingRequestId
+        idempotent: false (deduped via partial unique index)
+        money: false
+      - name: get-booking-widget (embeds/)
+        description: Resolve embed + place display info + accepting flag for the iframe.
+        input: embedId, hostOrigin
+        output: embed, place summary, accepting flag
+        idempotent: true
+        money: false
+      - name: claim-booking-request (booking-requests/)
+        description: >
+          Signed-in performer redeems claim token: attaches performer identity
+          to an ACCEPTED anonymous request, then creates the Agreement via the
+          existing respond/accept internals (idempotency key reused).
+        input: actorHumanId, claimToken, performerOwnerType/Id
+        output: agreementId
+        idempotent: true
+        money: false
+      - name: respond-to-booking-request (modified)
+        description: >
+          Accept branch forks on anonymous vs performer-owned: anonymous →
+          ACCEPTED + claim token + invite email (no Agreement yet); owned →
+          unchanged.
+      - name: create-booking-request (modified)
+        description: Emits the FR-008 venue notification (also covers platform submissions).
+      - name: upsert-embed / list-embeds / revoke-embed (modified)
+        description: Accept subjectType "place" with requirePlaceOwnership RBAC.
+
+  ports:
+    new: []
+    existing:
+      - booking-requests repo (extend for anonymous fields + claim token)
+      - embeds repo
+      - notifier / notify() pipeline (in-app, email, push)
+      - turnstile
+      - rate-limit
+      - idempotency
+      - reporter (ReporterPort for swallowed notification failures)
+      - audit log
+
+  adapters:
+    new: []
+    existing:
+      - packages/adapters prisma booking-requests (nullable owner, contact fields, claim token, new partial index P2002 mapping)
+      - prisma embeds (subjectType "place")
+      - @th/ui-email (new templates: venue new-request, submitter invite-to-claim)
+
+  transport:
+    trpc_procedures:
+      - embeds.getBookingWidget (public, origin-enforced)
+      - embeds.createBookingInquiry (public, Turnstile + IP rate limit, origin-enforced)
+      - bookingRequests.claim (authed, performer-mode required)
+      - NO new handoff procedures: the popup (first-party page) mints a
+        short-lived JWT via the existing Better Auth /api/auth/token endpoint
+        (scanner precedent: auth-token-store.ts mintJwt) and postMessages it to
+        window.opener with targetOrigin pinned to our own origin; the iframe
+        holds it in memory and calls authed tRPC with Authorization: Bearer
+        (existing ctx.authToken → JWKS verification path in guard.ts)
+      - bookingRequests.listMySenders or reuse of existing performer/org
+        queries to enumerate selectable senders (self + orgs with edit roles)
+        and the default-sender resolution (FR-011)
+      - embeds.upsert/list/revoke (extended inputs for place subject)
+    webhooks: []
+
+  ui:
+    pages:
+      - apps/web/src/app/embed/book/[embedId]/ (iframe widget: form, success, not-accepting, error screens)
+      - claim landing route (e.g. /booking-requests/claim/[token] → sign-in redirect → claim)
+    components:
+      - hf-embed.js widget:"booking" modal support (+ .d.ts)
+      - Place admin booking-embed section (domains, snippet, preview) near BookingAcceptanceToggle
+      - BookingInbox: anonymous-inquiry rendering (contact card, mailto, source badge)
+      - Invite/claim status affordance on accepted-anonymous rows ("invite sent", resend)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models:
+    - BookingRequest: performerOwnerType/Id → nullable; + contactName, contactEmail,
+        source (PLATFORM|EMBED, default PLATFORM), embedId?, claimTokenHash?,
+        claimTokenExpiresAt?, claimedAt?; + partial unique index
+        (placeId, lower(contactEmail)) on open anonymous requests
+    - Embed: no schema change (subjectType String already); code-level allowlist gains "place"
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Nullable performerOwner ripples through every booking-request use case,
+      repo type, and the inbox UI; a missed null-guard breaks the existing
+      performer flow.
+    severity: HIGH
+    mitigation: >
+      Type the sender as a discriminated union (owned | anonymous) in
+      packages/types; exhaustive-switch in list/respond/inbox; regression tests
+      on the owned path.
+  - risk: >
+      Anonymous endpoint becomes a spam cannon into venue inboxes (and FR-008
+      turns that into email/push spam to venues).
+    severity: HIGH
+    mitigation: >
+      Turnstile + 5/60s per-IP + per-(place,email) open dedupe + notification
+      idempotency; consider per-place daily cap as a follow-up if abused.
+  - risk: >
+      Accept-before-claim leaves ACCEPTED requests with no Agreement
+      indefinitely (submitter never claims).
+    severity: MEDIUM
+    mitigation: >
+      Claim-token expiry (30d) + inbox affordance showing invite state with
+      resend; venue can still coordinate via the visible email.
+  - risk: >
+      Popup token handoff is a session-transfer surface — postMessage origin
+      bugs would leak auth.
+    severity: HIGH
+    mitigation: >
+      One-time short-lived token, strict origin checks both directions, token
+      bound to embedId + minted server-side against the active session;
+      dedicated security review of this step before ship.
+  - risk: >
+      Venue notification emails silently fail if @th/ui-email dist isn't
+      rebuilt (known template_not_found footgun).
+    severity: LOW
+    mitigation: Build step reminder + runtime template smoke test in CI.
+
+open_questions:
+  - Claimed identity vs. duplicate performer requests — claim path must re-check
+    the owned open-pair uniqueness (what if the claimer already has an open
+    request at that place?). Proposed: claim wins, other open request stays.
+  - Should embed submissions honor a per-place daily cap from day one, or wait
+    for evidence of abuse?
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Third-party-cookie-based silent SSO inside the iframe (unreliable; see note)
+  - Booking embeds for orgs or events (place subject only)
+  - SMS notifications for new requests (in-app + email + push only)
+  - Agreement editor changes (claim funnels into the existing flow)
+  - Wildcard/multi-domain patterns in the allowlist (single hostnames, as today)
+  - Per-embed frame-ancestors CSP tightening (tracked in embed-hardening follow-ups)
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - Venue admin adds their website domain on the place admin page, copies the
+    modal snippet, and the button renders + opens the form on that domain.
+  - Same snippet on a NON-allowlisted domain renders the widget shell but every
+    tRPC call fails FORBIDDEN (fail-closed), showing the blocked-origin message.
+  - Anonymous visitor submits a valid inquiry → BookingRequest row
+    (source=EMBED, null owner, contact fields set) appears in the venue's
+    BookingInbox with a mailto link; a second open submission with the same
+    email at the same place → duplicate_open_request error surfaced inline.
+  - Submission without a valid Turnstile token, or beyond 5/60s per IP, is
+    rejected with no row written.
+  - Place with acceptsBookingRequests=false (or unverified) shows the
+    not-accepting state; createBookingInquiry rejects server-side regardless.
+  - Venue owner receives in-app + email + push notification for a new request
+    from EITHER the embed or the platform form; duplicate deliveries prevented
+    by derived idempotency keys; a throwing notifier does not fail submission
+    and the swallow is reported via reportError (regression test).
+  - Signed-in path: clicking "Log in" in the embed opens the popup; with an
+    active ithasfire.com session it resolves without re-entering credentials,
+    the form switches to signed-in mode with booking defaults prefilled, and
+    submission creates a performer-owned request (normal accept→Agreement).
+    A replayed or expired handoff token is rejected.
+  - Venue accepts an anonymous request → invite email with claim link;
+    submitter signs up, enables performer mode, claims → request gains their
+    identity and an Agreement DRAFT exists; redeeming the link twice is a no-op
+    with a friendly message.
+  - Existing signed-in /p/[slug] booking flow and org/event embeds behave
+    exactly as before (regression suite passes).

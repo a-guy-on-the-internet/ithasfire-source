@@ -1,0 +1,189 @@
+/* ── The review-tier pair ──────────────────────────────────────────────────
+   `venue_stats` (performer testimony) and `audience_stats` (attendee
+   testimony) sit back to back in the PLACE template. They are the SAME
+   question asked from opposite sides of the stage — "would you come back?" /
+   "would you play here again?" — so they must carry ONE visual system, and a
+   reader must never have to work out which side a number came from.
+
+   Two rules make that true and they are the reason this file exists rather
+   than the styles living in each block:
+     1. The TIER STAMP is the first thing in both blocks and holds nothing but
+        the source word (ATTENDEES / PERFORMERS). Same box, same idiom, both
+        sides — that identical box is what makes the pair scan as a pair.
+     2. The HEADLINE figure gets the same type, the same rule above it and the
+        same label idiom under it in both blocks, so the two percentages read
+        as comparable rather than as two unrelated statistics.
+
+   THEME: these blocks render inside an owner-themed page, so every colour
+   resolves from the per-page custom properties (`--th-color-*`) with a
+   currentColor-derived fallback. No literal light/dark value may appear here —
+   a hardcoded ink would be invisible on a dark venue theme and vice versa. */
+
+/* The mono label idiom (design-system-v2 §"Two brand fonts"): size and
+   tracking always travel together, so every pair below comes off the SAME
+   ladder step in globals.css (`--fs-mono-*` / `--tr-mono-*`). Writing the two
+   halves as literals is how an off-scale pair gets in — an 11px size with
+   1.4px tracking is not "close to the idiom", it is a different step's
+   tracking on this step's size. `--font-mono` is the self-hosted IBM Plex
+   Mono; the platform stack behind it is the last-resort fallback only. */
+.tierStamp {
+	display: inline-block;
+	width: fit-content;
+	margin: 0 0 0.75rem;
+	/* Right padding is short by roughly the 2.5px of trailing letter-space the
+	   tracking adds after the final glyph, so the box looks optically even. */
+	padding: 0.25rem 0.375rem 0.25rem 0.625rem;
+	border: 2px solid currentColor;
+	border-radius: 0;
+	font-family: var(
+		--font-mono,
+		ui-monospace,
+		SFMono-Regular,
+		Menlo,
+		Consolas,
+		monospace
+	);
+	/* xs — the stamp step. */
+	font-size: var(--fs-mono-xs, 10px);
+	font-weight: 600;
+	line-height: 1.2;
+	letter-spacing: var(--tr-mono-xs, 2.5px);
+	text-transform: uppercase;
+	color: var(--th-color-text, inherit);
+}
+
+/* The mirrored figure: one percentage, its source-naming label, and the count
+   band that percentage was computed over. One <p> so assistive tech reads the
+   three parts as the single sentence they are. */
+.tierHeadline {
+	display: flex;
+	flex-direction: column;
+	gap: 0.3125rem;
+	/* The bottom margin is load-bearing: whatever follows a headline is
+	   another figure (the legacy 0–5 grid, the median payout) or a second
+	   count line, and without it the two mono lines butt together and read as
+	   one confusing paragraph. Adjacent margins collapse here — <section> is
+	   block layout — so this and `.tierCountStandalone` resolve to one gap. */
+	margin: 0.875rem 0 1rem;
+	padding-top: 0.875rem;
+	border-top: 2px solid
+		var(--th-color-border, color-mix(in srgb, currentColor 28%, transparent));
+}
+
+.tierFigure {
+	font-size: 2.25rem;
+	font-weight: 700;
+	line-height: 1;
+	letter-spacing: -0.02em;
+	font-variant-numeric: tabular-nums;
+	color: var(--th-color-primary, inherit);
+}
+
+.tierFigureLabel {
+	font-family: var(
+		--font-mono,
+		ui-monospace,
+		SFMono-Regular,
+		Menlo,
+		Consolas,
+		monospace
+	);
+	/* sm — the label step. */
+	font-size: var(--fs-mono-sm, 11px);
+	font-weight: 600;
+	line-height: 1.3;
+	letter-spacing: var(--tr-mono-sm, 2px);
+	text-transform: uppercase;
+	color: var(--th-color-text, inherit);
+	opacity: 0.82;
+}
+
+/* Provenance count. ALWAYS a server-supplied band string printed verbatim —
+   never an integer, never arithmetic. See AudienceStatsBlock's header. */
+.tierCount {
+	margin: 0;
+	font-family: var(
+		--font-mono,
+		ui-monospace,
+		SFMono-Regular,
+		Menlo,
+		Consolas,
+		monospace
+	);
+	/* md — the meta-line step. */
+	font-size: var(--fs-mono-md, 11.5px);
+	font-weight: 500;
+	line-height: 1.4;
+	letter-spacing: var(--tr-mono-md, 1.4px);
+	text-transform: uppercase;
+	color: var(--th-color-text, inherit);
+	opacity: 0.62;
+}
+
+/* A count line standing on its own: either the block has no headline
+   percentage, or this count describes a DIFFERENT population from the one that
+   does (the legacy 0–5 slice counts everyone who reviewed; the headline counts
+   only the people who answered it). It sits tight to the figures it belongs to
+   and clear of the ones it does not. */
+.tierCountStandalone {
+	margin-top: 0.75rem;
+	margin-bottom: 0.25rem;
+}
+
+/* "Most named …" / "Most flagged …": a mono kicker followed by the plain-text
+   list. Inline so the pair reads as the sentence the design calls for. */
+.tagLine {
+	margin: 0.75rem 0 0;
+	font-size: 0.875rem;
+	line-height: 1.55;
+	color: var(--th-color-text, inherit);
+}
+
+.tagLineLabel {
+	margin-right: 0.5rem;
+	font-family: var(
+		--font-mono,
+		ui-monospace,
+		SFMono-Regular,
+		Menlo,
+		Consolas,
+		monospace
+	);
+	/* xs — the table-head / kicker step. */
+	font-size: var(--fs-mono-xs, 10px);
+	font-weight: 600;
+	letter-spacing: var(--tr-mono-xs, 2.5px);
+	text-transform: uppercase;
+	opacity: 0.62;
+}
+
+/* The one line that names the pairing out loud: which axes the other side of
+   the stage also rates. Built from the vocabulary's mirror map, never a
+   hardcoded list. */
+.tierMirrorNote {
+	margin: 0.625rem 0 0;
+	font-size: 0.75rem;
+	line-height: 1.45;
+	color: var(--th-color-text, inherit);
+	/* 0.7 is the floor that keeps 12px ink on Stub paper at AA (measured 5.9:1);
+	   the 0.55 this started at measured 3.7:1 and failed. */
+	opacity: 0.7;
+}
+
+/* Narrow phones: the figure drops a step so a long uppercase label under it
+   still gets two comfortable lines at 320px. */
+@container entity-page (max-width: 388px) {
+	.tierFigure {
+		font-size: 2rem;
+	}
+}
+
+/* Fallback for browsers without container queries (iOS 15 Safari and
+   older): the viewport rule this replaced. Keep in sync with the block above. */
+@supports not (container-type: inline-size) {
+	@media (max-width: 420px) {
+		.tierFigure {
+			font-size: 2rem;
+		}
+	}
+}

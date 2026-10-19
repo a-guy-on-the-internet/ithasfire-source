@@ -1,0 +1,538 @@
+status: superseded
+priority: p1
+superseded_by:
+  - docs/specs/2026-07-07/completed/entity-page-templates.spec.yaml
+  - docs/specs/2026-07-07/completed/musician-epk-content.spec.yaml
+superseded_note: >
+  This spec's `current_state` section describes the old Profile/
+  ProfileModule model, since replaced by EntityPage/PageBlock — treat as
+  historical context only, not ground truth. Its module-kind ideas (tracks,
+  video, press, stats, past_shows, rider, genre_tags) are carried forward
+  into entity-page-templates.spec.yaml + musician-epk-content.spec.yaml
+  against the current data model. The "Book Me" CTA / auto one-sheet PDF
+  ideas remain unbuilt and out of scope for both successor specs — see
+  their out_of_scope sections. Do not implement from this file as written.
+depends_on:
+  - entity-profiles-and-page-blocks.spec.yaml
+  - agreements-booking-requests-payout-consolidation.md
+  - fan-follow-notify.spec.yaml
+
+task: >
+  Turn the existing Profile + ProfileModules system into a full Electronic
+  Press Kit (EPK) that artists can link in booking request pitches and share
+  externally.  Add structured EPK modules (tracks, video embeds, past show
+  stats, genre tags) and a "Book Me" CTA that flows directly into the booking
+  request pipeline.
+
+goal: >
+  Make the Ithas Fire profile the best artist EPK on the internet.  Venue
+  owners evaluating a booking request should be able to vet the artist in
+  under 60 seconds: listen to a track, watch a clip, see attendance numbers,
+  and hit "Accept" without leaving the platform.  This turns the profile from
+  a vanity page into a conversion tool.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Context: What Exists Today
+# ───────────────────────────────────────────────────────────────────────────────
+
+current_state:
+  profile: >
+    Profile model: humanId, displayName, slug, bio, avatarUrl, bannerUrl,
+    visibility (PUBLIC/PRIVATE).  ProfileSlugHistory tracks slug changes.
+    ProfileTheme allows color/font/layout customization.
+
+  profile_modules: >
+    ProfileModule: humanId, kind, orderIndex, data (JSON).
+    Existing supported kinds: "about", "shows", "music", "photos", "links".
+    The legacy "custom_html_sanitized" kind is unsupported and should not be
+    rendered, added, or edited. The module system is already extensible -- adding
+    new structured kinds requires no schema migration, just new UI renderers and
+    validation logic.
+
+  booking_requests: >
+    BookingRequest has a `links` JSON field (array of social/music links)
+    and a `message` text field.  These are the artist's current "pitch"
+    materials.  No structured EPK data is attached to the request.
+
+  audio_uploads: >
+    AudioUpload model exists (used for event audio previews).  Could be
+    reused for EPK track uploads.  The audio-transcoder service handles
+    format conversion.
+
+  event_human: >
+    EventHuman links artists to events.  This is the source of truth for
+    "past shows" data.  Combined with EventDailyStats, we can compute
+    attendance numbers per show.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Design Principles
+# ───────────────────────────────────────────────────────────────────────────────
+
+principles:
+  - No new tables for EPK content.  Use existing ProfileModule with new `kind`
+    values and structured `data` JSON schemas.  The module system was designed
+    for exactly this extensibility.
+
+  - EPK data is a superset of the regular profile.  Every artist profile IS
+    an EPK.  There's no separate "EPK mode" -- just richer modules.
+
+  - "Book Me" CTA is a profile-level setting, not a module.  It's always
+    visible (if enabled) regardless of which modules are active.
+
+  - Past show stats are computed, not manually entered.  The platform already
+    has the data (EventHuman + EventDailyStats).  Surface it automatically.
+
+  - One-sheet PDF is auto-generated from profile data.  No manual upload
+    required (though manual upload is an option as an override).
+
+# ───────────────────────────────────────────────────────────────────────────────
+# New ProfileModule Kinds
+# ───────────────────────────────────────────────────────────────────────────────
+
+new_module_kinds:
+  - kind: tracks
+    data_schema: |
+      {
+        items: {
+          id: string;             // AudioUpload ID or external embed ID
+          title: string;
+          source: "upload" | "spotify" | "soundcloud" | "bandcamp" | "youtube";
+          url?: string;           // External URL (for embeds)
+          audioUploadId?: string; // Internal AudioUpload ID (for uploads)
+          durationSeconds?: number;
+          coverUrl?: string;
+        }[];
+        displayStyle: "list" | "grid";  // list = tracklist, grid = album art
+      }
+    description: >
+      Audio tracks the artist wants to showcase.  Supports both uploaded
+      tracks (via existing AudioUpload + transcoder) and external embeds
+      (Spotify, SoundCloud, Bandcamp, YouTube).  Embedded players render
+      inline using oEmbed or provider-specific iframe patterns.
+
+  - kind: video
+    data_schema: |
+      {
+        items: {
+          title: string;
+          source: "youtube" | "vimeo" | "instagram" | "tiktok";
+          url: string;
+          thumbnailUrl?: string;
+        }[];
+        displayStyle: "featured" | "grid";  // featured = hero video + list
+      }
+    description: >
+      Video embeds -- live performance clips, music videos, behind-the-scenes.
+      Uses oEmbed for thumbnail extraction.  Featured style shows one large
+      video with smaller thumbnails below.
+
+  - kind: press
+    data_schema: |
+      {
+        items: {
+          title: string;        // "Featured in Rolling Stone"
+          publication: string;  // "Rolling Stone"
+          url: string;
+          date?: string;        // ISO date
+          quote?: string;       // Pull quote
+        }[];
+      }
+    description: >
+      Press mentions and reviews.  Venue owners care about press coverage.
+
+  - kind: stats
+    data_schema: |
+      {
+        // All computed automatically from EventHuman + EventDailyStats
+        showsPlayed: number;
+        citiesPlayed: string[];
+        totalAttendees: number;   // sum of tickets sold at events where artist performed
+        avgAttendance: number;
+        followerCount: number;    // from ArtistFollow (fan-follow-notify spec)
+        // Manual overrides (artist can supplement with external stats)
+        overrides?: {
+          spotifyMonthlyListeners?: number;
+          instagramFollowers?: number;
+          customStats?: { label: string; value: string }[];
+        };
+      }
+    description: >
+      Computed performance stats from Ithas Fire data, optionally
+      supplemented with external metrics the artist enters manually.
+      This module is auto-populated -- the artist doesn't have to do
+      anything for it to have data.
+
+  - kind: past_shows
+    data_schema: |
+      {
+        limit: number;   // how many to show (default 10)
+        showPrivate: boolean;  // include events where attendance < threshold
+        items: {
+          // Auto-populated from EventHuman + Event + EventDailyStats
+          eventId: string;
+          title: string;
+          date: string;
+          placeName: string | null;
+          city: string | null;
+          attendees: number | null;  // null if showPrivate=false and below threshold
+        }[];
+      }
+    description: >
+      Auto-generated list of past shows with attendance data.  The artist
+      controls visibility: they can hide shows with low turnout.  This
+      replaces the existing "shows" module kind with a richer, data-backed
+      version.
+
+  - kind: rider
+    data_schema: |
+      {
+        sections: {
+          title: string;   // "Backline", "Catering", "Hospitality"
+          items: string[]; // ["Full drum kit", "2x DI boxes", "1x vocal mic"]
+        }[];
+        notes?: string;    // Free-text additional notes
+      }
+    description: >
+      Structured rider information.  When a venue views the EPK, they can
+      see exactly what the artist needs.  This data is also pre-populated
+      into BookingRequest.metadata when the artist sends a pitch.
+
+  - kind: genre_tags
+    data_schema: |
+      {
+        primary: string;     // "Indie Rock"
+        secondary: string[]; // ["Shoegaze", "Dream Pop"]
+      }
+    description: >
+      Genre classification.  Used for Place -> Artist matching in booking
+      request discovery and for search/filter on artist directory pages.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# "Book Me" CTA
+# ───────────────────────────────────────────────────────────────────────────────
+
+book_me_cta:
+  schema_change: >
+    Add to Profile model:
+      bookMeEnabled    Boolean @default(false)
+      bookMeLabel      String? // custom CTA text, defaults to "Book Me"
+      bookMeMessage    String? // pre-filled message template for booking requests
+
+  behavior:
+    - Visible on the public profile page when bookMeEnabled = true
+    - Click opens a booking request form pre-filled with the artist's humanId
+    - If the viewer is a place owner, the form is pre-filled with their place
+    - The form includes the artist's preferred dates (from a new
+      "availability" module or manual entry), expected draw, genre, and links
+      (all pulled from EPK modules)
+    - Submitting creates a BookingRequest (same as the existing flow, but
+      initiated from the profile page instead of the place page)
+
+  inversion_note: >
+    The existing BookingRequest flow is artist -> place.  The "Book Me" CTA
+    enables place -> artist (the venue discovers the artist's profile and
+    initiates contact).  The BookingRequest model already supports both
+    directions -- the artistHumanId field identifies the artist regardless
+    of who initiated.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# One-Sheet PDF Generation
+# ───────────────────────────────────────────────────────────────────────────────
+
+one_sheet_pdf:
+  description: >
+    Auto-generated single-page PDF summarizing the artist's EPK.  Designed
+    for email attachments when pitching venues outside Ithas Fire.
+
+  content:
+    - Artist name, photo, bio (truncated)
+    - Genre tags
+    - Key stats (shows played, avg attendance, follower count)
+    - Top 3 past shows with attendance
+    - Top 3 press quotes (if press module exists)
+    - Social links
+    - QR code linking to the full Ithas Fire profile
+    - "Book Me" URL
+
+  generation:
+    approach: >
+      Server-side PDF generation using a headless renderer (Puppeteer or
+      @react-pdf/renderer).  Generated on-demand when the artist clicks
+      "Download One-Sheet" and cached in GCS with a 24h TTL.  Cache is
+      invalidated when any EPK module is updated.
+    endpoint: "GET /api/epk/{humanSlug}/one-sheet.pdf"
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Use Cases
+# ───────────────────────────────────────────────────────────────────────────────
+
+use_cases:
+  - name: updateEpkModule
+    location: packages/core/src/use-cases/profiles/update-epk-module.ts
+    input: >
+      { actorHumanId: string; moduleKind: string; data: unknown }
+    output: >
+      { moduleId: string }
+    flow:
+      - Validate actorHumanId owns the profile
+      - Validate data against the schema for the given moduleKind
+      - Upsert ProfileModule (create if not exists, update if exists)
+      - Invalidate one-sheet PDF cache
+    notes: >
+      This extends the existing profile module system.  The new kinds (tracks,
+      video, press, stats, past_shows, rider, genre_tags) use the same
+      ProfileModule table -- just new `kind` values with stricter data
+      validation.
+
+  - name: computeEpkStats
+    location: packages/core/src/use-cases/profiles/compute-epk-stats.ts
+    input: "{ humanId: string }"
+    output: >
+      { showsPlayed: number; citiesPlayed: string[]; totalAttendees: number;
+        avgAttendance: number; followerCount: number }
+    flow:
+      - Query EventHuman where humanId matches, join Event (status = COMPLETED)
+      - Aggregate: count events, distinct cities, sum tickets sold
+      - Fetch follower count from ArtistFollow
+      - Return computed stats
+    notes: >
+      Called when rendering the stats module on the profile page.  Cached in
+      Redis (TTL 1 hour) since it involves aggregation queries.
+
+  - name: getEpkPastShows
+    location: packages/core/src/use-cases/profiles/get-epk-past-shows.ts
+    input: "{ humanId: string; limit?: number }"
+    output: >
+      { shows: { eventId: string; title: string; date: Date;
+        placeName: string | null; city: string | null;
+        attendees: number | null }[] }
+    flow:
+      - Query EventHuman where humanId matches, join Event (completed, past)
+      - Join EventDailyStats for attendance numbers
+      - Apply the artist's showPrivate preference (hide low-attendance shows)
+      - Return ordered by date descending
+
+  - name: generateOneSheet
+    location: packages/core/src/use-cases/profiles/generate-one-sheet.ts
+    input: "{ humanId: string }"
+    output: "{ url: string; expiresAt: Date }"
+    flow:
+      - Check GCS cache for existing PDF
+      - If cache miss, gather all EPK data (profile, modules, stats, past shows)
+      - Render PDF using template
+      - Upload to GCS with 24h TTL
+      - Return signed URL
+
+  - name: toggleBookMe
+    location: packages/core/src/use-cases/profiles/toggle-book-me.ts
+    input: >
+      { actorHumanId: string; enabled: boolean; label?: string;
+        message?: string }
+    output: "{ enabled: boolean }"
+    flow:
+      - Validate actor owns the profile
+      - Update Profile.bookMeEnabled, bookMeLabel, bookMeMessage
+    notes: >
+      Separate from updateEpkModule because it's a profile-level setting,
+      not a module.
+
+  - name: initiateBookingFromProfile
+    location: packages/core/src/use-cases/profiles/initiate-booking-from-profile.ts
+    input: >
+      { actorHumanId: string; artistHumanId: string; placeId: string;
+        message: string; preferredDates?: { date: string }[] }
+    output: "{ bookingRequestId: string }"
+    flow:
+      - Validate place is owned by actor (or actor is an org member with booking perms)
+      - Validate artist has bookMeEnabled
+      - Create BookingRequest (same model, but initiated by venue)
+      - Auto-attach artist's rider data to BookingRequest.metadata
+      - Notify artist
+    notes: >
+      This is the "venue discovers artist" flow.  Reuses the existing
+      BookingRequest model.  The only difference from the artist-initiated
+      flow is who fills in which fields.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Transport
+# ───────────────────────────────────────────────────────────────────────────────
+
+transport:
+  trpc:
+    router_additions:
+      profiles:
+        - name: updateEpkModule
+          type: mutation
+          auth: required
+
+        - name: getEpkStats
+          type: query
+          auth: none (public)
+
+        - name: getEpkPastShows
+          type: query
+          auth: none (public, respects showPrivate setting)
+
+        - name: generateOneSheet
+          type: mutation
+          auth: required (artist only)
+
+        - name: toggleBookMe
+          type: mutation
+          auth: required
+
+      bookingRequests:
+        - name: initiateFromProfile
+          type: mutation
+          auth: required
+          notes: Venue-initiated booking request
+
+  rest:
+    - endpoint: "GET /api/epk/:slug/one-sheet.pdf"
+      auth: none (public, signed URL)
+      notes: Serves the cached PDF from GCS
+
+# ───────────────────────────────────────────────────────────────────────────────
+# UI
+# ───────────────────────────────────────────────────────────────────────────────
+
+ui:
+  public_profile_page:
+    enhancements:
+      - Render new module kinds (tracks, video, press, stats, past_shows, rider, genre_tags)
+      - "Book Me" CTA button (prominent, above the fold if enabled)
+      - Follower count badge (from fan-follow-notify spec)
+      - "Download One-Sheet" link (visible to venue owners / logged-in users)
+      - Inline audio player for tracks module
+      - Embedded video player for video module (YouTube/Vimeo oEmbed)
+
+  profile_editor:
+    route: /dashboard/profile/edit
+    enhancements:
+      - Module picker shows new EPK kinds
+      - Stats module has a "Refresh stats" button (triggers computeEpkStats)
+      - Past shows module has visibility toggles per show
+      - Rider module has a structured form (sections + items)
+      - Genre tags module has autocomplete from existing Tag slugs
+      - "Book Me" toggle with custom label and message fields
+      - One-sheet preview + download button
+
+  booking_request_integration:
+    - When an artist sends a BookingRequest from a place page, auto-link
+      their EPK (profile URL in the request metadata)
+    - When a venue owner views a BookingRequest, show an "EPK Preview"
+      panel alongside the pitch message with key stats, genre, and a
+      track player
+    - When a venue clicks "Book Me" on an artist profile, the booking
+      request form is pre-filled with the artist's rider and genre data
+
+  mobile:
+    - Same EPK rendering on profile screens
+    - Simplified module editor (reorder + enable/disable, full editing on web)
+    - Audio player for tracks module
+    - "Book Me" button deep-links to booking request form
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Test Matrix
+# ───────────────────────────────────────────────────────────────────────────────
+
+tests:
+  - name: Create and render each new module kind
+    validates: >
+      Each of tracks, video, press, stats, past_shows, rider, genre_tags
+      can be created with valid data and rejected with invalid data
+
+  - name: Stats module auto-computation
+    validates: >
+      Artist with 5 completed events in 3 cities gets correct showsPlayed,
+      citiesPlayed, totalAttendees, avgAttendance
+
+  - name: Past shows respects showPrivate flag
+    validates: >
+      Shows with attendance below threshold are hidden when showPrivate=false
+
+  - name: One-sheet PDF generation
+    validates: PDF is generated, cached in GCS, and served via signed URL
+
+  - name: One-sheet cache invalidation on module update
+    validates: Updating any EPK module invalidates the cached PDF
+
+  - name: Book Me CTA toggle
+    validates: >
+      Enable -> CTA visible on public profile.
+      Disable -> CTA hidden.
+
+  - name: Venue-initiated booking request via Book Me
+    validates: >
+      BookingRequest created with correct artistHumanId, placeId, and
+      rider data auto-attached
+
+  - name: Tracks module with mixed sources (upload + Spotify embed)
+    validates: Both internal AudioUpload and external URL render correctly
+
+  - name: Genre tags used in place-artist matching
+    validates: >
+      Place with genre preference finds matching artists in discovery
+
+  - name: Profile with no modules returns empty EPK
+    validates: Graceful empty state, no errors
+
+  - name: Non-owner cannot update EPK modules
+    validates: Authz enforcement on updateEpkModule
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Migration Path from Existing Modules
+# ───────────────────────────────────────────────────────────────────────────────
+
+migration:
+  existing_shows_module: >
+    The existing "shows" module kind displays a simple list.  Replace it
+    with "past_shows" which adds attendance data and visibility controls.
+    Migrate existing "shows" modules: if data.limit exists, map to
+    past_shows with showPrivate=false.  No data loss.
+
+  existing_music_module: >
+    The existing "music" module is a simple links list.  The new "tracks"
+    module is richer (inline player, cover art, sources).  Keep both kinds
+    supported -- "music" for simple link lists, "tracks" for the full
+    player experience.  Artists can migrate manually by adding a tracks
+    module and removing the music module.
+
+  existing_links_module: >
+    No change.  "links" remains for generic URLs (social profiles, website).
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Open Questions
+# ───────────────────────────────────────────────────────────────────────────────
+
+open_questions:
+  - question: Should the one-sheet PDF be customizable?
+    context: >
+      v1: auto-generated from a single template.  v2 could allow artists to
+      pick from 2-3 templates or adjust which sections appear.  Keep it
+      simple for now. Simple two templates for now
+
+  - question: Should we support direct file uploads for the one-sheet?
+    context: >
+      Some artists already have a professionally designed EPK PDF.  Could
+      allow them to upload a custom one-sheet that overrides the auto-generated
+      version.  Simple to implement (just a file upload + GCS storage). Yep allow this
+
+  - question: Embedding rights for Spotify/SoundCloud/YouTube?
+    context: >
+      oEmbed is generally fine for user-initiated embeds.  Each provider has
+      ToS around iframe embedding.  We're not hosting the content, just
+      rendering the provider's embed player.  Standard practice for EPK sites.
+
+  - question: Should computed stats include events where the artist was a HOST vs PERFORMER?
+    context: >
+      A HOST might be an emcee who doesn't draw their own crowd.  Stats
+      might be more meaningful if limited to PERFORMER and DJ roles.
+      Configurable per-artist, or hard-coded to performer roles only. Only perfomer.
+
+  - question: Should the EPK be shareable as a standalone page?
+    context: >
+      The public profile IS the EPK page (same URL).  But consider a
+      "clean" mode (no Ithas Fire navigation, just the EPK content) for
+      embedding in emails or external sites.  Similar to the existing Embed
+      model pattern. both options are good

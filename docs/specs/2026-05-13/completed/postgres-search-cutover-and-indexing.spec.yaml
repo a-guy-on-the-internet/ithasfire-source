@@ -1,0 +1,253 @@
+# postgres-search-cutover-and-indexing.spec.yaml
+# Migration plan for switching unified search to Postgres while preserving fresh event publish indexing and admin-triggerable repair jobs.
+
+version: "1.0"
+updated: "2026-05-13"
+
+summary:
+  problem: >
+    The Postgres-backed MultiSearchPort removes the need for Cloud Run Meilisearch
+    in normal unified search traffic, but the operational model still assumes
+    scheduled full reindexing and Meilisearch-specific background job names.
+    We need a safe migration path that keeps newly published events searchable
+    immediately, keeps repair jobs available to platform admins, and avoids
+    turning search maintenance into a user-facing write dependency.
+  solution: >
+    Flip API and Jobs to SEARCH_BACKEND=postgres, keep event publish indexing as
+    a best-effort after-commit refresh, expose full and per-entity search repair
+    jobs through the platform admin jobs UI, and use scheduled full reindexing as
+    reconciliation until incremental coverage is broad enough to retire it.
+  users:
+    - Platform admin
+    - Event organizer
+    - Event attendee using search/autocomplete
+  surfaces:
+    - api
+    - jobs
+    - web
+    - infra
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Dev and prod deployments can select Postgres unified search by setting
+        SEARCH_BACKEND=postgres for both API and Jobs.
+    - id: FR-002
+      description: >
+        Publishing an event refreshes that event's search document after the
+        domain transaction and idempotency commit complete. The user-facing
+        publish result must not fail only because search indexing failed.
+    - id: FR-003
+      description: >
+        Platform admins can trigger registered jobs from the admin jobs surface,
+        including search.full-reindex and the per-entity search.index-* jobs.
+    - id: FR-004
+      description: >
+        search.full-reindex remains scheduled and available as a manual
+        repair/reconciliation task through the cutover and stability window.
+        Removing the schedule requires a later acceptance gate proving that
+        incremental mutation coverage is broad enough to replace the safety net.
+    - id: FR-005
+      description: >
+        Incremental queue jobs must be backend-neutral in labels, logs, and
+        descriptions; they index into the selected MultiSearchPort backend, not
+        specifically Meilisearch.
+    - id: FR-006
+      description: >
+        Decommissioning Meilisearch is a later step gated by a stability window,
+        successful admin-triggered repair runs, and search smoke checks in prod.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Search indexing is best-effort after commit. It must log failures with
+        entity type/id and backend, but must not block event publishing.
+    - id: NFR-002
+      description: >
+        Admin-triggered repair jobs must require platform-admin authorization and
+        Jobs service authentication; public or org-scoped users cannot run them.
+    - id: NFR-003
+      description: >
+        Autocomplete and repair-job performance must be monitored through DB CPU,
+        query latency, Jobs duration/error rate, and SearchDocument row counts.
+
+architecture:
+  core:
+    use_cases:
+      - name: publishEvent
+        description: >
+          Continue refreshing the published event search document after commit.
+          This is the only freshness-critical synchronous-adjacent indexing path
+          required for initial cutover.
+        input: actorHumanId, eventId, clientKey
+        output: eventId, status, publishedAt
+        idempotent: true
+        money: false
+      - name: buildSearchIndex
+        description: >
+          Retain full and per-entity search repair behavior behind MultiSearchPort.
+          Used by Jobs and by any future after-commit refresh helper.
+        input: fullReindex, eventIds, humanIds, placeIds, organizationIds, batchSize
+        output: indexed counts and typed error list
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - MultiSearchPort
+      - Repos
+      - LoggerPort
+
+  adapters:
+    new: []
+    existing:
+      - MultiIndexPostgresAdapter
+      - PrismaRepos
+
+  transport:
+    trpc_procedures:
+      - name: platform jobs trigger procedure
+        description: >
+          Existing or new platform-admin procedure that invokes Jobs service
+          tasks by registered job name.
+    webhooks: []
+
+  ui:
+    pages:
+      - apps/web/src/app/platform/jobs/page.tsx
+      - apps/web/src/app/platform/places/page.tsx, existing shortcut only
+    components: []
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+  notes: >
+    The SearchDocument schema migration is already covered by the Postgres search
+    adapter spec. This plan changes deployment behavior and job orchestration,
+    not the database shape.
+
+migration_plan:
+  phases:
+    - id: phase-0-preflight
+      description: >
+        Confirm the SearchDocument migration has run in dev/prod, deploy the API
+        and Jobs images containing the Postgres adapter, and verify that the jobs
+        service can construct MultiIndexPostgresAdapter.
+      validation:
+        - db migration status shows 20260512_search_documents applied
+        - jobs health endpoint passes with SEARCH_BACKEND=postgres
+    - id: phase-1-dev-flip
+      description: >
+        Set SEARCH_BACKEND=postgres for dev API and Jobs. Keep
+        enable_meilisearch=true for rollback. Run search.full-reindex manually
+        from the jobs service or platform admin jobs UI.
+      validation:
+        - search autocomplete returns seeded dev events, places, humans, and orgs
+        - publishing a dev event creates or updates event_<eventId> in SearchDocument
+    - id: phase-2-prod-flip
+      description: >
+        Set SEARCH_BACKEND=postgres for prod API and Jobs after dev smoke passes.
+        Run a manual prod search.full-reindex and smoke autocomplete against real
+        event/place queries.
+      validation:
+        - prod autocomplete top results remain comparable to the relevance spike
+        - Jobs logs show successful manual search.full-reindex completion
+    - id: phase-3-reconciliation-policy
+      description: >
+        Keep scheduled search.full-reindex enabled through the stability window
+        and treat it as reconciliation rather than primary freshness. Platform
+        admins can also run it on demand from the jobs/admin flow when drift is
+        suspected or after operational incidents.
+      validation:
+        - platform admin can trigger search.full-reindex on demand
+        - per-entity search.index-* jobs remain available for targeted repairs
+    - id: phase-4-meili-retirement
+      description: >
+        After the stability window, set enable_meilisearch=false and remove
+        Meili-specific secrets/env injection from active deployments. Code removal
+        of the Meili adapter is a separate cleanup after rollback is no longer
+        needed.
+      validation:
+        - API and Jobs boot with no MEILISEARCH_* env vars
+        - search smoke and admin-triggered repair jobs pass after Meili teardown
+
+indexing_policy:
+  immediate:
+    - event publish refreshes its event search document after commit
+  nightly_or_manual_reconciliation:
+    - event edits after publish
+    - event image changes
+    - ticket pricing changes
+    - place directory listing and profile changes
+    - human/profile/entity-page changes
+    - organization profile/entity-page changes
+  targeted_admin_repairs:
+    - search.index-event
+    - search.index-human
+    - search.index-place
+    - search.index-organization
+
+infra_changes:
+  dev:
+    api_env:
+      SEARCH_BACKEND: postgres
+    jobs_env:
+      SEARCH_BACKEND: postgres
+    keep_for_rollback:
+      enable_meilisearch: true
+  prod:
+    api_env:
+      SEARCH_BACKEND: postgres
+    jobs_env:
+      SEARCH_BACKEND: postgres
+    keep_for_rollback:
+      enable_meilisearch: true
+  post_stability_scheduler_override:
+    search.full-reindex:
+      enabled: false
+      gate: >
+        Use only after the stability window and after incremental mutation
+        coverage is accepted as a replacement for scheduled reconciliation.
+
+risks:
+  - risk: >
+      Published event edits can drift until the reconciliation job runs because
+      only publish is freshness-critical in the initial policy.
+    severity: MEDIUM
+    mitigation: >
+      Keep search.full-reindex scheduled during the first cutover window, or run
+      targeted admin repairs after editing high-visibility published events.
+  - risk: >
+      Disabling scheduled full reindex before the admin jobs surface can trigger
+      repair jobs leaves no easy operator recovery path.
+    severity: HIGH
+    mitigation: >
+      Verify platform-admin job triggering before disabling the schedule in prod.
+  - risk: >
+      Search query load now competes with product queries on Postgres.
+    severity: MEDIUM
+    mitigation: >
+      Monitor autocomplete p95, Postgres CPU, pool saturation, query plans, and
+      SearchDocument row count; add caching/debounce or reconsider an external
+      search service if search QPS or corpus size outgrows Postgres.
+
+open_questions: []
+
+out_of_scope:
+  - Removing the MultiIndexMeilisearchAdapter from source code.
+  - Moving every event/place/profile mutation to after-commit incremental indexing.
+  - Changing the MultiSearchPort contract or document types.
+  - Adding new SearchDocument database columns or indexes.
+
+acceptance_criteria:
+  - Dev and prod can run API and Jobs with SEARCH_BACKEND=postgres.
+  - A newly published event appears in autocomplete without waiting for nightly reconciliation.
+  - A forced publish-time indexing failure does not fail event publish and logs the entity type, entity id, backend, and error.
+  - Platform admins can manually trigger search.full-reindex from the jobs/admin flow.
+  - Platform admins can manually trigger per-entity search.index-* repairs where handlers exist.
+  - Search job descriptions and logs no longer describe backend-neutral jobs as Meilisearch-only.
+  - Scheduled search.full-reindex remains enabled through the agreed stability window unless a later spec explicitly replaces reconciliation coverage.
+  - Meili remains available for rollback until the agreed stability window is complete.

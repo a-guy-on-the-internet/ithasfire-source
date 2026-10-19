@@ -14,13 +14,15 @@ related:
 specs:
   [
     "2026-04-18/completed/donation-ticket-type",
-    "2026-08-10/time-based-ticket-pricing",
+    "2026-08-10/completed/time-based-ticket-pricing",
   ]
 ---
 
 Ticket types are the tiers buyers choose from on your event page. Most events run 1–3 tiers: General Admission, VIP, Early Bird.
 
 Running the same setup across events? You can save an event's ticket types as a template and reuse them — see [Reuse ticket setups with templates](/help/organising-events/reuse-ticket-setups-with-templates).
+
+On an event with a seating map, you can also give single seats their own price: see [Give single seats a custom price](/help/organising-events/price-individual-seats).
 
 ## Adding a ticket type
 
@@ -32,35 +34,62 @@ Open your event in the builder, jump to **Tickets** (the **Build** group in the 
 
   If your event starts within the next day there is no "24 hours before" left to aim at, so the window is left off and a line under the box says so. Set the times yourself if you still want a window — and if you use both presets on a same-day event, give Advance a closing time, or the advance and door tiers will sell alongside each other and buyers will simply choose the cheaper one.
 - **Name** — shown to buyers (e.g. "General Admission")
-- **Price** — in your default currency. Type it either way: `12.50` and `12,50` both mean twelve fifty. Leave out thousands separators — enter `1500`, not `1,500`, which could be read as either 1500 or 1.50 and is rejected so it can't be guessed wrong.
+- **Price** — in your default currency. Not shown for **Pay What You Want** tiers, where the buyer names the price. Type it either way: `12.50` and `12,50` both mean twelve fifty. Leave out thousands separators — enter `1500`, not `1,500`, which could be read as either 1500 or 1.50 and is rejected so it can't be guessed wrong.
 - **Capacity** — number available (or unlimited)
-- **Pricing mode** — `FIXED` (buyer pays what you set) or `ADJUSTABLE` (buyer picks an amount at or above your minimum)
+- **Pricing** — **Fixed Price** (buyer pays what you set) or **Pay What You Want** (buyer picks an amount at or above your minimum)
 - **Resale allowed** — toggle that lets buyers list the ticket on the in-app resale marketplace (resale is not currently available on Ithas Fire, so this toggle and the cap below are hidden for now)
-- **Resale cap** — optional maximum ask price when resale is allowed
+- **Resale cap** — optional maximum ask price when resale is allowed. A ticket whose original price was higher than the cap can still be listed for up to that price
 
 While resale is switched off, the **Resale** tab in **Revenue splits** is hidden too — there's nothing to share out until buyers can resell. Tickets that already have resale saved on them keep that setting; it just has no effect and isn't shown. See [resale marketplace](/help/buying-tickets/resale-marketplace).
 
-## Adjustable-price tickets
+## Pay-what-you-want tickets
 
-Set pricing mode to `ADJUSTABLE` to offer:
+Under **Pricing**, choose **Pay What You Want**. The **Price** field disappears, because the buyer names the price, and two fields take its place:
 
-- A **minimum** (floor — the lowest a buyer can pay)
-- A **suggested amount** (shown as the default at checkout)
+- **Minimum ($)** — the lowest a buyer can pay. Leave it blank or enter `0` to let buyers pay nothing.
+- **Suggested ($)** — the amount checkout starts at. Buyers can change it by dragging a slider, typing an exact amount, or picking one of the preset amounts. The slider starts at your minimum and runs well past your suggested amount. A buyer who wants to pay more than the slider reaches can type the amount, up to $10,000.00.
 
-Useful for sliding-scale community events, pay-what-you-can shows, and donation add-ons.
+Neither **Minimum** nor **Suggested** can be more than $10,000.00, the most a buyer can pay for one ticket. A higher amount shows a message under the field and the ticket type isn't saved until you lower it. A saved ticket setup (template) holding a higher amount can't be applied: nothing is added, and the message names the ticket type to fix.
+
+Useful for sliding-scale community events, pay-what-you-can shows, and donation tiers.
+
+### What the buyer pays
+
+**The amount the buyer chooses is the ticket price, and all of it goes to your event.** Anything else is added on top, exactly as it would be for a fixed-price ticket at that amount:
+
+- the platform fee;
+- the processing fee;
+- tax, where your place's location charges it.
+
+A buyer who chooses $15 pays $15 plus those fees and tax, and your event is credited the $15, as with any ticket. Checkout shows the full total before the buyer holds their tickets. One buyer can pay at most $10,000.00 per ticket.
+
+Pay-what-you-want tickets are non-refundable, and checkout tells buyers so.
+
+### What buyers see on your event page
+
+The tier is quoted from its minimum, with fees and tax included, the same way a fixed-price tier shows what a buyer pays. A $5.00 minimum reads **From $6.09** where the place's location charges 8.88% tax: that is what a buyer pays for one ticket if they choose the minimum. Your event page, your embeds and checkout all show this figure. If the minimum is $0, the tier reads **Pay what you want** instead, followed by your suggested amount (for example *suggested $15.00*) when you set one. Listings and search read **Pay what you want**, never **Free**, for an event with a $0-minimum tier, including when paid tiers sit beside it. The suggested amount is shown without fees and tax, because it is the amount the buyer chooses.
 
 :::tip
-Adjustable tickets are the simplest way to offer "pay more if you can" without creating multiple tiers. Buyers see your suggested amount prefilled — most take it.
+Pay-what-you-want tickets are the simplest way to offer "pay more if you can" without creating multiple tiers. Buyers see your suggested amount prefilled — most take it.
 :::
 
-## Platform fee handling
+## Platform and processing fees
 
-Each event chooses how the platform fee is applied:
+Fees are always added on top of your ticket price, on every event. At checkout the buyer sees the ticket price, the platform fee, the processing fee and tax on separate lines, so what they pay is exactly what they see. There is no setting for this. Under each paid ticket type, the **Tickets** section previews the fees and tax a buyer pays on top of its price.
 
-- `PASS_THROUGH` — fee added on top of your price (buyer pays it)
-- `ABSORB` — fee comes out of your ticket price (you receive less per ticket)
+The platform fee is taken once, from the buyer. Your event is credited the full ticket price. Take a $10.00 ticket with a 33¢ platform fee: the buyer pays $10.33 plus the processing fee and tax, and your event is credited $10.00. Tickets sold before 13 October 2026 were credited the price minus the platform fee, and those orders keep the amounts they were credited.
 
-Switch between them with the fee toggle in the builder's **Tickets** section — it reads **Fees passed to buyer** or **Fees absorbed by organizer**.
+:::tip
+If your event used to take the platform fee out of your share rather than charge it to buyers, it has moved to fees on top. Buyers now see the platform fee and the processing fee added to your price. Orders placed earlier keep the amounts they were charged.
+:::
+
+### The fee line under each ticket type
+
+Under each fixed-price ticket type that costs more than $0, the **Tickets** section shows one line with the numbers for a single ticket. It isn't shown for pay-what-you-want tiers, because there the fees depend on the amount the buyer picks.
+
+**Platform fee**, **Processing fee** and **Tax** are added on top of your price, and **Buyer pays** is the total of all four: the same figure your event page shows for one ticket. When tax can't be calculated, the line says so and leaves **Buyer pays** out. **Tax** is shown only where your place's location charges it.
+
+**Your event is credited** shows your price. None of the lines added on top comes out of it, and **Revenue splits** share it out.
 
 ## Editing after sales open
 
@@ -70,6 +99,14 @@ Most fields stay editable, with two constraints:
 - **Reducing a price triggers partial refunds** automatically for buyers who paid more
 
 Price increases only apply to future buyers — existing ticket holders keep the price they paid.
+
+## Refunded tickets go back on sale
+
+A refunded ticket stops counting against its ticket type's capacity, so one more is offered on your event page, in your embed and at the door. The same goes for a voided comp.
+
+:::warning
+Refunding a ticket that was already scanned in marks that person as having left: the ticket stops working and goes back on sale. Refund it at the door, as they go.
+:::
 
 ## Scheduling a price change
 

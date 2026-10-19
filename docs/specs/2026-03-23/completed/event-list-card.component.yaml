@@ -1,0 +1,226 @@
+# event-list-card.component.yaml
+meta:
+  goal: >
+    Build a public-facing EventListCard component for the consumer event
+    discovery page. Renders scraped and published events in a scannable
+    card/list format with distance calculation, filter chips, and source
+    attribution. Designed for mobile-first layouts.
+  owner: ui
+  status: shipped  # 2026-10-08 docs consolidation; was: draft
+  created: 2026-03-23
+  last_updated: 2026-03-23
+  depends_on:
+    - ../2026-03-23/scraped-events.schema.yaml
+    - ../2026-03-23/hearth-scraper.spec.yaml
+    - event-card.component.yaml
+  related:
+    - event-grid.component.yaml
+    - event-grid-filters.component.yaml
+    - consumer/discovery-navigation.flow.yaml
+  files:
+    shared:
+      component: packages/ui/src/ui/tamagui/components/event-list/EventListCard.tsx
+      distance: packages/ui/src/ui/tamagui/components/event-list/EventListDistance.tsx
+      source: packages/ui/src/ui/tamagui/components/event-list/EventListSource.tsx
+      tests: packages/ui/src/ui/tamagui/components/__tests__/EventListCard.test.tsx
+      stories: packages/ui/src/ui/tamagui/components/EventListCard.stories.tsx
+    web:
+      page: apps/web/src/app/events/page.tsx
+      filters: apps/web/src/app/events/_components/EventFilterChips.tsx
+      list: apps/web/src/app/events/_components/EventListView.tsx
+  exports:
+    - EventListCard
+    - EventListDistance
+    - EventListSource
+    - EventFilterChips
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data types
+# ─────────────────────────────────────────────────────────────────────────────
+
+types:
+  EventListItem:
+    description: >
+      Unified shape consumed by EventListCard. Can be hydrated from either
+      a published Event or a ScrapedEvent. The page-level data fetcher
+      merges both sources into this shape.
+    fields:
+      id: string
+      kind: '"event" | "scraped"'
+      name: string
+      startsAt: string            # ISO 8601
+      endsAt: string | null
+      locationLabel: string | null
+      addressText: string | null
+      lat: number | null
+      lng: number | null
+      distanceKm: number | null   # Computed by the API when user location is provided
+      distanceMi: number | null
+      sourceUrl: string | null    # Only for scraped events
+      sourceName: string | null
+      heroImageUrl: string | null # Only for published events
+      slug: string | null         # Only for published events (link to /e/[slug])
+      claimStatus: ScrapedEventClaimStatus | null
+      tags: string[]
+      confidence: number | null
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EventListCard component
+# ─────────────────────────────────────────────────────────────────────────────
+
+event_list_card:
+  props:
+    required:
+      - event: EventListItem
+    optional:
+      - onPress?: (event: EventListItem) => void
+      - onClaim?: (event: EventListItem) => void  # Only shown for scraped events
+      - showDistance?: boolean                      # default true when lat/lng available
+      - showSource?: boolean                       # default true for scraped events
+      - layout?: '"compact" | "expanded"'          # default compact
+      - testIdBase?: string
+  layout:
+    structure: |
+      ┌─────────────────────────────────────────────────┐
+      │ [Hero Image / Placeholder]                      │  <- 80x80 thumbnail or colored placeholder
+      │                                                 │
+      │  Event Name                         2.3 mi away │  <- title + distance badge
+      │  Tue, Mar 24 · 7:00 PM                         │  <- formatted date/time
+      │  The Blue Note · Columbia, MO                   │  <- location
+      │                                                 │
+      │  [open-mic] [poetry]               via FB ↗    │  <- tags + source attribution
+      └─────────────────────────────────────────────────┘
+    notes:
+      - Compact layout: single row per event (horizontal card, image left, content right). Good for long lists.
+      - Expanded layout: stacked card with larger image. Better for fewer results or featured events.
+      - Published events link to /e/[slug]. Scraped events link to sourceUrl in a new tab.
+      - Scraped events without a hero image get a gradient placeholder with the first letter of the event name.
+      - Distance badge only renders when the user has shared their location.
+      - Source attribution shows sourceName as a subtle link (e.g., "via Eventbrite").
+  responsive:
+    mobile: Full-width compact cards. Tags wrap to second line if needed.
+    tablet: Two-column grid of compact cards.
+    desktop: Single column expanded cards or three-column compact grid (user toggle).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EventListDistance sub-component
+# ─────────────────────────────────────────────────────────────────────────────
+
+event_list_distance:
+  description: >
+    Displays the distance from the user's location to the event.
+    Uses the existing GeoPort.distance() method on the server, or
+    haversine client-side when lat/lng are available on both ends.
+  props:
+    required:
+      - distanceKm: number
+    optional:
+      - unit?: '"mi" | "km"'     # default inferred from user locale
+      - compact?: boolean         # "2.3 mi" vs "2.3 miles away"
+  implementation_notes:
+    server_side: >
+      The tRPC endpoint that fetches the event list accepts optional
+      `userLat` and `userLng` params. When present, the API computes
+      distance using the existing GeoPort.distance() or haversineDistance()
+      and returns it as `distanceKm` on each EventListItem. This avoids
+      exposing exact user coordinates to the client-side bundle.
+    client_fallback: >
+      If the API did not compute distance (e.g., user location was
+      provided after initial load), the client can compute haversine
+      locally using the event's lat/lng. Import haversineDistance from
+      @th/core/lib/geo/haversine.
+    geolocation_prompt: >
+      The events page shows a "Show events near me" chip. Tapping it
+      triggers the browser geolocation API. Permission is requested
+      once and cached. If denied, the chip becomes "Set location" and
+      opens a city/zip input.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EventListSource sub-component
+# ─────────────────────────────────────────────────────────────────────────────
+
+event_list_source:
+  description: >
+    Subtle source attribution for scraped events. Rendered as
+    "via {sourceName}" with an external link icon, linking to sourceUrl.
+  props:
+    required:
+      - sourceName: string
+      - sourceUrl: string
+    optional:
+      - compact?: boolean    # icon-only on mobile
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Filter chips
+# ─────────────────────────────────────────────────────────────────────────────
+
+filter_chips:
+  description: >
+    Horizontal scrollable row of filter chips above the event list.
+    Active filters update the URL search params for shareability.
+  chips:
+    - label: "Near me"
+      behavior: >
+        Requests browser geolocation. When active, sorts results by
+        distance ascending and shows distance badges on cards.
+      icon: MapPin
+    - label: "This week" / "This weekend" / "Today"
+      behavior: Preset date range filters. Mutually exclusive.
+      icon: Calendar
+    - label: "Open Mics"
+      behavior: Tag filter (tags contains "open-mic").
+      icon: Mic
+    - label: "Music"
+      behavior: Tag filter.
+      icon: Music
+    - label: "Community"
+      behavior: Tag filter (tags contains "community", "recovery", "support").
+      icon: Heart
+    - label: "Poetry"
+      behavior: Tag filter.
+      icon: BookOpen
+    - label: "Free"
+      behavior: >
+        Shows only events with no ticket price (scraped events are always
+        free in phase 1; published events where cheapest tier is $0).
+      icon: null
+  interaction:
+    - Chips are toggleable. Multiple can be active simultaneously (AND logic).
+    - Active chips show a filled background; inactive show outline.
+    - A "Clear all" pill appears when any filter is active.
+    - URL updates: /events?near=37.77,-122.42&tags=open-mic&range=this-week
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Page: /events
+# ─────────────────────────────────────────────────────────────────────────────
+
+page:
+  route: /events
+  data_fetching:
+    strategy: >
+      Server-side initial load via tRPC. The endpoint unions published
+      Events (status=PUBLISHED, visibility=PUBLIC) with ScrapedEvents
+      (claimStatus in [UNCLAIMED, CLAIM_PENDING]) into EventListItem[].
+      Results are sorted by startsAt ascending (soonest first), with an
+      optional distance sort when user location is provided.
+    endpoint: events.listPublicWithScraped (new tRPC procedure)
+    params:
+      userLat: number | null
+      userLng: number | null
+      tags: string[]
+      dateRange: "today" | "this_week" | "this_weekend" | null
+      limit: number (default 20)
+      offset: number
+    response:
+      items: EventListItem[]
+      total: number
+  pagination: >
+    Offset-based with a "Load more" button (not infinite scroll, to avoid
+    accidental data usage on mobile). 20 items per page.
+  empty_state: >
+    "No events found nearby. Try expanding your search or removing filters."
+    With an illustration and a CTA to "List your own event."
+  seo:
+    title: "Events near you | Ithas Fire"
+    description: "Discover open mics, live music, poetry nights, and community events near you."
+    structured_data: ItemList of Event schema.org entries.

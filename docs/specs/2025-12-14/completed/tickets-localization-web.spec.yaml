@@ -1,0 +1,88 @@
+# Spec: Web Ticket Localization Integration
+meta:
+  owner: web
+  status: complete
+  reviewers:
+    - platform
+    - design-system
+    - qa
+  last_updated: 2025-11-14
+summary: |
+  Integrate `next-intl` with the shared `@th/locale` package to localize all
+  ticket purchase, management, and wallet experiences in the Next.js web app.
+  Ensure routing, metadata, and server actions render localized copy while
+  preserving existing hexagonal boundaries and performance budgets.
+objectives:
+  - Replace hard-coded strings in ticket-related routes with dictionary-backed `t("tickets.*")` messages.
+  - Provide locale negotiation across route groups (path prefix, cookie, Accept-Language) with graceful fallback to organizer/user preferences.
+  - Guarantee SEO/metadata (Open Graph, Twitter, canonical tags) reflect localized ticket titles and descriptions.
+  - Maintain hydration-safe behavior so server components and client components share the same locale context without waterfalls.
+  - Deliver locale switcher surfaces for authenticated users and marketing entry points without breaking deep links or checkout state.
+scope:
+  in_scope:
+    - Routes: `(app)/checkout/**`, `(app)/orders/**`, `(app)/tickets/**`, `(app)/events/[slug]` ticket CTA blocks.
+    - Shared ticket utilities in `app/shared/{hooks,services,components}` consumed by the above routes.
+    - `generateMetadata` implementations tied to ticketing pages.
+    - Middleware for locale detection + persistence (cookie `th_locale`).
+    - Testing updates (Vitest + Playwright smoke) to cover localized render snapshots.
+  out_of_scope:
+    - Payment processor copy (Stripe-hosted pages) — follow-up via Stripe localization settings.
+    - Admin-only ticket tooling (separate spec once organizer dashboards localize).
+    - Runtime locale editing of existing orders (e.g., reissuing tickets in a different language) — to be covered in jobs/email spec.
+personas:
+  - buyer: completes checkout and views wallet in their preferred language.
+  - support_agent: replicates buyer flows using locale switcher to verify translations.
+  - seo_bot: indexes localized ticket landing pages with accurate metadata.
+success_metrics:
+  - 0 untranslated ticket strings caught by lint/missing-key check in CI.
+  - Locale negotiation adds <20 ms server overhead (p50) and <1 KB HTML delta per page.
+  - Checkout conversion unaffected (<1% variance week-over-week after launch) for baseline locales.
+  - Playwright smoke suite runs in both default locale and one secondary locale without failures.
+flags:
+  - name: feature.localization.web
+    default: false
+    rollout: per-locale, per-route-group
+    note: Enables middleware + localized UI when parity completed and QA approved.
+architecture:
+  locale_negotiation:
+    - `apps/web/middleware.ts` inspects URL prefix `/[locale]/`, cookie `th_locale`, then `Accept-Language` header.
+    - Valid locale list sourced from `@th/locale` (`SUPPORTED_LOCALES`).
+    - Non-supported locales fall back to `DEFAULT_LOCALE` and set cookie for consistency.
+  provider_setup:
+    - New `app/providers/intl-provider.tsx` (RSC) loads dictionaries via `@th/locale/loadMessages` and wraps children with `NextIntlClientProvider`.
+    - Client components use `useTranslations`, `useFormatter` from `next-intl`. Server components use `getTranslations`, `getFormatter` helpers.
+  routing:
+    - Ticket routes receive locale segment in layout: `/[locale]/(app)/checkout/...`.
+    - Link helpers updated to include locale prefix via `usePathname` + `createHref({ locale })`.
+  metadata:
+    - `generateMetadata` fetches translations server-side (locale-specific) for title/description, including dynamic values (event name, seat labels) with fallback to English if key missing.
+  data_flow:
+    - Server actions and loaders remain locale-agnostic; they pass raw values (e.g., status enums) to React components which then localize copy.
+    - Error boundaries and `not-found.tsx` within ticket routes use localized messages.
+implementation_plan:
+  - Step 1: Install `next-intl`, scaffold middleware + provider shell guarded by feature flag.
+  - Step 2: Localize `(app)/checkout/**` components, starting with CTA buttons, error messages, line-item labels.
+  - Step 3: Localize `(app)/tickets/**` wallet and PDF download flows, including toast notifications.
+  - Step 4: Update SEO metadata and add locale-aware canonical URLs.
+  - Step 5: Add Playwright smoke scenario for secondary locale (e.g., `es`).
+  - Step 6: Roll out flag to internal QA orgs, monitor metrics, then general availability.
+testing:
+  - Unit: Vitest snapshots for key server components verifying `t()` output.
+  - Integration: Playwright runs `checkout.spec.ts` in `en` + `es`.
+  - Lint: `pnpm -F @th/locale check:missing` ensures no unresolved keys referenced.
+risks:
+  - Mismatched locale between RSC and client provider causing hydration warnings.
+  - Increased bundle size if dictionaries inlined; mitigate via dynamic imports per locale namespace.
+  - SEO regressions if canonical URLs misconfigured.
+open_questions:
+  - Should we expose locale switcher in the checkout flow or keep it entry-only to avoid abandonment risk?
+  - Do we need server redirects for legacy `/app/checkout` URLs without locale segment?
+  - How do organizer-level locale defaults interact with buyer cookies (priority rules)?
+dependencies:
+  - `@th/locale` shared package (Phase 0).
+  - `next-intl` install + TypeScript types.
+  - Feature flag entry in config service.
+references:
+  - ../../platform/localization-platform.spec.yaml
+  - ../../design/component-library.md
+  - ../../engineering-standards.md

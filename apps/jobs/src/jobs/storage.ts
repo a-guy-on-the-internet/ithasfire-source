@@ -76,10 +76,17 @@ export const drainPendingDeletionsJob = defineScheduledTask({
   handler: async ({ input, ctx }) => {
     const result = await drainPendingDeletions(
       {
-        repos: { pendingObjectDeletions: ctx.repos.pendingObjectDeletions },
+        repos: {
+          pendingObjectDeletions: ctx.repos.pendingObjectDeletions,
+          // The live-reference re-check for handover Clear and page draft
+          // Discard rows.
+          entityPages: ctx.repos.entityPages,
+          places: ctx.repos.places,
+        },
         fileStorage: ctx.fileStorage,
         logger: ctx.logger,
         clock: ctx.clock,
+        reportError: ctx.reportError,
       },
       input,
     );

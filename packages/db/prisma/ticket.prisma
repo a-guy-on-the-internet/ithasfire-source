@@ -1,0 +1,497 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Ticket — Ticket types, tickets, promos, scans, transfers.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Ticket {
+  id           String       @id @default(uuid())
+  eventId      String
+  orderId      String?
+  orderItemId  String?      @unique
+  ticketTypeId String?
+  ownerHumanId String
+  code         String       @unique
+  status       TicketStatus @default(VALID)
+  issuedAt     DateTime     @default(now())
+  scannedAt    DateTime?
+  seatId       String?      @unique
+
+  event      Event       @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  order      Order?      @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  orderItem  OrderItem?  @relation(fields: [orderItemId], references: [id], onDelete: SetNull)
+  ticketType TicketType? @relation(fields: [ticketTypeId], references: [id], onDelete: SetNull)
+  owner      Human       @relation("TicketOwner", fields: [ownerHumanId], references: [id], onDelete: Restrict)
+  seat       Seat?       @relation(fields: [seatId], references: [id], onDelete: SetNull)
+
+  /// Every resale listing this ticket ever had; at most one is ACTIVE/HELD
+  /// (partial unique index "Listing_ticketId_live_key", see resale.prisma).
+  resaleListings        ResaleListing[]
+  transfers             TicketTransfer[]
+  pendingTransfers      PendingTicketTransfer[]
+  scans                 TicketScan[]
+  volunteerRewardGrants VolunteerRewardGrant[]  @relation("VolunteerRewardGrantTicket")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([orderId, ticketTypeId, code]) // to prevent duplicate tickets in an order
+  @@index([eventId])
+  // No `scannedAt` index, deliberately: attendance and its stale arm read
+  // the TicketScan log (`TicketScan(eventId, scannedAt)` /
+  // `TicketScan(scannedAt)`) since R11 was re-ruled (2026-09-25, FU-005);
+  // the two Ticket indexes built for the old basis were dropped in
+  // 20260925140000 / 20260925140001.
+  @@index([ownerHumanId])
+  // Supports unified scan resolver (FR-009b): "does this human also hold a
+  // ticket for this event?" lookup.
+  @@index([eventId, ownerHumanId])
+  // The per-ticket-type counts: the `issued` half of capacity accounting
+  // (`lockAndCountCapacityForTicketType`, `countCapacityUsageForTicketTypes`,
+  // `countCapacityConsumingForTicketType`, which also filter on `status`) and
+  // the all-rows `countIssuedForTicketType` delete guard. The @@unique above
+  // leads with orderId so it cannot serve this lookup, and Postgres does not
+  // auto-index FKs. Without this the count is a sequential scan of every
+  // ticket ever issued, which POS capacity checks now run while holding the
+  // per-ticket-type advisory lock — i.e. every concurrent seller at the door
+  // queues behind it.
+  @@index([ticketTypeId])
+}
+
+// TicketType represents a type of ticket for an event (e.g., General Admission, VIP, etc.)
+// Additionallly, TicketType can be associated with a SeatSection for reserved seating.
+model TicketType {
+  id          String                @id @default(uuid())
+  eventId     String
+  name        String
+  description String?
+  priceCents  Int
+  pricingMode TicketTypePricingMode @default(FIXED)
+
+  /// Minimum amount in cents the buyer must pay (ADJUSTABLE mode).
+  /// Null or 0 = truly pay-what-you-want.
+  minimumCents Int?
+
+  /// Suggested amount shown as default in the checkout input (ADJUSTABLE mode).
+  suggestedCents Int?
+
+  capacity      Int
+  status        TicketTypeStatus @default(ACTIVE)
+  // optional seat section grouping (e.g., GA vs Reserved sections)
+  seatSectionId String?
+
+  /// Whether tickets of this type can be listed for resale.
+  /// Only effective if the event has a resalePayoutTermsId set.
+  resaleAllowed Boolean @default(false)
+
+  /// Maximum resale price in cents. Null = no cap.
+  /// Enforced at resale listing creation time.
+  resaleCapCents Int?
+
+  /// Whether tickets of this type can be transferred (gifted) to another user.
+  /// Distinct from resale — transfers are free, no money changes hands.
+  transferAllowed Boolean @default(true)
+
+  /// Scheduled price change (time-based-ticket-pricing spec FR-005). ONE row,
+  /// ONE capacity pool — "the same 100 tickets, cheaper until Friday".
+  ///
+  /// Semantics: strictly BEFORE `scheduledPriceAt` the effective online price
+  /// is `priceCents`; AT or AFTER it, `scheduledPriceCents`. Resolved at READ
+  /// time by `resolveUnitPriceCents` (packages/core/src/lib/orders/door-pricing.ts)
+  /// against the injected clock — never materialised by a job (NFR-002), and
+  /// never recomputed after purchase (the paid price is snapshotted onto
+  /// OrderItem.unitPriceCents, NFR-003).
+  ///
+  /// INVARIANT: both null or both set. A half-configuration is rejected at the
+  /// write boundary with TICKET_TYPE_SCHEDULE_INCOMPLETE — it is never
+  /// silently ignored. `scheduledPriceCents` must be >= 0; 0 is a legitimate
+  /// "free after T" tier and is NOT the same as null.
+  ///
+  /// The door sells at this same resolved price: there is no separate door
+  /// price (door-sales-same-price-and-tax spec FR-012).
+  scheduledPriceCents Int?
+
+  /// UTC instant at which `scheduledPriceCents` takes effect. Stored ABSOLUTE
+  /// (FR-007).
+  ///
+  /// The admin UI (SHIPPED in Phase 1c — the ticket-type editor) collects a
+  /// WALL-CLOCK date/time and resolves it against `Event.timezone`, then
+  /// previews the resolved moment back to the organizer before save. Never
+  /// browser-local arithmetic.
+  ///
+  /// USE `zonedWallClockToInstant` (apps/web/src/lib/template-shift-offset).
+  /// An earlier revision of this comment said "with luxon
+  /// (`DateTime.fromJSDate(d, { zone }).toUTC()`)". That was WRONG about this
+  /// codebase and is corrected here because a schema comment is the most
+  /// durable doc surface in the repo: apps/web has NO date library, Phase 1c
+  /// correctly added none, and `zonedWallClockToInstant` is the repo's
+  /// Intl-based converter (it also REJECTS an instant that doesn't read back to
+  /// the requested wall clock, which is how DST gaps are caught). Do not "fix"
+  /// this by adding luxon.
+  ///
+  /// Also do NOT reach for the event builder's own `toIsoInTimeZone` for this:
+  /// it had a single-probe bug that got an hour wrong across a DST boundary
+  /// (fixed at source, but `zonedWallClockToInstant` is the converter with the
+  /// read-back guarantee and is what the schedule editor uses).
+  ///
+  /// DO NOT copy PAYOUT_TZ / REFUND_TZ here. Those hardcode America/Chicago
+  /// for settlement-calendar reasons; a price flip resolved on that shortcut
+  /// fires at the wrong hour for a Pacific (or any non-Central) event.
+  ///
+  /// Known edge, documented not solved (R-004): editing `Event.timezone` or
+  /// `startsAt` after a schedule is set does NOT re-resolve this instant. The
+  /// admin surfaces the resolved local time so the drift is visible.
+  scheduledPriceAt DateTime?
+
+  /// Per-type sales window (ticket-type-packs spec FR-014, adopted by
+  /// time-based-ticket-pricing FR-009). NULL = "no bound", which is today's
+  /// behaviour for every existing row — no backfill.
+  ///
+  /// BOUNDARY SEMANTICS, pinned rather than emergent:
+  ///   `salesOpenAt`  is INCLUSIVE — at exactly this instant the tier IS on
+  ///                  sale. Mirrors the scheduled-price flip, which is live at
+  ///                  exactly `scheduledPriceAt`.
+  ///   `salesCloseAt` is EXCLUSIVE — at exactly this instant the tier is
+  ///                  CLOSED. So a 12:00→18:00 window sells at 18:00:00.000
+  ///                  minus a millisecond and refuses at 18:00:00.000, and two
+  ///                  back-to-back tiers (close A = open B) never overlap and
+  ///                  never leave a gap.
+  ///
+  /// INVARIANT when both are set: `salesOpenAt` < `salesCloseAt`, rejected at
+  /// the write boundary with TICKET_TYPE_SALES_WINDOW_INVALID. Equal instants
+  /// are rejected too — that window can never sell anything.
+  ///
+  /// ENFORCED, not decorative (FR-014: "a stored window with no checkout guard
+  /// is UI theatre"). Every site that takes money — createCheckout,
+  /// updateOrderItems, claimFreeTickets, startPosSale, recordCashSale —
+  /// refuses through `assertTicketTypeOnSale`
+  /// (packages/core/src/lib/orders/door-pricing.ts) at the injected clock.
+  ///
+  /// COMPOSES WITH the EVENT-level sales close (`now >= endsAt ?? startsAt`);
+  /// it never widens it. The stricter of the two wins because both are pure
+  /// refusals: the event gate runs first on the online paths and a per-type
+  /// window can only add a reason to refuse.
+  ///
+  /// Absolute UTC instants, same as `scheduledPriceAt` — resolve the
+  /// organizer's wall clock against `Event.timezone` before writing, never
+  /// browser-local arithmetic and never PAYOUT_TZ / REFUND_TZ.
+  salesOpenAt  DateTime?
+  salesCloseAt DateTime?
+
+  seatSection SeatSection? @relation(fields: [seatSectionId], references: [id])
+
+  event                Event                 @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  tickets              Ticket[]
+  orderItems           OrderItem[]
+  resalePriceSnapshots ResalePriceSnapshot[]
+  payoutTermsLines     PayoutTermsLine[]
+  volunteerRewards     VolunteerReward[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([eventId, name])
+  @@index([eventId])
+}
+
+model Promo {
+  id                     String      @id @default(uuid())
+  code                   String
+  codeNormalized         String      @unique(map: "coupon_code_normalized_unique")
+  kind                   PromoKind
+  value                  Int
+  currency               String      @default("usd") @db.VarChar(3)
+  scope                  PromoScope
+  scopeId                String?
+  startsAt               DateTime?
+  endsAt                 DateTime?
+  maxRedemptions         Int?
+  maxRedemptionsPerHuman Int?
+  minOrderCents          Int         @default(0)
+  maxDiscountCents       Int?
+  stackable              Boolean     @default(false)
+  /// Public codes (e.g. marketing campaigns) may be auto-applied from
+  /// shareable URLs. Private codes (comps, employee discounts) require
+  /// manual entry by the buyer. Defaults to false — admin opts in.
+  isPublic               Boolean     @default(false)
+  status                 PromoStatus @default(ACTIVE)
+
+  redemptions PromoRedemption[]
+  holds       PromoHold[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, startsAt, endsAt])
+  @@index([scope, scopeId])
+  @@index([isPublic, status], map: "Coupon_isPublic_status_idx")
+  @@map("Coupon")
+}
+
+/// ONE ledger, TWO sources.
+///
+/// A discount reaches an order either as a typed/URL promo code (`promoId`) or
+/// as a membership entitlement (`membershipBenefitId`) — never both, enforced
+/// by the `CouponRedemption_source_xor` CHECK. Everything downstream
+/// (confirm, release, `amountDiscountCents` reporting) is source-agnostic, so
+/// there is no second hold lifecycle to keep in step.
+///
+/// `code` is the normalized promo code for a typed application and a stable
+/// `benefit:{id}` marker for a grant — benefits have no code, by design.
+model PromoRedemption {
+  id                  String   @id @default(uuid())
+  promoId             String?  @map("couponId")
+  /// SetNull, unlike the hold below — and this is the ONE place in the ledger
+  /// where the source invariant is deliberately loosened.
+  ///
+  /// `removeTierBenefit` soft-deletes, so the ordinary retire-a-benefit case
+  /// never reaches this FK. What reaches it is HUMAN ERASURE, and only that:
+  ///
+  ///   * Deleting an ORG is not the case. `Event.org` is Cascade, so the org's
+  ///     events, their Orders, and these redemptions all die together anyway —
+  ///     this FK changes nothing there. (A benefit can only discount its own
+  ///     owner's events, so there are no other orders to consider.)
+  ///   * Deleting a HUMAN is. `Event.human` is SetNull, so a personal event
+  ///     and its Orders SURVIVE erasure — while `MembershipTier.ownerHuman` is
+  ///     Cascade, taking the tier and its benefits. Under Cascade the surviving
+  ///     order would silently lose its discount record; under Restrict the
+  ///     erasure would fail outright.
+  ///
+  /// SetNull keeps the money AND the attribution — `code` still carries the
+  /// `benefit:{id}` marker — at the cost of the FK. The
+  /// `CouponRedemption_source_xor` CHECK is therefore "at most one" rather than
+  /// "exactly one"; the HOLD keeps the strict form, which is what the adapter's
+  /// non-null casts actually depend on.
+  membershipBenefitId String?
+  orderId             String
+  humanId             String
+  code                String
+  amountDiscountCents Int
+  redeemedAt          DateTime @default(now())
+
+  promo             Promo?             @relation(fields: [promoId], references: [id], onDelete: Cascade)
+  membershipBenefit MembershipBenefit? @relation(fields: [membershipBenefitId], references: [id], onDelete: SetNull)
+  order             Order              @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([promoId, orderId], map: "CouponRedemption_couponId_orderId_key")
+  @@unique([membershipBenefitId, orderId], map: "CouponRedemption_membershipBenefitId_orderId_key")
+  @@index([promoId, humanId], map: "CouponRedemption_couponId_humanId_idx")
+  @@index([membershipBenefitId, humanId])
+  @@map("CouponRedemption")
+}
+
+/// The hold half of the one ledger — same two-source shape as
+/// PromoRedemption, but a STRICTER source rule: exactly-one-of
+/// (`CouponHold_source_xor` is `= 1`, where the redemption's is `<= 1`).
+///
+/// The asymmetry is deliberate and this side is the strict one because a hold
+/// is ephemeral — ≤20 min, scoped to one order — so cascading it away with a
+/// deleted benefit costs nothing, and the adapter's non-null casts on
+/// `hold.promoId` / `hold.membershipBenefitId` depend on exactly-one holding
+/// here. The redemption is the permanent record and had to give the guarantee
+/// up so that deleting an owner does not fail; see its comment.
+///
+/// Idempotency keys are `order:{orderId}:promo:{promoId}` and
+/// `order:{orderId}:benefit:{benefitId}` respectively, unique per source.
+model PromoHold {
+  id                  String          @id @default(uuid())
+  promoId             String?         @map("couponId")
+  membershipBenefitId String?
+  orderId             String
+  humanId             String
+  idempotencyKey      String
+  code                String
+  amountDiscountCents Int
+  status              PromoHoldStatus @default(PENDING)
+  expiresAt           DateTime
+
+  promo             Promo?             @relation(fields: [promoId], references: [id], onDelete: Cascade)
+  membershipBenefit MembershipBenefit? @relation(fields: [membershipBenefitId], references: [id], onDelete: Cascade)
+  order             Order              @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([promoId, idempotencyKey], map: "CouponHold_couponId_idempotencyKey_key")
+  @@unique([membershipBenefitId, idempotencyKey], map: "CouponHold_membershipBenefitId_idempotencyKey_key")
+  @@index([orderId])
+  @@index([expiresAt])
+  @@map("CouponHold")
+}
+
+/// Platform-curated bundle of ticket-type templates ("general admission",
+/// "advance + door", …). Metadata only — a pack owns no ticket types of its
+/// own; the catalogue content is ordinary TicketTypeTemplate rows pointing
+/// back at it via `packId`. Mirrors VolunteerPack (volunteer.prisma) minus
+/// targeting (`targetCategoryIds` / `rankFirst` stay off until the volunteer
+/// side's inert category-ranking path proves useful).
+///
+/// Deletion: a pack's PLATFORM templates are meant to die with it, while an
+/// owner's fork of one keeps `packId` as provenance and survives. Postgres
+/// FKs take exactly ONE referential action, so the FK below is SET NULL (the
+/// fork-safe half) and the platform-row cascade is done explicitly by the
+/// remove-pack use case — `deleteMany({ packId, ownerId: null })` inside the
+/// same transaction as the pack delete, BEFORE it. Do not "simplify" the FK
+/// to Cascade: it would delete every owner's fork too.
+///
+/// That ordering is DB-enforced, not documented-and-hoped: the CHECK
+/// constraint `TicketTypeTemplate_platform_pack_check` (20260804140000
+/// migration) requires every `isPlatform` row to carry a `packId`, so the
+/// FK's SET NULL on a platform row raises instead of silently leaving an
+/// orphan behind. Deleting a pack that still has platform templates
+/// therefore FAILS — delete the templates first, in the same transaction.
+model TicketPack {
+  id               String           @id @default(uuid())
+  /// Stable slug used by the seed path so dev/staging/prod converge on the
+  /// same packs, and so a re-seed updates rather than duplicates.
+  key              String           @unique
+  name             String
+  /// Staff-authored free text shown to organizers. Escaped on output —
+  /// no HTML passthrough (NFR-005).
+  blurb            String?
+  status           TicketPackStatus @default(DRAFT)
+  sortOrder        Int              @default(0)
+  curatedByHumanId String?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  curator   Human?               @relation("TicketPackCurator", fields: [curatedByHumanId], references: [id], onDelete: SetNull)
+  templates TicketTypeTemplate[]
+
+  @@index([status, sortOrder])
+  @@index([curatedByHumanId])
+}
+
+/// A named, owner-scoped bundle of ticket-type configurations an organizer
+/// can apply to an event later. Entries live in `ticketTypes` (Json) and are
+/// copied onto real TicketType rows at apply time — deliberately excluding
+/// event-specific fields (seatSectionId) that would dangle across events.
+/// Reuses the TemplateOwnerScope enum from EventTemplate.
+///
+/// Two kinds of row share this table (ticket-type-packs spec FR-002):
+///
+///   - OWNED row    — `ownerId` set, `isPlatform` false, `packId` null
+///                    (or set, when it was forked from a pack).
+///   - PLATFORM row — `ownerId` NULL, `isPlatform` true, `packId` set.
+///                    Staff-curated catalogue content, read-only to every
+///                    organizer, surfaced inline in their list when the
+///                    owning pack is LIVE. `ownerScope` on such a row is
+///                    ORGANIZATION by convention and ignored.
+///
+/// Because `ownerId` is nullable, "not owner B's" is no longer the same test
+/// as "not null": every query states which kind it means, and every MUTATING
+/// use case rejects `isPlatform` rows before it runs an owner-access check —
+/// there is no owner to derive authz from on a platform row (FR-005).
+///
+/// Expected drift (both SQL-only in the 20260804140000 migration, invisible
+/// to Prisma, same precedent as VolunteerRoleTemplate's pair):
+///
+///   - A raw partial unique index "TicketTypeTemplate_platform_pack_name_key"
+///     ON ("packId", "name") WHERE "ownerId" IS NULL — Postgres treats NULLs
+///     as distinct, so nothing else constrains two platform templates sharing
+///     a name inside one pack. Per PACK, not per catalogue: two different
+///     packs may both ship a "General admission".
+///   - A CHECK constraint "TicketTypeTemplate_platform_pack_check"
+///     (`"isPlatform" = false OR "packId" IS NOT NULL`) keeps every platform
+///     row inside that index and makes pack deletion fail loudly rather than
+///     orphan platform rows. See the TicketPack doc comment.
+model TicketTypeTemplate {
+  id               String             @id @default(uuid())
+  ownerScope       TemplateOwnerScope
+  /// NULL = platform catalogue row (see `isPlatform`). Set = owner-scoped.
+  ownerId          String?
+  name             String
+  ticketTypes      Json
+  /// True only on catalogue rows, which always have `ownerId` NULL. The flag
+  /// is the read-only gate; it is checked on its own so a mis-shaped row
+  /// (flag set WITH an ownerId) still fails closed rather than open.
+  isPlatform       Boolean            @default(false)
+  /// Owning pack on a platform row; provenance of the source pack on an
+  /// owned fork. SetNull — see the TicketPack doc comment.
+  packId           String?
+  /// Nullable: creator reference is detached (SetNull) on account deletion.
+  createdByHumanId String?
+  archivedAt       DateTime?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  createdByHuman Human?      @relation("TicketTypeTemplateCreatedBy", fields: [createdByHumanId], references: [id], onDelete: SetNull)
+  pack           TicketPack? @relation(fields: [packId], references: [id], onDelete: SetNull)
+
+  @@index([ownerScope, ownerId, archivedAt])
+  @@index([ownerScope, ownerId, name])
+  @@index([createdByHumanId])
+  @@index([packId])
+  @@index([isPlatform])
+}
+
+model TicketScan {
+  id           String            @id @default(uuid())
+  ticketId     String
+  eventId      String
+  actorHumanId String
+  scannedAt    DateTime
+  lat          Float?
+  lng          Float?
+  outcome      TicketScanOutcome
+  message      String?
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  event  Event  @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  actor  Human  @relation("TicketScanActor", fields: [actorHumanId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+
+  @@index([ticketId])
+  @@index([eventId, scannedAt])
+  // Recent ADMITS platform-wide: the "a ticket at this place was admitted
+  // since lastCalculatedAt" arm of PlaceStatsRepo.listStalePlaceIds ranges
+  // over the last STALE_WINDOW_DAYS of scans and joins to Event for the
+  // place (venue-track-record R11 / FU-005 — attendance is counted from
+  // this log, not Ticket.scannedAt).
+  @@index([scannedAt])
+}
+
+model TicketTransfer {
+  id          String   @id @default(uuid())
+  ticketId    String
+  fromHumanId String
+  toHumanId   String
+  reason      String // "primary" | "resale" | "gift" | "admin" (validate in app)
+  orderId     String?
+  at          DateTime @default(now())
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  from   Human  @relation("TransferFrom", fields: [fromHumanId], references: [id], onDelete: Restrict)
+  to     Human  @relation("TransferTo", fields: [toHumanId], references: [id], onDelete: Restrict)
+  order  Order? @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@index([ticketId])
+  @@index([fromHumanId])
+  @@index([toHumanId])
+}
+
+/// A pending transfer to a recipient who may not yet have an account.
+/// The sender initiates the transfer by email; the recipient must create an
+/// account (or sign in) and accept the transfer to complete it.
+model PendingTicketTransfer {
+  id               String                      @id @default(uuid())
+  ticketId         String
+  fromHumanId      String
+  recipientEmail   String
+  reason           String // "gift" | "primary" (validate in app)
+  token            String                      @unique // opaque claim token sent in the invite link
+  status           PendingTicketTransferStatus @default(PENDING)
+  expiresAt        DateTime
+  createdAt        DateTime                    @default(now())
+  claimedAt        DateTime?
+  claimedByHumanId String?
+  cancelledAt      DateTime?
+
+  ticket    Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  from      Human  @relation("PendingTransferFrom", fields: [fromHumanId], references: [id], onDelete: Restrict)
+  claimedBy Human? @relation("PendingTransferClaimedBy", fields: [claimedByHumanId], references: [id], onDelete: SetNull)
+
+  @@index([recipientEmail, status])
+  @@index([ticketId, status])
+  @@index([token])
+  @@index([fromHumanId])
+}

@@ -1,0 +1,65 @@
+# Spec: Event Daily Stats Snapshot Job
+meta:
+  owner: platform-eng
+  status: complete
+  reviewers:
+    - revenue-ops
+    - product-eng
+summary: |
+  Nightly job that computes and persists per-event daily statistics: tickets sold, revenue,
+  sell-through rate, refund counts, and capacity utilisation. Writes rows to EventDailyStats
+  so dashboards and downstream jobs (resale pricing, organizer digests) read from a
+  pre-computed table rather than scanning Orders/OrderItems at query time.
+scope:
+  included:
+    - Aggregating order + order-item data grouped by (eventId, date).
+    - Computing sell-through rate per ticket type (sold / capacity).
+    - Computing gross revenue, net revenue (minus refunds), and refund count.
+    - Upserting rows into EventDailyStats (idempotent on eventId + date).
+    - Emitting per-run metrics (events processed, rows written, duration).
+  excluded:
+    - Real-time counters (handled by HotEventsPort / Redis).
+    - Per-buyer analytics or PII-level breakdowns.
+    - Historical backfill of dates prior to job launch (separate one-off script).
+execution:
+  orchestration: keda-cronjob
+  image: ghcr.io/ithasfire/jobs:analytics-latest
+  command: ["node", "dist/analytics/event-daily-stats.js"]
+  schedule:
+    cron: "30 3 * * *"   # 03:30 UTC daily — after midnight settlements window
+inputs:
+  postgres_tables:
+    - events
+    - ticket_types
+    - orders
+    - order_items
+    - tickets
+  config:
+    # Only process events whose startsAt is within this window relative to now.
+    # Avoids scanning the entire events table.
+    lookback_days: 90
+    lookahead_days: 180
+outputs:
+  postgres_tables:
+    - EventDailyStats (upsert)
+  metrics:
+    - analytics.event_daily_stats.events_processed
+    - analytics.event_daily_stats.rows_upserted
+    - analytics.event_daily_stats.duration_ms
+  notifications:
+    - Slack alert to #platform-eng if run exceeds 15 minutes or error rate > 0.
+failure_modes:
+  - name: large_event_count
+    mitigation: Process events in batches of 200, checkpoint progress.
+  - name: db_lock_contention
+    mitigation: Use ON CONFLICT DO UPDATE with advisory locks; schedule after settlement window.
+  - name: partial_failure
+    mitigation: Log failed eventIds, continue processing remaining; alert on > 5% failure rate.
+acceptance_criteria:
+  - All events within the lookback/lookahead window have a stats row for the current date.
+  - sell_through_rate agrees with (tickets sold / capacity) within 0.01 tolerance.
+  - Job completes in under 5 minutes for 5 000 active events.
+  - Re-running the job for the same date is idempotent (upsert, no duplicates).
+rollout_notes:
+  - Deploy EventDailyStats migration first; run job in dry-run mode for one week.
+  - Backfill historical data with a one-off script before switching dashboards to read from the table.

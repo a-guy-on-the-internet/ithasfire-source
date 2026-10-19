@@ -34,7 +34,12 @@ export const refreshRecurringDates = defineScheduledTask({
 
     try {
       const summary = await refreshRecurringEventDates(
-        { repos: ctx.repos, clock: ctx.clock, logger: ctx.logger },
+        {
+          repos: ctx.repos,
+          clock: ctx.clock,
+          logger: ctx.logger,
+          reportError: ctx.reportError,
+        },
         {
           ...(input.limit !== undefined ? { limit: input.limit } : {}),
           ...(input.maxEvents !== undefined
@@ -51,17 +56,17 @@ export const refreshRecurringDates = defineScheduledTask({
 
       return { success: true, ...summary, durationMs };
     } catch (error) {
-      // The use-case isolates per-event failures internally; a throw here means
-      // a batch-level failure (e.g. the enumeration query / DB down). Surface
-      // it, but never let the scheduler treat a partial run as a hard error
-      // beyond this boundary.
+      // The use-case isolates per-event failures internally (one bad listing
+      // is counted and reported there, and the run still returns), so a throw
+      // here is a batch-level failure: the enumeration query, the DB down.
+      // That is a failed run, so THROW, never return `{ success: false }`:
+      // app.ts answers 200 for any returned value, so only a throw makes the
+      // run fail and show. No `ctx.reportError` here: the run route's catch
+      // reports what it catches.
       ctx.logger.error("community.refresh-recurring-dates.failed", {
         error: error instanceof Error ? error.message : String(error),
       });
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
+      throw error;
     }
   },
 });

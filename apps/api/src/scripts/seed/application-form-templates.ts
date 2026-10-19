@@ -72,6 +72,11 @@ type SeedQuestion = {
 type SeedTemplate = {
   name: string;
   description: string;
+  /**
+   * What the template is for (open calls v1). Omitted = ATTEND, the attendee
+   * gate's builder. PERFORM templates belong to the open-call builder.
+   */
+  purpose?: "ATTEND" | "PERFORM";
   introText?: string;
   questions: SeedQuestion[];
 };
@@ -79,6 +84,7 @@ type SeedTemplate = {
 export const LAUNCH_APPLICATION_FORM_TEMPLATES: SeedTemplate[] = [
   {
     name: "Performer / artist application",
+    purpose: "PERFORM",
     description:
       "For open calls and booking submissions — collects the act, links, and set length you need to make a booking decision.",
     introText: "Tell us about your act — we book from these applications.",
@@ -198,6 +204,7 @@ export const LAUNCH_APPLICATION_FORM_TEMPLATES: SeedTemplate[] = [
 export type EncodedApplicationTemplate = {
   name: string;
   description: string;
+  purpose: "ATTEND" | "PERFORM";
   introText: string | null;
   questions: Array<{
     type: SeedQuestion["type"];
@@ -239,6 +246,7 @@ export function encodeApplicationFormTemplate(
   return {
     name: template.name,
     description: template.description,
+    purpose: template.purpose ?? "ATTEND",
     introText: template.introText ?? null,
     questions: parsed.map((question) => ({
       type: question.type,
@@ -263,6 +271,7 @@ type ExistingTemplate = {
   id: string;
   name: string;
   description: string | null;
+  purpose: "ATTEND" | "PERFORM";
   introText: string | null;
   questions: Prisma.JsonValue;
   archivedAt: Date | null;
@@ -324,6 +333,7 @@ export function applicationTemplateContentDiffers(
   return (
     existing.name !== desired.name ||
     existing.description !== desired.description ||
+    existing.purpose !== desired.purpose ||
     existing.introText !== desired.introText ||
     stableStringify(existing.questions) !==
       stableStringify(desired.questions) ||
@@ -388,6 +398,7 @@ export async function ensureApplicationFormTemplates(
         id: true,
         name: true,
         description: true,
+        purpose: true,
         introText: true,
         questions: true,
         archivedAt: true,
@@ -421,6 +432,7 @@ export async function ensureApplicationFormTemplates(
           ownerScope: "ORGANIZATION",
           name: template.name,
           description: template.description,
+          purpose: template.purpose,
           introText: template.introText,
           questions: template.questions as unknown as Prisma.InputJsonValue,
           createdByHumanId: null,
@@ -435,6 +447,7 @@ export async function ensureApplicationFormTemplates(
         data: {
           name: template.name,
           description: template.description,
+          purpose: template.purpose,
           introText: template.introText,
           questions: template.questions as unknown as Prisma.InputJsonValue,
           archivedAt: null,

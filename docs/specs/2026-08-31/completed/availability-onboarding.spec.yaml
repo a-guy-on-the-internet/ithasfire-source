@@ -1,0 +1,204 @@
+# availability-onboarding.spec.yaml
+#
+# A venue can turn on booking requests, publish a calendar, and become
+# UNCONTACTABLE without being told. The cause is one condition with no owner:
+# a Place with ZERO CalendarAvailability rows.
+#
+# This spec closes that condition on three surfaces and makes the fix reachable
+# from the place the mistake is made, rather than from a settings page the
+# venue would have to know to look for.
+#
+# NAMING: "hours" is the user-facing word for a weekly CalendarAvailability
+# window (the editor is already CalendarHoursEditor). "Dark" is the word for a
+# day with no open window — reserve it for the day, never for the venue.
+# A venue with no rows at all is UNCONFIGURED, which is a different sentence
+# from dark and must never be rendered as one.
+
+version: "1.0"
+updated: "2026-08-31"
+status: shipped  # 2026-10-08 docs consolidation; was: proposed
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Availability is stored in CalendarAvailability, where an OPEN weekly window
+    is a row with dayOfWeek + isOpen:true. A day with no matching row computes
+    as `closed` — and `closed` is the ABSENCE of a statement that the venue is
+    open, not a statement that it is shut. A Place therefore starts life with
+    every day closed, forever, until somebody adds a row.
+
+    Nothing tells them. Turning on booking requests publishes a form whose
+    required "preferred dates" field has no attainable value: every day renders
+    disabled, and both the client helper and the server's pitchSchema demand at
+    least one date. The venue believes it is taking bookings and is silently
+    uncontactable. The new hold picker shows the same condition from the other
+    side — a month of identical DARK cells that reads like a bug.
+
+  measured_evidence: >
+    Local and dev databases both hold 0 CalendarAvailability and 0
+    PlaceAvailability rows across all 11 seeded places, with
+    accepts_booking_requests = true. Driven in a browser: 31 of 31 August days
+    and 30 of 30 September days render disabled, SEND REQUEST fires no network
+    call, and the hold picker renders 31 identical dark cells.
+
+  solution: >
+    Detect the unconfigured state precisely, say so in the venue's own words at
+    the three moments it matters, and put the fix one click away with presets
+    so it takes seconds rather than a trip to another page.
+
+  non_goals:
+    - Auto-seeding hours on Place creation. The platform must not invent trading
+      hours a venue never stated; a wrong default is harder to notice than an
+      empty one, and it would silently make every seeded venue "open".
+    - Blocking the booking-requests toggle. Turning it on is often the moment a
+      venue is proving the feature to itself; stopping them to do a second task
+      is worse than warning them clearly.
+    - Any change to how `dayStatus` computes, or to the hold rules. A hold on a
+      dark night stays legal — the server refuses only a past date and a line
+      with a CONFIRMED winner.
+
+# ── The detector ─────────────────────────────────────────────────────────────
+
+detector:
+  rule: >
+    UNCONFIGURED = the Place has zero CalendarAvailability rows, counting both
+    place-wide rows (calendarId: null) and every named calendar's rows.
+  why_precise: >
+    With zero rows every day returns status `closed` and NO day ever returns
+    `blackout`, because a blackout requires an explicit dated isOpen:false row.
+    So "all closed and nothing blacked out" distinguishes "never set hours" from
+    "genuinely dark on Mondays" without guessing. This is what lets the empty
+    states be specific instead of a generic nag.
+  placement: >
+    One read, exposed once and consumed by every surface — do NOT re-derive it
+    per surface. Recommend a `places.getAvailabilitySetupState` query returning
+    { configured: boolean, calendarCount: number, defaultCalendarId: string|null }
+    so the modal knows which scope to open on.
+
+# ── FR-001 · Warning under the toggle ────────────────────────────────────────
+
+FR-001:
+  surface: apps/web/src/app/admin/[slug]/places/[placeId]/bookings/_components/BookingAcceptanceToggle.tsx
+  trigger: acceptsBookingRequests is ON and the detector says unconfigured.
+  behaviour: >
+    A warning sits DIRECTLY UNDER the slider — not a toast, which would vanish
+    before it is read. It states the consequence in the venue's terms ("Acts
+    can't send you a request until you set your hours — every date shows as
+    unavailable") and carries a primary control, "Set your hours", that opens
+    the modal in FR-002 in place. Nothing is blocked; the toggle still works.
+  copy_rule: >
+    Name the consequence, not the schema. Never "no CalendarAvailability rows".
+  states: [unconfigured, configured (nothing renders), toggle off (nothing renders)]
+
+# ── FR-002 · The hours modal, with presets ───────────────────────────────────
+
+FR-002:
+  reuse: >
+    CalendarHoursEditor already takes { placeId, scope, scopeLabel }, commits on
+    blur with no save button, and treats scope null as the place-wide row. It is
+    embeddable as-is — do NOT fork it.
+  scope_opened: >
+    The place's DEFAULT calendar when one exists, else the place-wide (null)
+    scope. Place-wide is the honest default for a venue that has not thought
+    about streams yet: one row set covers every calendar.
+  presets:
+    why: >
+      The blank weekly grid is the reason this gets deferred. A preset turns the
+      task into one click, and every preset is fully editable afterwards — it
+      seeds rows, it is not a mode.
+    set:
+      - { id: evenings_thu_sat, label: "Thu–Sat evenings", windows: "19:00–00:00 on Thu, Fri, Sat" }
+      - { id: evenings_wed_sun, label: "Wed–Sun evenings", windows: "19:00–00:00 Wed through Sun" }
+      - { id: every_night, label: "Every night", windows: "18:00–02:00 daily" }
+      - { id: weekends, label: "Weekends only", windows: "12:00–00:00 Sat, Sun" }
+    rules:
+      - A preset WRITES rows through the existing upsertCalendarAvailability
+        path. No new write path, no bulk endpoint that bypasses its validation.
+      - Presets are offered ONLY while unconfigured. Once rows exist, the modal
+        opens on the editor alone — a preset that silently replaced a venue's
+        real hours would be a data-loss bug.
+      - Overnight windows already exist in the helpers (isOvernight); every_night
+        crosses midnight deliberately and must round-trip.
+  on_success: >
+    Modal closes, the FR-001 warning disappears (the detector now says
+    configured), and the public form becomes reachable.
+
+# ── FR-003 · In-app notification ─────────────────────────────────────────────
+
+FR-003:
+  trigger: >
+    EITHER of (user-locked, 2026-08-31): acceptsBookingRequests transitions
+    OFF → ON while unconfigured, OR a Calendar is created for a place that is
+    unconfigured. A calendar with no availability programs nothing, so both
+    moments are the same mistake from different doors.
+  behaviour: >
+    One in-app notification to the acting staff human, linking to the calendars
+    page for that place. This is the path back for someone who turned the toggle
+    on, ignored the inline warning, and closed the tab.
+  channel: in-app only. NOT email, NOT push — this is a setup nudge, not a
+    transactional event, and it must not train venues to ignore our mail.
+  idempotency: >
+    Keyed so re-toggling cannot spam. One notification per (place, unconfigured
+    episode) — a second OFF→ON while still unconfigured must not produce a
+    second row.
+  suppression: Not emitted when the detector already says configured.
+
+# ── FR-004 · Admin banner on the bookings workspace ──────────────────────────
+
+FR-004:
+  surface: the venue's bookings workspace (the inbox surface, not the toggle page).
+  trigger: unconfigured and acceptsBookingRequests is ON.
+  persistence: >
+    DISMISSIBLE, REAPPEARS NEXT SESSION (user-locked). Dismissal is per-session
+    client state — deliberately NOT persisted to the database. A venue that
+    knows and is getting to it is not nagged within the session; a venue that
+    forgot is reminded next time. It disappears permanently the moment a row
+    exists, because the condition is gone, not because it was silenced.
+
+# ── FR-005 · Public booking form ─────────────────────────────────────────────
+
+FR-005:
+  decision: >
+    HIDE THE FORM (user-locked). A venue that is unconfigured is treated as not
+    taking requests right now.
+  rationale: >
+    The act gets a truthful dead end instead of a form that cannot be submitted.
+    It also leaks nothing about the venue's internal state — "not taking requests
+    right now" is true and says nothing about why.
+  scope:
+    - The place page's booking CTA and the booking form route.
+    - The booking EMBED must make the same decision, or the embed becomes the
+      hole this closes on the main site. Fail closed, consistent with the embed
+      hardening posture.
+  server_side: >
+    The gate belongs where the read is, not only in the component — a client-only
+    hide leaves the mutation reachable. `bookingRequests.create` should refuse an
+    unconfigured place with a typed error, so the two cannot drift.
+
+# ── FR-006 · The picker's unconfigured empty state ───────────────────────────
+
+FR-006:
+  surface: apps/web/src/components/bookings/HoldDatePicker.tsx
+  problem: >
+    A month of 31 identical DARK cells is noise, not information, and it reads
+    as a broken grid rather than an unconfigured venue.
+  behaviour: >
+    When the detector says unconfigured, replace the per-cell DARK word with one
+    explanation above the grid: no hours set, so every date reads as dark, with
+    the same "Set your hours" control as FR-001. The grid stays USABLE — holds on
+    dark nights are legal and staff may still pencil an act in.
+  note: >
+    Independently worth doing even when configured: suppress the per-cell word
+    when EVERY day in the month is dark. The hatch and the legend already carry
+    it; 31 repetitions of one word is not information.
+
+# ── Open questions ───────────────────────────────────────────────────────────
+
+open_questions:
+  - Does the preset set belong to the venue's country/timezone? "Every night
+    18:00–02:00" is a US bar assumption. Ship the four above and revisit rather
+    than guessing a locale matrix now.
+  - FR-005 hides the form for an unconfigured venue. Is there an existing
+    "venue not accepting requests" empty state to reuse, or is one being built
+    here? Check before writing new copy.

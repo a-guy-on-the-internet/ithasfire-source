@@ -1,0 +1,19 @@
+{
+  "options": {
+    "paths": {
+      "root": ".",
+      "fonts": "fonts",
+      "styles": "styles",
+      "pmtiles": "data"
+    },
+    "maxSize": 2048,
+    "maxScaleFactor": 2
+  },
+  "styles": {
+    "streets": { "style": "streets/style.json" },
+    "streets-dark": { "style": "streets-dark/style.json" }
+  },
+  "data": {
+    "protomaps": { "pmtiles": "openmaptiles.pmtiles" }
+  }
+}

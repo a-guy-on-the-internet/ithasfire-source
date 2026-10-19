@@ -134,12 +134,20 @@ export function describeScanResult(
   opts: {
     /** Name of the event the operator has selected — for wrong-event copy. */
     selectedEventName?: string | null;
-    /** Pre-formatted local time of a prior scan, for ALREADY IN. */
+    /** Pre-formatted local time of a prior scan, for ALREADY USED. */
     scannedAtLabel?: string | null;
     /**
-     * FR-004 — `planExpressMode` halted with `recently_admitted_here`. Carried
-     * through so the VERDICT can say so; a halt the operator cannot see is a
-     * guard that only exists in a Sentry tag.
+     * THIS operator just admitted this ticket on this screen. Carried through
+     * so the post-admit state reads ADMITTED / DONE rather than the
+     * do-not-admit field — both are `SCANNED` on the wire, and showing the
+     * second one moments after a successful admission teaches the operator to
+     * walk past it.
+     */
+    admitted?: boolean;
+    /**
+     * `planExpressMode` halted with `recently_admitted_here`. Carried through
+     * so the VERDICT can say so; a halt the operator cannot see is a guard that
+     * only exists in a Sentry tag.
      */
     admittedHereRecently?: boolean;
   } = {},
@@ -150,6 +158,7 @@ export function describeScanResult(
         kind: "ticket",
         status: result.status,
         scannedAtLabel: opts.scannedAtLabel ?? null,
+        admitted: opts.admitted ?? false,
         admittedHereRecently: opts.admittedHereRecently ?? false,
       };
     case "wrong_event":

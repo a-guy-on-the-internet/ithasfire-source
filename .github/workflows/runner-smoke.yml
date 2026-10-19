@@ -1,0 +1,179 @@
+# Proves a self-hosted runner can do quality_gate's and typecheck's real work
+# before deploy-dev bets a deploy on it.
+#
+# Dispatch-only on purpose: it must never fire on push and spend the metered
+# minutes this whole arrangement exists to save.
+#
+# It runs the EXPENSIVE half deliberately. A smoke that installs deps and runs
+# one cheap pure-TypeScript suite would pass on any box and certify nothing —
+# the risks in moving to an arm64 Linux VM are native binaries
+# (@next/swc-linux-arm64-gnu, lightningcss, sharp), memory ceilings (apps/web
+# forks per-core with a 4 GB heap each; typecheck-all runs eight sequential tsc
+# targets at 8 GB), and service-container reachability. So it exercises exactly
+# those.
+name: Runner smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label to test"
+        required: false
+        default: "hf-linux"
+      probe_amd64:
+        description: "Also time a linux/amd64 docker build (Rosetta vs QEMU)"
+        type: boolean
+        required: false
+        default: false
+
+# No id-token: this runs third-party package code on a personal machine and
+# authenticates to nothing.
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Smoke (${{ inputs.runner }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 90
+    env:
+      TZ: UTC
+      CI: "true"
+      NODE_OPTIONS: "--max-old-space-size=4096"
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dev
+      TESTCONTAINERS_REUSE_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dev
+      TESTCONTAINERS_REUSE_REDIS_URL: redis://localhost:6379
+      NEXT_PUBLIC_TILESERVER_URL: "https://tiles-dev.ithasfire.com"
+      NEXT_PUBLIC_GEOAPIFY_API_KEY: ${{ vars.NEXT_PUBLIC_GEOAPIFY_API_KEY }}
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres" --health-interval=5s --health-timeout=2s --health-retries=10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping" --health-interval=5s --health-timeout=2s --health-retries=10
+    steps:
+      - name: Host facts
+        run: |
+          echo "arch:   $(uname -m)"
+          echo "tz:     $(date +%Z)   (must be UTC — hosted runners are)"
+          echo "cpus:   $(nproc)      (apps/web forks availableParallelism()-1)"
+          free -h || true
+          df -h / | tail -1
+          docker version --format 'docker:  {{.Server.Version}} ({{.Server.Arch}})' || echo "docker: ABSENT"
+          docker buildx version || echo "buildx: ABSENT"
+
+      # A persistent runner fills up monotonically, and this repo has learned
+      # twice that a full disk surfaces as a job that fails with no logs at all.
+      # Name it here instead.
+      - name: Assert disk headroom
+        run: |
+          free_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "${free_gb}G free"
+          [ "$free_gb" -ge 15 ] || { echo "::error::Under 15G free — prune the runner before trusting any result below."; exit 1; }
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # setup-node FIRST: corepack ships WITH Node, and a clean Linux box has no
+      # system Node, so the reverse order dies on `corepack: command not found`.
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Enable corepack and pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.16.1 --activate
+
+      # quality_gate reaches its service containers over localhost. A runner
+      # inside a container could not (siblings publish to the docker host's
+      # namespace), which is why this is a VM and not a container.
+      - name: Reach the service containers
+        run: |
+          command -v pg_isready >/dev/null || { echo "::error::pg_isready missing — install postgresql-client on the runner"; exit 1; }
+          command -v redis-cli  >/dev/null || { echo "::error::redis-cli missing — install redis-tools on the runner"; exit 1; }
+          for i in $(seq 1 20); do
+            pg_isready -h localhost -p 5432 -U postgres && break || sleep 3
+          done
+          pg_isready -h localhost -p 5432 -U postgres
+          redis-cli -h localhost -p 6379 ping
+
+      # The arm64 moment of truth: every optional native dep needs a
+      # linux-arm64 build present in the lockfile.
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Prisma validate + generate + migrate
+        run: |
+          pnpm -F @th/db exec prisma validate --config ../../prisma.config.ts
+          pnpm exec prisma generate
+          pnpm -F @th/db exec prisma migrate deploy --config ../../prisma.config.ts
+
+      - name: Build @th/ui-email
+        run: pnpm -F @th/ui-email run build
+
+      # jsdom + Tamagui: pulls lightningcss-linux-arm64-gnu and the SWC tree.
+      - name: "Suite: @th/ui (native CSS + Tamagui)"
+        run: pnpm -F @th/ui exec vitest --run --retry=1 --testTimeout=30000 --hookTimeout=30000
+
+      - name: Memory after @th/ui
+        if: always()
+        run: free -h || true
+
+      # The heaviest single thing either moved job does: ~2,644 tests through
+      # @next/swc-linux-arm64-gnu, forking per-core with a 4 GB heap each. This
+      # is where an under-provisioned box dies with "Worker exited unexpectedly"
+      # rather than a test failure.
+      - name: "Suite: apps/web (~2,644 tests, the memory ceiling)"
+        run: pnpm -F web run test:ci
+
+      - name: Memory after apps/web
+        if: always()
+        run: |
+          free -h || true
+          df -h / | tail -1
+
+      # The whole `typecheck` job, which is also moving. Eight sequential tsc
+      # targets at --max-old-space-size=8192. spawnSync treats a signal-killed
+      # child as a failure, so an OOM here reports as a typecheck failure —
+      # check `free -h` above before believing it is a type error.
+      - name: "typecheck:all (8 sequential tsc @ 8 GB heap)"
+        run: pnpm typecheck:all
+
+      # Informational only — this decides whether the four build_* jobs can
+      # follow, which is a separate phase. It must never redden a smoke run
+      # whose subject is the gate jobs.
+      - name: Probe linux/amd64 build speed
+        if: ${{ inputs.probe_amd64 }}
+        continue-on-error: true
+        run: |
+          probe="$RUNNER_TEMP/probe"          # NOT /tmp: buildkit tars the whole context
+          mkdir -p "$probe"
+          cat > "$probe/Dockerfile" <<'EOF'
+          FROM --platform=linux/amd64 node:24-bookworm-slim
+          RUN node -e "let s=0;for(let i=0;i<3e8;i++)s+=i;console.log('arch',process.arch,s)"
+          EOF
+          start=$(date +%s)
+          docker buildx build --platform linux/amd64 --no-cache --progress plain "$probe" || true
+          echo "::notice::amd64 probe took $(( $(date +%s) - start ))s"
+
+      # cancel-in-progress plus a ~30-min serialized gate makes mid-install
+      # cancellation routine, and a SIGKILL during a content-addressable store
+      # write leaves a truncated blob that fails EVERY later --frozen-lockfile
+      # with what looks like a lockfile error. The hosted runner was discarded
+      # between runs; this one is not.
+      - name: Prune the pnpm store on failure
+        if: failure()
+        run: pnpm store prune || true

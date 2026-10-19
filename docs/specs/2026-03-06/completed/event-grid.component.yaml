@@ -1,0 +1,114 @@
+# event-grid.component.yaml
+meta:
+  goal: Deliver a responsive EventGrid surface for web and native that composes event cards into grid or carousel layouts with configurable pagination and grouping.
+  files:
+    shared:
+      entry: packages/ui/src/ui/tamagui/components/event-grid/EventGrid.tsx
+      hooks: packages/ui/src/ui/tamagui/components/event-grid/use-event-grid-layout.ts
+      skeleton: packages/ui/src/ui/tamagui/components/event-grid/EventGridSkeleton.tsx
+      tests: packages/ui/src/ui/tamagui/components/__tests__/EventGrid.test.tsx
+      stories: packages/ui/src/ui/tamagui/components/EventGrid.stories.tsx
+  exports:
+    - EventGrid
+    - EventGridSection
+    - useEventGridLayout
+    - EventGridSkeleton
+  tech:
+    - React 18 (Next.js / Expo targets)
+    - Tamagui for layout primitives
+    - react-native-reanimated (for carousel momentum, optional)
+    - react-native-gesture-handler (horizontal carousel swipe) on native
+props:
+  required:
+    - events: EventSummary[] # minimum card data set; see event-card spec for shape
+  optional:
+    - variant?: "grid" | "carousel" | "auto" (default "auto")
+    - pageSize?: number # number of cards per page; defaults derived from layout + maxRows
+    - maxRows?: number # used for grid variant; default 3 desktop / 5 tablet / unlimited mobile
+    - minCardWidth?: number # px unit for web, dp for native; default 256
+    - spacing?: { row?: number; column?: number }
+    - groupBy?: "date" | "venue" | "none" | GroupByConfig
+    - filters?: EventGridFiltersConfig # see filters spec
+    - renderCard?: (event: EventSummary, context: EventGridRenderContext) => React.ReactNode
+    - renderSectionHeader?: (section: EventGridSectionInfo) => React.ReactNode
+    - onFavoriteToggle?: (eventId: string, next: boolean) => void
+    - onCardPress?: (event: EventSummary) => void
+    - pagination?: EventGridPaginationConfig # supplies controlled page index + callbacks
+    - testIdBase?: string # default "event-grid"
+    - qaId?: string
+layout:
+  structure:
+    - Root container (YStack) with gap token, responsive padding.
+    - Optional filter toolbar slot rendered above grid when `filters.enabled`.
+    - Section wrapper per grouping when groupBy != none:
+        - Header row (XStack) containing title + metadata counts.
+        - Grid region or carousel region.
+    - Grid region uses CSS Grid (web) / Tamagui `Stack` layout calculations (native) to auto-fit columns based on container width & minCardWidth.
+    - Carousel variant uses horizontal `ScrollView` (native) or scroll snap (web) with optional prev/next controls.
+    - Pagination controls row (when enabled) with page indicator + buttons.
+  responsive:
+    - Breakpoints derived from Tamagui tokens: mobile (≤600), tablet (600-992), desktop (≥992).
+    - `useEventGridLayout` hook measures container width on web via `ResizeObserver` and infers columns for grid variant.
+    - Mobile forced to single column regardless of variant to maintain readability.
+interactions:
+  - Card tap/click triggers `onCardPress` and navigates using consumer-provided handler.
+  - Favorite button delegated to EventCard; grid re-emits `onFavoriteToggle` for analytics.
+  - Pagination controls update internal state unless controlled via `pagination` prop.
+  - Keyboard navigation on web: arrow keys move focus across cards; home/end jump to start/end of row; page up/down moves between sections/pages.
+  - Carousel variant exposes swipe gestures on native and wheel/drag on web.
+states:
+  - loading: when `events` undefined/null; show `EventGridSkeleton` using layout hints.
+  - empty: when events length 0; render `EmptyState` slot or default copy.
+  - filtering: show active filter chips, highlight applied filter count.
+  - paginated: maintain current page state and compute page count (ceil(events.length / pageSize)).
+  - nestedScroll: allow opt-in `nestedScrollEnabled` flag for React Native to coordinate with parent scroll views.
+a11y:
+  - Root container identifies as `region` with `aria-label` / `accessibilityRole="summary"` describing event list.
+  - Cards remain focusable; maintain logical tab order left-to-right, top-to-bottom.
+  - Carousel includes `aria-roledescription="carousel"` and announces slide position.
+  - Provide `aria-live="polite"` updates when filters or pagination change the result count.
+  - Ensure favorite toggles announce state (`pressed=true/false`).
+rendering:
+  - Defer expensive layout calculations to `useEventGridLayout`, memoized by container width + breakpoints.
+  - Virtualization not in v1; rely on pagination to constrain card count. Document potential follow-up for windowing if event list > 200.
+  - For grouping, derive sorted sections key (date ascending or venue name) and maintain stable keys for animations.
+filters:
+  config:
+    - enabled?: boolean
+    - controlledState?: EventGridFilterState
+    - defaultState?: EventGridFilterState
+    - onChange?(next: EventGridFilterState): void
+    - renderControls?: (state: EventGridFilterState, helpers: EventGridFilterHelpers) => React.ReactNode
+  state_shape:
+    - dateRange?: { start?: string; end?: string }
+    - categoryIds?: string[]
+    - venueIds?: string[]
+    - organizerIds?: string[]
+    - priceRange?: { min?: number; max?: number }
+test_hooks:
+  data_testids:
+    - container: `${testIdBase}-container`
+    - section: `${testIdBase}-section-${sectionId}`
+    - card: `${testIdBase}-card-${eventId}`
+    - favorite: `${testIdBase}-card-${eventId}-favorite`
+    - pagination_next: `${testIdBase}-pagination-next`
+    - pagination_prev: `${testIdBase}-pagination-prev`
+    - filter_chip: `${testIdBase}-filter-${filterKey}`
+quality:
+  - Type-only imports from `@th/types` for `EventSummary` once available; otherwise define shared interface under `packages/types`.
+  - Ensure deterministic sorting for groupings.
+  - Integrate with Tamagui theme tokens for spacing and surfaces.
+tests:
+  - Verify responsive column calculation across breakpoints using mocked layout widths.
+  - Ensure pagination state resets when filter results change.
+  - Confirm favorite toggles and card presses propagate callbacks.
+  - Carousel keyboard navigation + aria attributes snapshot on web.
+  - Snapshot skeleton rendering matches expected tile count for configured rows/columns.
+non_goals:
+  - Infinite scroll / virtualization (deferred).
+  - Server-driven filtering UI (provided externally via props).
+  - Persisting favorites; parent handles state + network.
+implementation_notes:
+  - Provide context provider (`EventGridContext`) that exposes layout + pagination to nested components (filters bar, pagination controls).
+  - Use `useId` / deterministic key generator for section headers.
+  - Support SSR by guarding `ResizeObserver` usage (fallback to CSS grid auto-fit).

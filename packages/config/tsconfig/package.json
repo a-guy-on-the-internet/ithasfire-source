@@ -1,0 +1,16 @@
+{
+  "name": "@th/tsconfig",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    "./base.json": "./base.json",
+    "./react-library.json": "./react-library.json",
+    "./base.json/tsconfig.json": "./base.json",
+    "./react-library.json/tsconfig.json": "./react-library.json"
+  }
+}

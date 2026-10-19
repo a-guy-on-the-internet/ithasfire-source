@@ -1,0 +1,82 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Performer — opt-in performer mode (performer-mode.spec.yaml, 2026-06-05).
+//
+// A PerformerProfile row is the ONLY signal that an entity (Human or Org) is a
+// performer. Enabled means `enabledAt != null && disabledAt == null` — see
+// `isPerformerEnabled` in packages/core/src/lib/performer-mode.ts. Nothing may
+// gate on Human.jobs[] / genreTags[]; those are profile *content*, not the gate.
+//
+// This model stays content-FREE. `acceptsBookingRequests` is a GATE (like
+// `enabledAt`) — the consent flag for receiving organizer→performer booking
+// requests (organizer-booking-requests FR-002), mirroring
+// Place.acceptsBookingRequests. Profile *content* (names, links, defaults, …)
+// remains forbidden here; it lives in PerformerBookingDefaults / entity pages.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model PerformerProfile {
+  id         String    @id @default(uuid())
+
+  // Polymorphic owner — "human" | "organization" (app-enforced, mirrors the
+  // Agreement proposer/counterparty party convention).
+  ownerType  String
+  ownerId    String
+
+  enabledAt  DateTime?
+  disabledAt DateTime?
+
+  // Opt-in gate for RECEIVING organizer booking requests (TO_PERFORMER).
+  // Only meaningful while performer mode is enabled — the create gate checks
+  // BOTH (`isPerformerEnabled(profile) && profile.acceptsBookingRequests`).
+  acceptsBookingRequests Boolean @default(false)
+
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@unique([ownerType, ownerId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Performer booking defaults — saved prefill values for the booking-request
+// pitch form (performer-mode.spec.yaml, 2026-07-11).
+//
+// SEPARATE store from PerformerProfile (which is a content-FREE opt-in gate and
+// forbids content fields). This row holds a performer's saved defaults that
+// later prefill the create-booking-request form. Every field is nullable — a
+// save can clear any field by omitting/nulling it.
+//
+// Field parity with the booking-request create input (create-booking-request.ts)
+// EXCEPT `genre`: genre is intentionally NOT stored here — it comes from
+// Human.genreTags (the create path prefills the human sender's first genre tag).
+// ─────────────────────────────────────────────────────────────────────────────
+
+model PerformerBookingDefaults {
+  id         String   @id @default(uuid())
+
+  // Polymorphic owner — "human" | "organization" (app-enforced, mirrors
+  // PerformerProfile / the Agreement proposer/counterparty party convention).
+  ownerType  String
+  ownerId    String
+
+  // All-nullable saved defaults. `feeAmountCents` is integer cents interpreted
+  // in `feeCurrency` (platform base "usd" snapshotted when an amount is set;
+  // see create-booking-request.ts). NOTE: no `genre` — see header comment.
+  actName              String?
+  lineupSize           Int?
+  setLengthMinutes     Int?
+  techNeeds            String?
+  contactPhone         String?
+  feeType              BookingFeeType?
+  feeAmountCents       Int?
+  feeCurrency          String?         @db.VarChar(3)
+  messageTemplate      String?
+  includeVerifiedStats Boolean?
+  linkMusic            String?
+  linkVideo            String?
+  linkSocial           String?
+  linkEpk              String?
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([ownerType, ownerId])
+}

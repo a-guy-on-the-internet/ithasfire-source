@@ -1,0 +1,92 @@
+/* Robust banner + avatar media for entity-page headers (HUMAN / ORG / PLACE
+   freeform layouts). Both reveal only on a positive load, so a blocked
+   (ORB), missing, or 404'd source never leaves a broken-image box — the
+   base under-layer / initials show through instead. Mirrors the standard
+   venue hero's fallback behaviour (place-entity.module.css). */
+
+.bannerFrame {
+  position: relative;
+  width: 100%;
+  /* Matches the shared shell `.banner` box so overlap math is unchanged. */
+  height: 12rem;
+  margin-bottom: 1rem;
+  overflow: hidden;
+  border-radius: 0;
+  /* Flat brand-tinted base under-layer — shown when the banner is
+     blocked/missing so we never render a broken box. */
+  background-color: color-mix(
+    in srgb,
+    var(--th-color-primary, #E2481D) 16%,
+    var(--th-color-bg, #F6F0E4)
+  );
+}
+
+.bannerImg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.bannerImg[data-loaded="true"] {
+  opacity: 1;
+}
+
+/* Fixed-size 72px avatar box. Initials sit underneath and the image fades in
+   over them on a positive load. This exists rather than the shared @th/ui
+   <Avatar> because it paints from the PER-ENTITY theme vars below; the shared
+   one paints from the global Tamagui theme. See the note on EntityAvatar. */
+.avatar {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 72px;
+  height: 72px;
+  flex-shrink: 0;
+  overflow: hidden;
+  border-radius: 0;
+  /* `--th-color-surface-muted` is never overridden (buildEntityPageThemeVars only
+     emits --th-color-primary/-bg/-text), so the fallback always renders. Re-themed
+     as a unit: a warm raised-paper tile (Stub surfaceRaised) with a soft ink edge
+     and ink initials below — a coherent placeholder, not the old navy-on-cream
+     leftover. `onStructure` stays a light paper hairline for separation. */
+  border: 2px solid
+    var(--th-color-border, color-mix(in srgb, var(--onStructure, #FDFAF3) 20%, transparent));
+  background-color: var(--th-color-surface-muted, #EFE7D6);
+}
+
+.avatarInitials {
+  font-size: 1.5rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: -0.01em;
+  color: color-mix(in srgb, var(--th-color-text, #211C16) 82%, transparent);
+  user-select: none;
+}
+
+.avatarImg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.avatarImg[data-loaded="true"] {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bannerImg,
+  .avatarImg {
+    transition: none;
+  }
+}

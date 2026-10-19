@@ -1,6 +1,6 @@
 ---
 title: "Volunteer at an event"
-description: "Sign up for volunteer roles and shifts, track your application, and get shift reminders."
+description: "Sign up for volunteer roles and shifts, track your application, and get reminders."
 category: "getting-started"
 order: 3
 tags: ["volunteering", "shifts", "waitlist", "reminders"]
@@ -9,16 +9,15 @@ related:
     "organising-events/manage-volunteers",
     "getting-started/coordinate-a-volunteer-group",
     "getting-started/find-events",
-    "getting-started/the-action-bar",
   ]
 specs: ["2026-03-23/completed/volunteering", "2026-06-10/completed/volunteer-system-gaps"]
 ---
 
-Some events recruit volunteers — door crew, setup, cleanup — directly on the event page. This article covers signing up, what the statuses mean, and how shift reminders work.
+Some events recruit volunteers — door crew, setup, cleanup — directly on the event page. This article covers signing up, what the statuses mean, and how reminders work.
 
 ## Find the volunteer sign-up
 
-On the event page, click **Volunteer** in the action bar. A sheet opens listing every role the organiser is recruiting for, with a short description and a spot counter:
+On the event page, scroll to the volunteering section and click **Volunteer**. A sheet opens listing every role the organiser is recruiting for, with a short description and a spot counter:
 
 - **Open spots** — no limit set, everyone who's approved gets in
 - **2 / 4** — confirmed volunteers out of the total needed
@@ -41,7 +40,7 @@ You can volunteer with or without an account:
 - **Signed in** — the sheet shows **Submitting as** with your name and email; nothing to fill in.
 - **As a guest** — enter your email (required) and optionally your name.
 
-Click **Add phone or note (optional)** to leave a phone number or a note for the organiser. Once you've entered a phone number, a checkbox appears: **Text me a reminder before my shift**. Ticking it opts you in to up to 2 texts per shift (24 hours and 1 hour before). Leave it unticked and you'll still get email reminders.
+Click **Add more details** to leave a phone number or a note for the organiser. The organiser sees the number. When texts are offered and you've picked a shift or a role without shifts, entering one also shows an unticked box: **Text me a reminder before my shift**, or **Text me a reminder before the event starts** for a role without shifts. Tick it for a text about 24 hours and 1 hour before each start time (US numbers only). It's optional; email reminders come either way.
 
 If the event requires a volunteer waiver, the waiver text appears above the **Apply** button with a checkbox: **I have read and agree to the volunteer waiver**. **Apply** stays disabled until you tick it. If you're signed in and already accepted the current version of this event's waiver, you'll see **Waiver already on file** instead — no need to sign again. Waivers for volunteering work the same way as [waivers at checkout](/help/buying-tickets/signing-a-waiver).
 
@@ -55,25 +54,29 @@ Each shift you applied for gets its own result:
 - **Pending review** — the organiser reviews each application; you'll get an email when they decide.
 - **Waitlisted** — "Currently full — you're on the waitlist. We'll email you if a spot opens." The shift was full when you applied, so your application stays pending until the organiser frees a spot or raises capacity.
 
-You'll receive a confirmation email either way. If you signed up as a guest, that email includes a link to finish creating an account with the same address, so you can track your sign-up on the event page.
+If you're signed in, you get a confirmation by email and in the app, and the organiser's decision the same way.
+
+A sign-up made while you're signed out isn't linked to your Ithas Fire account, even if you type your account's email address. If that address already has an account, we send it a short confirmation and, later, the organiser's decision, but the sign-up won't appear in **My Volunteering**. To keep a sign-up in your history, sign in before you apply.
 
 ## See all your shifts in one place
 
-The Volunteer sheet only shows one event at a time. To see everything you've signed up for, go to **My Volunteering** — it's in the menu behind your avatar, under **Navigate**, or straight at [/my-volunteering](/my-volunteering). You need to be signed in; guest sign-ups only appear once you've created an account with the same email address.
+The Volunteer sheet only shows one event at a time. To see everything you've signed up for, go to **My Volunteering** — it's in the menu behind your avatar, under **Navigate**, or straight at [/my-volunteering](/my-volunteering). You need to be signed in. Guest sign-ups made with a new email address appear once you create an account with that address; guest sign-ups made with an address that already had an account don't appear there.
 
 The page groups your sign-ups so you can tell at a glance what you're actually committed to:
 
-- **Next up** — your nearest confirmed shift, with the date, role, time and venue
+- **Next up** — your nearest confirmed shift, with the date, role, time and place
 - **Confirmed** — the rest of your confirmed shifts, plus any ongoing roles with no fixed shift time
 - **Awaiting confirmation** — applications the organiser hasn't decided on yet, each showing the date you applied
 - **History** — shifts you've worked, along with applications that were declined or that you withdrew
 
 Applications are deliberately kept out of **Confirmed** and never mixed into your schedule by date: until an organiser approves you, you're not on the rota.
 
-Each row links back to the event (or to the sign-up page for a general volunteer call), so you can open it to withdraw, change your reminder settings, or add the shift to your calendar.
+Each row links back to the event (or to the sign-up page for a general volunteer call), so you can open it to withdraw or add the shift to your calendar. When a sign-up gets reminders and you gave a phone number, its row also has a text-reminder box.
+
+If the organiser can't take new volunteers right now, a confirmed row says **Shift sign-ups are paused** and has no link. Shifts you already claimed still stand and stay on your list with their times, but you can't claim new ones until sign-ups reopen.
 
 :::tip
-Shift times are shown in the venue's local time with its time zone, so a shift at 6:00 PM CDT reads the same whether you're in Nashville or reading it from another time zone.
+Shift times are shown in the place's local time with its time zone, so a shift at 6:00 PM CDT reads the same whether you're in Nashville or reading it from another time zone.
 :::
 
 At the bottom you'll see **Hours this year** and **Shifts this year**. These count only shifts an organiser checked you in for — signing up, or being approved, doesn't add hours on its own.
@@ -82,19 +85,13 @@ Hours come from the shift's scheduled length, unless the organiser recorded a di
 
 The totals only appear once you've been checked in for at least one shift in the current year.
 
-## Reminders before your shift
+## Reminders
 
-Confirmed volunteers on a shift get reminders 24 hours and 1 hour before it starts:
+Confirmed volunteers on a shift get reminders 24 hours and 1 hour before it starts. On a role with no shifts, they come 24 hours and 1 hour before the event starts. Roles on the same event that start at the same time share one reminder.
 
 - **Email** — always
 - **In-app notification** — if you have an account
-- **Text message** — only if you gave a phone number *and* ticked the SMS opt-in
-
-You can change your mind any time: reopen the Volunteer sheet on the event page and toggle **Text me shift reminders** on your existing sign-up row.
-
-:::tip
-Replying STOP to any reminder text opts you out of texts everywhere on Ithas Fire, not just for that shift. To opt back in later, use the toggle on your sign-up row.
-:::
+- **Text message** — only if you ticked the text box. Turn texts on or off with the box on your sign-up row, on the event page or in [My volunteering](/my-volunteering), or reply STOP to any text (that stops every Ithas Fire text to your number). To get texts back after a STOP, see [Text messages](/help/account/notification-settings#text-messages).
 
 ## Add your shifts to your calendar
 

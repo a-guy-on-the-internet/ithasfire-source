@@ -12,6 +12,16 @@ import type { AuthNPort } from "@th/ports/authn";
 import type { ClockPort } from "@th/ports/clock";
 import type { IdempotencyPort } from "@th/ports/idempotency";
 import { safeReporter } from "@th/ports/reporter";
+import { configureLocationObfuscation } from "@th/core/lib/location/obfuscation-key";
+import {
+  LOCATION_OBFUSCATION_CANARY_EVENT,
+  LOCATION_OBFUSCATION_CANARY_PLACE,
+  canaryPoint,
+  verifyLocationObfuscationLive,
+} from "@th/core/lib/location/obfuscation-self-test";
+import { projectPublicEventLocation } from "@th/core/lib/location/project-public-event-location";
+import { redactPlaceLocation } from "@th/core/lib/location/redact-place-location";
+import { adaptersLocationObfuscationCanary } from "@th/adapters/geo/obfuscation";
 import type { EmailDeliverabilityPort } from "@th/ports/comms/email-deliverability";
 import type { MailerPort } from "@th/ports/comms/mailer";
 import type { PaymentProcessorPort } from "@th/ports/payment-processor-port";
@@ -31,14 +41,39 @@ import type {
 import { SearchPortError, err } from "@th/ports/search";
 import { formatOrderCode } from "@th/types/order-identifier";
 import { createPrismaRepos } from "@th/adapters/db/prisma-repos";
+import { GoogleCloudTranslationAdapter } from "@th/adapters/translator/google-cloud-translation-adapter";
 import { createPrismaEmailDeliverabilityAdapter } from "@th/adapters/db/prisma-email-deliverability-adapter";
 import { createPinoLoggerAdapter } from "@th/adapters/infra/logger";
 import { LoggerMetricsAdapter } from "@th/adapters/infra/logger-metrics";
 import { initOpenTelemetry } from "@th/adapters/infra/otel-bootstrap";
 import { withGuardedRepos } from "@th/adapters/decorators/with-dependency-guard";
+import { withOutboxDrainTriggers } from "@th/adapters/decorators/with-outbox-drain-triggers";
+import { createJobTrigger } from "@th/adapters/queue/job-trigger";
+import { withSearchReindexDrainScheduling } from "@th/adapters/decorators/with-search-reindex-drain-scheduling";
+import { withTaxRateFillQueue } from "@th/adapters/decorators/with-tax-rate-fill-queue";
+import { createTaxRateFillQueue } from "@th/core/use-cases/tax/tax-rate-fill-queue";
+import {
+  createLineupSweepContinuation,
+  createSearchReindexDrainTrigger,
+  createTaxRateFillScheduler,
+} from "@th/adapters/queue/cloud-tasks-scheduler";
 import { withCachedPlatformSettings } from "@th/adapters/decorators/with-cached-platform-settings";
+import { createTtlReadThroughCache } from "@th/adapters/decorators/ttl-read-through-cache";
+import {
+  createCacheGeneration,
+  createRedisCacheGenerationStore,
+} from "@th/adapters/decorators/cache-generation";
+import {
+  withPublicReadBumpOnIndexWrites,
+  withPublicReadBumpOnSearchDocumentWrites,
+} from "@th/adapters/decorators/with-public-read-bump-on-search-writes";
+import { createThrottledReporter } from "@th/core/lib/throttled-reporter";
+import { deriveInviteTokenSecret } from "@th/core/lib/security/invite-token";
+import { deriveInviteOptOutSecret } from "@th/core/lib/security/invite-optout-token";
+import { deriveOpenCallStatusTokenSecret } from "@th/core/lib/security/open-call-status-token-key";
 import { RedisIdempotency } from "@th/adapters/idempotency/redis-adapter";
 import { RedisRateLimitAdapter } from "@th/adapters/rate-limit/redis-rate-limit-adapter";
+import { resolveRedisConnection } from "@th/adapters/redis/connection-config";
 import { createSystemClock } from "@th/adapters/infra/clock";
 import { createDbAuthZAdapter } from "@th/adapters/authz/db-authz-adapter";
 import { createBetterAuthAuthNAdapter } from "@th/adapters/authn/better-auth-authn-adapter";
@@ -67,6 +102,7 @@ import type { PushPort } from "@th/ports/comms/push";
 import { createGeoAdapter } from "@th/adapters/geo/index";
 import { createS3FileStorage } from "../bootstrap/storage";
 import type { TrpcDeps } from "@th/trpc";
+import { staffSecondFactorBypassEnabled } from "@th/trpc/dev-staff-2fa-bypass";
 import type { TelemetryPort } from "@th/ports/telemetry";
 import {
   createFileStorageError,
@@ -92,8 +128,10 @@ import {
   detectCloudRunEnvTag,
 } from "@th/adapters/infra/discord-alerts";
 import { env, forceConnectCapabilities } from "./env";
+import { isSmsConfigured } from "./sms-capability";
 import { WebhookDlq } from "./webhook-dlq";
 import { buildSettlementFailureAlerter } from "./settlement-failure-alert";
+import { trpcClientIpDepsFromEnv } from "./trpc-ip-deps";
 import { Sentry } from "../instrument";
 
 const discordAlertLogger = createPinoLoggerAdapter().child({
@@ -319,6 +357,14 @@ class MissingStripePaymentProcessor implements PaymentProcessorPort {
     return this.fail("refundPaymentIntent");
   }
 
+  async listRefundsForPaymentIntent(
+    _input: Parameters<
+      NonNullable<PaymentProcessorPort["listRefundsForPaymentIntent"]>
+    >[0],
+  ): Promise<never> {
+    return this.fail("listRefundsForPaymentIntent");
+  }
+
   async cancelPaymentIntent(
     _input: Parameters<PaymentProcessorPort["cancelPaymentIntent"]>[0],
   ): Promise<never> {
@@ -331,6 +377,10 @@ class MissingStripePaymentProcessor implements PaymentProcessorPort {
     >[0],
   ): Promise<never> {
     return this.fail("getProcessingFeeForPaymentIntent");
+  }
+
+  async getPlatformBalance(): Promise<never> {
+    return this.fail("getPlatformBalance");
   }
 
   async createTransfer(
@@ -349,6 +399,14 @@ class MissingStripePaymentProcessor implements PaymentProcessorPort {
     _input: Parameters<PaymentProcessorPort["retrievePaymentIntent"]>[0],
   ): Promise<never> {
     return this.fail("retrievePaymentIntent");
+  }
+
+  async retrievePaymentIntentWithClientSecret(
+    _input: Parameters<
+      NonNullable<PaymentProcessorPort["retrievePaymentIntentWithClientSecret"]>
+    >[0],
+  ): Promise<never> {
+    return this.fail("retrievePaymentIntentWithClientSecret");
   }
 
   async createConnectAccount(): Promise<never> {
@@ -453,6 +511,24 @@ class MissingStripePaymentProcessor implements PaymentProcessorPort {
     _input: Parameters<PaymentProcessorPort["cancelReaderAction"]>[0],
   ): Promise<never> {
     return this.fail("cancelReaderAction");
+  }
+
+  async retrieveDispute(
+    _input: Parameters<PaymentProcessorPort["retrieveDispute"]>[0],
+  ): Promise<never> {
+    return this.fail("retrieveDispute");
+  }
+
+  async updateDisputeEvidence(
+    _input: Parameters<PaymentProcessorPort["updateDisputeEvidence"]>[0],
+  ): Promise<never> {
+    return this.fail("updateDisputeEvidence");
+  }
+
+  async uploadDisputeEvidenceFile(
+    _input: Parameters<PaymentProcessorPort["uploadDisputeEvidenceFile"]>[0],
+  ): Promise<never> {
+    return this.fail("uploadDisputeEvidenceFile");
   }
 }
 
@@ -611,10 +687,16 @@ const createNotify = (input: {
         push: input.push,
         ...(input.mailer ? { mailer: input.mailer } : {}),
         logger: input.logger,
+        // An in-app row that cannot store its render payload (so it can
+        // never show in the reader's language) is reported, not just logged.
+        reportError: safeReporter(Sentry.captureException),
       },
       payload,
     );
 };
+
+/** Same window the rate limiter uses for its fail-open reports. */
+const PUBLIC_READ_GENERATION_REPORT_THROTTLE_MS = 15 * 60 * 1000;
 
 export async function buildDeps(): Promise<AppDeps> {
   // Prisma v7 can fail on startup if the generated client config is missing
@@ -651,6 +733,47 @@ export async function buildDeps(): Promise<AppDeps> {
   await prisma.$connect();
 
   const logger = createPinoLoggerAdapter();
+
+  // ── Location obfuscation key ──────────────────────────────────────────
+  // Keys every public obfuscation circle (places and events). HKDF-derived
+  // from UNSUBSCRIBE_SECRET — the one HMAC secret the API AND the jobs
+  // service carry in every environment (jobs draws the SAME circles into the
+  // search index; see `apps/jobs/src/lib/container.ts`). Missing → every
+  // circle fails closed to "fully hidden", reported once at boot. Rotating
+  // the secret moves every circle — see `obfuscation-key.ts`.
+  configureLocationObfuscation({
+    secret: env.UNSUBSCRIBE_SECRET,
+    logger,
+    reportError: safeReporter(Sentry.captureException),
+  });
+  // Boot self-test: draw a canary circle through the SAME specifiers the
+  // read paths import (core's projections, and the adapters' own resolution
+  // of them). A null means the key is missing or those paths load a keyless
+  // COPY of the module configured above — every circle silently hidden.
+  // Production refuses to boot; elsewhere it is an error log + report.
+  verifyLocationObfuscationLive({
+    failHard: process.env.NODE_ENV === "production",
+    logger,
+    reportError: safeReporter(Sentry.captureException),
+    canaries: [
+      {
+        source: "@th/core/lib/location/project-public-event-location",
+        draw: () =>
+          canaryPoint(
+            projectPublicEventLocation(LOCATION_OBFUSCATION_CANARY_EVENT),
+          ),
+      },
+      {
+        source: "@th/core/lib/location/redact-place-location",
+        draw: () =>
+          canaryPoint(redactPlaceLocation(LOCATION_OBFUSCATION_CANARY_PLACE)),
+      },
+      {
+        source: "@th/adapters/geo/obfuscation",
+        draw: adaptersLocationObfuscationCanary,
+      },
+    ],
+  });
 
   // ── File storage (S3) ─────────────────────────────────────────────────
   // Created early so it can be injected into repos (placeLayoutBlobs) and
@@ -744,15 +867,88 @@ export async function buildDeps(): Promise<AppDeps> {
   // that silently caches is a nasty surprise when you go looking for stale
   // reads. Writes go through `upsert`, which invalidates this instance; the
   // TTL is the backstop for other instances.
-  const cachedPlatformSettings = withCachedPlatformSettings(
-    prismaRepos.platformSettings,
+  //
+  // 15 minutes for the `getAll()` snapshot (the feature-gate read on every
+  // render) so the uptime check's home-page render stops waking Neon every
+  // minute; 60s for `get(key)`, whose readers include a key the jobs process
+  // writes and two read-modify-write paths. See the decorator's header.
+  //
+  // Both this snapshot and the discovery cache below are tagged with a shared
+  // generation (one Redis counter). What bumps it, in every process:
+  //   · every mutation by a RESOLVED actor (`bumpPublicReadsAfterActorMutation`
+  //     in @th/trpc — failed ones too: a use case can commit, then throw);
+  //   · every SEARCH INDEX write, after it commits — here and in the jobs
+  //     process (`with-public-read-bump-on-search-writes.ts`), because the
+  //     featured list reads the index, which is written after the mutation;
+  //   · the e2e reset/seed routes.
+  // What each cache then guarantees, for a change that went through one of
+  // those: the writing instance stops serving the old answer at once; other
+  // instances within their read memo — 30s for the discovery cache, 60s for
+  // this settings snapshot (it is consulted on every feature-gate read, authed
+  // too, so it gets the longer memo to stay inside the Upstash budget; see
+  // docs/ops/resource-burn.md RB-0003; both env-tunable). A change nothing bumps for — the clock (an
+  // event starting, a price tier flipping), a direct DB script, or a failed
+  // INCR (reported) — waits for the TTL. Redis unreachable → both read fresh
+  // and store nothing (reported, throttled).
+  //
+  // The store closes over `redis`, which is constructed further down; it is
+  // only called at request time, after `buildDeps` has returned.
+  // One throttled reporter for the generation and the settings snapshot's
+  // swallow branch: both fire per request during a Redis/port failure.
+  const publicReadReportError = createThrottledReporter(
+    safeReporter(Sentry.captureException),
+    PUBLIC_READ_GENERATION_REPORT_THROTTLE_MS,
+  );
+  const publicReadGeneration = createCacheGeneration({
+    store: createRedisCacheGenerationStore({
+      eval: (script, numKeys, ...args) => redis.eval(script, numKeys, ...args),
+    }),
+    reportError: publicReadReportError,
+    logger,
+  });
+  const discoveryGeneration = publicReadGeneration.reader(
+    env.PUBLIC_DISCOVERY_GENERATION_MEMO_S * 1000,
   );
 
-  const reposBase = {
-    ...prismaRepos,
-    platformSettings: cachedPlatformSettings,
-  };
-  const repos = withGuardedRepos(reposBase, logger, {
+  const cachedPlatformSettings = withCachedPlatformSettings(
+    prismaRepos.platformSettings,
+    {
+      ttlMs: env.PLATFORM_SETTINGS_CACHE_TTL_S * 1000,
+      pointReadTtlMs: 60 * 1000,
+      generation: publicReadGeneration.reader(
+        env.PLATFORM_SETTINGS_GENERATION_MEMO_S * 1000,
+      ),
+      reportError: publicReadReportError,
+    },
+  );
+
+  // Anonymous home-page discovery lists (`events.countryEvents`,
+  // `search.featuredEvents`, `categories.listBrowsable`, plus `categories.list`
+  // for the category pages), cached per instance so the uptime check's render
+  // does not read Event/SearchDocument/TicketType/Place/Category every ~50s
+  // and keep production Neon awake. Only anonymous requests are handed this cache (see
+  // `isAnonymousRequest` in @th/trpc). Freshness: the generation above
+  // (PUBLIC_DISCOVERY_GENERATION_MEMO_S, default 30s). Never serves stale on a DB error — a stale card could be one a
+  // write just made private.
+  const publicDiscoveryCache =
+    env.PUBLIC_DISCOVERY_CACHE_TTL_S > 0
+      ? createTtlReadThroughCache({
+          name: "public-discovery",
+          ttlMs: env.PUBLIC_DISCOVERY_CACHE_TTL_S * 1000,
+          generation: discoveryGeneration,
+          staleIfErrorMs: 0,
+          reportError: safeReporter(Sentry.captureException),
+          logger,
+        })
+      : null;
+
+  // Innermost, so every decorator below sees the post-commit bump the same
+  // way: a tx-bound search document write announces itself after COMMIT.
+  const reposBase = withPublicReadBumpOnSearchDocumentWrites(
+    { ...prismaRepos, platformSettings: cachedPlatformSettings },
+    publicReadGeneration,
+  );
+  const guardedRepos = withGuardedRepos(reposBase, logger, {
     events: {
       classifyTransient: (error) => {
         const message =
@@ -762,14 +958,80 @@ export async function buildDeps(): Promise<AppDeps> {
     },
   });
 
-  const redisUrl =
-    env.REDIS_URL ??
-    (process.env.NODE_ENV === "production"
-      ? undefined
-      : "redis://localhost:6379");
-  if (!redisUrl) {
-    throw new Error("REDIS_URL is required in production");
+  // Outbox drain wake-ups: a committed RSVP notice, event-change notice or
+  // image-moderation row publishes a wake-up for its drain (Pub/Sub on Cloud
+  // Run; direct HTTP locally with JOB_TRIGGER_BACKEND=http; nothing otherwise,
+  // leaving the scheduled safety net). A visible composition-root decision,
+  // like the two decorators above. Publish failures are reported and never
+  // fail the write — see with-outbox-drain-triggers.ts.
+  const jobTrigger = createJobTrigger(
+    {
+      JOB_TRIGGER_TOPIC_PREFIX: env.JOB_TRIGGER_TOPIC_PREFIX,
+      JOB_TRIGGER_BACKEND: env.JOB_TRIGGER_BACKEND,
+      JOBS_SERVICE_URL: env.JOBS_SERVICE_URL,
+      JOBS_API_KEY: env.JOBS_API_KEY,
+      // The local-only http backend is refused on Cloud Run / in production.
+      NODE_ENV: process.env.NODE_ENV,
+      K_SERVICE: process.env.K_SERVICE,
+    },
+    logger,
+    safeReporter(Sentry.captureException),
+  );
+  const reposWithDrainTriggers = jobTrigger
+    ? withOutboxDrainTriggers(guardedRepos, {
+        trigger: jobTrigger,
+        logger,
+        reportError: safeReporter(Sentry.captureException),
+      })
+    : guardedRepos;
+  // Edit-triggered search reindex: once a transaction that marked entities
+  // (`SearchReindexPending`) commits, ask Cloud Tasks for ONE delayed
+  // `search.drain-reindex-pending` run (deduplicated per time slot). No
+  // queue configured = the marks wait for the nightly full reindex. Nothing
+  // here polls. See with-search-reindex-drain-scheduling.ts.
+  const searchReindexDrain = createSearchReindexDrainTrigger({
+    CLOUD_TASKS_QUEUE: env.CLOUD_TASKS_QUEUE,
+    CLOUD_TASKS_INVOKER_SA: env.CLOUD_TASKS_INVOKER_SA,
+    JOBS_SERVICE_URL: env.JOBS_SERVICE_URL,
+    SEARCH_REINDEX_DRAIN_DELAY_S: env.SEARCH_REINDEX_DRAIN_DELAY_S,
+    SEARCH_REINDEX_DRAIN_WINDOW_S: env.SEARCH_REINDEX_DRAIN_WINDOW_S,
+  });
+  const reposWithDrainScheduling = searchReindexDrain
+    ? withSearchReindexDrainScheduling(reposWithDrainTriggers, {
+        trigger: searchReindexDrain,
+        clock: createSystemClock(),
+        logger,
+        reportError: safeReporter(Sentry.captureException),
+      })
+    : reposWithDrainTriggers;
+  // Background venue tax-rate fills, queued by listings for a venue with no
+  // cached rate (`repos.taxRateFills`; owner ruling 2026-10-06: a listing
+  // never calls the tax provider inline). On their OWN Cloud Tasks queue
+  // (CLOUD_TASKS_TAX_FILL_QUEUE, infra/terraform/tax-rate-fill.tf), never the
+  // search drain's: that one is pinned to one dispatch at a time, and a ZipTax
+  // error spell would park hundreds of slow failing lookups ahead of every
+  // drain. No fallback: unset = nothing is queued, the card says "See
+  // details" and the venue fills on its next event-page view or checkout.
+  // OUTERMOST: a decorator applied after it would drop the property.
+  const taxRateFillScheduler = createTaxRateFillScheduler({
+    CLOUD_TASKS_TAX_FILL_QUEUE: env.CLOUD_TASKS_TAX_FILL_QUEUE,
+    CLOUD_TASKS_INVOKER_SA: env.CLOUD_TASKS_INVOKER_SA,
+    JOBS_SERVICE_URL: env.JOBS_SERVICE_URL,
+  });
+  if (!taxRateFillScheduler) {
+    logMissingOptionalIntegration(logger, "tax_rate_fill_queue_not_configured", {
+      hint: "Set CLOUD_TASKS_TAX_FILL_QUEUE (with CLOUD_TASKS_INVOKER_SA and JOBS_SERVICE_URL) to queue background venue tax-rate fills from listings.",
+    });
   }
+  const repos = withTaxRateFillQueue(
+    reposWithDrainScheduling,
+    taxRateFillScheduler
+      ? createTaxRateFillQueue({
+          scheduler: taxRateFillScheduler,
+          clock: createSystemClock(),
+        })
+      : null,
+  );
 
   // `commandTimeout` + `maxRetriesPerRequest` are bounded so a
   // wedged/unreachable Redis connection fails fast instead of hanging (or
@@ -784,14 +1046,30 @@ export async function buildDeps(): Promise<AppDeps> {
   // `IDEMPOTENCY_BACKEND=redis`) shares this same client; failing fast on a
   // wedged connection is an improvement there too — idempotency callers
   // shouldn't hang the request indefinitely either.
-  const redis = new Redis(redisUrl, {
-    commandTimeout: 500,
-    maxRetriesPerRequest: 2,
+  //
+  // The bounds, the "required in production" guard and the loopback-host
+  // guard all live in `resolveRedisConnection` so jobs gets exactly the same
+  // ones — jobs having neither is what let the 2026-09-01 dev outage run for
+  // eleven days.
+  const redisConnection = resolveRedisConnection({
+    url: env.REDIS_URL,
+    namespace: env.REDIS_NAMESPACE,
+    nodeEnv: process.env.NODE_ENV,
+  });
+  const redis = new Redis(redisConnection.url, {
+    ...(redisConnection.keyPrefix
+      ? { keyPrefix: redisConnection.keyPrefix }
+      : {}),
+    commandTimeout: redisConnection.commandTimeout,
+    maxRetriesPerRequest: redisConnection.maxRetriesPerRequest,
   });
   redis.on("error", (err) => {
     logger.error("redis_error", { err });
   });
 
+  // NOTE: this port also carries a 10-YEAR durable ledger — the lineup
+  // notices' `lineup-notice:*` keys (see packages/ports/src/idempotency.ts).
+  // Changing the backend or the "api" namespace below drops it.
   const idempotency: IdempotencyPort =
     env.IDEMPOTENCY_BACKEND === "postgres"
       ? new PrismaIdempotencyAdapter(prisma, "api", logger)
@@ -803,7 +1081,13 @@ export async function buildDeps(): Promise<AppDeps> {
   const rateLimitAdapter = new RedisRateLimitAdapter(redis);
   const contentFilter = createProfanityContentFilterAdapter();
   const clock = createSystemClock();
-  const authz = createDbAuthZAdapter({ repos });
+  // The dev-only switch (false on Cloud Run, and under any NODE_ENV other
+  // than unset, `development` or `test`). The early tRPC check in `guard.ts`
+  // asks this port, so the two cannot disagree.
+  const authz = createDbAuthZAdapter({
+    repos,
+    staffSecondFactorBypass: staffSecondFactorBypassEnabled,
+  });
   // Expo push (FR-006 platform push wiring). Constructed unconditionally —
   // Expo's public push API needs no credentials; EXPO_ACCESS_TOKEN is the
   // optional enhanced-security token. With no registered devices the notify()
@@ -1013,7 +1297,7 @@ export async function buildDeps(): Promise<AppDeps> {
     });
   }
   // Lazy-load search adapters only when their backend is selected/configured.
-  const { searchQuery, multiSearch } = await (async (): Promise<{
+  const { searchQuery, multiSearch: rawMultiSearch } = await (async (): Promise<{
     searchQuery: SearchQueryPort;
     multiSearch: MultiSearchPort | null;
   }> => {
@@ -1058,6 +1342,10 @@ export async function buildDeps(): Promise<AppDeps> {
       }),
     };
   })();
+  // Index writes bump the public-read generation (see above).
+  const multiSearch = rawMultiSearch
+    ? withPublicReadBumpOnIndexWrites(rawMultiSearch, publicReadGeneration)
+    : null;
 
   // Cloudflare Turnstile (bot protection for public embed checkout).
   // Turnstile fails CLOSED, so the adapter gets the Sentry-backed reporter:
@@ -1086,10 +1374,14 @@ export async function buildDeps(): Promise<AppDeps> {
     // every other surface too. `logger.error` (Sentry-captured) + an explicit
     // report is the honest middle.
     const message =
-      "turnstile_not_configured: the anonymous event-application and embed-checkout paths are reachable with NO bot protection";
+      "turnstile_not_configured: the anonymous event-application and embed-checkout paths are reachable with NO bot protection, and the event-password challenge (events.validatePassword) degrades to the hard caps only";
     logger.error(message, {
       hint: "Set TURNSTILE_SECRET_KEY to enable Cloudflare Turnstile.",
-      affects: ["events.submitApplication", "embeds.createBookingInquiry"],
+      affects: [
+        "events.submitApplication",
+        "embeds.createBookingInquiry",
+        "events.validatePassword",
+      ],
     });
     try {
       Sentry.captureException(new Error(message), {
@@ -1109,6 +1401,13 @@ export async function buildDeps(): Promise<AppDeps> {
   const taxRateLookup: TaxRateLookupPort | null = env.ZIPTAX_API_KEY
     ? (await import("@th/adapters/tax-rate-lookup")).createZiptaxAdapter(
         env.ZIPTAX_API_KEY,
+        // An address lookup that failed while the postal fallback answered.
+        {
+          reportError: createThrottledReporter(
+            safeReporter(Sentry.captureException),
+            10 * 60_000,
+          ),
+        },
       )
     : (() => {
         logMissingOptionalIntegration(logger, "ziptax_not_configured", {
@@ -1268,6 +1567,14 @@ export async function buildDeps(): Promise<AppDeps> {
     // reporter that threw would escape the swallow branch and become the
     // caller's failure (observed on checkout as `dependency_failed`).
     reportError: safeReporter(Sentry.captureException),
+    // Cloud Translation for the category forms' prefill. Needs the project id
+    // (Terraform sets GCP_PROJECT_ID on the API) and ADC; without the id,
+    // suggestCategoryTranslations returns no suggestions.
+    translator: process.env.GCP_PROJECT_ID?.trim()
+      ? new GoogleCloudTranslationAdapter({
+          projectId: process.env.GCP_PROJECT_ID.trim(),
+        })
+      : null,
     // Dev-only capability override for `Payee` syncs (always false in prod).
     forceConnectCapabilities,
     idempotency,
@@ -1288,11 +1595,50 @@ export async function buildDeps(): Promise<AppDeps> {
     // Lets the platform router invalidate after `updatePlatformSetting`, which
     // writes through `repos.tx(...)` and so bypasses the cached instance.
     platformSettingsCache: cachedPlatformSettings,
+    publicDiscoveryCache,
+    publicReadGeneration: discoveryGeneration,
     publicAppUrl: env.PUBLIC_WEB_URL,
+    // Owned page-image recognition (the moderator place page handover's
+    // Clear queues the images it orphans). Only with real storage: the noop
+    // storage owns no object.
+    storagePublicBaseUrl: storageFullyConfigured
+      ? env.S3_PUBLIC_BASE_URL?.trim() || null
+      : null,
+    // A publish sweep that runs out of its 10s budget queues one delayed
+    // `lineup-notices.continue-sweep` run on its OWN Cloud Tasks queue
+    // (CLOUD_TASKS_LINEUP_SWEEP_QUEUE, infra/terraform/lineup-notice-sweep.tf).
+    // Its own because the search-drain queue is pinned to
+    // `max_concurrent_dispatches = 1` — overlapping search DRAINS would read
+    // the same marks — and a continuation holding that single slot for up to
+    // the 300s dispatch deadline made drains queue behind lineup work and
+    // back. A sweep claims each row in the OWED/SENT ledger, so its own queue
+    // needs no such pin.
+    //
+    // FALLBACK, deliberate: with no dedicated queue in the env — every
+    // revision between this commit and the terraform apply that creates the
+    // queue — this rides the search-drain scheduler, exactly as it did
+    // before. Worse isolation, but the continuations still run. Only with no
+    // Cloud Tasks at all is it null, and then leftover rows are reported and
+    // wait for a future publish.
+    lineupSweepContinuation: createLineupSweepContinuation(
+      {
+        CLOUD_TASKS_LINEUP_SWEEP_QUEUE: env.CLOUD_TASKS_LINEUP_SWEEP_QUEUE,
+        CLOUD_TASKS_INVOKER_SA: env.CLOUD_TASKS_INVOKER_SA,
+        JOBS_SERVICE_URL: env.JOBS_SERVICE_URL,
+      },
+      searchReindexDrain?.scheduler ?? null,
+    ),
     // Static venue-map images for comp-ticket (volunteer reward) emails —
     // mirrors the Stripe webhook's `env.TILESERVER_URL` for purchased tickets.
     tileServerUrl: env.TILESERVER_URL ?? null,
     unsubscribeSecret: env.UNSUBSCRIBE_SECRET ?? null,
+    // Open-call status links (owner ruling 2026-10-07): the token is an HMAC
+    // of the submission id, so every guest email can carry the link while
+    // the DB keeps only its hash. The key is HKDF-derived from
+    // UNSUBSCRIBE_SECRET (own label), which jobs holds too, so both derive
+    // the same key. Missing/short root → null → submit NOT_CONFIGURED.
+    // Rotating UNSUBSCRIBE_SECRET voids every outstanding status link.
+    openCallStatusTokenSecret: deriveOpenCallStatusTokenSecret(env.UNSUBSCRIBE_SECRET),
     senderPhysicalAddress: env.SENDER_PHYSICAL_ADDRESS ?? null,
     // Fail-closed signal for CAN-SPAM opt-out enforcement in announcement
     // dispatch. Uses the same `NODE_ENV` distinction the rest of this file does.
@@ -1318,6 +1664,7 @@ export async function buildDeps(): Promise<AppDeps> {
     enableResale: env.ENABLE_RESALE,
     enableHumanProfilesPublic: env.ENABLE_HUMAN_PROFILES_PUBLIC,
     enableWaitlists: env.ENABLE_WAITLISTS,
+    smsConfigured: isSmsConfigured(env),
     discordAlert: fireDiscordAlert,
     notifySupport,
     supportRateLimits: {
@@ -1330,6 +1677,27 @@ export async function buildDeps(): Promise<AppDeps> {
     },
     webhookDlq: new WebhookDlq(redis),
     eventUnlockSecret: env.BETTER_AUTH_SECRET ?? null,
+    // Gated-event invite links: the token key is HKDF-derived from the root
+    // secret here, once per process, so the root is never the MAC key and
+    // nothing new is provisioned. Unset/short root → null → NOT_CONFIGURED.
+    inviteTokenSecret: deriveInviteTokenSecret(env.BETTER_AUTH_SECRET),
+    // "Stop invites from this organiser" tokens: their own HKDF label, so an
+    // opt-out link can never act as an invite link or vice versa.
+    inviteOptOutSecret: deriveInviteOptOutSecret(env.BETTER_AUTH_SECRET),
+    // Delegate invitation links: core derives a purpose-bound signing key
+    // from this root secret (HKDF), so no new secret has to be provisioned.
+    delegateInviteSecret: env.BETTER_AUTH_SECRET ?? null,
+    // Ban-that-sticks identity hashes (banned email / network): core derives
+    // a purpose-bound HMAC key from this root secret (HKDF). The Better Auth
+    // hooks derive the same key from the same secret, so hashes agree.
+    identityHashSecret: env.BETTER_AUTH_SECRET ?? null,
+    // The web app signs the visitor's IP onto its server-to-server calls
+    // (x-th-client-ip*) so guests stop sharing the web server's rate-limit
+    // bucket. Same secret the origin guard checks; already injected into both
+    // services, so nothing new to provision. Unset locally → forwards ignored.
+    // Plus enforce | shadow | off for the tRPC `global:<actor>` bucket
+    // (env.ts). Pure mapping, unit-tested in test/trpc-ip-deps.test.ts.
+    ...trpcClientIpDepsFromEnv(env),
     // Fully credit-covered checkouts create settlements inline (no Stripe
     // webhook, hence no DLQ backstop). Reuse the same Discord + Sentry alerter
     // the webhook finalize path uses so a settlement-creation failure is loud

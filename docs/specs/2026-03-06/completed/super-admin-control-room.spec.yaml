@@ -1,0 +1,98 @@
+# Superseded by the /platform staff console in apps/web (built instead of a separate HQ app) (2026-10-08 docs consolidation)
+# Spec: Super Admin Control Room
+meta:
+  owner: platform
+  status: draft
+  reviewers:
+    - security
+    - ops
+    - finance
+    - product
+  last_updated: 2025-11-26
+summary: |
+  Define the internal-only Super Admin Control Room (HQ) that centralizes incident response, financial
+  oversight, compliance reviews, and feature flag management. Runs on a separate domain, enforces
+  hardened authentication, and surfaces read/write tools spanning events, payouts, and experiments.
+goals:
+  - Provide internal staff a unified dashboard to triage incidents without touching production client apps.
+  - Maintain strict auditability (reason codes, immutable logs) for all actions.
+  - Support impersonation/masquerade flows with safeguards and automatic reversion.
+  - Keep the board loosely coupled via public transports/use cases to avoid bespoke backdoors.
+scope:
+  in_scope:
+    - HQ web app architecture (domain, auth, routing, data fetching patterns).
+    - Primary modules: Incidents, Events, Financials, Compliance, Experiments, Feature Flags.
+    - Workflow guardrails (approvals, dual control, notifications).
+  out_of_scope:
+    - Consumer/admin-facing UI (covered elsewhere).
+    - Mobile clients (read-only follow-up spec later).
+    - Core pricing/accounting logic (reused via adapters).
+architecture:
+  deployment:
+    - Domain: `hq.ithasfire.internal` (internal DNS + VPN access).
+    - Frontend: Next.js app in `apps/hq` (to be created) served via Cloudflare Access.
+    - Backend: Reuse `apps/api` transports; HQ makes tRPC/REST calls through existing gateways with super-admin tokens.
+    - Auth: SSO via Okta + WebAuthn hardware key, enforced at edge. Sessions limited to 8 hours.
+  modules:
+    incidents:
+      - Queue of open incidents (webhooks, payouts, abuse) ingesting from PagerDuty + internal alerts.
+      - Actions: assign owner, update status, attach notes, trigger comms templates.
+    events:
+      - Global search for events/orgs/users; supports impersonation (view as organizer) with reason code.
+      - Display event health (sales, disputes, check-in anomalies).
+    financials:
+      - Payout overview, reserve adjustments, refund approvals. Dual-control required for payouts > $50k.
+    compliance:
+      - KYC/KYB review queue, ID doc viewer, watchlist hits. Integrates with compliance vendors via adapters.
+    experiments & feature flags:
+      - Manage LaunchDarkly-style flags, preview cohorts, rollbacks with audit.
+  layout:
+    - Left nav: Incidents, Events, Financials, Compliance, Experiments, Flags, Settings.
+    - Top bar: Environment badge, search, active masquerade indicator, timer until session expiry.
+security_controls:
+  - Edge requires VPN + IP allowlist + Cloudflare Access.
+  - App enforces hardware key via WebAuthn challenge every 12 hours (session reauth).
+  - Every mutation requires reason text (min 20 chars) saved alongside audit log.
+  - Masquerade flows auto-expire after 15 minutes; UI shows red banner with "Acting as" info and End Session button.
+  - Downloading PII triggers watermark and email alert to security distribution.
+  - Access to Financials module limited to `role=finance` and requires second factor at action time.
+telemetry:
+  - Audit log schema: { id, userId, module, action, payloadHash, reason, actingAs?, timestamp } stored in `hq_audit_logs`.
+  - Alert Slack channel on high-risk actions (reserve change, payout override, feature flag enabling for all users).
+  - Session heartbeats recorded every 5 minutes; abnormal termination triggers review queue.
+integrations:
+  - PagerDuty API for incidents import.
+  - Stripe/Bank provider for payout statuses (through adapters).
+  - S3 secure bucket for document previews (compliance).
+  - Feature flag service (existing) with special service tokens for HQ.
+  - Idempotency service reused for repeated payout or refund actions.
+workflows:
+  incident_triage:
+    1. Alert arrives → automatically creates incident record via webhook.
+    2. On-call reviews details, assigns to self, adds initial notes.
+    3. If organizer impact, use built-in comms templates (Email/SMS) tied to incidents.
+    4. Close incident with resolution summary + impacted org list.
+  payout_override:
+    - Finance selects payout → view ledger + hold reasons.
+    - Submit override form with justification + attachments.
+    - Dual approver receives notification, must approve before mutation executes.
+  masquerade:
+    - Search for organizer → click "View as" → confirm modal capturing reason + ticket number.
+    - All requests include `X-Acting-As` header logged server-side.
+    - Auto-dismiss banner when timer hits 0; revert context.
+  flag_rollout:
+    - Choose feature flag, review metrics snapshot.
+    - Adjust targeting or kill switch; system records before/after diff.
+    - Automated message posted to #feature-flags channel.
+monitoring:
+  - Dedicated dashboards (Grafana) for HQ errors, audit log ingestion, and high-risk action counts.
+  - Synthetic checks ensure domain unreachable outside VPN.
+  - Alert if no audit logs recorded for >15 minutes (possible outage).
+open_questions:
+  - Should we support read-only mode for contractors with limited scope?
+  - How do we archive incident data for SOC2 evidence automatically?
+  - Do we need mobile push for urgent incidents or keep to email/SMS?
+next_steps:
+  - Create `apps/hq` scaffold + secure deployment pipeline.
+  - Implement context-aware transports (reuse context-routing spec).
+  - Draft runbook for ops on onboarding/offboarding HQ users.

@@ -1,0 +1,263 @@
+# saved-events-watchlist.spec.yaml
+#
+# General saved-events / watchlist model: a signed-in user bookmarks ANY event
+# (owned/ticketed or community/RSVP) into a private "keep-for-later" list at
+# /saved. Saving doubles as WATCHING — the save set is one half of the
+# change-notification audience (savers ∪ RSVPers).
+#
+# Split out of docs/specs/2026-07-01/completed/community-managed-event-listings.spec.yaml
+# (decision: "Save/bookmark — RESOLVED to SPLIT OUT"). Hard dependency #2 of
+# docs/specs/2026-07-01/community-listing-change-notifications.spec.yaml.
+#
+# Confirmed no existing model to reuse (resolves the community spec's open
+# question): EntityFollow (entity-page.prisma:70) is keyed to entityPageId —
+# Human/Place/Org PAGES, not events — and SavedLocation (place.prisma:113) is
+# venue-location reuse for event creation. EventSave is new; it MIRRORS the
+# follows pattern (idempotent upsert, unfollow, cursor list) without extending it.
+
+version: "1.0"
+updated: "2026-07-01"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    There is no way to keep an event for later. Users either buy immediately,
+    RSVP (attendance intent, RSVP events only), or lose the event. The
+    discovery flow (2026-03-06/discovery-navigation.flow.yaml) already designs
+    a /saved tab, saved-strip carousel, and "Sign in to save" CTAs — none of it
+    has a backing model. The change-notification spec needs a watcher set that
+    doesn't exist.
+  solution: >
+    A minimal private EventSave model — (eventId, humanId) unique, mirroring
+    EventRsvp — behind a repos/event-saves port with idempotent save/unsave,
+    a cursor-paginated /saved list (Upcoming/Past), batch saved-state for
+    event cards, and listHumanIdsForEvent for the notification fan-out. Save is
+    keep-for-later AND implicit watch; it is distinct from RSVP (attendance
+    intent) and from EntityFollow (page-level, follows people/venues/orgs, not
+    individual events). No public save counts — same privacy posture as RSVP.
+  users:
+    - Signed-in attendee saving events from discovery, search, or event detail
+    - The change-notification fan-out (machine consumer of the watcher set)
+  surfaces:
+    - web
+    - api
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        A signed-in user can save and unsave any event they can currently see
+        (status PUBLISHED; PRIVATE events only if the save request passes the
+        same gate the detail page uses). Save is an idempotent upsert on
+        @@unique([eventId, humanId]); unsave is an idempotent delete. Anonymous
+        users get the sign-in CTA (discovery flow) — no anonymous saves.
+    - id: FR-002
+      description: >
+        Saves work uniformly across ALL event kinds: TICKETED+OWNED,
+        RSVP+OWNED, RSVP+COMMUNITY. Save carries no side effects — no hold, no
+        reservation, no RSVP, no notification subscription record beyond the
+        save row itself (the change-notification spec derives the audience by
+        reading the save set at dispatch time).
+    - id: FR-003
+      description: >
+        Saves are PRIVATE: no public save counts, no "N people saved this", no
+        visibility of who saved what — mirrors the community spec's no-public-
+        going-count stance (FR-004 there). Internal analytics may read
+        aggregates later; exposing them is out of scope.
+    - id: FR-004
+      description: >
+        /saved lists the user's saves cursor-paginated, joined to event
+        summaries (title, hero, startsAt, venue label, status), grouped
+        Upcoming vs Past by startsAt, with unsave as the quick action
+        (discovery flow's saved_flow). A saved event that has since been
+        CANCELLED still appears, badged — seeing the cancellation is watchlist
+        value, not noise; COMPLETED likewise stays (the Past tab's whole value
+        is past events). The read-time filter is STATUS-based (keep PUBLISHED,
+        CANCELLED, COMPLETED; drop DRAFT/other): platform-wide, PRIVATE
+        visibility means unlisted-reachable-by-link (get-public-event-body
+        gates only on status), and a saver by definition had the link — so a
+        visibility flip does NOT hide the save, exactly matching what the
+        detail shell would show them. Un-published events are filtered out,
+        not leaked as stubs. (Resolved 2026-07-01 during build review; the
+        change-notification spec's dispatch guard must use this same
+        status-based definition.)
+    - id: FR-005
+      description: >
+        Batch saved-state: one query returns the user's saved flag for a list
+        of eventIds so discovery grids / search results / the saved-strip
+        carousel can render save toggles without N+1 calls.
+    - id: FR-006
+      description: >
+        Watcher-set read for the notification fan-out:
+        repos.eventSaves.listHumanIdsForEvent(eventId) (paged). This is the
+        method the change-notification spec unions with
+        repos.eventRsvps.listHumanIdsForEvent.
+    - id: FR-007
+      description: >
+        Deleting an event hard-deletes its saves (FK onDelete: Cascade);
+        deleting a Human cascades likewise. No orphan cleanup job needed.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Saved-state and save/unsave are hot-path (every event card renders a
+        toggle): single-index lookups on @@unique([eventId, humanId]) and the
+        batch query bounded to the page of visible cards (≤50 ids). No
+        expensive joins on the toggle path.
+    - id: NFR-002
+      description: >
+        Additive migration only: one new table, no changes to Event. Zero
+        behavior change for users who never save.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: save-event
+        description: >
+          Idempotent upsert of EventSave after verifying the actor can see the
+          event (PUBLISHED + visibility gate — same check as event detail).
+          Mirrors follow-entity.ts.
+        input: actorHumanId, eventId
+        output: save
+        idempotent: true
+        money: false
+      - name: unsave-event
+        description: Idempotent delete by (eventId, actorHumanId). Mirrors unfollow-entity.ts.
+        input: actorHumanId, eventId
+        output: void
+        idempotent: true
+        money: false
+      - name: list-saved-events
+        description: >
+          Cursor-paginated saves for the actor, joined event summaries,
+          visibility-filtered (FR-004), with an upcoming|past filter param.
+          Mirrors list-followed-entities.ts.
+        input: actorHumanId, scope(upcoming|past), cursor?
+        output: items[], nextCursor
+        idempotent: true
+        money: false
+      - name: get-saved-state
+        description: Batch saved flags for eventIds (≤50) for the actor. Mirrors is-following.ts, batched.
+        input: actorHumanId, eventIds[]
+        output: Record<eventId, boolean>
+        idempotent: true
+        money: false
+
+  ports:
+    new:
+      - repos/event-saves (upsert, delete, existsForUser, listForHuman,
+        getSavedStateForEvents, listHumanIdsForEvent)
+    existing:
+      - repos/events (event summaries + visibility fields for the list join)
+      - ports/clock
+
+  adapters:
+    new:
+      - db/prisma/event-saves.ts
+    existing: []
+
+  transport:
+    trpc_procedures:
+      - eventSaves.save (protected)
+      - eventSaves.unsave (protected)
+      - eventSaves.listMine (protected)
+      - eventSaves.savedState (protected, batch) # no public procedures — saves are private (FR-003)
+    webhooks: []
+
+  ui:
+    pages:
+      - /saved (Upcoming/Past groups, unsave quick action, signed-out promo + CTA per discovery flow)
+    components:
+      - SaveHeart (heart toggle on event cards; optimistic, sign-in CTA when anonymous)
+      - SaveButton (simple labeled save/saved button on the event detail page; same behavior)
+      - SavedStrip (signed-in carousel on discover home — discovery flow's saved_strip)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - name: EventSave
+      fields: >
+        id, eventId (FK Event, onDelete Cascade), humanId (FK Human, onDelete
+        Cascade), createdAt.
+        @@unique([eventId, humanId]); @@index([humanId, createdAt]) (the /saved
+        list). NO separate eventId index — the watcher fan-out
+        (listHumanIdsForEvent) rides the compound unique's leading column,
+        which gives an index-only scan of humanIds and keyset pagination for
+        free; a standalone @@index([eventId]) would be pure write overhead on
+        the hot save/unsave path.
+        (Deliberately identical in shape to the community spec's EventRsvp —
+        the two are parallel primitives: keep-for-later vs attendance intent.)
+  modified_models: []
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Save vs RSVP vs Follow is three similar-looking toggles; users (and
+      future devs) conflate them, or product pressure later demands merging.
+    severity: MEDIUM
+    mitigation: >
+      Document the triangle here: Follow = a page (person/venue/org, drives
+      new-event notifications), Save = one event, keep-for-later + watch,
+      RSVP = one event, "I'm going" (RSVP events only). They intersect only in
+      the change-notification audience (save ∪ RSVP). UI keeps them distinct:
+      heart = save (cards), labeled Save button (detail) vs "I'm going" (RSVP
+      listings only).
+  - risk: >
+      Visibility drift: an event saved while PUBLIC later becomes PRIVATE or
+      unpublished; the saved list or the notification fan-out leaks its
+      existence.
+    severity: MEDIUM
+    mitigation: >
+      Visibility re-checked at read time in list-saved-events (FR-004) and at
+      dispatch time in the change-notification spec (FR-004 there). The save
+      row persisting is harmless — it's never exposed to anyone but its owner,
+      and the owner only sees events that pass the gate.
+  - risk: >
+      Save-toggle spam (rapid save/unsave) hammering the API from cards.
+    severity: LOW
+    mitigation: >
+      Idempotent upsert/delete makes retries and races harmless; client
+      debounces the optimistic toggle. No server rate-limit needed in v1.
+
+open_questions:
+  - Should RSVP-ing an event auto-save it (one gesture feeding both lists)?
+    Proposed: no in v1 — the notification audience is the union anyway, so
+    auto-save adds no watcher coverage, only list clutter. Revisit with usage.
+  - Mobile Saved tab (bottom nav per discovery flow): apps/mobile is
+    mid-Phase-1 (GA checkout). Proposed: web + api now; mobile screen rides a
+    later mobile phase against the same tRPC procedures.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Change-notification delivery — the follow-on spec
+    (community-listing-change-notifications) consumes listHumanIdsForEvent;
+    this spec sends nothing.
+  - Public save counts, "trending by saves", or exposing aggregates (internal
+    analytics may come later).
+  - Saved searches / category alerts ("Alert me" in the discovery flow's
+    zero-results state — separate feature).
+  - Price-drop / on-sale reminders for saved ticketed events.
+  - Merging with EntityFollow or adding an EVENT entity-page type.
+  - Mobile + scanner surfaces (web + api in v1).
+  - Sharing or exporting saved lists.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A signed-in user can save a PUBLISHED event; saving twice is a no-op returning the same state; unsaving twice is a no-op.
+  - An anonymous request to eventSaves.save is rejected (UNAUTHORIZED); the UI shows the sign-in CTA instead of the toggle action.
+  - Saving works identically on a TICKETED+OWNED event and an RSVP+COMMUNITY listing, with zero side effects on orders, RSVPs, or notifications.
+  - /saved shows the user's saves grouped Upcoming/Past with event summaries; a CANCELLED saved event appears with a cancelled badge; an event the user can no longer see does not appear at all.
+  - savedState returns correct flags for a batch of 50 eventIds in one round trip; no per-card queries.
+  - No procedure exposes another user's saves or any save count.
+  - listHumanIdsForEvent returns exactly the humanIds with a save row for that event (paged), and is consumable by the change-notification dispatch use-case.
+  - Deleting an event removes its EventSave rows via FK cascade.

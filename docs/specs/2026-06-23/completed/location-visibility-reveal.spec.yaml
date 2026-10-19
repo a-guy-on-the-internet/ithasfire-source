@@ -1,0 +1,533 @@
+version: "1.0"
+updated: "2026-06-23"
+status: shipped  # 2026-10-08 docs consolidation; was: draft
+title: "Collapse location mode to Exact/Obscured + scheduled address-reveal notifications"
+
+summary:
+  problem: >
+    Events support three location modes — EXACT, APPROXIMATE, HIDDEN
+    (packages/types/src/repos/events.ts:9). HIDDEN coarsens the public map and
+    reveals the exact address to ticket holders once `addressRevealAt` passes;
+    APPROXIMATE coarsens the public map and NEVER reveals the exact address.
+    Two problems:
+      (1) Nothing ever proactively tells a ticket holder where to go. The
+          reveal is purely pull-based: `redactLocation` unlocks the address in
+          the API response (packages/core/src/lib/location/redact-location.ts:114),
+          and the TicketIssued email — sent once at purchase from the Stripe
+          webhook (apps/api/src/routes/stripe/webhook.ts:247) — bakes in
+          whatever the lock state was at purchase time and is never re-sent.
+          A buyer who purchases a HIDDEN event a week out gets an email saying
+          "location revealed the day before," the day before arrives, and
+          NOTHING happens. No job in apps/jobs references reveal/location.
+      (2) Once APPROXIMATE is given the same reveal-to-ticket-holders behaviour,
+          APPROXIMATE and HIDDEN become functionally identical — they already
+          render identically to the public (both return the same obfuscated
+          circle + area label). The two enum values, the branching, and the
+          UI carry a distinction that no longer means anything.
+  solution: >
+    Two coordinated changes:
+      (A) MODEL — collapse `EventLocationMode` to `EXACT | OBSCURED`. OBSCURED
+          carries a public-precision control (`locationRadiusMeters`) that
+          ranges from a tight obfuscation circle out to FULLY HIDDEN (no public
+          map at all, `locationRadiusMeters = null`) — this governs only the
+          PUBLIC pre-reveal view. Every OBSCURED event ALSO has a mandatory
+          `addressRevealAt` (default day-before) at which the exact address is
+          revealed to ticket holders. There is no 'never reveal'. The editor
+          uses explicit EXACT / OBSCURED choice cards, with a precision slider
+          (radius → fully hidden) and a required reveal-timing control under
+          OBSCURED. SEPARATELY, this work also fixes a pre-existing leak where
+          non-EXACT events expose their true pin via the nearby map + search
+          index (redaction was only ever applied on the event-detail path).
+      (B) NOTIFY — add a scheduled job that, when a OBSCURED event's
+          `addressRevealAt` crosses, fans out a transactional reveal
+          notification to every active ticket holder over the existing unified
+          notify system (push + email + in-app), idempotently.
+  users:
+    - "Ticket holder of a OBSCURED event (gets told where to go, on time)"
+    - "Organiser setting up a secret-location / private-residence event"
+    - "Public browsing an event with a non-exact location"
+  surfaces: ["web", "email", "push", "sms", "jobs", "account-settings"]
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        `EventLocationMode` is `EXACT | OBSCURED`. APPROXIMATE and HIDDEN are
+        removed from the application type and all branching. EXACT behaviour is
+        unchanged (full public address + coords).
+    - id: FR-002
+      description: >
+        OBSCURED with `locationRadiusMeters` set: the public (non-ticket-holder,
+        or ticket-holder before reveal) sees a deterministically obfuscated
+        point + radius + area label — today's APPROXIMATE/HIDDEN public view.
+    - id: FR-003
+      description: >
+        OBSCURED with `locationRadiusMeters = null` ("fully hidden"): NO public
+        map or coordinates are returned at all before reveal — only the area
+        label / city string. This is a NEW capability; no existing event uses it.
+    - id: FR-004
+      description: >
+        OBSCURED reveal: a ticket holder (active ticket: VALID | SCANNED |
+        LISTED) sees the EXACT address + coordinates once
+        `now >= addressRevealAt`. Before that they see the same view as the
+        public (obfuscated circle, or nothing for fully-hidden).
+    - id: FR-005
+      description: >
+        Every OBSCURED event ALWAYS has a reveal date — `addressRevealAt` is
+        required and non-null (default preset DAY_BEFORE). There is NO
+        'never reveal' state. The precision control (FR-002/003) only governs
+        the PUBLIC pre-reveal view; the exact address is always revealed to
+        ticket holders at `addressRevealAt`.
+    - id: FR-006
+      description: >
+        A new scheduled job dispatches a `event.location-revealed` notification
+        to every active ticket holder of a OBSCURED event at the moment its
+        `addressRevealAt` is crossed. Channels: email + push + in-app + SMS,
+        routed through the existing `notify()` use case
+        (packages/core/src/use-cases/comms/notify.ts), which resolves each
+        human's devices/email/phone and honours their stored per-category ×
+        per-channel preferences automatically. Category: transactional. SMS
+        only fires for users who have a phone on file AND have opted SMS in.
+    - id: FR-007
+      description: >
+        The reveal notification is sent at most once per (event, human). Late
+        buyers (purchasing AFTER the reveal tick) are NOT in the job fan-out;
+        they receive the exact address in their TicketIssued purchase email,
+        which is already unlocked at that point.
+    - id: FR-008
+      description: >
+        Editor: explicit EXACT / OBSCURED choice cards. Under OBSCURED, a
+        precision slider drives `locationRadiusMeters` from a tight circle out
+        to a "Hidden — no public map" end-stop (= null), plus a REQUIRED
+        reveal-timing control (Immediately / 1h before / Day before / Week
+        before / Custom) that writes `addressRevealPreset` + `addressRevealAt`.
+        There is no 'Never' option — a reveal date is mandatory for OBSCURED.
+    - id: FR-009
+      description: >
+        Existing search index entries and any locationMode-conditioned logic
+        (waiver auto-select, embeds, SEO) continue to function under the
+        two-value enum. A full search reindex is triggered as part of rollout.
+    - id: FR-013
+      description: >
+        PRE-EXISTING LEAK FIX — non-EXACT (OBSCURED) events must not expose
+        precise coordinates or address through ANY read path, not just the event
+        page. The Event row always stores true lat/lng/addressText/geohash8
+        (~150m); redaction is applied only in redactLocation today, so multiple
+        public paths emit the real pin:
+          • The HOMEPAGE MAP — events.eventsForMapOverview + events.nearbyEventsForMap
+            return nearbyEventsToMapDto (raw lat/lng), and HeroEventMap plots a
+            point marker per event. Today an OBSCURED event's exact location is a
+            pin on the public homepage map.
+          • The Meilisearch index (build-search-index) bakes real lat/lng/addressText.
+          • The nearby list/geo adapter returns raw lat/lng + addressText.
+        Fix (see architecture): serve a COARSENED coordinate for OBSCURED events
+        on every public surface, and never select the true lat/lng/addressText
+        into a public response. Recommended: filter on the true coordinate
+        server-side (discovery stays accurate) but emit only the obscured point;
+        compute displayed distance from the obscured point (anti-triangulation).
+        Map UI: obscured-circle events render as a circle/blob (not a sharp pin);
+        FULLY-HIDDEN events show NO point marker pre-reveal (drop from the map,
+        or a coarse region only — product call). EXACT events are unaffected.
+    - id: FR-010
+      description: >
+        SMS becomes a user-selectable channel. The account notification
+        settings UI (NotificationsSection) exposes SMS alongside in-app /
+        email / push as a fourth toggle per category, reading/writing through
+        the existing notificationPreferences tRPC router. The backend already
+        models SMS (categories.ts smsDefaultEnabled); this closes the UI gap
+        (today only in_app|email|push are rendered).
+    - id: FR-011
+      description: >
+        SMS sends require an on-file phone number and explicit opt-in/consent.
+        If a user enables an SMS toggle without a verified phone, the UI
+        prompts them through the existing phone-capture + SMS consent flow
+        (PhoneNumberSection, record-sms-opt-in, ensure-sms-deliverable). No SMS
+        is sent without consent on record.
+    - id: FR-012
+      description: >
+        Preference granularity is per-CATEGORY × per-channel (not per-individual
+        notification). The location-reveal notification is category
+        'transactional'; users control it via the transactional × {channel}
+        toggles. Disabling a transactional channel suppresses that channel for
+        the reveal (their choice).
+  non_functional:
+    - id: NFR-001
+      description: >
+        Obfuscation stays deterministic (same coords → same offset) so the
+        circle can't be triangulated by repeated requests — existing
+        `obfuscateCoordinate` behaviour is preserved, not rewritten.
+    - id: NFR-002
+      description: >
+        The reveal job is idempotent under cron drift and overlapping ticks,
+        mirroring the volunteer-reminder ledger pattern
+        (apps/jobs/src/jobs/volunteers.ts). No double-sends.
+    - id: NFR-003
+      description: >
+        Migration gives every existing APPROXIMATE/HIDDEN event a concrete
+        reveal date (default DAY_BEFORE). Past-dated events are effectively
+        already-revealed; future events reveal day-before. No event is left
+        without a reveal date. (Supersedes the earlier 'never reveal old
+        approximate events' position — 'never' no longer exists.)
+    - id: NFR-004
+      description: >
+        Non-EXACT events never leak precise coordinates or address to the
+        public through ANY read path — SEO, embeds, search index, nearby/geo
+        queries, sitemaps, or map markers. See FR-013.
+
+architecture:
+  core:
+    use_cases:
+      - name: redact-location (lib)
+        file: packages/core/src/lib/location/redact-location.ts
+        change: >
+          Rewrite the mode branch for the two-value enum:
+            • EXACT → exact (unchanged).
+            • OBSCURED (addressRevealAt is always set):
+                revealed = callerIsTicketHolder && now >= addressRevealAt
+                - revealed → exact.
+                - not revealed && radiusMeters != null → obfuscated circle +
+                  area label (existing obfuscateCoordinate path).
+                - not revealed && radiusMeters == null → FULLY HIDDEN: return
+                  NO lat/lng/radius; only areaLabel (city/region or
+                  locationLabel). New `PublicLocation` shape variant
+                  `isExact:false, hidden:true`.
+          The radiusMeters=null sentinel (hidden) is the PRE-reveal public view
+          only; it is orthogonal to addressRevealAt, which always governs the
+          ticket-holder reveal.
+        idempotent: true
+        money: false
+      - name: build-event-seo (shared)
+        file: packages/core/src/use-cases/events/_shared/build-event-seo.ts
+        change: >
+          Handle the new fully-hidden result: when redactLocation returns a
+          hidden result, emit a location object with only areaLabel (no
+          latitude/longitude/radiusMeters) so the public page/SEO/JSON-LD never
+          carries a coordinate. Keep the obfuscated-circle and exact branches.
+        idempotent: true
+        money: false
+      - name: get-event-seo
+        file: packages/core/src/use-cases/events/get-event-seo.ts
+        change: >
+          The ticket-holder lookup (hasActiveTicketForEvent) currently gates on
+          HIDDEN; gate on OBSCURED instead. EXACT still skips the lookup.
+        idempotent: true
+        money: false
+      - name: save-event-shared
+        file: packages/core/src/use-cases/events/_shared/save-event-shared.ts
+        change: >
+          • baseSaveEventInputSchema.locationMode → z.enum(["EXACT","OBSCURED"]).
+          • locationRadiusMeters: allow null to mean fully-hidden under OBSCURED;
+            keep the 100..50_000 bound when non-null; null/ignored for EXACT.
+          • resolveAddressReveal(): branch on OBSCURED (was HIDDEN). OBSCURED
+            ALWAYS resolves a non-null addressRevealAt (default preset
+            DAY_BEFORE; CUSTOM honoured). No NEVER preset. EXACT nulls both
+            fields.
+        idempotent: false
+        money: false
+      - name: events/get-event-for-edit, publish-event, embeds/get-embed-event-detail
+        file: packages/core/src/use-cases/events/get-event-for-edit.ts; publish-event.ts; packages/core/src/use-cases/embeds/get-embed-event-detail.ts
+        change: >
+          Replace HIDDEN/APPROXIMATE comparisons with OBSCURED. publish-event
+          validation that references location mode must accept OBSCURED +
+          (radius | hidden) + reveal config.
+        idempotent: true
+        money: false
+      - name: dispatch-address-reveal-notifications (NEW)
+        file: packages/core/src/use-cases/events/dispatch-address-reveal-notifications.ts
+        change: >
+          New use case invoked by the job. Input: a time window (windowStart,
+          windowEnd) or explicit eventId. Steps:
+            1. repos.events.findObscuredEventsCrossingReveal(window) — PUBLISHED,
+               mode=OBSCURED, addressRevealAt in (windowStart, windowEnd],
+               addressRevealNotifiedAt IS NULL.
+            2. For each event, load active ticket holders (distinct humanId with
+               ticket status in VALID|SCANNED|LISTED).
+            3. For each holder, call notify() with variant
+               "event.location-revealed", category transactional, channels
+               {email, push, inApp}, payload {eventId, title, address, mapUrl,
+               directionsUrl, startsAt}, idempotencyKey
+               `event-location-revealed:${eventId}:${humanId}`.
+            4. Stamp event.addressRevealNotifiedAt so the scan won't re-pick it.
+          Idempotency is two-layer: the event cursor stops re-fan-out; the
+          per-recipient idempotencyKey stops duplicate channel sends under tick
+          overlap.
+        idempotent: true
+        money: false
+      - name: comms/renderers + categories
+        file: packages/core/src/use-cases/comms/renderers.ts
+        change: >
+          Register a renderer for variant "event.location-revealed" producing
+          email (EventLocationRevealed template), push (title/body with venue +
+          "tap for directions"), and in-app copy. Category: transactional
+          (packages/core/src/use-cases/comms/categories.ts).
+        idempotent: true
+        money: false
+      - name: orders/send-ticket-issued-email
+        file: packages/core/src/use-cases/orders/send-ticket-issued-email.ts
+        change: >
+          Update the address-locked computation to key on OBSCURED +
+          addressRevealAt (was HIDDEN). Behaviour preserved: locked → suppress
+          address/map/directions and include addressRevealAtISO; unlocked →
+          full address. Fully-hidden pre-reveal also renders the "revealed on
+          {date}" notice (no obfuscated map in the email).
+        idempotent: true
+        money: false
+  ports:
+    new:
+      - "Repos.events.findObscuredEventsCrossingReveal(window) — scan for due reveals"
+      - "Repos.events.markAddressRevealNotified(eventId, at) — set cursor"
+    existing:
+      - "Repos.tickets.activeTicketHolderHumanIds(eventId) (or reuse hasActiveTicketForEvent fan-in) — packages/adapters/src/db/prisma/tickets.ts:231"
+      - "PushPort (packages/ports/src/comms/push.ts) — already wired into notify()"
+      - "MailerPort — already wired into notify(); in-app notifications still send via notify()'s persisted in-app channel (the live-push InAppPort was removed 2026-06-23; delivery is polling)"
+      - "ClockPort, IdempotencyPort — already on notify()"
+  adapters:
+    new: []
+    existing:
+      - "packages/adapters/src/db/prisma/events.* — implement the two new repo methods"
+      - "packages/adapters/src/comms/push/expo-push.ts — no change (notify already uses it)"
+      - "packages/adapters/src/search/meilisearch-adapter.ts + multi-index-* — locationMode facet value changes EXACT|OBSCURED; needs reindex. ALSO (FR-013): stop indexing precise lat/lng/addressText/geohash8 for non-EXACT events — index coarse geometry only (geohash6/obfuscated centroid)."
+      - "packages/adapters/src/geo/db-geo-adapter.ts (FR-013): nearbyEvents returns raw lat/lng with no redaction — coarsen/redact non-EXACT events, or exclude their precise coordinate from map output."
+      - "packages/transport/trpc/src/event-summary-mapper.ts (FR-013): nearbyEventToMapDto emits raw lat/lng ('preserves coords the standard DTO strips') — must emit redacted coords for non-EXACT events."
+      - "packages/core/src/use-cases/search/build-search-index.ts (FR-013): document builder copies event.lat/lng/addressText verbatim — coarsen for non-EXACT."
+  transport:
+    trpc_procedures:
+      - router: events
+        procedure: save / publish input mappers
+        change: >
+          locationMode enum narrows to EXACT|OBSCURED; locationRadiusMeters
+          accepts null (=hidden); reveal preset is REQUIRED for OBSCURED (no
+          NEVER). Update events-search router
+          (packages/transport/trpc/src/routers/events-search.ts) locationMode
+          handling.
+      - router: events
+        procedure: getEventForEdit output
+        change: "Return mode/radius(null=hidden)/reveal preset for the new editor UI."
+      - router: events
+        procedure: nearbyEventsForMap + eventsForMapOverview (FR-013)
+        change: >
+          Both currently return nearbyEventsToMapDto(rawLatLng). Must emit the
+          coarsened coordinate for OBSCURED events and drop the point for
+          fully-hidden ones. Filter on true coords server-side; never return
+          them. Feeds HeroEventMap on the homepage.
+    webhooks:
+      - "stripe webhook ticket-issued path unchanged in wiring; email lock logic updated in the use case (above)."
+  ui:
+    pages:
+      - apps/web/src/app/admin/[slug]/events/new/_components/EventBuilder.tsx
+      - apps/web/src/app/admin/[slug]/events/new/_components/LocationSection.tsx
+    components:
+      - path: apps/web/src/app/admin/[slug]/events/new/_components/LocationVisibilitySection.tsx
+        change: >
+          Rework from 3-way enum to: two choice cards (Exact address /
+          Obscured). Under Obscured: a precision slider bound to
+          locationRadiusMeters with a "Hidden — no public map" end-stop (=null),
+          a live preview of what the public sees (circle vs city-only), and a
+          REQUIRED reveal-timing control (Immediately / 1h / Day before / Week
+          before / Custom) writing addressRevealPreset + addressRevealAt.
+      - path: apps/web/src/app/admin/[slug]/events/new/_components/event-builder-helpers.ts
+        change: "Map the new UI state to/from save input; default new Obscured events to DAY_BEFORE."
+      - path: "public event page / EventDetail + my-tickets ticket detail"
+        change: >
+          Render the fully-hidden pre-reveal state (no map, 'Location revealed
+          {date}' notice) and the post-reveal exact address for ticket holders.
+      - path: apps/web/src/app/_components/home/HeroEventMap.tsx (FR-013)
+        change: >
+          Consumes events.nearbyEventsForMap + events.eventsForMapOverview to
+          plot point markers from e.lat/e.lng. Once the procedures emit coarsened
+          coords for OBSCURED events, render those as a circle/region rather than
+          a sharp pin, and render NO marker for fully-hidden pre-reveal events.
+      - path: apps/web/src/app/account/settings/_components/NotificationsSection.tsx
+        change: >
+          Add 'sms' to ChannelKey and CHANNEL_KEYS so the toggle grid renders a
+          fourth SMS column per category. Gate the SMS toggle on phone-on-file:
+          if absent, route the user into PhoneNumberSection / the SMS consent
+          flow before the toggle can be enabled. Reads/writes via the existing
+          notificationPreferences.get/update tRPC procedures (no new transport).
+      - path: "i18n messages (apps/web/src/i18n/messages/* + packages/locale/messages/*)"
+        change: "Add reveal-notification + hidden-state + SMS-channel copy; retire APPROXIMATE/HIDDEN-specific strings. DO NOT hand-edit locale JSON bundles directly — follow the project's message workflow."
+  email:
+    - path: packages/ui-email/src/templates/EventLocationRevealed.tsx (NEW)
+      change: >
+        Clone TicketIssued's address + static-map + directions block into a
+        standalone reveal email: 'The location for {event} is now live'. Register
+        in packages/ui-email/src/templates/registry.ts and the notify renderer.
+  jobs:
+    - path: apps/jobs/src/jobs/events.ts (NEW; register in apps/jobs/src/jobs/index.ts)
+      change: >
+        defineScheduledTask "events.address-reveal-notify". Runs every ~15 min.
+        Window = (lastTick, now] derived from clock (accept optional
+        windowStartIso/windowEndIso for backfill, like volunteers). Calls
+        dispatchAddressRevealNotifications with ctx.{repos, clock, mailer, push,
+        inApp, renderEmailTemplate, appBaseUrl, logger}. Add schedule entry to
+        the jobs manifest (getSchedule key "events.address-reveal-notify").
+
+data:
+  new_models: []
+  modified_models:
+    - model: Event (packages/db/prisma/event.prisma:209)
+      changes:
+        - "locationMode: EventLocationMode now resolves to EXACT|OBSCURED at the app layer."
+        - "locationRadiusMeters Int? — null under OBSCURED means FULLY HIDDEN (no public map) — the pre-reveal public view only. Documented sentinel."
+        - "addressRevealAt DateTime? — REQUIRED (non-null) for OBSCURED; null only for EXACT. No 'never' state."
+        - "NEW addressRevealNotifiedAt DateTime? @map(\"address_reveal_notified_at\") — job cursor; null = not yet fanned out."
+        - "NOTE: lat/lng/addressText/geohash6/geohash8 remain stored in full for ALL modes. Privacy is enforced at read time (FR-013), not by dropping the columns."
+    - enum: EventLocationMode (packages/db/prisma/enums.prisma:174)
+      changes:
+        - "Final shape: {EXACT, OBSCURED}. NAMING: deliberately NOT 'PRIVATE' — that value already exists on the separate EventVisibility enum (PUBLIC|PRIVATE, event.prisma:207), a different axis (who can find the event vs how exact the location is). OBSCURED avoids the collision and covers both the fuzzed-circle and fully-hidden states."
+        - "Postgres can't drop enum values in place, so: (migration 1) add OBSCURED + backfill all rows off APPROXIMATE/HIDDEN; (migration 2, after no rows reference them) recreate the type as exactly {EXACT, OBSCURED} — rename old type, CREATE TYPE new, ALTER COLUMN ... USING, DROP old. APPROXIMATE/HIDDEN are removed."
+    - enum: AddressRevealPreset (packages/db/prisma/enums.prisma:181)
+      changes:
+        - "No change to values (IMMEDIATELY/ONE_HOUR_BEFORE/DAY_BEFORE/WEEK_BEFORE/CUSTOM). NO 'never' preset — a reveal date is mandatory for OBSCURED."
+  migrations_needed: true
+  notes: >
+    Data backfill (single migration, in this order):
+      1. UPDATE Event SET locationMode='OBSCURED' WHERE locationMode IN ('APPROXIMATE','HIDDEN').
+      2. Any now-OBSCURED row with addressRevealAt IS NULL: set
+         addressRevealAt = LEAST(now(), "startsAt") and preset = CUSTOM. This
+         covers BOTH legacy APPROXIMATE (never had a date) and legacy HIDDEN+null
+         (immediate). Past-dated events resolve to an already-passed reveal =
+         effectively revealed; future events get a sane day-of fallback.
+         (Optional nicety: for future events use startsAt - 24h instead of
+         LEAST(now,startsAt) so they reveal day-before rather than immediately.)
+      3. now-OBSCURED rows with addressRevealAt already set: leave as-is.
+      4. addressRevealNotifiedAt: backfill to now() for any event whose
+         addressRevealAt is already in the PAST, so the new job does not retro-
+         spam historical events. Only future reveals notify.
+    NOTE (product flag): step 2 means existing APPROXIMATE events — which never
+    exposed the exact pin — WILL now reveal it to ticket holders at the
+    backfilled date. This is the agreed consequence of dropping 'never reveal'.
+    Seed: update apps/api/src/scripts/seed/* events to EXACT|OBSCURED, and the
+    waiver-clause auto-select rule (HIDDEN → OBSCURED).
+
+risks:
+  - risk: >
+      CONFIRMED PRE-EXISTING LEAK (not introduced by this work). The Event row
+      stores true lat/lng/addressText/geohash8(~150m) for all modes, and
+      redaction is applied ONLY in redactLocation on the event-detail/SEO path.
+      The nearby map route (event-summary-mapper.nearbyEventToMapDto — emits raw
+      lat/lng) and the Meilisearch index (build-search-index — copies real
+      lat/lng/addressText) bypass redaction entirely, so today a HIDDEN/
+      APPROXIMATE event's exact pin is exposed via discovery map + search.
+    severity: HIGH
+    mitigation: >
+      FR-013: make non-EXACT coordinate emission impossible by default. Coarsen
+      or drop precise coords for non-EXACT events at the geo adapter, the
+      map-DTO mapper, and the search-index builder; index only geohash6 (~1km)
+      or an obfuscated centroid. Add tests asserting a non-EXACT event exposes
+      NO precise coordinate via SEO, embed, search, nearby, and sitemap. Treat
+      this as a security fix that should ship even ahead of the rest.
+  - risk: >
+      Migration leaves a OBSCURED event with no reveal date, or reveals a future
+      event sooner than the organiser expects.
+    severity: MEDIUM
+    mitigation: >
+      Backfill step 2 guarantees every OBSCURED row gets a non-null
+      addressRevealAt. Assert post-migration: 0 OBSCURED rows with NULL
+      addressRevealAt. Communicate to organisers of affected (formerly
+      APPROXIMATE) future events that their address now reveals to ticket
+      holders at the backfilled date.
+  - risk: >
+      Reveal notification double-send (cron overlap) or send-storm on a
+      large-attendance event.
+    severity: MEDIUM
+    mitigation: >
+      Two-layer idempotency (event cursor + per-recipient idempotencyKey).
+      Fan-out batched; rely on notify()'s existing per-channel idempotency
+      (IDEMPOTENCY_TTL + key). Log a per-event summary like the volunteer job.
+  - risk: >
+      Waiver auto-select breaks. The 'private-residential' clause auto-selects
+      on locationMode eq HIDDEN (apps/api/src/scripts/seed/waiver-clauses.ts:113);
+      after collapse no event is HIDDEN.
+    severity: MEDIUM
+    mitigation: >
+      Update the auto-select rule to locationMode eq OBSCURED (DECIDED: triggers
+      on ANY obscured-location event, not only fully-hidden). The rule also
+      pairs with EventVisibility eq PRIVATE in the seed (a DIFFERENT axis — who
+      can find the event — left unchanged). Verify the rule engine reads the new
+      locationMode value; update the seed and any persisted rules.
+  - risk: >
+      Stale search facets. Meilisearch stores locationMode; old APPROXIMATE/
+      HIDDEN facet values linger until reindex.
+    severity: LOW
+    mitigation: >
+      Trigger search.full-reindex after deploy; update the search schema
+      enum (packages/ports/src/search/schemas.ts).
+  - risk: >
+      Postgres enum value removal is not transactional-safe in place.
+    severity: LOW
+    mitigation: >
+      Phase it: migration 1 adds OBSCURED + backfills; migration 2 (after no rows
+      reference the old values) recreates the type as {EXACT, OBSCURED}.
+  - risk: >
+      SMS sent without valid consent (TCPA/regulatory exposure) if the new SMS
+      toggle dispatches before opt-in is recorded.
+    severity: HIGH
+    mitigation: >
+      notify()'s SMS channel must verify consent on record (reuse
+      ensure-sms-deliverable / record-sms-opt-in). The settings toggle cannot be
+      'on' without a verified phone + stored consent. Test: enabling SMS with no
+      consent records no send.
+
+open_questions:
+  # Resolved with product (2026-06-23), kept for the record:
+  #  • Fully-hidden after reveal → TICKET-HOLDERS ONLY (public never sees exact).
+  #  • 'Never reveal' → REMOVED. Every OBSCURED event has a mandatory reveal date.
+  #  • 'Hidden' = no public map until the reveal date (precision slider end-stop).
+  #  • SMS → in scope; users self-serve channels (incl. SMS) in account settings.
+  #  • Residential waiver → triggers on ANY obscured-location event.
+  #  • Enum cleanup → DROP APPROXIMATE/HIDDEN (recreate type as {EXACT,OBSCURED}).
+  - >
+    Preference granularity — controls are per-CATEGORY × channel (transactional
+    /announcements/marketing/organizer), NOT per-individual-notification. The
+    reveal rides on 'transactional'. Is category-level control enough, or do we
+    eventually want per-notification opt-outs? (Spec: category-level for now;
+    per-variant prefs are a separate, larger effort — see out_of_scope.) Category level for now
+  - >
+    Reveal-date edits after some recipients already notified (organiser moves
+    the date). Cursor + per-recipient key prevent re-spam, but moving the date
+    LATER after a send won't 'un-reveal'. Acceptable for v1? (Spec: yes.) If they change the address then it should re-reveal it if it's past the reveal date
+  - >
+    Should disabling the 'transactional' SMS/push channel be allowed to suppress
+    the reveal at all, given it's safety-relevant ('where do I go')? Spec honours
+    the user's toggle; flag if product wants reveal to be non-suppressible. SMS/Push/Email can be suppressed, but the in app notification cannot be
+
+out_of_scope:
+  - Per-individual-notification preference granularity (controls stay per-category × channel). SMS itself IS in scope as a channel.
+  - Building a net-new SMS consent/opt-in system — we reuse the existing one (record-sms-opt-in, ensure-sms-deliverable, PhoneNumberSection).
+  - Re-sending the reveal to attendees who already received it (e.g. on venue change) — a venue-change flow is separate (EventRescheduled template exists for time changes; a location-change analogue is future work).
+  - Calendar (.ics) updates carrying the revealed address.
+  - Reworking the deterministic obfuscation algorithm itself.
+  - Mobile editor (apps/mobile) for the new precision UI — web admin first.
+
+acceptance_criteria:
+  - >
+    A buyer purchases a ticket to a OBSCURED event whose addressRevealAt is 24h
+    out. At purchase, the event page and TicketIssued email show the obfuscated
+    circle (or, if fully-hidden, no map) and a 'revealed on {date}' notice. When
+    the reveal time passes, the scheduled job sends them an email + push + in-app
+    notification with the exact address and a directions link, exactly once.
+  - >
+    A non-EXACT event (obfuscated OR fully-hidden) exposes NO precise
+    coordinate or address to a non-ticket-holder through ANY read path — event
+    page, JSON-LD/SEO, embed, search index, nearby/geo map markers, or sitemap.
+    Verified by a test per surface (FR-013).
+  - >
+    Every migrated event (formerly APPROXIMATE or HIDDEN) ends up OBSCURED with a
+    non-null addressRevealAt. Past-dated events read as already-revealed; future
+    events reveal at their backfilled date. No OBSCURED row has a null reveal date.
+  - >
+    The editor shows two cards (Exact / Obscured); selecting Obscured reveals the
+    precision slider (tight circle → Hidden end-stop) and the reveal-timing
+    control. Saving round-trips through getEventForEdit unchanged.
+  - >
+    The 'private-residential' waiver clause auto-selects for the appropriate
+    OBSCURED events after the rule update.
+  - >
+    Running events.address-reveal-notify twice over an overlapping window sends
+    each ticket holder the reveal notification exactly once (idempotency).
+  - >
+    In account settings, a user sees SMS as a fourth channel column. Enabling it
+    with no phone on file walks them through phone capture + consent; once
+    consented, the next transactional notification (e.g. a reveal) also arrives
+    by SMS. A user with SMS off for transactional receives no reveal SMS.

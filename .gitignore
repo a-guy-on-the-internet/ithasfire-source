@@ -38,6 +38,11 @@ Temporary Items
 # dependencies
 /node_modules
 **/node_modules/
+# Also match a SYMLINK named node_modules. The trailing-slash form above
+# only matches directories, so a symlink slips past it — that is how 13
+# absolute-path symlinks into a developer's home directory reached main
+# and broke every CI install with ERR_PNPM_ENOENT.
+node_modules
 /.pnp
 .pnp.js
 

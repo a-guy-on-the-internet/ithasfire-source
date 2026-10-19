@@ -24,7 +24,11 @@ function makeDeps(
 ): ShadowUpgradeDeps {
   return {
     logger: makeLogger(),
-    findCredentialAccount: vi.fn().mockResolvedValue(null),
+    loadUpgradeEligibility: vi.fn().mockResolvedValue({
+      emailVerified: false,
+      accountCount: 0,
+      passkeyCount: 0,
+    }),
     hashPassword: vi.fn().mockResolvedValue("hashed-pw"),
     createCredentialAccount: vi.fn().mockResolvedValue(undefined),
     updateAuthUserName: vi.fn().mockResolvedValue(undefined),
@@ -88,18 +92,97 @@ describe("handleShadowUpgrade", () => {
 
   it("skips when the user already has a credential account (real duplicate signup)", async () => {
     const deps = makeDeps({
-      findCredentialAccount: vi.fn().mockResolvedValue({ id: "acct-1" }),
+      loadUpgradeEligibility: vi.fn().mockResolvedValue({
+        emailVerified: false,
+        accountCount: 1,
+        passkeyCount: 0,
+      }),
     });
 
     const result = await handleShadowUpgrade(deps, shadowUser, makeRequest());
 
-    expect(result).toEqual({ outcome: "skipped_has_credential" });
+    expect(result).toEqual({ outcome: "skipped_not_shadow" });
     expect(deps.createCredentialAccount).not.toHaveBeenCalled();
     expect(deps.hashPassword).not.toHaveBeenCalled();
     expect(deps.logger.info).toHaveBeenCalledWith(
-      "shadow_upgrade_skipped_has_credential",
+      "shadow_upgrade_skipped_not_shadow",
       expect.objectContaining({ authUserId: "auth-user-1" }),
     );
+  });
+
+  // ── F7 (2026-09-29 review): the upgrade must never attach a stranger's
+  // password to a REAL account. Every one of these users is a takeover
+  // target the old "no credential account" check let through.
+  describe("refuses anything that is not a true shadow (no password attached)", () => {
+    const cases = [
+      {
+        name: "a verified user with no accounts (email-code / magic-link only)",
+        eligibility: { emailVerified: true, accountCount: 0, passkeyCount: 0 },
+      },
+      {
+        name: "a Google/Apple user (verified, one OAuth account)",
+        eligibility: { emailVerified: true, accountCount: 1, passkeyCount: 0 },
+      },
+      {
+        name: "an UNVERIFIED user with an OAuth account",
+        eligibility: { emailVerified: false, accountCount: 1, passkeyCount: 0 },
+      },
+      {
+        name: "a passkey-only user (verified)",
+        eligibility: { emailVerified: true, accountCount: 0, passkeyCount: 1 },
+      },
+      {
+        name: "an UNVERIFIED passkey-only user",
+        eligibility: { emailVerified: false, accountCount: 0, passkeyCount: 2 },
+      },
+    ];
+
+    it.each(cases)("$name", async ({ eligibility }) => {
+      const deps = makeDeps({
+        loadUpgradeEligibility: vi.fn().mockResolvedValue(eligibility),
+      });
+
+      const result = await handleShadowUpgrade(
+        deps,
+        shadowUser,
+        makeRequest({ password: "attackerPass1", name: "Mallory" }),
+      );
+
+      expect(result).toEqual({ outcome: "skipped_not_shadow" });
+      expect(deps.hashPassword).not.toHaveBeenCalled();
+      expect(deps.createCredentialAccount).not.toHaveBeenCalled();
+      expect(deps.updateAuthUserName).not.toHaveBeenCalled();
+      expect(deps.updateHumanName).not.toHaveBeenCalled();
+      expect(deps.sendVerificationEmail).not.toHaveBeenCalled();
+    });
+
+    it("refuses when the AuthUser no longer exists", async () => {
+      const deps = makeDeps({
+        loadUpgradeEligibility: vi.fn().mockResolvedValue(null),
+      });
+
+      const result = await handleShadowUpgrade(deps, shadowUser, makeRequest());
+
+      expect(result).toEqual({ outcome: "skipped_not_shadow" });
+      expect(deps.createCredentialAccount).not.toHaveBeenCalled();
+    });
+
+    it("checks eligibility BEFORE reading the password from the body", async () => {
+      const deps = makeDeps({
+        loadUpgradeEligibility: vi.fn().mockResolvedValue({
+          emailVerified: true,
+          accountCount: 1,
+          passkeyCount: 0,
+        }),
+      });
+      const request = makeRequest();
+      const cloneSpy = vi.spyOn(request, "clone");
+
+      await handleShadowUpgrade(deps, shadowUser, request);
+
+      expect(deps.loadUpgradeEligibility).toHaveBeenCalledWith("auth-user-1");
+      expect(cloneSpy).not.toHaveBeenCalled();
+    });
   });
 
   it("skips when no request object is provided", async () => {
@@ -237,9 +320,9 @@ describe("handleShadowUpgrade", () => {
     );
   });
 
-  it("returns error outcome when findCredentialAccount throws", async () => {
+  it("returns error outcome when the eligibility lookup throws, and attaches nothing", async () => {
     const deps = makeDeps({
-      findCredentialAccount: vi
+      loadUpgradeEligibility: vi
         .fn()
         .mockRejectedValue(new Error("connection lost")),
     });
@@ -247,5 +330,55 @@ describe("handleShadowUpgrade", () => {
     const result = await handleShadowUpgrade(deps, shadowUser, makeRequest());
 
     expect(result).toEqual({ outcome: "error", error: expect.any(Error) });
+    expect(deps.createCredentialAccount).not.toHaveBeenCalled();
+  });
+
+  it("reports the swallowed failure to Sentry via reportError", async () => {
+    const reportError = vi.fn();
+    const deps = makeDeps({
+      reportError,
+      createCredentialAccount: vi.fn().mockRejectedValue(new Error("boom")),
+    });
+
+    const result = await handleShadowUpgrade(deps, shadowUser, makeRequest());
+
+    expect(result).toEqual({ outcome: "error", error: expect.any(Error) });
+    expect(reportError).toHaveBeenCalledWith(
+      expect.any(Error),
+      expect.objectContaining({
+        tags: expect.objectContaining({ op: "shadow_upgrade" }),
+      }),
+    );
+  });
+
+  it("reports (but survives) a failed Human name update", async () => {
+    const reportError = vi.fn();
+    const deps = makeDeps({
+      reportError,
+      updateHumanName: vi.fn().mockRejectedValue(new Error("name write")),
+    });
+
+    const result = await handleShadowUpgrade(deps, shadowUser, makeRequest());
+
+    expect(result).toEqual({ outcome: "upgraded" });
+    expect(reportError).toHaveBeenCalledWith(
+      expect.any(Error),
+      expect.objectContaining({
+        tags: expect.objectContaining({ op: "shadow_upgrade_human_name" }),
+      }),
+    );
+  });
+
+  it("a throwing reporter does not change the outcome", async () => {
+    const deps = makeDeps({
+      reportError: vi.fn(() => {
+        throw new Error("sentry down");
+      }),
+      createCredentialAccount: vi.fn().mockRejectedValue(new Error("boom")),
+    });
+
+    await expect(
+      handleShadowUpgrade(deps, shadowUser, makeRequest()),
+    ).resolves.toEqual({ outcome: "error", error: expect.any(Error) });
   });
 });

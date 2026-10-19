@@ -1,0 +1,249 @@
+# deal-terms-and-settlement.spec.yaml
+#
+# The agreement states the whole deal — guarantees, versus, door splits,
+# deductions off the top — and one calculator shows who is owed what: while the
+# terms are being drafted ("if we sell 150 tickets"), and after the show with the
+# real numbers. Stage 1 builds the terms and the calculator; the platform keeps
+# paying only per-order percentage lines, and the calculator shows what is left
+# to settle directly between the parties. Stage 2 (specced, not built) lets the
+# platform pay the whole settlement at event end once every recipient is a payee.
+#
+# Revives the parked plan: docs/specs/2026-08-07/completed/event-settlement-report.spec.md
+# (its §5 pipeline and §6 data model are adopted, with the changes below) and
+# docs/specs/2026-07-27/completed/compounding-deal-terms-model.spec.md (FIXED/PERCENT
+# lines). Reverses, in stage 2 only, the 2026-08 ruling "Ithas Fire records deals;
+# it does not execute them" — stage 1 still only records and calculates.
+#
+# Owner decisions 2026-09-28/29 (grilling after the booking-flow canvas audit):
+# S1–S5 and Q47, stamped M1–M7.
+
+version: "1.0"
+updated: "2026-09-29"
+status: draft (owner-locked decisions; design on canvas QVdGnAjDwxNyTPa5L5LnMz rows A, P, Z; not built)
+supersedes_in_part:
+  - "docs/specs/2026-08-07/completed/event-settlement-report.spec.md — adopted as the model; its execution sections (§7 settlement rewrite, payout-batch gating) become stage 2 here."
+  - "docs/specs/2026-07-27/completed/compounding-deal-terms-model.spec.md — its FIXED/PERCENT line and deal presets are adopted; its deferral of versus and after-expenses is lifted (as 08-07 already did)."
+related:
+  - docs/specs/2026-09-25/booking-the-night.spec.yaml (N7: the agreement editor inside the event builder's Revenue splits)
+  - docs/specs/2026-09-25/lineup-booking-requests-v3.spec.yaml (L2: joined acts offered as payees)
+
+# ── Today (verified 2026-09-28) ─────────────────────────────────────────────
+
+as_built:
+  - "A payout line is payee + whole percent (+ hidden cap/priority) of each order's post-platform-fee basis (finance.prisma:376-420; compute-order-splits.ts:76-93). Resolved per order at checkout finalize."
+  - "floorCents is ignored by the split math (compute-order-splits.ts:9-16,56-75); a floor was never a guarantee (08-07 §2: a $400 floor paid $250)."
+  - "Agreement.guaranteeCents is recorded only, never paid (agreement.prisma:33; hint en.ts:8415-8416)."
+  - "The editor shows Payee / Share / Confirmation; never says what the percent is of; totals under 100% are not flagged; the leftover is spread one cent at a time round-robin (distribute-remainder.ts:78-137)."
+  - "No preview, estimate, breakdown or settlement page exists anywhere."
+
+# ── Decisions ────────────────────────────────────────────────────────────────
+
+decisions:
+  - id: M1
+    stage: agreement / event
+    text: >
+      Two stages. Stage 1 (build now): the agreement holds the full deal and a
+      calculator shows the split; the platform pays only the per-order percentage
+      lines as today, and the calculator shows, per payee, what the platform has
+      paid and what is left to settle directly. Stage 2 (spec only): when every
+      recipient is a payee (Stripe-ready), the platform pays the whole settlement
+      at event end, guarantees included.
+  - id: M2
+    stage: agreement
+    text: >
+      First-version deal shapes: guarantee; door split (percentage of the pool);
+      guarantee + percentage ("dollar one"); versus (greater of guarantee or
+      percentage); deductions before the split — expenses, the house nut, a room
+      rental recouped, a deposit already paid. Deferred: tiered escalators,
+      bonuses, merch, series.
+  - id: M3
+    stage: agreement / event
+    text: >
+      One calculation, two places: the agreement editor ("if we sell ___
+      tickets at $__", per-payee breakdown, updates as the terms change) and a new
+      event settlement page after the show (real ticket numbers, entered
+      off-platform money, shortfall warning).
+  - id: M4
+    stage: event
+    text: >
+      Money the platform never sees (door cash, a bar share in the deal) is typed
+      into the settlement page by whoever is settling. Anything not entered
+      renders "Not entered", never $0.00.
+  - id: M5
+    stage: agreement / event
+    text: >
+      Every party to the agreement sees the whole breakdown; each payee who is
+      not a party sees their own line. Never public.
+  - id: M6
+    stage: agreement
+    text: >
+      On a request with a bill, the guarantee is owed to the sender, who pays the
+      acts they brought. A joined act gets money through the platform only if
+      someone adds them as a payee (lineup-v3 L2).
+  - id: M7
+    stage: all
+    text: >
+      Redistribution only (08-07 §5 invariant): no clause changes the buyer's
+      price, the gross, the platform fee or tax; the pool is always fully
+      distributed; a shortfall (a guarantee the pool can't cover) is shown as a
+      debt between the parties, never fronted by the platform.
+  - id: M8
+    stage: all
+    text: >
+      (Owner, 2026-10-03.) "Gross" in a clause means ticket money only: the sum
+      of each order's basis (order gross minus the platform fee), net of
+      refunds, the same number per-order payouts divide. Money the platform
+      never sees (door cash, a bar share) is listed on the settlement sheet but
+      is not split by GROSS or NET_POOL percentages; it changes who already
+      holds money, not what the deal allocates. (Supersedes 08-07 §7.4's
+      `GROSS ? adjustedGross` for this spec.)
+  - id: M9
+    stage: 1
+    text: >
+      (Owner, 2026-10-03.) For a line the platform pays per order (PERCENT on
+      GROSS), the settlement sheet's entitlement on actual numbers is what the
+      per-order engine paid, so a deal paid entirely per order settles at
+      $0.00 with nothing owed between the parties. Projections (the editor's
+      "if we sell…") use the exact percentage.
+  - id: M10
+    stage: agreement
+    text: >
+      (Owner, 2026-10-03.) A deposit is not a deduction. "Deposit already
+      paid" records money that already changed hands (e.g. promoter → venue)
+      and reduces what that party still owes; the deal's split is unchanged.
+      DEPOSIT_PAID leaves the "Off the top" kinds.
+  - id: M11
+    stage: event
+    text: >
+      (Owner, 2026-10-03.) Off-platform money entered on the sheet (door cash,
+      a bar share) belongs to the remainder party by default; the person
+      entering a row may name another participant it belongs to (e.g. "Bar
+      share — belongs to Lowlight Collective"). Whoever holds it has it counted
+      against what they are still owed; it is never split by percentages (M8).
+  - id: M12
+    stage: 1
+    text: >
+      (Owner, 2026-10-03.) Costs off the top are recouped only from ticket
+      money the platform has not already paid out per order. In stage 1 the
+      per-order percentage lines are paid first, as tickets sell; what a cost
+      can't recover from the rest is "Not recovered", the credited party's loss
+      (FR-002), so nobody hands over more than they received. "Already paid
+      out" means paid to OTHER payees per order: the remainder party's own
+      per-order money is money it holds, so costs can still be recouped from it
+      (the owner's worked example, 2026-10-03: $1,000 gross, act paid $200,
+      $1,000 rental → $800 recouped, $200 not recovered).
+  - id: M13
+    stage: agreement / event
+    text: >
+      (Owner, 2026-10-04.) "Every party to the agreement sees the whole
+      breakdown" (M5) means people with edit or finance roles in a party
+      organisation, or the human party: owners, admins, editors and finance.
+      Viewers and door scanners do not see the deal or the settlement sheet.
+      The existing agreement page's payout lines are unchanged.
+  - id: M14
+    stage: event
+    text: >
+      (Owner, 2026-10-04.) A payee who is not a party sees their own line with
+      the number their percentage is of ("10% of the pool after costs ($3,050) =
+      $305"), so they can check their own money; nothing else.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      stage: 1
+      description: >
+        Clause model (08-07 §6.1, adopted): PayoutTermsLine gains amountType
+        (FIXED | PERCENT | FIXED_AND_PERCENT), amountCents, basis (GROSS |
+        NET_POOL), resolution (SUM | GREATER_OF, only when both parts are set),
+        and a displayLabel. New model PayoutTermsDeduction (ordered): kind
+        (RENTAL | EXPENSE | HOUSE_NUT — DEPOSIT_PAID removed by M10), label, amountCents or
+        percent, creditedPayeeId (who fronted it), estimated (boolean — an
+        expense whose actual is entered after the show). Agreement.guaranteeCents
+        stays as the header summary but is derived from the sender's clause when
+        one exists. floorCents is dropped from the UI and deprecated.
+    - id: FR-002
+      stage: 1
+      description: >
+        Pure calculator computeDealSettlement(terms, inputs) in core, used by
+        every surface: inputs = ticket revenue basis (projected or actual), entered
+        off-platform amounts, deduction actuals. Output per payee: entitlement
+        (with how it resolved, e.g. "guarantee $800 vs 70% of pool $2,135 →
+        greater"), paid through the platform so far, balance to settle directly
+        (+/-), and credited deductions; plus the waterfall (gross → deductions →
+        net pool), shortfall, and a conservation check (distributions = gross).
+        Exhaustive unit tests, including the 08-07 worked example and shortfall
+        case. Deterministic; integer cents; rounding rule stated. Negative money
+        never flows through the pool: deductions are recouped in their order only
+        from money that exists (the rest is "Not recovered", credited party's
+        loss); the net pool is never below $0; a percentage of a $0 pool is $0;
+        a fixed amount the pool can't cover is a shortfall owed by the party the
+        remainder falls to (M7).
+    - id: FR-003
+      stage: 1
+      description: >
+        Agreement editor (and its embedded mode in the event builder, N7): the
+        money section becomes "The deal": (a) a preset picker — Guarantee · Door
+        split · Guarantee + % · Versus · Straight % · Room rental — that writes
+        the clauses and deductions in one step; (b) the clause list in plain
+        words ("Lowlight Collective: $800 guarantee vs 70% of the pool, whichever
+        is greater"), each editable; (c) "Off the top" deductions list; (d) the
+        calculator panel: tickets × price (defaults from the event's ticket types
+        when an event exists, else typed), the per-payee breakdown, the waterfall,
+        and "Paid through Ithas Fire / Settle directly" per payee. Payout lines'
+        payee picker keeps joined-act suggestions (lineup-v3 FR-011) and gains
+        groups (orgs). Parties see all; a non-party payee sees their line (M5).
+    - id: FR-004
+      stage: 1
+      description: >
+        Event settlement page /admin/[slug]/events/[id]/settlement (08-07 UI plan,
+        adopted): the same calculator on actual ticket revenue (net of refunds),
+        fields for off-platform money ("Door cash", "Bar share") and deduction
+        actuals with who entered them and when, "Not entered" for blanks, a
+        shortfall banner, the per-payee position (entitled · paid via platform ·
+        settle directly), and export (CSV; PDF later). Draft until the show ends,
+        then "Mark settled" by the event's organiser (records who settled; no money
+        moves in stage 1). Linked from the builder's Revenue splits and the
+        agreement page.
+    - id: FR-005
+      stage: 1
+      description: >
+        Per-order payouts in stage 1 are unchanged: only PERCENT lines on the
+        GROSS basis are paid per order. Clauses the platform can't pay per order
+        (FIXED, NET_POOL, GREATER_OF, deductions) are labelled in the editor
+        "Settled directly — Ithas Fire shows the math, the organiser pays it".
+        Publishing is not blocked by them.
+    - id: FR-006
+      stage: 2
+      description: >
+        Execution (spec only; do not build in stage 1): at event end, when every
+        payee is ACTIVE with payouts and charges enabled, the resolved settlement
+        rewrites the event's pending SettlementLines so the platform pays each
+        payee their entitlement; the payout batch skips events whose settlement
+        isn't resolved (08-07 execution sections). Shortfalls become payee ledger
+        debts, never platform-fronted. Gated behind a per-event "Ithas Fire pays
+        this settlement" switch the organiser turns on.
+  non_functional:
+    - id: NFR-001
+      description: "Conservation asserted in code: distributions sum to adjusted gross, exactly; the platform fee and tax are identical before and after resolution."
+    - id: NFR-002
+      description: "Unknown is never zero: blanks render \"Not entered\"; estimated deductions render \"Estimated\" until an actual is entered."
+    - id: NFR-003
+      description: "Money copy says what a percent is of, every time (\"70% of the pool after rental and expenses\")."
+
+acceptance_criteria:
+  - "Preset 'Versus' with $800 vs 70%, deductions rental $500 (recouped), sound $300, marketing $150, support 10%, venue remainder: at $4,000 gross the calculator shows headliner $2,135 (greater), support $305, venue $610 + $950 credits = $1,560, total $4,000 ✓ (08-07 worked example)."
+  - "Same deal at 75 tickets × $20 = $1,500 gross: deductions $950 are recouped in full, pool $550; Lowlight $800 (guarantee beats 70% = $385), Paper Moth $55, Marrow Hall −$305 → shortfall banner on both sides; total distributed $1,500 ✓."
+  - "At $600 gross: deductions recoup in order until the gross runs out (rental $500, then sound $100 of $300); pool $0; percentage clauses pay $0; the guarantee is owed in full as a shortfall; unrecovered costs ($200 sound, $150 marketing) show as 'Not recovered' against whoever fronted them."
+  - "A non-party payee sees only their line; the public never sees any of it."
+  - "Door cash left blank shows 'Not entered', and the totals say they exclude it."
+  - "In stage 1, per-order payouts match today's for PERCENT/GROSS lines; the settlement page shows each payee's 'Settle directly' balance."
+
+open_questions:
+  - "(Owner, 2026-09-30, canvas note on Z1.) The settlement sheet is where Ithas Fire could handle tax for the parties (e.g. sales tax collected on tickets, what each payee should report). Not in stage 1; scope with the tax work (see project_tax_base_is_jurisdictional)."
+
+out_of_scope:
+  - "Stage 2 execution (FR-006) until owner go-ahead."
+  - Tiered escalators, bonuses, merch, series settlement.
+  - Paying anyone who is not a payee.

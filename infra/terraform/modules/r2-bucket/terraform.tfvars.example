@@ -1,0 +1,8 @@
+enabled    = true
+account_id = "<cloudflare-account-id>"
+name       = "hf-dev-storage"
+# endpoint          = "https://<accountid>.r2.cloudflarestorage.com"
+# access_key_id     = "..."
+# secret_access_key = "..."
+# public_base_url   = "https://files.example.com"
+# default_public    = false

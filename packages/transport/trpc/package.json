@@ -1,0 +1,48 @@
+{
+  "name": "@th/trpc",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./utils": {
+      "types": "./src/utils.ts",
+      "default": "./src/utils.ts"
+    },
+    "./client-ip": {
+      "types": "./src/client-ip.ts",
+      "default": "./src/client-ip.ts"
+    },
+    "./rate-limit-markers": {
+      "types": "./src/rate-limit-markers.ts",
+      "default": "./src/rate-limit-markers.ts"
+    },
+    "./dev-staff-2fa-bypass": {
+      "types": "./src/dev-staff-2fa-bypass.ts",
+      "default": "./src/dev-staff-2fa-bypass.ts"
+    }
+  },
+  "scripts": {
+    "build": "echo '@th/trpc ships raw .ts — nothing to compile'",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@th/core": "workspace:^",
+    "@th/errors": "workspace:^",
+    "@th/ports": "workspace:^",
+    "@th/types": "workspace:^",
+    "@trpc/server": "^11.5.1",
+    "google-auth-library": "^10.3.0",
+    "superjson": "^2.2.2",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@th/tsconfig": "workspace:^",
+    "ioredis": "^5.8.0"
+  }
+}

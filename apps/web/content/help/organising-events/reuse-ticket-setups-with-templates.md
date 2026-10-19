@@ -9,7 +9,7 @@ related:
     "organising-events/manage-ticket-types",
     "organising-events/create-an-event",
   ]
-specs: ["2026-08-04/ticket-type-packs", "2026-08-10/time-based-ticket-pricing"]
+specs: ["2026-08-04/completed/ticket-type-packs", "2026-08-10/completed/time-based-ticket-pricing"]
 ---
 
 If you run more than one event, you don't have to rebuild the same ticket tiers every time. Save an event's ticket types as a template once, then apply it to any future event — or start from one of the ready-made setups Ithas Fire publishes.
@@ -24,7 +24,7 @@ The template captures each tier's name, price, pricing mode, capacity, and trans
 
 Three things are deliberately **not** saved:
 
-- **Seat sections** — they belong to a specific venue layout, so applied ticket types always arrive unseated.
+- **Seat sections** — they belong to a specific place layout, so applied ticket types always arrive unseated.
 - **On-sale windows** — the times a tier starts and stops selling.
 - **Scheduled price changes** — the moment a tier's price steps up.
 
@@ -32,7 +32,7 @@ The last two are left behind because a saved time is just a date, and a date can
 
 Set the timing on the new event after applying — see [On-sale windows](/help/organising-events/manage-ticket-types#on-sale-windows). If you want a tier that carries its own timing, the **Advance / Early Bird** and **Door** presets in the ticket form do exactly that, worked out against each event's own date.
 
-Templates belong to whoever you're managing: save one while working in an organisation and everyone in that organisation can use it; save one on your personal events and it's yours alone.
+Templates belong to the event's owner. An organisation's events save to and apply from the organisation's library, which its Owners, Admins and Editors share. Your personal events use your own library, and so do the delegates you've given edit access, when they work on your events: what they save lands in your list, not theirs.
 
 ## Applying a template
 
@@ -52,17 +52,19 @@ To retire a template you no longer use, click the remove icon on its row in the 
 The Apply dialog also shows a **From Ithas Fire** section — ready-made ticket setups curated by Ithas Fire, grouped into packs:
 
 - **General admission** — one simple fixed-price tier.
-- **Advance + door** — one tier, two prices: cheaper in advance, a little more at the door, sharing a single capacity pool.
+- **Advance + door** — one tier and one capacity pool: cheaper in advance, then the price goes up 24 hours before the show, online and at the door alike.
 - **Early-bird tiers** — three price steps that climb as each allocation sells out.
 - **Pay what you can** — an adjustable-price tier with a suggested amount and no minimum.
 
-Each entry shows its face price, capacity, and (where set) door price. The prices are starting points a small show could actually charge — not recommendations. You have two ways to use one:
+Each entry shows its face price (or suggested amount, on a pay-what-you-can tier) and capacity. The prices are starting points a small show could actually charge — not recommendations. You have two ways to use one:
 
 - **Apply** it directly, then edit the created ticket types on the event like any others.
-- **Customise** it first. This copies the template into your own list, where it replaces the catalogue version for you. If you already have a template with the same name, you'll be asked to pick a different name for your copy.
+- **Customise** it first. This copies the template into the event owner's list, where it replaces the catalogue version. If that list already has a template with the same name, you'll be asked to pick a different name for your copy.
+
+**Customise** needs owner or admin access: an organisation's Owners and Admins, or on a personal event, its owner and delegates with the Owner or Admin role. Editors don't see the button, but they can still apply any template and save new ones.
 
 :::tip
-Prices in packs (and in your own templates) are always the face price. Platform fees are worked out at checkout from your event's fee handling — see [Manage ticket types](/help/organising-events/manage-ticket-types).
+Prices in packs (and in your own templates) are always the face price. Platform and processing fees are added on top at checkout — see [Manage ticket types](/help/organising-events/manage-ticket-types).
 :::
 
 ## What can go wrong

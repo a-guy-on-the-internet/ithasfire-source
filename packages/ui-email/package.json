@@ -1,0 +1,54 @@
+{
+  "name": "@th/ui-email",
+  "version": "0.0.0",
+  "description": "Ithas Fire framework-agnostic email rendering utilities",
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts",
+    "dev": "tsx --loader ./scripts/eta-text-loader.mjs src/preview/server.tsx",
+    "test": "vitest --run",
+    "lint": "eslint . && pnpm run lint:colors",
+    "lint:colors": "node scripts/check-email-colors.mjs --selftest && node scripts/check-email-colors.mjs",
+    "storybook:samples": "tsx --loader ./scripts/eta-text-loader.mjs scripts/generate-storybook-data.ts",
+    "email:export": "tsx --loader ./scripts/eta-text-loader.mjs scripts/export-email.ts"
+  },
+  "dependencies": {
+    "@react-email/components": "latest",
+    "@react-email/render": "latest",
+    "@th/locale": "workspace:^",
+    "@th/types": "workspace:^",
+    "escape-html": "^1.0.3",
+    "eta": "latest",
+    "html-to-text": "10.0.1",
+    "qrcode-generator": "^2.0.4",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@th/tsconfig": "workspace:^",
+    "@types/escape-html": "^1.0.4",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "eslint": "~9.27.0",
+  "typescript-eslint": "^8.46.2",
+    "fastify": "latest",
+    "tsup": "latest",
+    "tsx": "4.23.1",
+    "typescript": "^5",
+    "vitest": "latest"
+  }
+}

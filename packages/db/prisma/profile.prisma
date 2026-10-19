@@ -1,0 +1,40 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Embeds — Embedded ticket-purchase widgets for external domains.
+//
+// NOTE: The old Profile / ProfileSlugHistory / ProfileTheme / ProfileModule
+// models that lived here have been replaced by EntityPage and friends
+// in entity-page.prisma.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Embed {
+  id          String      @id @default(uuid())
+  /// "event"|"organization"|"place"|"human" — a bare String, NOT a DB enum, so
+  /// new subject types need no migration. `upsert-embed.ts`
+  /// (ALLOWED_SUBJECT_TYPES) is the authority and rejects other values; the
+  /// read/revoke paths fork on the STORED value.
+  subjectType String
+  subjectId   String
+  domain      String
+  status      EmbedStatus @default(ACTIVE)
+  requireAuth Boolean     @default(false) // When true, embed forces Ithas Fire sign-in instead of guest checkout
+  linkOut     Boolean     @default(false) // When true, embed renders a "Get Tickets on Ithas Fire" CTA instead of in-iframe checkout
+  /// "list"|"calendar" — the browse view a BARE /embed/[id] renders. Like
+  /// `subjectType` this is a bare String, NOT a DB enum, so the vocabulary can
+  /// grow without a migration; `upsert-embed.ts` (EMBED_VIEWS) is the authority
+  /// on allowed values and the read paths fork on the STORED value. Default
+  /// "list" reproduces today's grid for every pre-existing row, so this column
+  /// needs no backfill. Meaningless (and rejected on write) for "place"
+  /// subjects — the booking-button embed is a separate product.
+  defaultView String      @default("list")
+  /// When true the widget renders a viewer-facing List/Calendar switcher.
+  /// Default false keeps every existing embed pixel-identical.
+  viewToggle  Boolean     @default(false)
+  /// Nullable: creator reference is detached (SetNull) on account deletion.
+  createdBy   String?
+  createdAt   DateTime    @default(now())
+
+  creator Human? @relation("EmbedCreator", fields: [createdBy], references: [id], onDelete: SetNull)
+
+  @@unique([subjectType, subjectId, domain])
+  @@index([domain])
+}

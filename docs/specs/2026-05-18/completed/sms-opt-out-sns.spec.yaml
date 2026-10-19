@@ -1,0 +1,303 @@
+# sms-opt-out-sns.spec.yaml
+# Account-wide and volunteer SMS opt-out handling for SNS / AWS End User Messaging SMS.
+
+version: "1.0"
+updated: "2026-05-18"
+
+summary:
+  problem: >
+    Ithas Fire sends phone OTPs and volunteer shift reminder SMS, and current
+    product copy tells users they can reply STOP. AWS can suppress future SNS
+    sends at the provider level, but the app does not yet persist SMS opt-out
+    state or expose a deterministic local test path for inbound STOP / HELP.
+  solution: >
+    Add an application-owned SMS consent ledger, reconcile AWS-managed provider
+    opt-out state into core use cases, check suppression before every non-OTP
+    SMS send, and document which parts can be tested locally versus only with a
+    real AWS origination number and handset. Treat self-managed inbound STOP /
+    HELP handling as a separate compliance-gated mode.
+  users:
+    - account holder with a verified phone number
+    - volunteer receiving shift reminders
+    - support/admin operator handling SMS consent requests
+    - platform engineer operating AWS SNS / End User Messaging SMS
+  surfaces:
+    - api
+    - jobs
+    - web
+    - infra
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Persist phone-level SMS consent state keyed by normalized E.164 number,
+        including status, source, reason keyword, provider message id when
+        available, timestamps, and audit metadata.
+    - id: FR-002
+      description: >
+        Provide a core use case that records STOP-family opt-outs idempotently
+        and disables every matching volunteer signup `smsOptIn` value whose
+        `contactPhone` matches that E.164 number.
+    - id: FR-003
+      description: >
+        Provide a core use case that records START/UNSTOP re-consent only from
+        explicit user action or provider opt-in signal, with audit metadata and
+        no automatic volunteer re-subscription unless the user opts into that
+        specific reminder flow again.
+    - id: FR-004
+      description: >
+        Add an API webhook endpoint for AWS SNS two-way SMS notifications when
+        two-way SMS is enabled. The endpoint must verify SNS subscription /
+        notification signatures before accepting payloads and parse the nested
+        two-way SMS JSON message. It must not assume STOP / HELP reserved
+        keywords arrive while AWS-managed opt-outs are enabled; mapping those
+        keywords is required only if Ithas Fire deliberately enables
+        self-managed opt-outs.
+    - id: FR-005
+      description: >
+        Add a support/admin mutation that can record a manual phone opt-out from
+        a support request without requiring access to AWS provider state.
+    - id: FR-006
+      description: >
+        Block volunteer shift reminder SMS when the phone is app-opted-out or
+        provider-opted-out. Phone OTP / account security SMS remains allowed only
+        where legally and provider-policy acceptable; otherwise fall back to
+        email/passkey flows.
+    - id: FR-007
+      description: >
+        Expose account settings copy/state so a signed-in user can see whether
+        reminder SMS are disabled for their phone and can request re-enable via
+        a deliberate flow.
+    - id: FR-008
+      description: >
+        Document local test fixtures for SNS webhook payloads and AWS CLI checks
+        for real provider opt-out state.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Opt-out recording must be idempotent, safe on SNS retries, and auditable.
+    - id: NFR-002
+      description: >
+        No inbound webhook may trust caller-provided payloads until SNS signature
+        and topic allow-list checks pass.
+    - id: NFR-003
+      description: >
+        Local tests must not require sending a real SMS or using AWS credentials.
+    - id: NFR-004
+      description: >
+        Real carrier STOP behavior must have a documented manual smoke test with
+        a real origination number; LocalStack/mock SNS is insufficient for this.
+
+architecture:
+  core:
+    use_cases:
+      - name: record-sms-opt-out
+        description: >
+          Normalizes a phone number, writes/updates the consent ledger, clears
+          matching volunteer signup SMS opt-ins, and records an audit event.
+        input: "phoneNumber, source, keyword?, providerMessageId?, actorHumanId?"
+        output: "status, affectedVolunteerSignupCount"
+        idempotent: true
+        money: false
+      - name: record-sms-opt-in
+        description: >
+          Records explicit re-consent for a phone number. It does not silently
+          re-enable prior volunteer signup reminder subscriptions.
+        input: "phoneNumber, source, actorHumanId?"
+        output: "status"
+        idempotent: true
+        money: false
+      - name: ensure-sms-deliverable
+        description: >
+          Shared guard used by reminder and future announcement senders before
+          calling SMSPort.
+        input: "phoneNumber, category"
+        output: "deliverable | suppressed reason"
+        idempotent: true
+        money: false
+
+  ports:
+    new:
+      - name: SmsConsentRepo
+        description: "CRUD/lookup methods for phone-level SMS consent state."
+      - name: SmsProviderOptOutPort
+        description: >
+          Optional provider lookup wrapper for CheckIfPhoneNumberIsOptedOut /
+          ListPhoneNumbersOptedOut without coupling core to AWS.
+    existing:
+      - VolunteerRepo
+      - AuditRepo
+      - SMSPort
+      - LoggerPort
+
+  adapters:
+    new:
+      - name: PrismaSmsConsentRepo
+        description: "Persists app-owned SMS consent state."
+      - name: SnsProviderOptOutAdapter
+        description: >
+          Wraps AWS SNS provider opt-out APIs for checks and reconciliation.
+    existing:
+      - SnsSmsAdapter
+      - PrismaVolunteerRepo
+
+  transport:
+    trpc_procedures:
+      - "account.smsConsent.get"
+      - "account.smsConsent.requestOptIn"
+      - "admin.smsConsent.recordOptOut"
+    webhooks:
+      - path: "POST /webhooks/aws/sms-inbound"
+        description: >
+          SNS HTTP endpoint for two-way SMS notifications and subscription
+          confirmation. Reserved STOP / HELP keywords are handled here only in
+          explicit self-managed mode.
+
+  ui:
+    pages:
+      - "apps/web/src/app/account/settings"
+    components:
+      - "PhoneNumberSection"
+
+data:
+  new_models:
+    - name: SmsConsent
+      fields:
+        - "id String @id @default(uuid())"
+        - "phoneE164 String @unique"
+        - "status SmsConsentStatus"
+        - "source String"
+        - "reasonKeyword String?"
+        - "providerMessageId String?"
+        - "actorHumanId String?"
+        - "metadata Json @default({})"
+        - "createdAt DateTime @default(now())"
+        - "updatedAt DateTime @updatedAt"
+        - "optedOutAt DateTime?"
+        - "optedInAt DateTime?"
+    - name: SmsConsentEvent
+      fields:
+        - "id String @id @default(uuid())"
+        - "phoneE164 String"
+        - "eventType String"
+        - "source String"
+        - "providerMessageId String?"
+        - "payloadHash String?"
+        - "createdAt DateTime @default(now())"
+  modified_models:
+    - name: VolunteerSignup
+      change: >
+        No required field change for MVP; STOP processing clears existing
+        `smsOptIn` by phone match. Consider later adding `smsOptOutAt` for
+        signup-level history if support needs per-signup provenance.
+  migrations_needed: true
+
+provider_behavior:
+  aws_sns_current_state: >
+    Current code uses SNS Publish for outbound SMS only. AWS automatically
+    suppresses numbers that reply STOP-family keywords to the same origination
+    identity, and exposes CheckIfPhoneNumberIsOptedOut / ListPhoneNumbersOptedOut.
+    That does not update Ithas Fire's `smsOptIn` rows by itself.
+  two_way_sms_option: >
+    AWS End User Messaging SMS two-way mode can publish inbound message payloads
+    to an SNS topic. Sender IDs do not support two-way SMS; this requires a
+    supported dedicated origination number or pool.
+  managed_vs_self_managed: >
+    Keep AWS-managed opt-outs unless there is a strong reason to self-manage.
+    In managed mode, AWS automatically replies to HELP / STOP and suppresses
+    future sends, so Ithas Fire should learn about STOP through provider
+    reconciliation or pre-send CheckIfPhoneNumberIsOptedOut checks. Self-managed
+    opt-outs route HELP / STOP to the SNS topic but make Ithas Fire responsible
+    for all STOP handling and responses, which is higher compliance risk.
+
+local_testing:
+  unit:
+    - >
+      Use fake SmsConsentRepo and VolunteerRepo to assert STOP clears matching
+      volunteer signup opt-ins and is idempotent on repeated provider messages.
+    - >
+      Mock AWS SDK v3 for CheckIfPhoneNumberIsOptedOut and ListPhoneNumbersOptedOut
+      the same way `packages/adapters/src/comms/__tests__/sns-sms.test.ts` mocks
+      PublishCommand.
+  api_fixture:
+    - >
+      POST a captured/synthetic SNS Notification envelope to the webhook route
+      with signature verification disabled only in explicit test mode, or verify
+      against a generated local cert fixture. The nested `Message` should match
+      AWS two-way SMS payload shape: originationNumber, destinationNumber,
+      messageKeyword, messageBody, inboundMessageId, previousPublishedMessageId.
+  local_stack_limit: >
+    LocalStack/mock SNS can prove our route parser and AWS SDK calls, but cannot
+    prove carrier STOP delivery, AWS-managed opt-out lists, sender identity
+    behavior, or handset responses.
+  real_smoke:
+    - >
+      In dev AWS, use a real supported origination number/pool with two-way SMS
+      configured to an SNS topic subscribed to the dev API webhook via HTTPS.
+    - >
+      Send a reminder to a test handset, reply STOP, confirm AWS provider state
+      via `aws sns check-if-phone-number-is-opted-out --phone-number +15555550123`,
+      and confirm Ithas Fire `SmsConsent.status` is OPTED_OUT after provider
+      reconciliation. If self-managed mode is explicitly enabled later, also
+      confirm the inbound webhook records the STOP event immediately.
+    - >
+      Confirm the next volunteer reminder skips SMS and leaves the email channel
+      unaffected.
+
+risks:
+  - risk: >
+      Assuming provider-managed STOP updates Ithas Fire state automatically.
+    severity: HIGH
+    mitigation: >
+      Add app-owned consent state and either two-way inbound processing or a
+      scheduled reconciliation job using SNS opt-out APIs.
+  - risk: >
+      Enabling self-managed opt-outs before HELP/STOP response handling is fully
+      implemented.
+    severity: HIGH
+    mitigation: >
+      Keep AWS-managed opt-outs for MVP. Treat self-managed mode as explicitly
+      out of scope until a compliance review approves it.
+  - risk: >
+      Local tests passing while real carrier/AWS behavior still fails.
+    severity: MEDIUM
+    mitigation: >
+      Require a dev handset smoke test before marking the spec complete.
+
+open_questions:
+  - >
+    Should phone OTP/security SMS ignore app-level marketing/reminder opt-out,
+    or should we fall back to email/passkey whenever provider opt-out is true?
+  - >
+    Do we want inbound two-way SMS immediately, or is a provider opt-out
+    reconciliation job enough for MVP?
+  - >
+    Which AWS origination identity will production use for two-way SMS, given
+    Sender IDs do not support inbound replies? no-reply?
+
+out_of_scope:
+  - Bulk announcement SMS unsubscribe behavior for invite lists beyond reusing
+    the phone-level suppression guard.
+  - Full self-managed STOP/HELP response automation.
+  - Twilio support unless the SMS provider strategy changes.
+  - Marketing preference-center redesign.
+
+acceptance_criteria:
+  - >
+    Repeated STOP payloads for the same phone are idempotent and leave one
+    current OPTED_OUT state plus audit events without re-enabling SMS.
+  - >
+    Volunteer reminder dispatch skips SMS for app-opted-out phones even when
+    `VolunteerSignup.smsOptIn` was previously true.
+  - >
+    Provider reconciliation tests cover opted-out and not-opted-out AWS SDK
+    responses. SNS webhook tests cover subscription confirmation rejection /
+    allow-listing, valid two-way payload, malformed payload, and retry replay;
+    STOP / HELP payload tests are required before enabling self-managed mode.
+  - >
+    Adapter tests cover AWS provider opt-out checks with mocked SDK commands.
+  - >
+    Documentation includes exact local fixture commands and the real AWS handset
+    smoke test steps.

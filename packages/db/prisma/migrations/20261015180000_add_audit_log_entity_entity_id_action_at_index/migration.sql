@@ -1,0 +1,17 @@
+-- Exact-match index backing `AuditRepo.listForEntity`: rows of ONE entity
+-- (`entity` + `entityId`) by action, newest first. The public PLACE page
+-- (`getPublicPage`) reads the latest `entity_page.community_handover` and
+-- `entity_page.community_updated` row for its page on every render (moderator
+-- place page spec, D6 / FR-006). With only [entity, at], a page with no such
+-- row scanned every `entity_page` audit row before answering.
+--
+-- `AuditLog` is written to synchronously (inside the same DB transaction)
+-- from nearly every use case in the app, including hot money/scan paths
+-- (create-checkout, finalize-from-payment-intent, scan-ticket). A plain
+-- `CREATE INDEX` would take a SHARE lock and block writes for the duration
+-- of the build. We use `CONCURRENTLY` so production deploys don't stall
+-- checkout / ticket-scan writes. `CONCURRENTLY` cannot run inside a
+-- transaction; this file is intentionally kept to a single statement so
+-- Prisma migrate can execute it without an implicit BEGIN/COMMIT.
+-- CreateIndex
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "AuditLog_entity_entityId_action_at_idx" ON "AuditLog"("entity", "entityId", "action", "at");

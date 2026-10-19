@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------------------
+# TileServer GL — Cloud Run / generic container image
+#
+# Build context must be infra/docker/ so the tileserver/ folder is available.
+#
+#   docker build -t ticket-tileserver -f Dockerfile.tileserver .
+#
+# For production, tile data (.pmtiles) is served from a GCS bucket mounted
+# via Cloud Run GCS FUSE (see terraform/modules/tileserver).
+# ---------------------------------------------------------------------------
+FROM maptiler/tileserver-gl:latest
+
+# TileServer GL's working directory is /data.
+# It reads config.json from /data/config.json by default and resolves
+# relative paths (styles, data, fonts) from there.
+
+# Place config.json at /data/config.json (the default lookup path)
+COPY tileserver/config/config.json /data/config.json
+
+# Place style files under /data/styles/ (matching paths.styles in config)
+COPY tileserver/styles/ /data/styles/
+
+# Create the fonts directory. TileServer GL requires it to exist even if empty;
+# the built-in Noto Sans Regular from the base image is auto-discovered.
+RUN mkdir -p /data/fonts && \
+    cp -r /usr/src/app/node_modules/tileserver-gl-styles/fonts/* /data/fonts/
+
+# Create the data directory. Tile data (.pmtiles) is provided at runtime via:
+#   - Docker volume mount (local dev: docker-compose)
+#   - GCS FUSE mount (Cloud Run: terraform/modules/tileserver)
+# The directory must exist for TileServer GL to start even before the mount.
+RUN mkdir -p /data/data
+
+# CORS proxy — lightweight Node.js reverse proxy that adds origin-restricted
+# CORS headers.  It starts TileServer GL on an internal port (8081) and listens
+# on PORT (8080) for external traffic.  Set ALLOWED_ORIGINS env var to restrict.
+COPY tileserver/cors-proxy.mjs /usr/src/app/cors-proxy.mjs
+
+EXPOSE 8080
+
+# Override the default entrypoint so the CORS proxy manages the lifecycle.
+# Careful: the base entrypoint (docker-entrypoint.sh) does more than exec node —
+# it also starts the Xvfb display that MapLibre's native renderer needs.  With no
+# display the container does not merely lose raster output: the first request to
+# /styles/*/static/* or /styles/*/{z}/{x}/{y}.png aborts tileserver-gl, which
+# ends the whole container, vector tiles included.  cors-proxy.mjs now starts and
+# supervises Xvfb — keep that if this ENTRYPOINT stays overridden.
+ENTRYPOINT ["node", "/usr/src/app/cors-proxy.mjs"]

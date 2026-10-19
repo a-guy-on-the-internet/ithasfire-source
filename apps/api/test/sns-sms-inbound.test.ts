@@ -5,6 +5,7 @@ import Fastify from "fastify";
 
 import {
   buildSnsStringToSign,
+  defaultFetchCertPem,
   type SnsEnvelope,
 } from "../src/routes/aws/sns-verify";
 import { classifyInboundKeyword } from "../src/routes/aws/sms-inbound";
@@ -42,7 +43,7 @@ function makeLogger() {
 
 function signEnvelope(
   unsigned: Omit<SnsEnvelope, "Signature">,
-  algorithm: "RSA-SHA1" | "RSA-SHA256" = "RSA-SHA1",
+  algorithm: "RSA-SHA1" | "RSA-SHA256" = "RSA-SHA256",
 ): Record<string, unknown> {
   const signer = createSign(algorithm);
   signer.update(buildSnsStringToSign(unsigned as SnsEnvelope), "utf8");
@@ -59,7 +60,7 @@ function makeNotificationEnvelope(
     TopicArn: TOPIC_ARN,
     Message: JSON.stringify(message),
     Timestamp: FRESH_TIMESTAMP,
-    SignatureVersion: "1",
+    SignatureVersion: "2",
     SigningCertURL: SIGNING_CERT_URL,
     ...overrides,
   } as Omit<SnsEnvelope, "Signature">;
@@ -69,12 +70,49 @@ function makeNotificationEnvelope(
   );
 }
 
+type FakeConsentRow = {
+  status: "OPTED_IN" | "OPTED_OUT";
+  optedInAt: Date | null;
+  optedOutAt: Date | null;
+};
+
 function makeFakeRepos() {
+  // Stateful ledger following the port's ordering rule, so redelivery
+  // order can be exercised end to end through the route.
+  const rows = new Map<string, FakeConsentRow>();
   const smsConsent = {
-    getByPhone: vi.fn(async () => null),
-    upsertStatus: vi.fn(async (input: Record<string, unknown>) => ({
-      ...input,
-    })),
+    rows,
+    getByPhone: vi.fn(async (phone: string) => rows.get(phone) ?? null),
+    applyDecisionIfNewer: vi.fn(
+      async (input: {
+        phoneE164: string;
+        status: "OPTED_IN" | "OPTED_OUT";
+        eventAt: Date;
+      }) => {
+        const current = rows.get(input.phoneE164);
+        const t = input.eventAt.getTime();
+        const outAt = current?.optedOutAt?.getTime() ?? null;
+        const inAt = current?.optedInAt?.getTime() ?? null;
+        const stale =
+          input.status === "OPTED_IN"
+            ? (outAt !== null && t <= outAt) || (inAt !== null && t < inAt)
+            : (inAt !== null && t < inAt) || (outAt !== null && t < outAt);
+        if (current && stale) return { applied: false, record: current };
+        const record: FakeConsentRow = {
+          status: input.status,
+          optedInAt:
+            input.status === "OPTED_IN"
+              ? input.eventAt
+              : (current?.optedInAt ?? null),
+          optedOutAt:
+            input.status === "OPTED_OUT"
+              ? input.eventAt
+              : (current?.optedOutAt ?? null),
+        };
+        rows.set(input.phoneE164, record);
+        return { applied: true, record };
+      },
+    ),
     recordEvent: vi.fn(async () => {}),
   };
   const volunteering = {
@@ -96,6 +134,7 @@ async function makeApp(input?: {
   repos?: ReturnType<typeof makeFakeRepos>["repos"];
   confirmSubscription?: (url: string) => Promise<void>;
   fetchCertPem?: (url: string) => Promise<string>;
+  reportError?: (err: unknown, ctx?: unknown) => void;
 }) {
   vi.resetModules();
   if (input && "topicArn" in input && input.topicArn === undefined) {
@@ -118,6 +157,7 @@ async function makeApp(input?: {
     trpc: {
       repos,
       clock: { now: () => new Date("2026-07-07T12:00:00.000Z") },
+      reportError: input?.reportError,
     },
   });
 
@@ -192,12 +232,26 @@ describe("classifyInboundKeyword", () => {
         messageBody: "opt out",
       }),
     ).toEqual({ kind: "opt_out", keyword: "OPT OUT" });
+  });
+
+  it("opts in only on the carrier-standard START and UNSTOP", () => {
+    expect(
+      classifyInboundKeyword({ originationNumber: PHONE, messageBody: "unstop" }),
+    ).toEqual({ kind: "opt_in", keyword: "UNSTOP" });
+    // Conversation-like words are not consent: "Yes thanks" to a reminder
+    // must never opt a number back in.
+    for (const messageBody of ["YES", "Yes thanks", "optin", "Opt in!"]) {
+      expect(
+        classifyInboundKeyword({ originationNumber: PHONE, messageBody }).kind,
+      ).toBe("other");
+    }
     expect(
       classifyInboundKeyword({
         originationNumber: PHONE,
-        messageBody: "Opt in!",
-      }),
-    ).toEqual({ kind: "opt_in", keyword: "OPT IN" });
+        messageBody: "yes",
+        messageKeyword: "YES",
+      }).kind,
+    ).toBe("other");
   });
 
   it("prefers AWS's matched messageKeyword over body token parsing", () => {
@@ -238,7 +292,7 @@ describe("sns sms-inbound webhook route", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ ok: true, action: "opted_out" });
-    expect(fakes.smsConsent.upsertStatus).toHaveBeenCalledWith(
+    expect(fakes.smsConsent.applyDecisionIfNewer).toHaveBeenCalledWith(
       expect.objectContaining({
         phoneE164: PHONE,
         status: "OPTED_OUT",
@@ -265,15 +319,95 @@ describe("sns sms-inbound webhook route", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ ok: true, action: "opted_in" });
-    expect(fakes.smsConsent.upsertStatus).toHaveBeenCalledWith(
+    expect(fakes.smsConsent.applyDecisionIfNewer).toHaveBeenCalledWith(
       expect.objectContaining({
         phoneE164: PHONE,
         status: "OPTED_IN",
         source: "sns_inbound",
+        // Consent evidence: the provider message id, same as on STOP.
+        providerMessageId: "inbound-2",
+      }),
+    );
+    expect(fakes.smsConsent.recordEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: "opt_in",
+        providerMessageId: "inbound-2",
       }),
     );
     // START must never silently re-enable volunteer reminder subscriptions.
     expect(fakes.volunteering.clearSmsOptInByPhone).not.toHaveBeenCalled();
+
+    await app.close();
+  });
+
+  it('a "Yes thanks" reply to a reminder opts nobody in', async () => {
+    const { app, fakes } = await makeApp();
+    const envelope = makeNotificationEnvelope({
+      originationNumber: PHONE,
+      messageBody: "Yes thanks",
+    });
+
+    const response = await postEnvelope(app, envelope);
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ ok: true, action: "ignored" });
+    expect(fakes.smsConsent.applyDecisionIfNewer).not.toHaveBeenCalled();
+
+    await app.close();
+  });
+
+  it("passes the envelope Timestamp through as the decision time", async () => {
+    const { app, fakes } = await makeApp();
+    const envelope = makeNotificationEnvelope({
+      originationNumber: PHONE,
+      messageBody: "STOP",
+    });
+
+    await postEnvelope(app, envelope);
+
+    expect(fakes.smsConsent.applyDecisionIfNewer).toHaveBeenCalledWith(
+      expect.objectContaining({ eventAt: new Date(FRESH_TIMESTAMP) }),
+    );
+
+    await app.close();
+  });
+
+  it("a redelivered START older than the STOP leaves the number opted out; a newer START opts in", async () => {
+    const fakes = makeFakeRepos();
+    const { app } = await makeApp({ repos: fakes.repos });
+    const t1 = "2026-07-07T11:40:00.000Z";
+    const t2 = "2026-07-07T11:50:00.000Z";
+    const t3 = "2026-07-07T11:55:00.000Z";
+
+    const stop = await postEnvelope(
+      app,
+      makeNotificationEnvelope(
+        { originationNumber: PHONE, messageBody: "STOP" },
+        { Timestamp: t2 },
+      ),
+    );
+    expect(stop.json()).toEqual({ ok: true, action: "opted_out" });
+
+    const staleStart = await postEnvelope(
+      app,
+      makeNotificationEnvelope(
+        { originationNumber: PHONE, messageBody: "START" },
+        { Timestamp: t1, MessageId: "start-redelivered" },
+      ),
+    );
+    expect(staleStart.statusCode).toBe(200);
+    expect(staleStart.json()).toEqual({ ok: true, action: "ignored" });
+    expect(fakes.smsConsent.rows.get(PHONE)?.status).toBe("OPTED_OUT");
+
+    const freshStart = await postEnvelope(
+      app,
+      makeNotificationEnvelope(
+        { originationNumber: PHONE, messageBody: "START" },
+        { Timestamp: t3, MessageId: "start-new" },
+      ),
+    );
+    expect(freshStart.json()).toEqual({ ok: true, action: "opted_in" });
+    expect(fakes.smsConsent.rows.get(PHONE)?.status).toBe("OPTED_IN");
 
     await app.close();
   });
@@ -289,7 +423,7 @@ describe("sns sms-inbound webhook route", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ ok: true, action: "ignored" });
-    expect(fakes.smsConsent.upsertStatus).not.toHaveBeenCalled();
+    expect(fakes.smsConsent.applyDecisionIfNewer).not.toHaveBeenCalled();
 
     await app.close();
   });
@@ -310,7 +444,7 @@ describe("sns sms-inbound webhook route", () => {
 
     expect(response.statusCode).toBe(400);
     expect(response.json()).toEqual({ ok: false, error: "bad_signature" });
-    expect(fakes.smsConsent.upsertStatus).not.toHaveBeenCalled();
+    expect(fakes.smsConsent.applyDecisionIfNewer).not.toHaveBeenCalled();
 
     await app.close();
   });
@@ -324,7 +458,7 @@ describe("sns sms-inbound webhook route", () => {
       TopicArn: TOPIC_ARN,
       Message: JSON.stringify({ originationNumber: PHONE, messageBody: "STOP" }),
       Timestamp: FRESH_TIMESTAMP,
-      SignatureVersion: "1",
+      SignatureVersion: "2",
       SigningCertURL: "https://sns.us-east-1.amazonaws.com.evil.example/cert.pem",
     } as Omit<SnsEnvelope, "Signature">);
 
@@ -333,7 +467,7 @@ describe("sns sms-inbound webhook route", () => {
     expect(response.statusCode).toBe(400);
     expect(response.json()).toEqual({ ok: false, error: "bad_signature" });
     expect(fetchCertPem).not.toHaveBeenCalled();
-    expect(fakes.smsConsent.upsertStatus).not.toHaveBeenCalled();
+    expect(fakes.smsConsent.applyDecisionIfNewer).not.toHaveBeenCalled();
 
     await app.close();
   });
@@ -346,7 +480,7 @@ describe("sns sms-inbound webhook route", () => {
       TopicArn: "arn:aws:sns:us-east-1:123456789012:some-other-topic",
       Message: JSON.stringify({ originationNumber: PHONE, messageBody: "STOP" }),
       Timestamp: FRESH_TIMESTAMP,
-      SignatureVersion: "1",
+      SignatureVersion: "2",
       SigningCertURL: SIGNING_CERT_URL,
     } as Omit<SnsEnvelope, "Signature">);
 
@@ -354,7 +488,7 @@ describe("sns sms-inbound webhook route", () => {
 
     expect(response.statusCode).toBe(403);
     expect(response.json()).toEqual({ ok: false, error: "topic_not_allowed" });
-    expect(fakes.smsConsent.upsertStatus).not.toHaveBeenCalled();
+    expect(fakes.smsConsent.applyDecisionIfNewer).not.toHaveBeenCalled();
 
     await app.close();
   });
@@ -368,7 +502,7 @@ describe("sns sms-inbound webhook route", () => {
       TopicArn: TOPIC_ARN,
       Message: "You have chosen to subscribe...",
       Timestamp: FRESH_TIMESTAMP,
-      SignatureVersion: "1",
+      SignatureVersion: "2",
       SigningCertURL: SIGNING_CERT_URL,
       SubscribeURL: SUBSCRIBE_URL,
       Token: "tok123",
@@ -394,7 +528,7 @@ describe("sns sms-inbound webhook route", () => {
       TopicArn: TOPIC_ARN,
       Message: "not-json-at-all",
       Timestamp: FRESH_TIMESTAMP,
-      SignatureVersion: "1",
+      SignatureVersion: "2",
       SigningCertURL: SIGNING_CERT_URL,
     } as Omit<SnsEnvelope, "Signature">);
 
@@ -402,14 +536,14 @@ describe("sns sms-inbound webhook route", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ ok: true, action: "ignored" });
-    expect(fakes.smsConsent.upsertStatus).not.toHaveBeenCalled();
+    expect(fakes.smsConsent.applyDecisionIfNewer).not.toHaveBeenCalled();
 
     await app.close();
   });
 
   it("returns 500 on a transient ledger failure so SNS redelivers", async () => {
     const fakes = makeFakeRepos();
-    fakes.smsConsent.upsertStatus.mockRejectedValueOnce(
+    fakes.smsConsent.applyDecisionIfNewer.mockRejectedValueOnce(
       new Error("db unavailable"),
     );
     const { app } = await makeApp({ repos: fakes.repos });
@@ -425,6 +559,37 @@ describe("sns sms-inbound webhook route", () => {
     await app.close();
   });
 
+  it("a ledger failure that echoes the number reaches neither the log nor the thrown error", async () => {
+    const fakes = makeFakeRepos();
+    fakes.smsConsent.applyDecisionIfNewer.mockRejectedValueOnce(
+      new Error(
+        `Invalid \`smsConsent.updateMany()\` invocation: { phoneE164: "${PHONE}" }`,
+      ),
+    );
+    const { app, logger } = await makeApp({ repos: fakes.repos });
+    const thrown: unknown[] = [];
+    app.addHook("onError", async (_req, _reply, err) => {
+      thrown.push(err);
+    });
+    const envelope = makeNotificationEnvelope({
+      originationNumber: PHONE,
+      messageBody: "STOP",
+    });
+
+    const response = await postEnvelope(app, envelope);
+
+    expect(response.statusCode).toBe(500);
+    const digits = PHONE.slice(-7);
+    expect(JSON.stringify(logger.error.mock.calls)).not.toContain(digits);
+    expect(thrown).toHaveLength(1);
+    const err = thrown[0] as Error;
+    expect(err.message).toContain("smsConsent.updateMany");
+    expect(err.message).not.toContain(digits);
+    expect(err.stack ?? "").not.toContain(digits);
+
+    await app.close();
+  });
+
   it("accepts a SignatureVersion 2 (RSA-SHA256) envelope", async () => {
     const { app, fakes } = await makeApp();
     const envelope = makeNotificationEnvelope(
@@ -436,9 +601,103 @@ describe("sns sms-inbound webhook route", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ ok: true, action: "opted_out" });
-    expect(fakes.smsConsent.upsertStatus).toHaveBeenCalledWith(
+    expect(fakes.smsConsent.applyDecisionIfNewer).toHaveBeenCalledWith(
       expect.objectContaining({ phoneE164: PHONE, status: "OPTED_OUT" }),
     );
+
+    await app.close();
+  });
+
+  it("refuses a SignatureVersion 1 (SHA1) envelope before any cert fetch", async () => {
+    const fetchCertPem = vi.fn(async () => PUBLIC_PEM);
+    const reportError = vi.fn();
+    const { app, fakes, logger } = await makeApp({ fetchCertPem, reportError });
+    // Validly signed with SHA1 by the trusted key: still refused.
+    const envelope = signEnvelope(
+      {
+        Type: "Notification",
+        MessageId: "msg-v1",
+        TopicArn: TOPIC_ARN,
+        Message: JSON.stringify({
+          originationNumber: PHONE,
+          messageBody: "STOP",
+        }),
+        Timestamp: FRESH_TIMESTAMP,
+        SignatureVersion: "1",
+        SigningCertURL: SIGNING_CERT_URL,
+      } as unknown as Omit<SnsEnvelope, "Signature">,
+      "RSA-SHA1",
+    );
+
+    const response = await postEnvelope(app, envelope);
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({
+      ok: false,
+      error: "unsupported_signature_version",
+    });
+    expect(fetchCertPem).not.toHaveBeenCalled();
+    expect(fakes.smsConsent.applyDecisionIfNewer).not.toHaveBeenCalled();
+    // Our topic switched to SHA1 would drop every STOP: logged at error
+    // (Sentry) and reported, never a quiet warn.
+    expect(logger.error).toHaveBeenCalledWith(
+      "sns_sms_inbound_unsupported_signature_version",
+      { signatureVersion: "1" },
+    );
+    expect(reportError).toHaveBeenCalledTimes(1);
+    expect(reportError.mock.calls[0]![1]).toMatchObject({
+      tags: { stage: "signature_version" },
+      extra: { signatureVersion: "1" },
+    });
+
+    await app.close();
+  });
+
+  it("a flood of SignatureVersion 1 envelopes reports and logs at error once per window", async () => {
+    const reportError = vi.fn();
+    const { app, logger } = await makeApp({ reportError });
+    const unsigned = {
+      Type: "Notification",
+      MessageId: "msg-v1-flood",
+      TopicArn: TOPIC_ARN,
+      Message: "{}",
+      Timestamp: FRESH_TIMESTAMP,
+      SignatureVersion: "1",
+      Signature: "not-verified",
+      SigningCertURL: SIGNING_CERT_URL,
+    };
+
+    for (let i = 0; i < 5; i += 1) {
+      const response = await postEnvelope(app, unsigned);
+      expect(response.statusCode).toBe(400);
+    }
+
+    expect(reportError).toHaveBeenCalledTimes(1);
+    expect(logger.error).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledTimes(5);
+
+    await app.close();
+  });
+
+  it("checks the topic before the signature version: a foreign SHA1 envelope is a quiet 403", async () => {
+    const reportError = vi.fn();
+    const { app, logger } = await makeApp({ reportError });
+
+    const response = await postEnvelope(app, {
+      Type: "Notification",
+      MessageId: "msg-foreign-v1",
+      TopicArn: "arn:aws:sns:us-east-1:999999999999:someone-else",
+      Message: "{}",
+      Timestamp: FRESH_TIMESTAMP,
+      SignatureVersion: "1",
+      Signature: "x",
+      SigningCertURL: SIGNING_CERT_URL,
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toEqual({ ok: false, error: "topic_not_allowed" });
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(reportError).not.toHaveBeenCalled();
 
     await app.close();
   });
@@ -456,7 +715,7 @@ describe("sns sms-inbound webhook route", () => {
     expect(response.statusCode).toBe(400);
     expect(response.json()).toEqual({ ok: false, error: "stale_timestamp" });
     expect(fetchCertPem).not.toHaveBeenCalled();
-    expect(fakes.smsConsent.upsertStatus).not.toHaveBeenCalled();
+    expect(fakes.smsConsent.applyDecisionIfNewer).not.toHaveBeenCalled();
 
     await app.close();
   });
@@ -476,7 +735,7 @@ describe("sns sms-inbound webhook route", () => {
     expect(response.statusCode).toBe(400);
     expect(response.json()).toEqual({ ok: false, error: "bad_signature" });
     expect(fetchCertPem).not.toHaveBeenCalled();
-    expect(fakes.smsConsent.upsertStatus).not.toHaveBeenCalled();
+    expect(fakes.smsConsent.applyDecisionIfNewer).not.toHaveBeenCalled();
 
     await app.close();
   });
@@ -496,7 +755,7 @@ describe("sns sms-inbound webhook route", () => {
     expect(response.statusCode).toBe(400);
     expect(response.json()).toEqual({ ok: false, error: "bad_signature" });
     expect(fetchCertPem).not.toHaveBeenCalled();
-    expect(fakes.smsConsent.upsertStatus).not.toHaveBeenCalled();
+    expect(fakes.smsConsent.applyDecisionIfNewer).not.toHaveBeenCalled();
 
     await app.close();
   });
@@ -512,8 +771,46 @@ describe("sns sms-inbound webhook route", () => {
 
     expect(response.statusCode).toBe(503);
     expect(response.json()).toEqual({ ok: false, error: "not_configured" });
-    expect(fakes.smsConsent.upsertStatus).not.toHaveBeenCalled();
+    expect(fakes.smsConsent.applyDecisionIfNewer).not.toHaveBeenCalled();
 
     await app.close();
+  });
+});
+
+describe("defaultFetchCertPem — fetch hardening", () => {
+  const certUrl = (id: string) =>
+    `https://sns.us-east-1.amazonaws.com/SimpleNotificationService-${id}.pem`;
+
+  it("never follows a redirect", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(PUBLIC_PEM, { status: 200 }));
+    try {
+      await defaultFetchCertPem(certUrl("redirectcheck"));
+      expect(fetchSpy).toHaveBeenCalledWith(certUrl("redirectcheck"), {
+        redirect: "error",
+      });
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it("refuses a declared oversize cert before reading the body", async () => {
+    const text = vi.fn(async () => PUBLIC_PEM);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-length": String(64 * 1024 + 1) }),
+      body: null,
+      text,
+    } as unknown as Response);
+    try {
+      await expect(defaultFetchCertPem(certUrl("oversize"))).rejects.toThrow(
+        "sns_cert_too_large",
+      );
+      expect(text).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });

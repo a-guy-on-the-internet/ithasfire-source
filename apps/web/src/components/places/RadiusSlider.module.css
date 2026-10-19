@@ -1,0 +1,77 @@
+/* The obfuscation-radius slider (RadiusSlider.tsx). Form content, so strict
+   Swiss: square thumb, flat track, no shadow. The accent fill and thumb are
+   graphics, not text. Fallbacks are the Stub values SSR paints before the
+   theme injector hydrates.
+
+   Focus: the global `:focus-visible` rule in globals.css paints the ring on
+   the input box. Nothing here touches `outline`. */
+
+.slider {
+  -webkit-appearance: none;
+  appearance: none;
+  /* The whole 44px strip is the hit target; the visible track is 4px. */
+  height: 44px;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+  /* Belt and braces for any engine that ignores the pseudo-elements below. */
+  accent-color: var(--accent, #e2481d);
+}
+
+.slider:disabled {
+  cursor: default;
+  /* appearance:none drops the engine's own disabled look, so say it here:
+     a pinned slider (e.g. a venue that hides its address) must not read as
+     a live control. */
+  opacity: 0.6;
+}
+
+/* ── WebKit / Blink ─────────────────────────────────────────── */
+
+.slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 0;
+  background: linear-gradient(
+    to right,
+    var(--accent, #e2481d) 0,
+    var(--accent, #e2481d) var(--range-fill, 0%),
+    var(--borderColor, #211c16) var(--range-fill, 0%),
+    var(--borderColor, #211c16) 100%
+  );
+}
+
+.slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  box-sizing: border-box;
+  width: 20px;
+  height: 20px;
+  /* Centre on the 4px track: (4 - 20) / 2. */
+  margin-top: -8px;
+  border: 2px solid var(--borderColor, #211c16);
+  border-radius: 0;
+  background: var(--accent, #e2481d);
+}
+
+/* ── Firefox ────────────────────────────────────────────────── */
+
+.slider::-moz-range-track {
+  height: 4px;
+  border-radius: 0;
+  background: var(--borderColor, #211c16);
+}
+
+.slider::-moz-range-progress {
+  height: 4px;
+  border-radius: 0;
+  background: var(--accent, #e2481d);
+}
+
+.slider::-moz-range-thumb {
+  box-sizing: border-box;
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--borderColor, #211c16);
+  border-radius: 0;
+  background: var(--accent, #e2481d);
+}

@@ -8,8 +8,11 @@
  *   and fail-closed dead-lettering (FLAGGED + degraded) on exhaustion. A fresh
  *   FLAGGED verdict fires the uploader HOLD notification.
  *
- * - moderation.report-queue-health: hourly count of the four ways this queue
- *   goes wrong, raising a Discord alert only when one of them is non-zero.
+ * - moderation.report-queue-health: hourly count of the five ways this queue
+ *   goes wrong, raising a Discord alert only when the set of firing signals
+ *   changes or goes a day stale. The read stays hourly; the page
+ *   does not, because two of the five counts never fall back to zero on their
+ *   own and used to re-page about the same stuck record every hour forever.
  *
  * - moderation.requeue-degraded: revives rows the SCANNER failed on (not rows
  *   the scanner judged), so a provider outage longer than the drain's ~3-day
@@ -47,8 +50,10 @@ export const drainImageModerationsJob = defineScheduledTask({
     "or the auto-approving stub when unconfigured), writing the verdict back " +
     "onto the record. Retries transient provider failures with exponential " +
     "backoff and dead-letters exhausted rows to FLAGGED+degraded so they " +
-    "surface in the human review queue rather than staying hidden. A fresh " +
-    "FLAGGED verdict fires the uploader HOLD notification.",
+    "surface in the human review queue rather than staying hidden. A row whose " +
+    "object no longer exists in storage resolves to ORPHANED on the first pass " +
+    "(permanent, hidden, never queued for a human) instead of burning the " +
+    "retry budget. A fresh FLAGGED verdict fires the uploader HOLD notification.",
   input: drainImageModerationsInputSchema,
   schedule: getSchedule("moderation.drain-image-moderations"),
   handler: async ({ input, ctx }) => {
@@ -58,7 +63,12 @@ export const drainImageModerationsJob = defineScheduledTask({
     const moderateImageFn = (storageKey: string) =>
       moderateImage(
         {
-          repos: { imageModerationRecords: ctx.repos.imageModerationRecords },
+          repos: {
+            imageModerationRecords: ctx.repos.imageModerationRecords,
+            // Read-only: a place page image deleted on purpose before its
+            // scan is not reported as a storage fault (isRemovedPageImage).
+            entityPages: ctx.repos.entityPages,
+          },
           fileStorage: ctx.fileStorage,
           moderation: ctx.moderation,
           config: {
@@ -84,13 +94,21 @@ export const drainImageModerationsJob = defineScheduledTask({
           sms: ctx.sms ?? undefined,
           push: ctx.push ?? undefined,
           logger: ctx.logger,
+          reportError: ctx.reportError,
         },
         payload,
       );
 
     const result = await drainImageModerations(
       {
-        repos: { imageModerationRecords: ctx.repos.imageModerationRecords },
+        repos: {
+          imageModerationRecords: ctx.repos.imageModerationRecords,
+          // Read-only: the HOLD notice names + links the event, or the
+          // place page, the image is on.
+          events: ctx.repos.events,
+          places: ctx.repos.places,
+          entityPages: ctx.repos.entityPages,
+        },
         moderateImage: moderateImageFn,
         notify,
         clock: ctx.clock,
@@ -150,23 +168,38 @@ export const reportModerationQueueHealthJob = defineScheduledTask({
     "Hourly health read over the image-moderation queue: images overdue for " +
     "draining (the drain is dead), images that failed to scan recently (the " +
     "provider is failing), images that exhausted the requeue cap (unscannable), " +
-    "and flagged images awaiting human review too long (nobody is chasing them, " +
-    "because uploaders are not emailed about holds). Raises a Discord alert ONLY " +
-    "when at least one count is non-zero — no heartbeat, so an alert always means " +
-    "something.",
+    "flagged images awaiting human review too long (nobody is chasing them, " +
+    "because uploaders are not emailed about holds), and images whose object " +
+    "vanished from storage (ORPHANED — terminal and hidden, so this count is " +
+    "their only operational signal). The read runs every hour, but the Discord " +
+    "alert is edge-triggered: it fires when the set of firing categories " +
+    "changes, or when the same " +
+    "picture has stood unchanged for reAlertAfterHours (default 24). Two of the " +
+    "counts never fall back to zero without a human, so a level trigger meant " +
+    "the same stuck record paged hourly forever until nobody read the channel.",
   input: reportModerationQueueHealthInputSchema,
   schedule: getSchedule("moderation.report-queue-health"),
   handler: async ({ input, ctx }) => {
     const result = await reportModerationQueueHealth(
       {
-        repos: { imageModerationRecords: ctx.repos.imageModerationRecords },
+        repos: {
+          imageModerationRecords: ctx.repos.imageModerationRecords,
+          // Edge-trigger state: the fingerprint of the last problem picture
+          // actually paged out. Uncached in the jobs container (only the API
+          // wraps platformSettings in a TTL cache), so this read sees the row
+          // the previous run wrote.
+          platformSettings: ctx.repos.platformSettings,
+        },
         clock: ctx.clock,
         logger: ctx.logger,
+        reportError: ctx.reportError,
       },
       input,
     );
 
-    if (result.unhealthy) {
+    // `shouldAlert`, not `unhealthy` — the use case owns the suppression
+    // decision; this layer only obeys it and holds the webhook.
+    if (result.shouldAlert) {
       const logsUrl = buildCloudLoggingUrl(ctx.runId);
       const fields = [
         {
@@ -189,6 +222,14 @@ export const reportModerationQueueHealthJob = defineScheduledTask({
           value: String(result.counts.awaitingReview),
           inline: true,
         },
+        {
+          // ORPHANED rows surface NOWHERE else — not the review queue, not the
+          // requeue job. Without this field the only trace is Sentry, which is
+          // exactly the signal that went unread for two weeks in August 2026.
+          name: "Objects missing",
+          value: String(result.counts.orphanedRecent),
+          inline: true,
+        },
       ];
       if (logsUrl) {
         fields.push({ name: "Logs", value: logsUrl, inline: false });
@@ -201,20 +242,39 @@ export const reportModerationQueueHealthJob = defineScheduledTask({
         logger: ctx.logger,
         level: "warn",
         message: "moderation.report-queue-health.unhealthy",
-        extra: { runId: ctx.runId, ...result.counts },
+        extra: {
+          runId: ctx.runId,
+          ...result.counts,
+          alertReason: result.alertReason,
+          fingerprint: result.fingerprint,
+        },
         alert: {
           send: fireDiscordAlert,
           payload: {
-            title: "Image moderation queue needs attention",
+            title:
+              result.alertReason === "heartbeat"
+                ? "Image moderation queue — still unresolved"
+                : "Image moderation queue needs attention",
             colour: "warning",
-            description: result.problems.join("\n\n"),
+            description:
+              result.alertReason === "heartbeat"
+                ? `${result.problems.join("\n\n")}\n\n_Unchanged since the last alert; this is the daily reminder, not a new problem._`
+                : result.problems.join("\n\n"),
             fields,
           },
         },
       });
     }
 
-    ctx.logger.info("moderation.report-queue-health.completed", result.counts);
+    // Fires every run regardless of whether anything was sent, so the hourly
+    // read stays visible in logs even while the Discord channel is quiet.
+    ctx.logger.info("moderation.report-queue-health.completed", {
+      ...result.counts,
+      unhealthy: result.unhealthy,
+      shouldAlert: result.shouldAlert,
+      alertReason: result.alertReason,
+      fingerprint: result.fingerprint,
+    });
     return result;
   },
 });

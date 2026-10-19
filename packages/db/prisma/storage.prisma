@@ -1,0 +1,52 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Storage — transactional outbox for reliable object-storage (R2/S3) deletes.
+//
+// Object storage is not transactional, so a delete that races a DB commit (or a
+// transient R2 outage) can orphan bytes forever once the owning DB row is gone.
+// Instead of best-effort fire-and-forget deletes, callers write the *intent* to
+// delete here in the SAME DB transaction as the cascade. A scheduled drain job
+// (storage.drain-pending-deletions) then removes the objects with retries,
+// exponential backoff, and a dead-letter terminal state.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model PendingObjectDeletion {
+  id String @id @default(uuid())
+
+  // The object to remove. Either an exact key or a prefix, disambiguated by
+  // `targetKind`.
+  targetKey String @map("target_key")
+
+  // "KEY"    → delete the single object at `targetKey`.
+  // "PREFIX" → list-and-delete every object under `targetKey` (e.g. an HLS
+  //            playlist + its `.ts` segments). Validated in app code.
+  targetKind String @map("target_kind")
+
+  // "PENDING" → eligible for the drain job to attempt.
+  // "DEAD"    → exhausted maxAttempts; left for manual inspection. Validated in
+  //             app code (not a Prisma enum — see Settlement.status house style).
+  status String @default("PENDING")
+
+  // Number of drain attempts so far. Incremented on every failure.
+  attempts Int @default(0)
+
+  // Last failure message, for triage. Null until the first failure.
+  lastError String? @map("last_error")
+
+  // Earliest time the drain job may (re)attempt this row. Pushed out on each
+  // failure via exponential backoff. Defaults to now so freshly enqueued rows
+  // are immediately due.
+  nextAttemptAt DateTime @default(now()) @map("next_attempt_at")
+
+  // Traceability: what enqueued this and the related entity id (e.g.
+  // "event_delete" / eventId). Both optional.
+  source   String? @map("source")
+  sourceId String? @map("source_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // The drain job's hot path: "status = 'PENDING' AND next_attempt_at <= now
+  // ORDER BY next_attempt_at ASC".
+  @@index([status, nextAttemptAt])
+  @@map("pending_object_deletion")
+}

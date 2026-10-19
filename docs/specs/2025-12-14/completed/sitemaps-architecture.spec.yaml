@@ -1,0 +1,194 @@
+# Spec: Ithas Fire Sitemap Architecture
+meta:
+  owner: platform-eng
+  status: draft
+  reviewers:
+    - seo
+    - platform-ops
+  last_updated: 2025-11-10
+summary: |
+  Define how Ithas Fire will generate and serve sitemap indexes for a large-scale
+event marketplace so that search engines reliably discover core, organizer, venue,
+human, and event pages without overruns or stale shards.
+objectives:
+  - Ensure crawlers see every public event, organizer profile, venue page, human profile, and key discovery page while excluding private or low-quality surfaces.
+  - Keep each sitemap shard within 50k URL / 50 MB limits with deterministic chunking.
+  - Support both full rebuilds (nightly) and incremental refreshes on content changes.
+  - Decouple generation from delivery so API/web surfaces can stream cached XML quickly.
+scope:
+  in_scope:
+    - Sitemap index structure and shard naming scheme.
+    - Source-of-truth datasets, filters, and canonical URL construction.
+    - Storage targets (object storage) and retention policy for active vs archive shards.
+    - Generation cadence, triggers, and idempotency expectations for jobs.
+    - Transport considerations for Fastify/Next.js endpoints that expose sitemap XML.
+  out_of_scope:
+    - Internal search UX (handled elsewhere).
+    - SEO copy or metadata work (covered by existing SEO helpers).
+    - Analytics dashboards (captured in observability spec).
+flags:
+  - name: feature.sitemaps
+    default: false
+    rollout: org-by-org
+    note: Toggle transport routes and scheduled jobs; keep disabled until specs complete.
+entities:
+  datasets:
+    events: |
+      Public events with `status in (PUBLISHED, COMPLETED)` and `visibility != PRIVATE`.
+      Exclude invite-only, waitlist-only, QA, or sandbox events (`seo_index = false`).
+      Includes canonical slug, org, venue, start/end timestamps, last modified time.
+    organizers: |
+      Public organizer and venue profiles flagged as indexable (`seo_index = true`).
+      Require at least one live or recently completed public event in the past 90 days.
+      Include slug, venue reference (if applicable), and last modified timestamp.
+    humans: |
+      People surfaces (performers, hosts, talent) with visibility limited to `PUBLIC` or `PRIVATE`.
+      Only include entries where `visibility = PUBLIC` and `seo_index = true`; ignore `PRIVATE` entirely.
+      Enforce upstream guardrail that no other visibility states are emitted—fail fast if detected.
+      Payload includes slug, primary organizer reference, roles, last modified timestamp.
+    collections: |
+      Static marketing pages, discovery lists, and curated landing pages.
+sharding:
+  strategy:
+    events:
+      key: start_date_utc.month
+      example: events-2025-11.xml
+      rule: >
+        Include events whose start timestamp falls within month boundary. If a shard
+        exceeds 45k URLs or 45 MB compressed, split into events-2025-11-a/b/c by
+        deterministic hashing on event UUID.
+    organizers:
+      key: slug_prefix
+      example: organizers-a.xml
+      rule: >
+        Bucket by lowercase slug first character (a-z, 0-9); fallback bucket "misc" for
+        symbols. Split further with suffix -1, -2 once a shard reaches 40k URLs.
+    humans:
+      key: slug_prefix
+      example: humans-a.xml
+      rule: |
+        Mirror organizer bucketing but keep shard soft limit at 25k URLs to prioritize
+        freshness. If a shard exceeds the limit, split deterministically with suffix -1/-2.
+    collections:
+      key: single
+      example: collections.xml
+      rule: Limited, expect <500 URLs. Keep separate for clarity.
+  invariants:
+    - Every canonical URL must appear exactly once across all shards.
+    - Shard filenames stable across runs; order inside shard sorted lexicographically.
+    - Do not emit draft/private/test URLs.
+    - Do not emit organizer or venue pages that fail `seo_index` guardrails.
+    - Completed events older than 120 days must be excluded unless explicitly whitelisted.
+    - Humans dataset must contain only `PUBLIC` or `PRIVATE` visibility; job aborts if other states appear.
+    - Humans shards include only `PUBLIC` humans; `PRIVATE` entries should be counted via guardrail metric but never emitted.
+url_format:
+  base_url: https://hearthfire.community
+  canonical_rules:
+    events: "/events/{slug}"
+    organizers: "/organizers/{slug}"
+    humans: "/humans/{slug}"
+    collections: stored absolute paths (e.g., "/about", "/contact", "/events")
+xml_contract:
+  required_tags:
+    - loc
+  optional_tags:
+    - lastmod: ISO8601 (UTC) derived from `updated_at` or latest related change.
+    - changefreq: dataset-specific value sourced from configuration (initially `weekly` for events, organizers, humans, and collections until crawl demand increases).
+    - priority: 0.8 for active events, 0.6 for organizer profiles, 0.5 for collections.
+  validation:
+    - Ensure UTF-8 encoding, XML declaration `<?xml version="1.0" encoding="UTF-8"?>`.
+    - Gzip compressed variant stored alongside raw XML.
+configuration:
+  changefreq_overrides:
+    source: `@th/config` key `seo.sitemaps.changefreq` (JSON map by dataset).
+    defaults:
+      events: weekly
+      organizers: weekly
+      humans: weekly
+      collections: biweekly
+    rollout: allow SEO team to adjust without redeploy; validate inputs against allowed values (`always`, `hourly`, `daily`, `weekly`, `monthly`).
+    notes: start conservative (weekly/biweekly) while sitemap jobs run nightly; revisit after Search Console impressions justify higher frequency claims.
+storage:
+  provider: s3  # Cloudflare R2 (S3-compatible)
+  bucket: seo-sitemaps
+  account: ${CLOUDFLARE_ACCOUNT_ID}
+  layout:
+    active: "sitemaps/{shard}.xml" and gzip twin "sitemaps/{shard}.xml.gz"
+    index: "sitemaps/index.xml"
+    archive: "sitemaps/archive/{YYYY}/{MM}/{shard}.xml.gz"
+    cdn: "https://cdn.hearthfire.community/sitemaps/{shard}.xml" served via Cloudflare cache rules.
+  retention:
+    active: "current + previous month" for event shards; organizers/collections latest only.
+    archive: 180 days stored in R2 with lifecycle transitions to infrequent access after 30 days.
+  synchronization:
+    - Background job verifies R2 objects have `cf-meta:lastmod` metadata for index manifest.
+    - R2 bucket notifications optional; rely on generator committing manifests once uploads finish.
+job_model:
+  generator:
+  entrypoint: apps/jobs/src/sitemaps/generate.ts
+    transactionality: idempotent per shard; writes to temp key then promotes.
+    batch_size: 5k URLs before streaming flush.
+  cadence:
+    full_rebuild: 01:30 UTC nightly.
+    delta_triggers:
+      - event publish/unpublish
+      - event update affecting SEO fields
+      - organizer profile publish/update
+      - human profile publish/update or visibility change
+    locking: distributed mutex (Redis or GCS composed objects) per shard to avoid overlaps.
+    retries: exponential backoff (3 attempts) on transient storage or data fetch errors.
+  orchestration:
+    preferred: KEDA Scheduled ScaledJob targeting the sitemap generator container image.
+    rationale: leverages existing Kubernetes deployment, horizontal scaling, and secret management; integrates with queue-based triggers for deltas.
+    implementation:
+      - Nightly cadence expressed as Cron string on the ScaledJob.
+      - Delta triggers via Redis/Queue scaler (reuse current event bus topics).
+      - No bespoke "KEDA adapter" needed in code—jobs package exposes plain CLI entrypoints; KEDA only orchestrates pods.
+    comparison:
+      - BullMQ lives inside long-running Node workers; good for high-volume task queues but adds Redis memory pressure and per-task polling.
+      - Sitemap generation is batch-heavy, benefits from cold-start isolation, and requires streaming uploads—KEDA aligns better with container-per-run semantics.
+      - If we ever need BullMQ, wrap generator calls in existing jobs queue abstractions, but default remains KEDA for operational simplicity.
+transport:
+  fastify_route:
+    path: /sitemaps/:shard
+    behavior: stream from storage with `Cache-Control: public, max-age=86400`.
+    fallback: 404 if shard missing, log metric.
+  index_route:
+    path: /sitemap.xml
+    behavior: >
+      Serve cached index manifest listing child sitemap URLs with lastmod derived from storage metadata.
+    caching: same as shard route.
+security:
+  - Ensure signed URLs not required (sitemaps public).
+  - Validate no private hosts or query parameters leak.
+observability_placeholders:
+  metrics:
+    - sitemap.generator.duration_ms
+    - sitemap.generator.urls_emitted
+    - sitemap.generator.shard_size_bytes
+    - sitemap.transport.cache_miss
+  logs:
+    - Structured JSON per generator run with shard name, counts, lastmod range.
+open_questions:
+  - Do we need region-specific shards for localized marketing pages?
+  - Should completed events remain indexable beyond 90 days?
+  - Where to persist dataset snapshots for diffing (BigQuery vs Postgres temp tables)?
+acceptance_criteria:
+  - [ ] Produces deterministic shard set under 50k/50MB limits in staging dataset.
+  - [ ] Index manifest validated via Google Search Console test tool.
+  - [ ] Routes return 200 with correct headers and gzip variants accessible.
+  - [ ] Archive retention job verified by test harness.
+dependencies:
+  - Postgres read replicas for bulk queries.
+  - Cloudflare R2 credentials (`access_key_id`, `secret_access_key`, `account_id`) via `@th/config` secrets.
+  - Redis (or equivalent) for job locking (if reused from existing infra).
+rollout:
+  phases:
+    - phase_0: generate shards in dry-run, store under `sitemaps/dry-run/`.
+    - phase_1: enable nightly job, keep routes behind feature flag.
+    - phase_2: enable routes + robots.txt entry + search console submission.
+    - phase_3: monitor and expand to additional locale shards if needed.
+notes:
+  - Keep shard generation streaming to avoid loading all URLs into memory.
+  - Hash collisions should be avoided by deterministic fallback (suffixing with 2-letter hash).
+  - Prefer direct uploads to R2 using S3-compatible SDK; reuse existing Cloudflare CDN rules for public caching.

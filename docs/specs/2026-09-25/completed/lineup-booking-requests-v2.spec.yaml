@@ -1,0 +1,262 @@
+# Superseded by docs/specs/2026-09-25/lineup-booking-requests-v3.spec.yaml (2026-10-08 docs consolidation)
+# lineup-booking-requests-v2.spec.yaml
+#
+# SUPERSEDED 2026-09-25 by lineup-booking-requests-v3.spec.yaml (same folder),
+# which fits this bill into the booking flow end to end. The v2 backend is the
+# base v3 builds on; read v3 for what changes.
+#
+# A booking request carries a BILL: the sender is the organizer of the ask,
+# the acts are rows — tagged platform artists (notify + confirm), free-text
+# acts, and optionally the sender's own act ("I'm on the bill"). One agreement
+# with the sender; the confirmed bill flows into the event minted from it.
+#
+# Supersedes docs/specs/2026-07-14/completed/lineup-booking-requests.spec.yaml (v1.0).
+# The July build trigger ("wait for a real organizer to stuff names into the
+# pitch") is LIFTED by owner decision 2026-09-25: the reply channel, holds,
+# venue confirmation and the event step all exist now, so a bill no longer
+# dead-ends. Four axis decisions taken 2026-09-25 are stamped D1–D4 below.
+
+version: "2.0"
+updated: "2026-09-25"
+supersedes: docs/specs/2026-07-14/completed/lineup-booking-requests.spec.yaml
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    A booking request models exactly one performer, and that performer IS the
+    sender. A promoter pitching a three-band night, a collective booking a
+    showcase, or a band bringing two supports has no way to say who is on the
+    bill: names get stuffed into the pitch text, the venue cannot see the real
+    lineup, tagged artists never learn their name was used, and a promoter who
+    is not performing has to pretend to be an act to send anything at all.
+  solution: >
+    The sender becomes the ORGANIZER of the request (D3). The form gains a
+    bill: "Add an act" searches platform artists (tagged, notified, they
+    confirm or decline) or adds a free-text act; "I'm on the bill" puts the
+    sender's own act on it. Accepting still mints ONE agreement with the
+    sender; creating the event from it attaches confirmed and free-text acts
+    as lineup rows in order.
+  users:
+    - Sender (a human or an org they can edit) building the bill
+    - Tagged platform artists (confirm / decline their spot)
+    - Venue (sees the real bill with confirmation state, in the inbox and the thread)
+  surfaces:
+    - web (place-page request dialog, venue inbox + thread, sent views, artist confirmation)
+    - embed (signed-in mode gets the picker; anonymous mode gets free-text acts only)
+
+# ── Decisions (owner, 2026-09-25) ────────────────────────────────────────────
+
+decisions:
+  - id: D3
+    text: >
+      The sender is the organizer. "I'm on the bill" adds the sender's own act.
+      Performer mode matters only for the act rows, never for sending.
+  - id: D3a
+    text: >
+      DEFAULT of "I'm on the bill": ON when the sender already has performer
+      mode enabled (a solo act pitching themselves — today's whole traffic —
+      must not have to tick a box on every request), OFF otherwise. The owner's
+      literal answer was "default off"; this is the same rule for the promoter
+      case and the no-regression rule for the act case. Flagged for review.
+  - id: D3b
+    text: >
+      `performerOwnerType/Id` keep their column names and the DB CHECK; their
+      MEANING becomes "the sender pair" (documented in the schema comment). No
+      column rename — the constraint, the open-pair uniqueness and every
+      existing read key on them.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        New model BookingRequestAct (junction, mirrors EventHuman): id,
+        bookingRequestId, source (SELF | TAGGED | EXTERNAL), actOwnerType/
+        actOwnerId (SELF: the sender pair, human OR org; TAGGED: a human),
+        externalName/externalUrl (EXTERNAL), role (default PERFORMER, reuse
+        EventHuman's role enum), sortOrder (0 = headliner), confirmation
+        (PENDING | CONFIRMED | DECLINED; SELF and EXTERNAL rows are CONFIRMED
+        at insert), invitedAt, respondedAt, declineReason?. @@unique on
+        (bookingRequestId, actOwnerType, actOwnerId) for platform rows.
+        Cascade on request delete.
+    - id: FR-002
+      description: >
+        createBookingRequest (owned path, PERFORM intent) accepts `bill`:
+        `includeSelf: boolean` + `acts[]` (≤ 12: tagged {humanId} | external
+        {name, url?}). RULE: a PERFORM request must carry ≥ 1 act on the bill
+        (self or other) — LINEUP_REQUIRED otherwise. The performer-mode gate
+        moves from the sender to the SELF row: includeSelf requires the sender
+        pair to be performer-enabled (PERFORMER_MODE_REQUIRED, same code, same
+        one-click enable UI); a sender with no self row needs no performer
+        mode. RENT/USE requests never carry a bill (strict-rejected).
+        Tagged humans must be taggable = what `search.autocompleteAdmin`
+        already surfaces (no new eligibility concept). Junction rows are
+        written in the same tx as the request; fan-out is post-commit.
+    - id: FR-003
+      description: >
+        Tagging notifies: each TAGGED human gets notify() (in-app + email +
+        push, variant `booking.lineup-invited`, renderer in comms/renderers.ts
+        beside `booking.hold-placed`) with one-tap confirm / decline. Use
+        cases confirmBookingRequestAct / declineBookingRequestAct: actor must
+        be the tagged human; CAS on confirmation (PENDING → CONFIRMED |
+        DECLINED); idempotent on repeat; DECLINED is terminal on that request.
+        The request never blocks on confirmation.
+    - id: FR-004
+      description: >
+        Rendering: the venue inbox row, the thread header, the sender's sent
+        views (SentBookingRequestsList, org Bookings hub) and the agreement
+        panel show the ordered bill with per-act state — CONFIRMED plain,
+        PENDING marked "invited", DECLINED struck for the sender and HIDDEN
+        from every venue-facing render. Platform acts link to their page.
+        The SELF row is labelled as the sender ("you" on the sender's own
+        views). `actName` (free text) stays as the request's display name and
+        prefills from the SELF row's name when includeSelf is on.
+    - id: FR-005
+      description: >
+        Embed: signed-in mode gets the same picker (the embed Bearer client
+        must reach an authed taggable search — verify `search.autocompleteAdmin`
+        works through it, else add `performers.searchTaggable` scoped to the
+        same eligibility); anonymous mode accepts EXTERNAL acts only, and a
+        smuggled humanId is a strict-schema 400 (no enumeration surface).
+    - id: FR-006
+      description: >
+        Flow-through: createEventFromAgreement (and the hold-confirm mint path
+        that reuses it) attaches CONFIRMED rows as EventHuman — human SELF /
+        TAGGED → {humanId}; org SELF → {externalName: org name, externalUrl:
+        org page url} (EventHuman has no org column; do not add one here);
+        EXTERNAL → {externalName, externalUrl} — preserving sortOrder and role.
+        PENDING rows become editor SUGGESTIONS on the event's lineup step, not
+        attached (consent carries through). DECLINED rows never flow.
+    - id: FR-007
+      description: >
+        Anti-abuse: per-sender budget of 30 distinct tagged humans per rolling
+        day (rate-limit port, same shape as the parked-request cap); a human
+        DECLINED on a request cannot be re-tagged on it; lineup-invited
+        notifications carry per (request, human) idempotency keys.
+    - id: FR-008
+      description: >
+        Thread visibility for a tagged artist: after CONFIRMING, the artist
+        gets READ-ONLY access to the request thread (messages.list authz gains
+        "confirmed act on this request"); no posting. Resolves the July open
+        question in the direction it leaned. Declined / pending artists see
+        nothing beyond their own invite.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Free-text act names pass plainTextRequired (≤ 120); externalUrl is
+        http(s)-only through the shared optionalHttpUrl.
+    - id: NFR-002
+      description: >
+        Consent is honest: a PENDING act is never rendered as confirmed
+        anywhere (inbox, thread, event, email), and confirm / decline is one
+        tap from the notification. Calm copy — no urgency, no pressure.
+    - id: NFR-003
+      description: >
+        Every notification swallow follows the ReporterPort convention with
+        regression tests (CLAUDE.md); inbox lists fetch the bill as ONE batched
+        child read per page (cap 12 per request).
+    - id: NFR-004
+      description: >
+        Direction guard: TO_PERFORMER requests (organizer → act) do not carry a
+        bill in this spec; the create path for them strict-rejects `bill`.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: createBookingRequest (modified)
+        description: >
+          Accepts `bill`; runs the act-row gates (self performer mode, taggable
+          humans, dedupe, budget); writes junction rows in-tx; post-commit
+          fans out `booking.lineup-invited` per TAGGED row.
+        input: bill { includeSelf, acts[] } on the PERFORM shape
+        output: request id + notificationIntents (existing shape, extended)
+        idempotent: false
+        money: false
+      - name: confirmBookingRequestAct / declineBookingRequestAct (new)
+        description: actor = the tagged human; CAS on confirmation; ledger entry.
+        input: bookingRequestId, (declineReason?)
+        output: the act row
+        idempotent: true
+        money: false
+      - name: listBookingRequests / getBookingRequest (modified)
+        description: summaries and detail gain `bill[]` (ordered, with state, venue-facing filter applied server-side).
+        idempotent: true
+        money: false
+      - name: createEventFromAgreement (modified)
+        description: FR-006 flow-through; suggestions for PENDING rows.
+        idempotent: true
+        money: false
+    ports:
+      new: []
+      existing: [booking-requests repo (+ acts child), humans, orgs, performer-profiles, event-humans, notify pipeline, rate-limit, reporter, ledger]
+  adapters:
+    new: [prisma booking-request-acts (child of the booking-requests repo)]
+    existing: [prisma booking-requests, prisma event-humans, comms renderers + ui-email template booking.lineup_invited]
+  transport:
+    trpc_procedures:
+      - bookingRequests.create — input gains `bill` (strict, ≤ 12 acts)
+      - bookingRequests.confirmAct / declineAct (authed)
+      - embeds.createBookingInquiry — anonymous path gains EXTERNAL-only `bill`
+      - bookingRequests.get / list — output gains `bill[]`
+    webhooks: []
+  ui:
+    pages:
+      - /bookings/acts/[requestId] — the one-tap confirm / decline landing (notification deep link; signed-in)
+    components:
+      - RequestToPlayForm + SignedInBookingPanel: "I'm on the bill" toggle (D3a default), "Add an act" rows (HumanSearchCombobox + free-text fallback), reorder
+      - Embed anonymous form: free-text act rows
+      - BookingInbox row, BookingThread header, SentBookingRequestsList, SentToActsList, agreement panel: bill rendering with state
+      - Event builder lineup step: "suggested from the booking" rows for PENDING acts
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - BookingRequestAct (FR-001) + enums BookingRequestActSource, BookingRequestActConfirmation
+  modified_models:
+    - BookingRequest: schema comment only (sender-pair semantics, D3b); no columns
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: Tag spam — blasting invites to well-known artists for clout.
+    severity: MEDIUM
+    mitigation: Daily budget, per-request dedupe, decline-is-terminal, idempotent notifications, one-tap decline.
+  - risk: The performer-mode gate moving off the sender silently widens who can send PERFORM requests (any signed-in human).
+    severity: MEDIUM
+    mitigation: LINEUP_REQUIRED keeps every request tied to at least one act; the parked-request cap and one-open-per-(sender, place) still apply to promoters. Measured in the inbox as a "promoter" label on requests with no SELF row.
+  - risk: Org SELF rows flow to events as external names, losing the org link on the event lineup.
+    severity: LOW
+    mitigation: externalUrl carries the org page; adding an org column to EventHuman is a separate decision (out of scope).
+
+open_questions:
+  - D3a — confirm the smart default (on for performer-mode senders) or insist on literal default-off.
+  - Should a tagged artist's confirmed spot appear on their own profile ("pitched for …")? Leaning no until the booking is accepted (unchanged from July).
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Per-act agreements or automatic splits (single sender agreement; N payees stay a PayoutTermsLine concern).
+  - Bills on TO_PERFORMER (organizer → act) requests.
+  - Retrofitting consent onto direct EventHuman attach in the event builder.
+  - Anonymous submitters tagging platform artists.
+  - An org column on EventHuman.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A promoter with NO performer mode submits a PERFORM request with 2 tagged artists + 1 free-text act and includeSelf off → accepted; venue inbox shows the ordered bill with two "invited" rows; both artists are notified once each.
+  - A solo act with performer mode opens the form → "I'm on the bill" is already on; submitting with no other acts works exactly as today's request (actName prefilled from their act).
+  - A request with includeSelf off and no acts → LINEUP_REQUIRED, surfaced inline with calm copy.
+  - includeSelf on without performer mode → PERFORMER_MODE_REQUIRED with the existing one-click enable.
+  - Tagged artist confirms → CONFIRMED everywhere; declines → struck for the sender, absent from the venue's inbox/thread/email; a second confirm/decline is a no-op.
+  - Accept mints exactly one agreement with the sender; create-event attaches confirmed + external acts as EventHuman rows in sortOrder; PENDING acts appear only as suggestions.
+  - Anonymous embed with a humanId in `bill` → 400; RENT/USE with a `bill` → 400.
+  - The 31st distinct tagged human in a day is rejected calmly; re-tagging a DECLINED artist on the same request is rejected.
+  - A confirmed artist can read the thread and cannot post; a pending one cannot read it.

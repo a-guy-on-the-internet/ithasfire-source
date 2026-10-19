@@ -4,10 +4,22 @@
  * Two windows that fan out into the same `sendVolunteerShiftReminders`
  * use case with a different `kind`:
  *
- *   • volunteers.reminders-24h — runs every 15 min, picks up APPROVED
- *     signups whose shift starts in the next ~24h band (23h45m–24h15m).
- *   • volunteers.reminders-1h  — runs every 5 min, picks up the
- *     55m–65m band.
+ *   • volunteers.reminders-24h — runs every 30 min, picks up APPROVED
+ *     signups whose anchor starts in the next ~24h band (23h30m–24h30m).
+ *   • volunteers.reminders-1h  — runs every 30 min (aligned with the
+ *     other :00/:30 jobs so the database wakes once per slot), picks up the
+ *     40m–80m band. Both bands are wider than the tick on purpose; see
+ *     DEFAULT_BAND_MS in send-volunteer-shift-reminders.ts.
+ *
+ * A signup's anchor is its shift's start; else, for an event role without
+ * shifts, the event's start; else, for a one-time ask with a start time,
+ * the ask's start (`signupReminderAnchor`, volunteer-ask-reminders). The
+ * result counts candidates per anchor in `byAnchor`.
+ *
+ * One person with several signups on the same event or ask at the same start
+ * gets one message per channel naming every role (R12). In the result,
+ * `sent` / `skipped` / `failed` count signups per channel and `messages`
+ * counts what went out, so a grouped text is `sent.sms: 2, messages.sms: 1`.
  *
  * Idempotency is enforced inside the use case via the
  * `VolunteerShiftNotification` unique `(signupId, kind, channel)`
@@ -35,7 +47,7 @@ const reminderInput = z.object({
 export const volunteersReminders24h = defineScheduledTask({
   name: "volunteers.reminders-24h",
   description:
-    "Dispatch 24h-ahead volunteer shift reminders (email + in-app for signed-in volunteers + SMS for opted-in numbers). Idempotent via the VolunteerShiftNotification ledger.",
+    "Dispatch 24h-ahead volunteer reminders for shifts, shiftless event roles and one-time asks (email + in-app for signed-in volunteers + SMS for opted-in numbers). Idempotent via the VolunteerShiftNotification ledger.",
   input: reminderInput,
   schedule: getSchedule("volunteers.reminders-24h"),
   handler: async ({ input, ctx }) => {
@@ -48,6 +60,7 @@ export const volunteersReminders24h = defineScheduledTask({
         renderEmailTemplate: ctx.renderEmailTemplate,
         appBaseUrl: ctx.appBaseUrl,
         logger: ctx.logger,
+        reportError: ctx.reportError,
       },
       { kind: "REMINDER_24H", ...input },
     );
@@ -59,7 +72,7 @@ export const volunteersReminders24h = defineScheduledTask({
 export const volunteersReminders1h = defineScheduledTask({
   name: "volunteers.reminders-1h",
   description:
-    "Dispatch 1h-ahead volunteer shift reminders. Tighter window + faster cron tick than the 24h variant.",
+    "Dispatch 1h-ahead volunteer reminders for shifts, shiftless event roles and one-time asks. Window +40m to +80m on a */30 tick; the per-channel ledger claim keeps overlapping ticks to one reminder.",
   input: reminderInput,
   schedule: getSchedule("volunteers.reminders-1h"),
   handler: async ({ input, ctx }) => {
@@ -72,6 +85,7 @@ export const volunteersReminders1h = defineScheduledTask({
         renderEmailTemplate: ctx.renderEmailTemplate,
         appBaseUrl: ctx.appBaseUrl,
         logger: ctx.logger,
+        reportError: ctx.reportError,
       },
       { kind: "REMINDER_1H", ...input },
     );

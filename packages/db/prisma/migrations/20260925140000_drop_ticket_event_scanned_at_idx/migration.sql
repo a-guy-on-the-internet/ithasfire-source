@@ -1,0 +1,13 @@
+-- Venue track record, R11 re-ruled 2026-09-25 (FU-005): attendance is counted
+-- from the append-only `TicketScan` log, not `Ticket.scannedAt`, so
+-- `TicketsRepo.countScannedByEvent` — the only reader this index was built
+-- for (20260924120000_place_stats_track_record) — now runs on
+-- `TicketScan(eventId, scannedAt)`. No query filters, ranges or sorts on
+-- `Ticket.scannedAt` any more (grepped 2026-09-25, raw SQL included), and
+-- eventId lookups keep `Ticket_eventId_idx`. A dead index on a hot table
+-- (issuance, door scans) costs a write on every mint and scan.
+--
+-- `CONCURRENTLY` so the drop does not take an ACCESS EXCLUSIVE lock that
+-- would block door scans; it cannot run inside a transaction, so this file is
+-- one statement (precedent: 20260924130000). `IF EXISTS` makes a retry safe.
+DROP INDEX CONCURRENTLY IF EXISTS "Ticket_eventId_scannedAt_idx";

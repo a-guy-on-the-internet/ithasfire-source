@@ -1,0 +1,250 @@
+# Not built yet (2026-10-08 docs consolidation): designer UI, per-event saved template, layout presets, PDF export
+# volunteer-badge-designer.spec.yaml
+#
+# Printable volunteer badge sheets with a per-event designer template.
+
+version: "0.1"
+status: draft
+updated: "2026-04-24"
+related:
+  - docs/specs/2026-04-24/volunteer-scanner-check-in.spec.yaml
+  - docs/specs/2026-03-23/volunteering.spec.md
+
+scope_note: >
+  This spec covers only printable volunteer badges and the admin-facing
+  designer that produces them. It reuses the existing volunteer scan
+  token port with the `print` kind (longer TTL, admin-only minting)
+  already defined in `volunteer-scanner-check-in.spec.yaml`. It does NOT
+  modify the token claim shape or scanner-side verification.
+
+dependencies:
+  hard:
+    - volunteer-scanner-check-in Phase 1 shipped (print-kind mint path
+      + `VolunteerScanTokenPort` wired in API)
+  soft:
+    - org branding assets captured on the org or event
+
+summary:
+  problem: >
+    At event-day speed, not every volunteer has a phone with the app or
+    a wallet pass. Staff leads need a way to hand out printed badges
+    with the volunteer's QR, name, role, and shift pre-printed on a
+    familiar lanyard-sized slot. Today there is no supported way to
+    produce this; leads resort to hand-written stickers or ad-hoc
+    spreadsheets.
+  solution: >
+    An admin-facing Badge Designer that produces a print-ready PDF
+    sheet of volunteer badges (A4 default, US-Letter alternate) for a
+    selected event, minting print-kind volunteer scan tokens per
+    signup, rendering QR + human + role + shift fields per a
+    customizable template.
+  users:
+    - Org admins / event staffing leads
+    - Volunteer coordinators printing and distributing badges before
+      doors
+  surfaces:
+    - web-admin (Badge Designer + "Print badges" batch action)
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        From the event volunteers admin surface, an org admin with
+        `ORG_EDIT_ROLES` must be able to open a Badge Designer for the
+        current event.
+    - id: FR-002
+      description: >
+        The designer must produce a downloadable PDF containing one
+        badge per selected APPROVED signup, laid out on the chosen
+        page size. A4 is the default; US-Letter is selectable.
+    - id: FR-003
+      description: >
+        Each badge must include, at minimum:
+          - Volunteer QR (print-kind scan token)
+          - Human display name
+          - Role label
+          - Shift label + shift start-end window
+          - Event title
+          - Org name / logo
+        Additional fields selectable per FR-006.
+    - id: FR-004
+      description: >
+        QR tokens embedded in each badge must be minted via the existing
+        `volunteer.signups.mintScanToken` mutation with `kind: "print"`.
+        Token TTL must honor the clamp defined in the scanner check-in
+        spec (event.endsAt - now + 24h, max 90 days). Minting must be
+        transactional and audit-logged (reuses existing
+        `scan_token_minted` audit action).
+    - id: FR-005
+      description: >
+        The designer must let the admin choose a layout preset:
+          - A4 / 8 per sheet (2 x 4, standard lanyard slot size)
+          - A4 / 10 per sheet (compact)
+          - US-Letter / 6 per sheet (3 x 2)
+          - US-Letter / 10 per sheet (compact)
+        Presets control paper size, badge dimensions, and margins.
+        v1 does NOT support fully custom dimensions.
+    - id: FR-006
+      description: >
+        The designer must offer a small set of toggleable template
+        fields beyond the FR-003 minimum:
+          - Contact email (masked or full, admin choice)
+          - "Arrive by" time (admin-entered or signup.shiftStartAt - 30m)
+          - Custom footer line (free text, per-event)
+          - Background accent color
+          - Organization hero image (optional)
+    - id: FR-007
+      description: >
+        A live preview must show the rendered badge for a single
+        representative signup before PDF generation.
+    - id: FR-008
+      description: >
+        Batch scope must support:
+          - All APPROVED signups for the event
+          - Filtered by role
+          - Filtered by shift
+          - Explicit selection from a checkbox list
+        Batch size cap per PDF is 500 badges. Beyond that, the
+        designer must offer to split into multiple PDFs.
+    - id: FR-009
+      description: >
+        The designer must save per-event template choices so a re-print
+        uses the same layout + field selections by default. Org-level
+        defaults (applied to new events) are a stretch goal; see
+        OQ-1.
+    - id: FR-010
+      description: >
+        Generated PDFs MUST NOT be stored permanently with embedded
+        tokens. Either stream them to the browser as a direct download,
+        or store them with a short-lived signed URL (<= 1h) and purge.
+        This mirrors the security posture for short-TTL credentials.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Batch of 100 badges must render in <= 10s p95 server-side.
+    - id: NFR-002
+      description: >
+        QR error correction level must be at least "M" (15%) to tolerate
+        light print smudging; size must be >= 25mm square on the A4 /
+        8-per-sheet preset.
+    - id: NFR-003
+      description: >
+        Layout must be deterministic: the same (event, selection,
+        template version) must produce byte-identical PDF output for
+        reproducibility (fonts embedded, no timestamp metadata).
+
+design:
+  page_presets:
+    a4_8:
+      paper: A4
+      cols: 2
+      rows: 4
+      badge_mm: [95, 65]
+      margin_mm: 10
+    a4_10:
+      paper: A4
+      cols: 2
+      rows: 5
+      badge_mm: [85, 54]
+      margin_mm: 10
+    letter_6:
+      paper: Letter
+      cols: 3
+      rows: 2
+      badge_mm: [86, 140]
+      margin_mm: 10
+    letter_10:
+      paper: Letter
+      cols: 2
+      rows: 5
+      badge_mm: [89, 50]
+      margin_mm: 10
+  field_bindings:
+    allowed_sources:
+      - signup.humanDisplayName
+      - signup.roleLabel
+      - signup.shiftLabel
+      - signup.shiftStartAt
+      - signup.shiftEndAt
+      - signup.contactEmailMasked
+      - event.title
+      - event.startsAt
+      - event.venueName
+      - org.name
+    formatters:
+      - localDateTime
+      - localDate
+      - localTime
+      - uppercase
+      - truncate(n)
+  render_pipeline: >
+    Use server-side PDF rendering (reuse ticket-PDF adapter if suitable,
+    otherwise a minimal HTML -> PDF pipeline with a locked-down CSS
+    template). No client-side canvas exports for the final artifact.
+
+acceptance_criteria:
+  - >
+    An org admin with edit role can select an event, open Badge Designer,
+    pick a page preset, select APPROVED signups, and download a PDF
+    with scannable QR codes per badge.
+  - >
+    Scanning a printed badge QR in the scanner app's volunteer check-in
+    mode successfully resolves the correct signup and permits check-in.
+  - >
+    Revoking or withdrawing a volunteer after printing does not permit
+    check-in because scanner verification re-checks signup status at
+    scan time (inherited guarantee from the scanner check-in spec).
+  - >
+    Every print-kind token mint is audit-logged with the minting admin.
+
+out_of_scope:
+  - Wallet passes (separate spec: volunteer-wallet-pass-designer)
+  - Custom badge dimensions outside the preset list
+  - Physical badge holder / lanyard fulfillment
+  - On-site badge-printer integration (thermal printers)
+  - Multi-language badge content (inherits org default locale)
+  - Attendee ticket badges
+
+open_questions:
+  - id: OQ-1
+    question: >
+      Do we ship org-level defaults in v1, or only per-event templates
+      with the option to "copy from another event"?
+  - id: OQ-2
+    question: >
+      Should PDF generation be synchronous (wait for download) or
+      async (queue -> email link)? Sync is simpler; async is required
+      for very large events (>500 badges).
+  - id: OQ-3
+    question: >
+      Do we embed a human-readable short ID (e.g. last-6 of signup id)
+      on the badge front for fallback manual lookup when the QR is
+      damaged? Helpful for search-fallback flow.
+  - id: OQ-4
+    question: >
+      Do we allow re-printing an already-printed badge, or force a
+      token rotation on re-print? Rotation is safer; re-use is more
+      convenient when a volunteer just lost theirs.
+
+risks:
+  - risk: >
+      Long-lived print-kind tokens leak via photos of badges on social
+      media.
+    severity: MEDIUM
+    mitigation: >
+      TTL is clamped to event.endsAt + 24h (max 90d). Scanner already
+      re-validates signup status server-side at scan time. Optional
+      rotation-on-reprint per OQ-4 further limits exposure.
+  - risk: >
+      Printed QR fails to scan under real-world lighting.
+    severity: MEDIUM
+    mitigation: >
+      Minimum QR size + error-correction level M per NFR-002;
+      preview-driven designer surfaces bad contrast before print.
+  - risk: >
+      Designer complexity grows into a general-purpose print layout
+      tool.
+    severity: MEDIUM
+    mitigation: >
+      v1 is preset-only. Custom dimensions are explicitly out of scope.

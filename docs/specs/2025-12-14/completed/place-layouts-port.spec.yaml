@@ -1,0 +1,165 @@
+status: complete
+task: Define place layout ports for single-venue layouts, glyph storage, layout status hydration, and realtime fan-out.
+repo_root: packages/ports/src/place-layouts
+goal: Provide stable TypeScript interfaces + zod schemas enabling adapters to implement
+  single-layout persistence per venue, glyph snapshot storage, availability hydration, and
+  optional streaming updates without leaking adapter-specific details.
+
+files:
+  - path: packages/ports/src/place-layouts/place-layout-repo.ts
+  - path: packages/ports/src/place-layouts/place-layout-blob-repo.ts
+  - path: packages/ports/src/place-layouts/place-layout-status-repo.ts
+  - path: packages/ports/src/place-layouts/place-layout-streaming-port.ts
+  - path: packages/ports/src/place-layouts/place-layout-parser.ts
+  - path: packages/ports/src/place-layouts/types.ts
+  - path: packages/ports/src/index.ts
+
+constraints:
+  - Ports expose only typed DTOs (no Prisma models or vendor SDK types).
+  - All read methods return `Result`-style discriminated unions or throw typed
+    errors with `{ code: <union>; message; details? }` matching standards.
+  - Use zod schemas alongside TypeScript interfaces for request/response validation.
+  - Include paginated/diff helpers to support admin UI comparisons.
+  - All write mutations accept `context: { actorId: string; requestId?: string }` for audit tracing.
+  - Streaming port must be optional but share payload schema with API transport.
+  - Parser port returns normalized geometry + validation issues, never throws on
+    recoverable errors.
+
+shared_types (types.ts):
+  PlaceLayoutGlyph:
+    - seatId: string
+    - sectionId: string
+    - geometry:
+        x: number
+        y: number
+        radius?: number
+        width?: number
+        height?: number
+        rotation?: number
+        facingAngle?: number
+    - label: string
+    - tierId?: string
+    - attrs?: { accessible?: boolean; companionSeatIds?: string[]; notes?: string }
+  SectionTransform:
+    - sectionId: string
+    - name: string
+    - transform: { origin: { x: number; y: number }; rotation: number; scale: number }
+    - geometry?: { polygons: Array<Array<{ x: number; y: number }>> }
+    - bounds: { minX: number; minY: number; maxX: number; maxY: number }
+    - visibility: "PUBLIC" | "ORGANIZER_ONLY"
+    - stageAnchor?: { facingAngle?: number; point?: { x: number; y: number } }
+  StageLayout:
+    - center: { x: number; y: number }
+    - polygon?: Array<{ x: number; y: number }>
+    - lookAt?: { x: number; y: number }
+    - label?: string
+  SeatIndexNode:
+    - minX: number
+    - minY: number
+    - maxX: number
+    - maxY: number
+    - children?: SeatIndexNode[]
+    - seatIds?: string[]
+  PlaceLayoutRecord:
+    - id: string
+    - venueId: string
+    - checksum: string
+    - glyphSnapshotKey: string
+    - metadata: {
+        defaultViewport: { center: { x: number; y: number }; zoom: number }
+        minZoom: number
+        maxZoom: number
+        sectionOverlays?: Array<{ sectionId: string; colorToken: string }>
+        notes?: string
+      }
+    - stage: StageLayout
+    - seatIndex: SeatIndexNode
+    - issues: ParserIssue[]
+    - createdAt: Date
+    - updatedAt: Date
+    - createdBy: string
+  PlaceLayoutDiff:
+    - added: number
+    - removed: number
+    - moved: number
+    - sectionsChanged?: string[]
+    - warnings?: string[]
+  PlaceLayoutAvailability:
+    - seatId: string
+    - status: "AVAILABLE" | "HELD" | "SOLD" | "BLOCKED" | "UNKNOWN"
+    - holdExpiresAt?: Date
+    - orderId?: string
+  ParserIssue:
+    - code: string
+    - message: string
+    - severity: "warning" | "error"
+    - seatId?: string
+    - sectionId?: string
+
+error_codes:
+  - "invalid_input"
+  - "not_found"
+  - "forbidden"
+  - "conflict"
+  - "dependency_failed"
+  - "transient"
+
+PlaceLayoutRepo (place-layout-repo.ts):
+  methods:
+    - getByVenue(venueId: string): Promise<Result<PlaceLayoutRecord, PlaceLayoutPortError>>
+    - getForEvent(eventId: string): Promise<Result<PlaceLayoutRecord, PlaceLayoutPortError>>
+    - replaceWithSnapshot(input: ReplacePlaceLayoutInput, context): Promise<Result<PlaceLayoutRecord, PlaceLayoutPortError>>
+    - previewDiff(input: ReplacePlaceLayoutInput): Promise<Result<PlaceLayoutDiff, PlaceLayoutPortError>>
+    - deleteForVenue(venueId: string, context): Promise<Result<{ deleted: boolean }, PlaceLayoutPortError>>
+  notes:
+    - `ReplacePlaceLayoutInput` contains normalized geometry snapshot ID, section metadata, and optional parser issues.
+    - Replace operation is destructive: delete existing sections/seats + layout row, then insert new snapshot in a single transaction.
+    - Persist `stage` and `seatIndex` so transport + UI can orient point-only seats without recomputing.
+    - `deleteForVenue` limited to venues without active events or during initial venue setup.
+
+PlaceLayoutBlobRepo (place-layout-blob-repo.ts):
+  methods:
+    - getByVenue(venueId: string): Promise<Result<PlaceLayoutGlyph[], PlaceLayoutPortError>> | stream variant for large payloads
+    - putForVenue(venueId: string, glyphs: PlaceLayoutGlyph[], context): Promise<Result<{ checksum: string }, PlaceLayoutPortError>>
+    - deleteForVenue(venueId: string, context): Promise<Result<void, PlaceLayoutPortError>>
+    - generateThumbnail(venueId: string): Promise<Result<{ url: string }, PlaceLayoutPortError>>
+  notes:
+    - Implementations may store binary blobs; keep API JSON-friendly.
+    - Glyph blobs must persist center `{ x, y }` and any supplied optional size/orientation fields.
+    - Provide helper to stream glyphs when seat index data needs regeneration or cache warmup.
+
+PlaceLayoutStatusRepo (place-layout-status-repo.ts):
+  methods:
+    - getAvailability(eventId: string): Promise<Result<{ seats: PlaceLayoutAvailability[]; checksum: string }, PlaceLayoutPortError>>
+    - getOrganizerView(eventId: string): Promise<Result<{ seats: PlaceLayoutAvailability[]; checksum: string }, PlaceLayoutPortError>>
+    - upsertSeatStatuses(input: UpsertPlaceLayoutStatusesInput, context): Promise<Result<void, PlaceLayoutPortError>>
+    - releaseExpiredHolds(now: Date, limit?: number): Promise<Result<{ released: number }, PlaceLayoutPortError>>
+  notes:
+    - Buyer view must redact `orderId`; organizer view retains.
+
+PlaceLayoutStreamingPort (place-layout-streaming-port.ts):
+  methods:
+    - publishStatusChanged(eventId: string, payload: PlaceLayoutAvailability, context): Promise<Result<void, PlaceLayoutPortError>>
+    - publishLayoutReplaced(venueId: string, checksum: string, context): Promise<Result<void, PlaceLayoutPortError>>
+    - subscribe?(eventId: string, handler: (payload) => void): AsyncIterator<PlaceLayoutAvailability> # optional, for adapters supporting inbound streams
+  notes:
+    - Stick to SSE-friendly payload size; include retry/backoff hints in context if needed.
+
+PlaceLayoutParserPort (place-layout-parser.ts):
+  methods:
+    - parse(input: { uploadRef: string; format: "cad" | "svg" | "csv"; venueId: string }): Promise<Result<{ glyphs: PlaceLayoutGlyph[]; sections: SectionTransform[]; stage?: StageLayout; issues: ParserIssue[] }, PlaceLayoutPortError>>
+  notes:
+    - Always return issues array even on success; callers decide whether to block publish.
+    - Parsers should infer `radius` fallback (`width`/`height` absent) and normalize `facingAngle` to degrees clockwise from positive X.
+    - Missing optional geometry fields must not throw; downstream renderers rely on point-only seats as MVP.
+    - Parser output should include bounding boxes to speed up R-tree creation during publish.
+
+index_exports:
+  - Re-export all ports + types from `packages/ports/src/index.ts` under `placeLayouts` namespace.
+  - Provide helper factory `createPlaceLayoutPorts()` for DI registration.
+
+tests (interface-level):
+  - Ensure zod schemas cover glyph + availability shapes; add contract tests with sample payloads (arena vs theater).
+  - Validate that optional geometry fields (`radius`, `width`, `height`, `facingAngle`) are all permitted and default correctly.
+  - Validate error code union shared across ports.
+  - Snapshot compile test verifying exported types align with spec (use dtslint or vitest type tests).

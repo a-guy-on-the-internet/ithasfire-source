@@ -1,5 +1,9 @@
 import { createAuthClient } from "better-auth/react";
-import { jwtClient, magicLinkClient } from "better-auth/client/plugins";
+import {
+  emailOTPClient,
+  jwtClient,
+  magicLinkClient,
+} from "better-auth/client/plugins";
 import { expoClient } from "@better-auth/expo/client";
 import * as SecureStore from "expo-secure-store";
 import * as WebBrowser from "expo-web-browser";
@@ -12,13 +16,28 @@ WebBrowser.maybeCompleteAuthSession();
 const SCHEME = "ithasfire";
 const STORAGE_PREFIX = "ithasfire-mobile";
 
+// Literal `process.env.EXPO_PUBLIC_*` at module scope: `babel-preset-expo`
+// inlines only that form. Reading it through `globalThis.process.env` stayed
+// a runtime lookup, `undefined` on Hermes in EAS builds, so the origin always
+// fell back to localhost. Same trap as src/config/api.ts.
+const ENV_AUTH_ORIGIN = process.env.EXPO_PUBLIC_AUTH_ORIGIN;
+
+// eas.json sets EXPO_PUBLIC_AUTH_ORIGIN for preview + production. The
+// localhost fallback is dev-only: a release build missing the var sends NO
+// Origin header rather than a wrong one. That holds only while the API does
+// NOT mount `@better-auth/expo`'s `expo()` server plugin; if it ever does,
+// the plugin promotes our `expo-origin: ithasfire://` header to Origin.
+// (Better Auth only checks Origin on cookie-bearing POSTs; either way that
+// request fails, but a missing header points at the config instead of
+// looking like a trusted-origins bug.)
 const resolveAuthOrigin = (): string | undefined => {
-  const envSource = globalThis as typeof globalThis & {
-    process?: { env?: Record<string, string | undefined> };
-  };
-  const envOrigin = envSource.process?.env?.EXPO_PUBLIC_AUTH_ORIGIN;
-  const trimmed = envOrigin?.trim();
-  return trimmed && trimmed.length > 0 ? trimmed : "http://localhost:3000";
+  const trimmed = ENV_AUTH_ORIGIN?.trim();
+  if (trimmed && trimmed.length > 0) return trimmed;
+  // Guarded like the scanner's client: `__DEV__` is undefined outside Metro
+  // (e.g. vitest), and this runs at module scope.
+  return typeof __DEV__ !== "undefined" && __DEV__
+    ? "http://localhost:3000"
+    : undefined;
 };
 
 export const magicLinkCallbackUrl = `${SCHEME}://auth-callback`;
@@ -36,6 +55,9 @@ export const authClient = createAuthClient({
     }),
     magicLinkClient(),
     jwtClient(),
+    // Email verification codes (`emailOtp.sendVerificationOtp` /
+    // `emailOtp.verifyEmail`) for the B2 own-orders gate.
+    emailOTPClient(),
   ],
   fetchOptions: {
     onRequest: (ctx) => {

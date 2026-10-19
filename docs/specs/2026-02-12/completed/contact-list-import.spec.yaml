@@ -1,0 +1,795 @@
+# Spec: Contact List Import (Email & SMS)
+# Enables orgs and humans to bulk-import email/phone contacts for event announcements.
+
+meta:
+  owner: comms
+  status: complete
+  reviewers:
+    - platform-eng
+    - product-ops
+    - security
+  last_updated: 2026-02-11
+
+summary: |
+  Allow organizations and individual humans to import external email and texting
+  (SMS) contact lists—typically exported from Mailchimp, Google Contacts, phone
+  address books, or plain spreadsheets—and store them as InviteList entries that
+  can be targeted by the comms announcement pipeline.
+
+  This spec covers:
+    1. Client-side file parsing with real-time in-app validation table (CSV, XLSX)
+    2. Column mapping & normalization
+    3. Validation, per-list deduplication, and consent tagging
+    4. Server receives pre-validated rows (no async job queue for import itself)
+    5. Merge-with-dedup use case for combining lists without duplicates
+    6. Linking imported lists as CUSTOM_SEGMENT audiences for announcements
+    7. AuthUser matching at import time (link humanId, no in-app notification)
+    8. Privacy, opt-out, and anti-spam guardrails
+
+  Design principle: parsing and validation happen entirely in the browser.
+  The UI shows a live preview table with per-row pass/fail indicators so the
+  user sees exactly what will be imported before confirming. Only validated,
+  normalized rows are sent to the server. For large imports the client chunks
+  rows into batches (≤ 5 000 per request) and drives the upload loop,
+  showing a progress bar—no background job or file-upload infrastructure
+  needed.
+
+  It builds on the existing InviteList / InviteListEntry models and the
+  comms.createAnnouncementDraft audience types.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Actors & Permissions
+# ─────────────────────────────────────────────────────────────────────────────
+actors:
+  org_admin:
+    description: Org OWNER, ADMIN, or EDITOR creating/managing lists for the org.
+    authz: repos.authz.ensureOrgRole(actorHumanId, orgId, [OWNER, ADMIN, EDITOR])
+  human_self:
+    description: A human managing their own personal contact lists (e.g., indie promoter).
+    authz: actorHumanId === owner.id when owner.kind === HUMAN
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Entry Points
+# ─────────────────────────────────────────────────────────────────────────────
+entry_points:
+  admin_ui:
+    route: apps/web/src/app/admin/[slug]/contacts/import/page.tsx
+    features:
+      - Drag-and-drop or file picker upload (CSV, XLSX)
+      - Client-side parsing via PapaParse (CSV) / SheetJS (XLSX) in the browser
+      - Real-time validation table showing every row with pass/fail status per field
+      - Interactive column mapping (auto-detected, user-adjustable)
+      - Invalid rows highlighted inline with error reasons (bad email, missing phone, etc.)
+      - User reviews the table, toggles individual rows on/off, then confirms import
+      - Post-import summary: added / skipped (duplicate) / rejected rows
+    nav:
+      - Add "Contacts" entry to ADMIN_SECTIONS in layout.tsx (lucide icon: Users)
+  human_ui:
+    route: apps/web/src/app/dashboard/contacts/import/page.tsx
+    features:
+      - Same UX as admin_ui but scoped to owner.kind=HUMAN
+  api:
+    transport: tRPC (comms router)
+    procedures:
+      - comms.importContacts         (mutation — receives pre-validated rows from client)
+      - comms.mergeContactLists      (mutation — merge source list into target with dedup)
+      - comms.listContactImports     (query, paginated — history of past imports)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Supported File Formats
+# ─────────────────────────────────────────────────────────────────────────────
+file_formats:
+  csv:
+    mime: text/csv
+    max_size_mb: 25
+    encoding: UTF-8 (with BOM detection)
+    delimiter_detection: comma, semicolon, tab (auto-sniffed by PapaParse)
+    client_lib: PapaParse (papaparse npm)
+  xlsx:
+    mime: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+    max_size_mb: 25
+    notes: First sheet only; header row required.
+    client_lib: SheetJS (xlsx npm)
+  limits:
+    max_rows_per_chunk: 5_000       # per-request ceiling (client splits into chunks)
+    max_columns: 50
+    max_cell_length: 1000
+    notes: >
+      There is no hard cap on total rows per import. The client parses the
+      full file locally, then sends validated rows in chunks of up to 5 000
+      to comms.importContacts. Each chunk is a separate tRPC mutation that
+      appends to the same ContactImport ledger row (identified by importId).
+      The first chunk creates the ledger row; subsequent chunks update it.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3a. Client-Side Parsing & Validation UX
+# ─────────────────────────────────────────────────────────────────────────────
+client_side_parsing:
+  description: |
+    All file parsing and row validation happens in the browser. No file is
+    uploaded to the server for processing. The flow:
+
+    1. User drops or picks a CSV/XLSX file.
+    2. Client parses the file entirely in-memory (PapaParse or SheetJS).
+    3. Auto-detect column mapping from headers (fuzzy match heuristics below).
+    4. User confirms/adjusts mapping via dropdown selectors per column.
+    5. Client normalizes + validates every row against the confirmed mapping:
+       - Email: lowercase, trim, regex + basic RFC 5322 check.
+       - Phone: E.164 via libphonenumber-js (bundled client-side).
+       - Each row gets a status: VALID, INVALID (with per-field error reasons).
+    6. UI renders a scrollable table with:
+       - Green check / red X per row.
+       - Inline error badges (e.g., "invalid email", "missing phone").
+       - Summary bar: "312 valid, 4 invalid, 0 duplicates".
+       - Toggle to hide/show invalid rows.
+       - Checkbox per row to include/exclude from import.
+    7. User clicks "Import N contacts". The client splits VALID + selected rows
+       into chunks of ≤ 5 000 and sends each chunk sequentially via
+       comms.importContacts:
+         a. First chunk: omits importId — server creates the ContactImport
+            ledger row + InviteList (if new) and returns the importId.
+         b. Subsequent chunks: include the importId returned from chunk 1.
+            Server appends entries and increments counts on the same ledger row.
+         c. Client shows a progress bar: "Chunk 3 / 7 — 12 400 of 32 000 rows".
+         d. On network failure, the client retries the failed chunk (safe
+            because per-list unique constraints make each row insert idempotent).
+         e. After the final chunk succeeds, client shows the post-import summary.
+
+  validation_rules:
+    contactEmail:
+      - Must match simplified RFC 5322 regex (same one used server-side in comms port).
+      - Lowercased + trimmed.
+      - Reject obvious junk: "test@test", "none", "n/a", single-char local parts.
+    contactPhone:
+      - Parsed via libphonenumber-js with user-selected default country.
+      - Must produce a valid E.164 string.
+      - Reject non-mobile numbers if SMS-only list (optional toggle).
+    row_level:
+      - At least one of contactEmail or contactPhone must be valid.
+      - Rows failing this are marked INVALID but remain visible for user review.
+
+  performance:
+    - No hard row-count cap. Files with hundreds of thousands of rows are
+      supported; only browser memory is the practical limit for parsing.
+    - Use Web Worker for parsing if file > 5k rows to avoid UI jank.
+    - Render table with virtualization (e.g., @tanstack/react-virtual) for large sets.
+    - Chunk upload keeps individual request payloads small (≤ 5 000 rows ≈ < 2 MB JSON).
+
+  chunked_upload_hook:
+    file: apps/web/src/hooks/use-chunked-import.ts
+    description: |
+      A React hook that encapsulates the chunk-upload loop. The import page
+      calls it after the user confirms the validated rows.
+
+      interface UseChunkedImportOptions {
+        owner: { kind: "ORG" | "HUMAN"; id: string };
+        targetListId?: string;
+        targetListName?: string;
+        fileName: string;
+        fileFormat: "CSV" | "XLSX";
+        contacts: ValidatedContact[];     // all valid, selected rows
+        consentSource?: string;
+        chunkSize?: number;               // default 5_000
+      }
+
+      interface UseChunkedImportResult {
+        start: () => void;
+        cancel: () => void;               // sets an abort flag; current chunk finishes
+        status: "idle" | "uploading" | "completed" | "error" | "canceled";
+        progress: {
+          currentChunk: number;
+          totalChunks: number;
+          rowsSent: number;
+          totalRows: number;
+          importedCount: number;           // running total from server
+          skippedCount: number;            // running total from server
+        };
+        error: Error | null;
+        importId: string | null;
+        inviteListId: string | null;
+      }
+
+    behavior:
+      - Splits contacts into chunks of chunkSize.
+      - First chunk omits importId; stores the returned importId for subsequent chunks.
+      - Each chunk generates a stable clientKey from a session-scoped UUID + chunkIndex.
+      - On network error, retries the failed chunk up to 3 times with exponential backoff.
+      - On cancel, stops sending new chunks but lets the in-flight chunk finish.
+      - On completion, returns the final running totals from the last chunk response.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Column Mapping
+# ─────────────────────────────────────────────────────────────────────────────
+column_mapping:
+  description: |
+    After parsing the header row, the client auto-maps columns to InviteListEntry
+    fields using fuzzy header matching. The user confirms or adjusts mappings in
+    the UI before rows are validated and sent to the server.
+
+  target_fields:
+    - contactEmail:
+        required_if: no contactPhone mapped
+        normalize: lowercase, trim, RFC 5322 validation
+    - contactPhone:
+        required_if: no contactEmail mapped
+        normalize: E.164 via libphonenumber-js (default country from org locale or env)
+    - displayName:
+        required: false
+        normalize: trim, collapse whitespace, max 200 chars
+    - tags:
+        required: false
+        notes: >
+          Comma-separated or multi-column. Stored as string[] on InviteListEntry.
+          Useful for segmenting within a list (e.g., "VIP", "2024-attendee").
+    - notes:
+        required: false
+        normalize: trim, max 500 chars
+    # All other columns are silently ignored (not stored).
+
+  auto_map_heuristics:
+    email: ["email", "e-mail", "email_address", "emailaddress", "mail"]
+    phone: ["phone", "mobile", "cell", "sms", "tel", "telephone", "phone_number"]
+    name:  ["name", "full_name", "fullname", "display_name", "displayname"]
+    first_last_concat:
+      description: >
+        If "first_name" and "last_name" columns are detected but no "name"
+        column exists, auto-map both and concatenate them as
+        "{first_name} {last_name}" into displayName during normalization.
+      headers: ["first_name", "firstname", "last_name", "lastname", "surname"]
+    tags:  ["tags", "labels", "groups", "categories", "lists"]
+    notes: ["notes", "comment", "comments", "memo"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Data Models (Prisma additions)
+# ─────────────────────────────────────────────────────────────────────────────
+data_model:
+  new_enums:
+    ContactImportFileFormat:
+      values: [CSV, XLSX]
+      location: packages/db/prisma/schema.prisma
+      note: Place near the existing InviteListOwnerType enum.
+
+  new_models:
+    ContactImport:
+      description: >
+        Ledger record for each import. Created on the first chunk and
+        incrementally updated as subsequent chunks arrive. Tracks running
+        totals so the client can resume or verify progress.
+      fields:
+        id:                 uuid PK
+        ownerType:          InviteListOwnerType (HUMAN | ORGANIZATION)
+        ownerId:            uuid
+        inviteListId:       uuid FK -> InviteList
+        fileName:           string
+        fileFormat:         ContactImportFileFormat
+        totalRows:          int       # total rows in the original file (set on first chunk)
+        importedCount:      int       # rows successfully inserted (incremented per chunk)
+        skippedCount:       int       # rows skipped as duplicates (incremented per chunk)
+        rejectedCount:      int       # rows the client marked invalid (set on first chunk)
+        chunksReceived:     int @default(1) # number of chunks processed so far
+        totalChunks:        int?      # expected chunk count (set on first chunk; null = unknown)
+        completedAt:        DateTime? # set when final chunk is processed
+        createdByHumanId:   uuid FK -> Human
+        createdAt:          DateTime @default(now())
+        updatedAt:          DateTime @updatedAt
+      indexes:
+        - [ownerType, ownerId]
+        - [inviteListId]
+        - [createdByHumanId]
+      relations:
+        - inviteList: InviteList (FK inviteListId)
+        - createdBy: Human (FK createdByHumanId)
+
+  existing_model_changes:
+    InviteListEntry:
+      add_fields:
+        - importId: uuid? FK -> ContactImport  # nullable; null = manually added
+        - consentSource: string?               # e.g., "csv_import:2026-02-10", "manual", "signup_form"
+        - consentRecordedAt: DateTime?
+        - unsubscribedAt: DateTime?            # soft opt-out per entry
+      add_indexes:
+        - @@unique([inviteListId, contactEmail])  # per-list dedup (partial: where contactEmail IS NOT NULL)
+        - @@unique([inviteListId, contactPhone])  # per-list dedup (partial: where contactPhone IS NOT NULL)
+        - [importId]
+
+    InviteList:
+      add_fields:
+        - contactCount: int @default(0)        # denormalized count for UI display
+        - lastImportAt: DateTime?              # updated after each import completes
+      add_relations:
+        - imports: ContactImport[]
+
+  uniqueness_policy: |
+    Contacts are unique **per list only**. The same email/phone can exist in
+    multiple lists belonging to different orgs or even the same org. The unique
+    constraints are partial (only on non-null values) to allow entries that have
+    only a phone or only an email.
+
+    At send time, sendAnnouncementNow is responsible for cross-list dedup if
+    multiple lists are targeted in a single announcement (future consideration).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5a. Port & Adapter Changes
+# ─────────────────────────────────────────────────────────────────────────────
+port_changes:
+  description: |
+    The import feature needs new port interfaces and extensions to existing ones.
+    All types live in @th/types (packages/types/src/repos/events.ts) and port
+    interfaces in @th/ports (packages/ports/src/repos/events.ts). Adapters live
+    in packages/adapters/src/db/prisma/.
+
+  new_enum:
+    ContactImportFileFormat:
+      values: [CSV, XLSX]
+      location: packages/db/prisma/schema.prisma (alongside InviteListOwnerType)
+
+  new_repo:
+    ContactImportsRepo:
+      description: >
+        CRUD for the ContactImport ledger model. Sits on Repos alongside
+        inviteLists.
+      port_file: packages/ports/src/repos/events.ts
+      adapter_file: packages/adapters/src/db/prisma/contact-imports.ts
+      methods:
+        - "create(input: CreateContactImportInput): Promise<ContactImportRecord>"
+        - "getById(importId: string): Promise<ContactImportRecord | null>"
+        - "incrementCounts(input: IncrementContactImportCountsInput): Promise<ContactImportRecord>"
+        - "complete(importId: string, completedAt: Date): Promise<ContactImportRecord>"
+        - "listByOwner(input: ListContactImportsByOwnerInput): Promise<ContactImportRecord[]>"
+      registration: >
+        Add contactImports: ContactImportsRepo to the Repos interface in
+        packages/ports/src/repos/index.ts.
+
+  existing_repo_changes:
+    InviteListsRepo:
+      new_methods:
+        - method: "batchUpsertEntries(input: BatchUpsertInviteListEntriesInput): Promise<BatchUpsertResult>"
+          description: >
+            Batch-insert entries with ON CONFLICT (inviteListId, contactEmail)
+            DO NOTHING and ON CONFLICT (inviteListId, contactPhone) DO NOTHING.
+            Returns { insertedCount, skippedCount }. Used by importContacts for
+            each chunk.
+          adapter_notes: >
+            Use a raw SQL INSERT ... ON CONFLICT or Prisma createMany with
+            skipDuplicates (once unique constraints are in place). For accurate
+            skip counts, prefer raw SQL with RETURNING or a CTE that counts.
+        - method: "updateListCounts(inviteListId: string): Promise<void>"
+          description: >
+            Recalculate InviteList.contactCount from a COUNT(*) on entries.
+            Called after each import chunk. Could also accept a delta to
+            increment atomically.
+      type_additions:
+        BatchUpsertInviteListEntriesInput:
+          fields:
+            inviteListId: string
+            entries:
+              - contactEmail?: string | null
+              - contactPhone?: string | null
+              - displayName?: string | null
+              - notes?: string | null
+              - tags?: string[]
+              - humanId?: string | null
+              - importId?: string | null
+              - consentSource?: string | null
+              - consentRecordedAt?: Date | null
+        BatchUpsertResult:
+          fields:
+            insertedCount: int
+            skippedCount: int
+
+    InviteListRecord:
+      add_fields:
+        - contactCount: number
+        - lastImportAt: Date | null
+
+    InviteListEntryRecord:
+      add_fields:
+        - importId: string | null
+        - consentSource: string | null
+        - consentRecordedAt: Date | null
+        - unsubscribedAt: Date | null
+
+  auth_user_lookup:
+    description: >
+      The importContacts use case needs to batch-lookup AuthUser records by
+      email to link humanId. This can use the existing humans repo or a direct
+      query. The recommended approach is to add a method to the existing
+      HumansRepo or a thin AuthUsersRepo:
+
+        batchLookupByEmail(emails: string[]): Promise<Map<string, string>>
+
+      Returns Map<email, humanId>. If the AuthUser table is accessed via
+      better-auth, use a raw SELECT or a dedicated read-only adapter.
+    port_file: packages/ports/src/repos/humans.ts
+    note: >
+      Do NOT fail the import if this lookup errors. Log a warning and continue
+      with humanId = null for all entries.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Use Cases
+# ─────────────────────────────────────────────────────────────────────────────
+use_cases:
+
+  import_contacts:
+    file: packages/core/src/use-cases/comms/import-contacts.ts
+    goal: >
+      Receive a chunk of pre-validated, normalized contact rows from the client
+      and insert them into an InviteList (existing or new), deduplicating within
+      the list by email/phone.
+
+      First chunk: creates the ContactImport ledger row and (optionally) a new
+      InviteList, then returns an importId. Subsequent chunks include that
+      importId and append entries + increment counts on the same ledger row.
+
+      If a contactEmail matches an existing AuthUser.email, link the entry's
+      humanId to that AuthUser's human (silently—no in-app notification sent).
+    ports: [Repos, Logger, Idempotency, Clock]
+    input_schema:
+      actorHumanId: uuid
+      owner:
+        kind: enum[ORG, HUMAN]
+        id: uuid
+      importId?: uuid           # omit on first chunk; include on subsequent chunks
+      targetListId?: uuid       # existing InviteList to append to (first chunk only)
+      targetListName?: string   # name for new list (first chunk only, required when targetListId omitted)
+      fileName: string          # original file name for the ledger record
+      fileFormat: enum[CSV, XLSX]
+      contacts: array (max 5_000)  # one chunk of pre-validated rows
+        - contactEmail?: string    # already lowercased + validated by client
+        - contactPhone?: string    # already E.164 normalized by client
+        - displayName?: string
+        - tags?: string[]
+        - notes?: string
+      totalRows?: int           # total rows across all chunks (first chunk only, for ledger)
+      totalChunks?: int         # expected number of chunks (first chunk only)
+      chunkIndex: int           # 0-based index of this chunk
+      isFinalChunk: boolean     # true on the last chunk; sets completedAt on the ledger
+      consentSource?: string    # e.g., "csv_import:2026-02-11", "mailchimp_export"
+      clientKey: string(min:8)
+    output_schema:
+      importId: uuid
+      inviteListId: uuid
+      chunkIndex: int             # echo back for client bookkeeping
+      chunkImportedCount: int     # rows inserted in this chunk
+      chunkSkippedCount: int      # duplicates skipped in this chunk
+      runningImportedCount: int   # cumulative rows inserted across all chunks so far
+      runningSkippedCount: int    # cumulative duplicates across all chunks so far
+      linkedToAuthUserCount: int  # entries matched to AuthUser in this chunk
+    invariants:
+      - Actor must have rights over owner (org role or self).
+      - Each contact must have at least one of contactEmail or contactPhone.
+      - Server re-validates all emails/phones (defense in depth; client already validated).
+      - Contacts are unique per list: skip if (inviteListId, contactEmail) or
+        (inviteListId, contactPhone) already exists (upsert semantics).
+      - First chunk (importId omitted):
+          - If targetListId provided, it must exist and belong to the same owner.
+          - If targetListId omitted, targetListName is required; create new InviteList.
+          - Creates a new ContactImport ledger row.
+      - Subsequent chunks (importId provided):
+          - importId must resolve to a ContactImport owned by the same actor+owner.
+          - importId must not already have completedAt set (import is still open).
+          - targetListId / targetListName are ignored; the list is already known from
+            the ledger row.
+      - When contactEmail matches an AuthUser.email, set InviteListEntry.humanId
+        to that AuthUser.humanId. Do NOT send any in-app notification or alert
+        to the matched user. This is a silent link for richer audience targeting.
+      - When isFinalChunk is true, set ContactImport.completedAt and update
+        InviteList.lastImportAt.
+    side_effects:
+      - DB: create InviteList if needed (first chunk only)
+      - DB: batch upsert InviteListEntry rows (within repos.tx())
+      - DB: create or update ContactImport ledger row (increment counts)
+      - DB: update InviteList.contactCount
+      - DB: set InviteList.lastImportAt + ContactImport.completedAt (final chunk)
+      - DB: lookup AuthUser.email for each contactEmail to populate humanId
+      - Audit: comms.contact_import.chunk_completed (each chunk)
+      - Audit: comms.contact_import.completed (final chunk only)
+    idempotency:
+      key: comms:importContacts:${owner.kind}:${owner.id}:${clientKey}:chunk${chunkIndex}
+      ttl_sec: 120
+      behavior: >
+        Each chunk has its own idempotency key (includes chunkIndex). Replaying
+        the same chunk returns the previously computed counts without re-inserting.
+        The per-list unique constraints on (inviteListId, contactEmail) and
+        (inviteListId, contactPhone) provide an additional safety net—even without
+        the idempotency layer, duplicate rows are harmlessly skipped.
+    errors:
+      - invalid_input(422): empty contacts array, bad email/phone on re-validation, chunk exceeds 5k rows
+      - forbidden(403): actor lacks rights
+      - not_found(404): owner, targetList, or importId missing
+      - conflict(409): idempotency mismatch; importId already completed (completedAt set)
+      - dependency_failed(424): DB failure
+    tests:
+      - happy path: single-chunk import of 100 contacts into new list
+      - multi-chunk: 12k contacts split into 3 chunks; running totals are correct
+      - append to existing list with dedup (3 dupes skipped across chunks)
+      - AuthUser email match links humanId silently
+      - mixed email-only and phone-only contacts
+      - re-validation catches bad email that slipped past client
+      - idempotency replay of individual chunk returns same counts
+      - chunk exceeds 5k rows → invalid_input
+      - second chunk with unknown importId → not_found
+      - chunk sent after import already completed → conflict
+      - network retry of a chunk is safe (unique constraints + idempotency)
+
+  merge_contact_lists:
+    file: packages/core/src/use-cases/comms/merge-contact-lists.ts
+    goal: >
+      Merge all entries from one or more source InviteLists into a target
+      InviteList, deduplicating by contactEmail and contactPhone. Ensures
+      no recipient receives duplicate emails/texts when the merged list is
+      used as an announcement audience.
+    ports: [Repos, Logger, Idempotency, Clock]
+    input_schema:
+      actorHumanId: uuid
+      targetListId: uuid
+      sourceListIds: array[uuid] (min 1, max 20)
+      deleteSourcesAfterMerge?: boolean (default false)
+      clientKey: string(min:8)
+    output_schema:
+      targetListId: uuid
+      mergedCount: int          # entries added from sources
+      skippedCount: int         # duplicates that already existed in target
+      deletedSourceIds?: uuid[] # source lists deleted (if deleteSourcesAfterMerge=true)
+    invariants:
+      - Actor must have rights over the target list's owner.
+      - Actor must have rights over every source list's owner.
+      - All lists must share the same ownerType+ownerId (cannot merge across orgs).
+      - Dedup by (contactEmail) and (contactPhone) against existing target entries.
+      - Preserve the target entry when a duplicate is found (source entry is discarded).
+      - If deleteSourcesAfterMerge=true, delete source lists after successful merge.
+    side_effects:
+      - DB: batch insert entries from sources into target (within repos.tx())
+      - DB: update target InviteList.contactCount
+      - DB: optionally delete source InviteLists (CASCADE deletes their entries)
+      - Audit: comms.contact_list.merged
+    idempotency:
+      key: comms:mergeContactLists:${targetListId}:${clientKey}
+      ttl_sec: 120
+    errors:
+      - invalid_input(422): empty sourceListIds, source === target
+      - forbidden(403): no rights on target or any source
+      - not_found(404): target or source list missing
+      - conflict(409): cross-owner merge attempt; idempotency mismatch
+    tests:
+      - merge 2 sources into target; 5 dupes skipped
+      - merge with deleteSourcesAfterMerge=true
+      - cross-owner merge blocked
+      - idempotency replay
+
+  copyEntries_behavioral_change:
+    description: |
+      The existing InviteListsRepo.copyEntries method currently does a blind
+      INSERT. This spec requires it to **deduplicate by default**: when copying
+      entries from source to target, skip any entry where (targetListId,
+      contactEmail) or (targetListId, contactPhone) already exists.
+
+      This is a behavioral change to the repo method itself, not a new use case.
+      The mergeContactLists use case above calls copyEntries internally.
+    file: packages/adapters/src/db/prisma/invite-lists.ts
+    change: |
+      UPDATE the copyEntries implementation to use INSERT ... ON CONFLICT
+      (inviteListId, contactEmail) DO NOTHING and similarly for contactPhone.
+      Return the count of actually inserted rows (not attempted rows).
+    tests:
+      - Copy 10 entries, 3 already exist in target → returns 7
+      - Copy with only phone contacts (no email) → dedup by phone
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Announcement Integration
+# ─────────────────────────────────────────────────────────────────────────────
+announcement_integration:
+  description: |
+    The existing createAnnouncementDraft use case supports audience kind
+    CUSTOM_SEGMENT with a segmentId. This spec makes InviteList the backing
+    entity for CUSTOM_SEGMENT:
+
+      audience:
+        kind: CUSTOM_SEGMENT
+        segmentId: <inviteListId>
+
+    When sendAnnouncementNow expands recipients, it queries InviteListEntry
+    rows for the given inviteListId, filtering out entries where
+    unsubscribedAt is set, and extracts contactEmail (for EMAIL channel)
+    and contactPhone (for SMS channel).
+
+  changes_to_existing_specs:
+    - comms.createAnnouncementDraft:
+        - Validate that segmentId resolves to an InviteList owned by the same owner.
+        - Validate list has entries matching the selected channels.
+    - comms.sendAnnouncementNow:
+        - Recipient expansion for CUSTOM_SEGMENT reads InviteListEntry rows.
+        - Filter out unsubscribedAt != null.
+        - Batch by channel (email entries -> comms.deliverEmail jobs, phone entries -> comms.deliverSMS jobs).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. AuthUser Matching
+# ─────────────────────────────────────────────────────────────────────────────
+auth_user_matching:
+  description: |
+    At import time, for each contactEmail in the batch, the server looks up
+    AuthUser.email. If a match is found, the InviteListEntry.humanId is set
+    to AuthUser.humanId. This is a **silent link only**:
+
+    - No in-app notification is sent to the matched user.
+    - No push notification or email is triggered by the match.
+    - The link enables richer audience targeting in announcements (e.g.,
+      preferring in-app delivery for users who have the app installed).
+    - The matched user is unaware they were added to a contact list unless
+      they receive an announcement from it later.
+
+  implementation_notes:
+    - Batch the email lookups: SELECT humanId, email FROM AuthUser WHERE email IN (...batch).
+    - Build a Map<email, humanId> and apply during InviteListEntry construction.
+    - Do NOT fail the import if the lookup query fails; log + continue without linking.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Privacy, Consent & Anti-Spam
+# ─────────────────────────────────────────────────────────────────────────────
+privacy_and_compliance:
+  consent_model:
+    description: |
+      Ithas Fire does not send unsolicited email/SMS on behalf of importers
+      without guardrails. The importer is responsible for having prior consent
+      from their contacts. The platform provides tools to record and respect
+      consent signals.
+    fields:
+      consentSource: >
+        Free-text recorded at import time (e.g., "csv_import:2026-02-10",
+        "mailchimp_export", "signup_form:mywebsite.com"). Stored on each
+        InviteListEntry for audit purposes.
+      consentRecordedAt: >
+        Timestamp when the consent assertion was made (usually import time).
+      unsubscribedAt: >
+        Set when a recipient clicks an unsubscribe link in an announcement
+        email or replies STOP to an SMS. Once set, the entry is excluded
+        from all future sends for that list.
+
+  unsubscribe_flow:
+    email: >
+      Every announcement email includes a List-Unsubscribe header and a
+      one-click unsubscribe link. Clicking it sets unsubscribedAt on the
+      matching InviteListEntry (matched by email + inviteListId). The
+      link is signed with HMAC to prevent abuse.
+    sms: >
+      STOP keyword replies are processed by the SNS/Twilio inbound handler,
+      which sets unsubscribedAt on matching entries (by phone + inviteListId).
+
+  rate_limits:
+    per_org_per_day:
+      email: 10_000   # configurable via env; higher tiers available
+      sms: 2_000
+    per_human_per_day:
+      email: 1_000
+      sms: 200
+    notes: >
+      Rate limits apply to announcement sends, not imports. Importing contacts
+      has no hard row cap (chunked upload). Limits are enforced in
+      sendAnnouncementNow when expanding recipients.
+
+  data_retention:
+    contact_data: >
+      InviteListEntry records persist until the list owner deletes them or the
+      list itself is deleted (CASCADE). No automatic expiry. No server-side
+      file storage—files are parsed entirely in the browser and never uploaded.
+
+  anti_abuse:
+    - Require email verification for the actor (ensureEmailVerified gate).
+    - Imports by new accounts (< 7 days old) are limited to 500 total contacts
+      per import (sum across all chunks of one importId).
+    - Org accounts on free tier limited to 3 lists / 2 000 total contacts.
+    - Suspicious patterns (> 5 imports/hour, > 80% bounce rate on sends) trigger
+      automatic pause + review by platform-ops.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. Observability
+# ─────────────────────────────────────────────────────────────────────────────
+observability:
+  metrics:
+    - comms.contact_import.chunk_completed
+    - comms.contact_import.completed
+    - comms.contact_import.rows_imported (counter)
+    - comms.contact_import.rows_skipped (counter)
+    - comms.contact_import.auth_user_linked (counter)
+    - comms.contact_list.merged
+  audit_events:
+    - comms.contact_import.chunk_completed
+    - comms.contact_import.completed
+    - comms.contact_list.merged
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. Acceptance Criteria
+# ─────────────────────────────────────────────────────────────────────────────
+acceptance_criteria:
+  - Client-side parsing of a 10,000-row CSV renders the validation table in < 3 seconds.
+  - Imports of any size are supported; the client chunks rows into batches of ≤ 5 000.
+  - A progress bar shows chunk N / M during upload; the user can wait without leaving the page.
+  - If a chunk fails (network error), the client retries it automatically without data loss.
+  - The validation table shows per-row pass/fail with inline error reasons in real time.
+  - Duplicate contacts within the same list are skipped (by email or phone).
+  - Phone numbers are stored in E.164 format regardless of input format.
+  - Emails are lowercased and RFC 5322-validated; invalid rows are flagged in the UI table.
+  - The imported list appears as a selectable CUSTOM_SEGMENT audience in createAnnouncementDraft.
+  - Unsubscribed contacts are excluded from announcement sends.
+  - AuthUser email matches silently link humanId; no in-app notification is sent.
+  - mergeContactLists deduplicates by email and phone; no recipient receives duplicate comms.
+  - copyEntries repo method deduplicates by default (INSERT ON CONFLICT DO NOTHING).
+  - Actors without verified email cannot initiate imports (email verification gate).
+  - Rate limits and tier caps are enforced for anti-abuse on sends (not on imports).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12. Rollout Plan
+# ─────────────────────────────────────────────────────────────────────────────
+rollout:
+  phase_1:
+    scope: >
+      CSV and XLSX import; org-owned and human-owned lists; admin + dashboard UI;
+      merge-with-dedup use case; AuthUser silent linking; anti-spam tooling
+    feature_flag: CONTACT_IMPORT_ENABLED (default false)
+    goal: Full import + merge + announcement integration end-to-end
+    docs_updates:
+      - Add importContacts to docs/auth.md#email-verification-gates (gated action).
+      - Add "Contacts" nav entry to ADMIN_SECTIONS in layout.tsx.
+      - Update docs/use-cases.md with import + merge entries.
+  phase_2:
+    scope: >
+      Recurring/scheduled re-imports (e.g., sync from a Google Sheet URL or
+      Mailchimp webhook). Tag-based sub-segmentation within a list.
+    goal: Power-user automation and finer audience targeting
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13. Resolved Decisions
+# ─────────────────────────────────────────────────────────────────────────────
+resolved_decisions:
+  - q: Do we need a background job for importing?
+    answer: >
+      No. Parsing happens client-side in the browser. The server receives
+      pre-validated rows in chunked synchronous mutations (≤ 5 000 rows per
+      request). The client drives the upload loop and shows a progress bar.
+      This eliminates the need for file upload infrastructure, job queues,
+      progress polling, and cancelation logic for the import itself.
+
+  - q: Should contacts be globally unique across lists, or per-list only?
+    answer: >
+      Per-list only. Each list is unique in itself. The same email/phone can
+      exist in multiple lists. Unique constraints are (inviteListId, contactEmail)
+      and (inviteListId, contactPhone).
+
+  - q: Do we need a "merge lists" use case?
+    answer: >
+      Yes. A dedicated mergeContactLists use case deduplicates by email and
+      phone when combining lists. The underlying copyEntries repo method is
+      also updated to dedup by default so we never email the same person twice.
+
+  - q: Should we match imported emails/phones against existing Human records?
+    answer: >
+      Yes, at import time. If contactEmail matches AuthUser.email, silently
+      link InviteListEntry.humanId. No in-app notification is sent to the
+      matched user. This enables richer targeting without surprising users.
+
+  - q: Should we support recurring/scheduled re-imports?
+    answer: Defer to phase 2. Manual re-import covers the initial need.
+
+  - q: Is there a hard cap on total rows per import?
+    answer: >
+      No hard cap. The client parses the full file locally and chunks validated
+      rows into batches of ≤ 5 000 for upload. Each chunk is a separate
+      comms.importContacts mutation that appends to the same ContactImport
+      ledger row. This keeps request payloads small, avoids server timeouts,
+      and lets the client show upload progress + retry individual chunks on
+      failure—all without a background job or file-upload service.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14. Open Questions
+# ─────────────────────────────────────────────────────────────────────────────
+open_questions:
+  - q: CAN-SPAM / TCPA / GDPR compliance—how much do we enforce vs. document?
+    leaning: >
+      Phase 1 provides tooling (consent fields, unsubscribe, rate limits) and
+      documents organizer responsibility in ToS. Platform-level enforcement
+      (e.g., requiring double opt-in) is a phase 2 consideration.
+
+  - q: Should we support vCard format?
+    leaning: >
+      Defer. CSV and XLSX cover the vast majority of use cases. vCard can
+      be added later if there's demand from users importing phone contacts.

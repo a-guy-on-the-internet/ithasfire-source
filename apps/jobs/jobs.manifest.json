@@ -1,9 +1,26 @@
 {
   "$comment": "Single source of truth for job infrastructure. Read by Terraform (Cloud Scheduler, Pub/Sub) and TypeScript (schedule metadata). Run the pre-commit hook or `pnpm -C apps/jobs validate:manifest` to check for drift.",
   "scheduled": {
+    "events.dispatch-follow-notifications": {
+      "_comment": "Rides the */30 slots the cart reaper already wakes the database for. One run expands every open notice (follower budget permitting) and delivers for up to 120s (240s at most), so the attempt deadline is 300s like the other drains.",
+      "description": "Deliver new event alerts to entity followers with durable channel progress and retries.",
+      "cron": "*/30 * * * *",
+      "timezone": "Etc/UTC",
+      "attemptDeadline": "300s"
+    },
     "community.dispatch-rsvp-confirmations": {
+      "_comment": "Write-triggered: committing an RsvpNotice publishes a wake-up to `triggerTopic`, whose push subscription POSTs this job (generated-jobs.tf). The cron is the SAFETY NET for a lost publish, and the only run that retries failed notices. It sits on the */30 slots the cart reaper already wakes the database for, so it adds no Neon wake-up; if those slots ever go away, drop this to hourly. retry false: Cloud Scheduler retries a deadline miss while the first run may still be sending, and the drain claims nothing past its SKIP LOCKED read (rsvp-notices.ts listUndispatched), so two copies can send one notice twice once notify's 60s key has lapsed; the next */30 tick is the retry.",
       "description": "Drain the RSVP-confirmation outbox and send each newly-RSVP'd attendee an in-app + email confirmation with event details and links to the event page and /my-rsvps, with retry and dead-lettering.",
-      "cron": "*/2 * * * *",
+      "cron": "*/30 * * * *",
+      "timezone": "Etc/UTC",
+      "triggerTopic": "hf-trigger-rsvp-confirmations",
+      "attemptDeadline": "300s",
+      "payload": "{\"origin\":\"schedule\"}",
+      "retry": false
+    },
+    "community.rsvp-reminders-24h": {
+      "description": "Remind community RSVPers ~24h before the date they said they are going to - per DATE on recurring listings, per EVENT on single-date ones. Window is startsAt-24h to startsAt-22h, so the */30 tick lands within 30 min of the mark and the 2h tail survives an outage. Idempotent via the RsvpReminder ledger's per-channel claim; a failed channel releases its claim and retries next tick. User-controllable: the 'reminders' notification category, GLOBAL and per-EVENT.",
+      "cron": "*/30 * * * *",
       "timezone": "Etc/UTC"
     },
     "community.purge-dispatched-rsvp-notices": {
@@ -13,7 +30,7 @@
     },
     "community.refresh-recurring-dates": {
       "description": "Rolling re-expansion of recurring community listings: tops up each listing's EventDate window and re-pins Event.startsAt to the next upcoming date so recurring listings stay 'upcoming' in discovery + geo×category SEO.",
-      "cron": "15 5 * * *",
+      "cron": "30 5 * * *",
       "timezone": "Etc/UTC"
     },
     "booking-requests.auto-expire": {
@@ -21,9 +38,16 @@
       "cron": "30 2 * * *",
       "timezone": "Etc/UTC"
     },
+    "events.sweep-open-calls": {
+      "_comment": "Hourly on the :00 slot the stats jobs already wake the database for, so it adds no Neon wake-up. Open calls v1 step 8: FR-021 backstop, FR-022 pulled calls, and the notice reconcile that the close procedure depends on (close sends at most 25 notices in-request).",
+      "description": "Open calls: settle PENDING applications whose last chosen date has started (not this time) or whose event or nights were called off (call pulled), and re-send any not-this-time, pulled or received notice that never went out (last 14 days, idempotent).",
+      "cron": "0 * * * *",
+      "timezone": "Etc/UTC",
+      "attemptDeadline": "300s"
+    },
     "events.expire-applications": {
       "description": "Nightly expiry of PENDING event-application submissions whose form closed more than the grace window (7 days) ago — flips them to EXPIRED in one batch, no emails.",
-      "cron": "45 2 * * *",
+      "cron": "30 2 * * *",
       "timezone": "Etc/UTC"
     },
     "post-event-prompts.enqueue": {
@@ -32,9 +56,11 @@
       "timezone": "Etc/UTC"
     },
     "post-event-prompts.dispatch": {
+      "_comment": "retry false: the drain marks a prompt sent only after notify returns and holds no claim past its SKIP LOCKED read, so a retry running beside a still-live first attempt can send a prompt twice once notify's 60s key has lapsed. A failed run waits for tomorrow's tick.",
       "description": "Drain the post-event prompt outbox: one-time in-app + email post-gig review prompt per performer, deep-linking to /review-a-place, with retry and dead-lettering. ATTENDEE prompts stay pending (dispatch-gated) until the attendee review form ships.",
       "cron": "30 15 * * *",
-      "timezone": "Etc/UTC"
+      "timezone": "Etc/UTC",
+      "retry": false
     },
     "attendee-reviews.recompute-aggregates": {
       "description": "Weekly rebuild of the anonymized attendee-review aggregate snapshots (threshold-gated, bucketed) served on event, venue, organizer and series surfaces. Weekly on purpose: the delay defeats temporal correlation.",
@@ -57,13 +83,27 @@
       "timezone": "Etc/UTC"
     },
     "events.dispatch-change-notifications": {
+      "_comment": "Write-triggered: committing an EventChangeNotice publishes a wake-up to `triggerTopic`. The cron is the safety net and the retry cadence; see community.dispatch-rsvp-confirmations. retry false for the same reason: each run fans out from its own snapshot of notifiedHumanIds, flushed every 25 sends, so an overlapping copy re-notifies recipients once notify's 60s key has lapsed.",
       "description": "Drain the event-change notification outbox (cancel / reschedule / venue-change) and fan each notice out to its watchers (savers + RSVPers) and refunded buyers over in-app + email, with retry and dead-lettering.",
-      "cron": "*/2 * * * *",
-      "timezone": "Etc/UTC"
+      "cron": "*/30 * * * *",
+      "timezone": "Etc/UTC",
+      "triggerTopic": "hf-trigger-event-change-notifications",
+      "attemptDeadline": "300s",
+      "payload": "{\"origin\":\"schedule\"}",
+      "retry": false
     },
     "events.address-reveal-notify": {
+      "_comment": "retry false: the at-most-once cursor is stamped AFTER the fan-out and the in-app ledger is read once at its start, so a retry overlapping a still-live first attempt re-sends to holders once notify's 60s key has lapsed. The 24h lookback means the next tick picks up a failed run.",
       "description": "Notify active ticket holders of OBSCURED events whose addressRevealAt just crossed that the exact address is now live (in-app forced on + email/push per preference). Idempotent via the per-event addressRevealNotifiedAt cursor.",
-      "cron": "*/15 * * * *",
+      "cron": "*/30 * * * *",
+      "timezone": "Etc/UTC",
+      "schedulerOverriddenIn": ["prod"],
+      "retry": false
+    },
+    "events.purge-follow-notices": {
+      "_comment": "Daily, on the 04:00 UTC slot events.purge-dispatched-change-notices already wakes the database for, so it adds no Neon wake-up.",
+      "description": "Delete follow-notification notices and deliveries for events that started more than 30 days ago (or no longer exist). Never touches a notice for an event that has not started.",
+      "cron": "0 4 * * *",
       "timezone": "Etc/UTC"
     },
     "events.purge-dispatched-change-notices": {
@@ -78,8 +118,9 @@
     },
     "places.recalculate-place-stats": {
       "description": "Recalculates aggregate stats (payout, scores, draw, flags, genre cloud) for places with stale review data.",
-      "cron": "*/15 * * * *",
-      "timezone": "Etc/UTC"
+      "cron": "*/30 * * * *",
+      "timezone": "Etc/UTC",
+      "schedulerOverriddenIn": ["prod"]
     },
     "places.recompute-public-snapshots": {
       "description": "Weekly rebuild of the anonymized public review snapshots (threshold-gated, bucketed aggregates) served on place pages. Weekly on purpose: the delay defeats temporal correlation.",
@@ -88,12 +129,12 @@
     },
     "humans.compute-human-stats": {
       "description": "Recomputes materialized performer stats from attributions, events, and follows.",
-      "cron": "10 * * * *",
+      "cron": "0 * * * *",
       "timezone": "Etc/UTC"
     },
     "orgs.compute-org-stats": {
       "description": "Recomputes materialized organization stats from events, orders, attributions, and follows.",
-      "cron": "20 * * * *",
+      "cron": "0 * * * *",
       "timezone": "Etc/UTC"
     },
     "search.full-reindex": {
@@ -103,13 +144,14 @@
     },
     "search.reindex-scheduled-price-flips": {
       "description": "Re-index events whose ticket-type scheduled price change (TicketType.scheduledPriceAt) crossed inside the scan window, so the search index's materialized minPaidPriceCents stops advertising the pre-flip price. Price stays read-time truth everywhere that takes money; this only refreshes a derived cache. Idempotent (the document is rewritten from source rows), and the 6h lookback absorbs cron drift. If it never runs, browse cards go stale until the nightly full reindex — never a mispriced sale.",
-      "cron": "*/15 * * * *",
+      "cron": "*/30 * * * *",
       "timezone": "Etc/UTC"
     },
     "stripe-connect.reconcile-capabilities": {
       "description": "Pull-based backstop for connected-account capability state. `account.updated` is the only push writer of Payee.chargesEnabled/payoutsEnabled, so a webhook that is never delivered or fails our shape guard leaves an org silently unable to publish a paid event. Re-reads the stalest accounts through the same derivation the webhook uses, and reports how many had drifted. Runs before the payout batch so a healed payee is payable the same night.",
-      "cron": "20 22 * * *",
-      "timezone": "America/Chicago"
+      "cron": "30 22 * * *",
+      "timezone": "America/Chicago",
+      "schedulerOverriddenIn": ["dev"]
     },
     "settlements.run-batch": {
       "description": "Consolidated per-payee payout batch.",
@@ -122,16 +164,22 @@
       "cron": "0 4 * * *",
       "timezone": "America/Chicago"
     },
+    "settlements.backfill-processor-fees": {
+      "description": "Reads what Stripe actually charged to process each order, from the charge's balance transaction, and stamps Order.processorFeeCents — the only source of the processor-cost input to platform revenue; a rate-card estimate is a different number wearing its name. A failed read leaves the column NULL ('not attributed'), backs the row off for 6h and parks it after 24 failures; Sentry hears about a row on its first failure and when it is parked, never on the retries between. Hourly.",
+      "cron": "0 * * * *",
+      "timezone": "Etc/UTC"
+    },
+    "disputes.chase-evidence-deadlines": {
+      "_comment": "Terraform-visible: this entry mints a Cloud Scheduler job on the next apply. 14:00 CT on purpose — business hours, so the Discord chase lands while a human is at the desk instead of scrolling past overnight noise. The HTTP endpoint (manual trigger from the platform jobs page) works as soon as the handler deploys, before any apply.",
+      "description": "Daily chase of chargeback evidence deadlines: sweeps OPEN disputes that are near or past their evidence deadline, have no deadline, have no evidence package, or whose last submit failed. Self-heals missing packages by re-running the assembler, then raises ONE Discord alert (error colour when anything is overdue) linking each dispute to the platform desk. Silent when nothing needs attention.",
+      "cron": "0 14 * * *",
+      "timezone": "America/Chicago"
+    },
     "sitemaps.generate": {
       "description": "Generate sitemap XML files for SEO.",
       "cron": "30 1 * * *",
       "timezone": "Etc/UTC",
       "payload": "{\"trigger\":{\"reason\":\"nightly\"},\"baseUrl\":\"https://ithasfire.com\"}"
-    },
-    "tickets.expire-resale-claims": {
-      "description": "Transition all open resale claims past their deadline to expired status.",
-      "cron": "0 2 * * *",
-      "timezone": "Etc/UTC"
     },
     "tickets.expire-resale-listings": {
       "description": "Expire ACTIVE resale listings past their expiry or event end.",
@@ -139,23 +187,25 @@
       "timezone": "Etc/UTC"
     },
     "tickets.release-expired-carts": {
+      "_comment": "Cadence is load-bearing for money: CAPACITY_HELD_WINDOW_SECONDS reserves a cart's tickets for TTL + 2 reaper periods. The period is recorded in packages/core/src/use-cases/orders/_shared/cart-reaper-cycle.ts, and validate-manifest fails if this cron drifts from it or any env overrides it. A pass takes pages until one is short. No cart starts after 210s and no PaymentIntent cart after 90s (DEFAULT_REAPER_TIME_BUDGET_MS, PI_CART_RESERVE_MS: one Stripe call can take 120s), so the reaper normally ends by ~240s and the door sweep, which runs after it in the same request, gets the rest of a 300s attempt deadline (not the 180s default).",
       "description": "Cancel stale PENDING orders and their Stripe PaymentIntents.",
-      "cron": "*/5 * * * *",
-      "timezone": "Etc/UTC"
+      "cron": "*/30 * * * *",
+      "timezone": "Etc/UTC",
+      "attemptDeadline": "300s"
     },
     "tickets.release-expired-holds": {
-      "description": "Release seat holds that have exceeded their TTL.",
-      "cron": "*/5 * * * *",
+      "description": "Release orphaned seat holds that have exceeded their TTL (open carts belong to release-expired-carts).",
+      "cron": "*/30 * * * *",
       "timezone": "Etc/UTC"
     },
     "volunteers.reminders-24h": {
-      "description": "Email/SMS/in-app reminders to volunteers ~24h before their shift. Window is +23h45m to +24h15m, so the */15 tick catches every shift exactly once.",
-      "cron": "*/15 * * * *",
+      "description": "Email/SMS/in-app reminders to volunteers ~24h before their shift. Window is +23h30m to +24h30m, wider than the */30 tick so every shift is seen at least once; the per-channel ledger claim makes a shift seen by two ticks still get exactly one reminder.",
+      "cron": "*/30 * * * *",
       "timezone": "Etc/UTC"
     },
     "volunteers.reminders-1h": {
-      "description": "Email/SMS/in-app reminders to volunteers ~1h before their shift. Window is +55m to +65m, so the */5 tick catches every shift exactly once.",
-      "cron": "*/5 * * * *",
+      "description": "Email/SMS/in-app reminders to volunteers ~1h before their shift. Window is +40m to +80m, wider than the */30 tick so every shift is seen at least once; the per-channel ledger claim makes a shift seen by two ticks still get exactly one reminder.",
+      "cron": "*/30 * * * *",
       "timezone": "Etc/UTC"
     },
     "storage.sweep-orphaned-uploads": {
@@ -165,12 +215,13 @@
     },
     "storage.drain-pending-deletions": {
       "description": "Drain the object-storage deletion outbox: delete keys/prefixes enqueued in-transaction by event deletes, with exponential backoff and dead-lettering.",
-      "cron": "*/15 * * * *",
-      "timezone": "Etc/UTC"
+      "cron": "*/30 * * * *",
+      "timezone": "Etc/UTC",
+      "schedulerOverriddenIn": ["prod"]
     },
     "moderation.report-queue-health": {
-      "description": "Hourly health read over the image-moderation queue: images overdue for draining, images that failed to scan recently, images that exhausted the requeue cap, and flagged images awaiting human review too long. Raises a Discord alert ONLY when a count is non-zero, so an alert always means something.",
-      "cron": "5 * * * *",
+      "description": "Hourly health read of the image-moderation queue: images overdue for draining, images that failed to scan, images past the requeue cap, images whose object vanished from storage, and flagged images awaiting review too long. The Discord alert is edge-triggered, firing when the set of firing signals changes, or when an unchanged picture goes 24h stale. Two counts never reach zero without a human, so a level trigger paged forever.",
+      "cron": "0 * * * *",
       "timezone": "Etc/UTC"
     },
     "moderation.requeue-degraded": {
@@ -179,9 +230,13 @@
       "timezone": "Etc/UTC"
     },
     "moderation.drain-image-moderations": {
+      "_comment": "Write-triggered: creating or requeueing an ImageModerationRecord publishes a wake-up to `triggerTopic`. The cron is the safety net, and the run that picks up rows whose retry backoff (nextAttemptAt) has come due; see community.dispatch-rsvp-confirmations.",
       "description": "Drain the image-moderation outbox (PENDING ImageModerationRecord rows) through the moderation provider (Azure AI Content Safety, or the auto-approving stub when unconfigured), writing verdicts back onto each record. Retries transient provider failures with exponential backoff and dead-letters exhausted rows to FLAGGED+degraded so held images clear (or surface for review) quickly.",
-      "cron": "*/2 * * * *",
-      "timezone": "Etc/UTC"
+      "cron": "*/30 * * * *",
+      "timezone": "Etc/UTC",
+      "triggerTopic": "hf-trigger-image-moderations",
+      "attemptDeadline": "300s",
+      "payload": "{\"origin\":\"schedule\"}"
     },
     "support.purge-resolved-threads": {
       "description": "Delete resolved support threads (and their messages) past the retention window (SUPPORT_RETENTION_DAYS).",
@@ -190,22 +245,33 @@
     },
     "push.drain-receipts": {
       "description": "Poll Expo push receipts for recently sent notifications and disable devices whose receipts report DeviceNotRegistered/InvalidCredentials (Expo only surfaces many dead installs in the receipt phase ~15min after the send ticket returns ok). Resolved and expired rows are deleted, so the PushReceipt outbox drains to empty.",
-      "cron": "*/15 * * * *",
-      "timezone": "Etc/UTC"
+      "cron": "*/30 * * * *",
+      "timezone": "Etc/UTC",
+      "schedulerOverriddenIn": ["prod"]
     },
     "idempotency.purge-expired": {
       "description": "Delete idempotency records past their retention window (no-op on the Redis backend, which expires keys itself).",
-      "cron": "45 5 * * *",
+      "cron": "30 5 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "security.purge-network-sightings": {
+      "description": "Delete hashed sign-up/sign-in network sightings older than 30 days, expired network ban rows, and edit-suggestion IP hashes older than 30 days (privacy-policy retention).",
+      "cron": "30 5 * * *",
+      "timezone": "Etc/UTC"
+    },
+    "memberships.report-health": {
+      "description": "Daily health read over the membership book: memberships whose card is failing (past_due / unpaid \u2014 benefits are ALREADY denied at checkout, and we send no dunning mail), signups stuck at 'incomplete' past the grace window, and memberships set to end inside the warning window. The Discord alert is edge-triggered, firing when the set of firing signals changes or when an unchanged picture goes stale. Daily, not hourly: every signal here is measured in days.",
+      "cron": "30 6 * * *",
       "timezone": "Etc/UTC"
     },
     "memberships.refresh-tax-jurisdictions": {
       "description": "Re-confirm cached membership tax rates against the rate provider, archiving and replacing any that changed and repointing affected subscriptions. The ONLY trigger that can catch a jurisdiction changing its own rate — no member-side event ever signals one, so without this a member who never moves would be billed a stale rate indefinitely.",
-      "cron": "40 6 * * *",
+      "cron": "30 6 * * *",
       "timezone": "Etc/UTC"
     },
     "jobs.prune-run-history": {
       "description": "Trim JobRun history to the retention cap across all jobs (no-op on the Redis backend, which trims on write).",
-      "cron": "50 5 * * *",
+      "cron": "30 5 * * *",
       "timezone": "Etc/UTC"
     }
   },
@@ -234,9 +300,30 @@
       "description": "Index a single organization into the selected search backend.",
       "topic": "hf-index-organization"
     },
+    "search.ensure-format": {
+      "_comment": "Post-deploy only: the deploy workflows publish {} to `triggerTopic` after the jobs service rolls; its push subscription POSTs /jobs/search.ensure-format verbatim (no_wrapper), like the scheduled drains' trigger topics. Needs generated-jobs.tf to create trigger topics for QUEUE entries too.",
+      "description": "Post-deploy: if the stored search index format version is behind this build's, claim, run the non-destructive full reindex and record the version. No-op when current or ahead.",
+      "topic": "hf-search-ensure-format",
+      "triggerTopic": "hf-trigger-search-ensure-format"
+    },
+    "search.drain-reindex-pending": {
+      "description": "Reindex entities marked in SearchReindexPending by recent edits; reschedules itself with backoff only while rows remain. Triggered by edits through the delayed scheduler (Cloud Tasks HTTP task to /jobs/search.drain-reindex-pending), never by cron.",
+      "topic": "hf-drain-search-reindex-pending"
+    },
+    "lineup-notices.continue-sweep": {
+      "_comment": "Called only by Cloud Tasks (HTTP task to /jobs/lineup-notices.continue-sweep on its OWN hf-<env>-lineup-notice-sweep queue (Cloud Tasks queues use the hf-<env> prefix, unlike the <env>-hf topics below), infra/terraform/lineup-notice-sweep.tf), like search.drain-reindex-pending is on the search-drain queue. It rode the search-drain queue until that file existed, and still falls back to it when CLOUD_TASKS_LINEUP_SWEEP_QUEUE is absent from the env. `topic` is the manifest's required per-queue-job topic, which nothing publishes to: the next terraform apply creates BOTH the <env>-hf-continue-lineup-notice-sweep topic AND an unused <env>-hf-continue-lineup-notice-sweep-push subscription (generated-jobs.tf iterates every queue job for each), exactly as it did for search.drain-reindex-pending.",
+      "description": "Continue a post-publish lineup-notice sweep that ran out of time: tell the rest of the event's owed lineup people (exactly once per row), re-queue itself while rows remain, give up and report after 5 runs. Triggered through the delayed scheduler (Cloud Tasks), never by cron.",
+      "topic": "hf-continue-lineup-notice-sweep"
+    },
+    "tax.fill-location-rate": {
+      "_comment": "Called only by Cloud Tasks (HTTP task to /jobs/tax.fill-location-rate), queued by listings through repos.taxRateFills on the search-drain queue's scheduler, like lineup-notices.continue-sweep's fallback. `topic` is the manifest's required per-queue-job topic, which nothing publishes to: the next terraform apply creates the <env>-hf-fill-location-tax-rate topic and an unused push subscription (generated-jobs.tf iterates every queue job), exactly as for search.drain-reindex-pending.",
+      "description": "Look up and cache the tax rate of one venue a listing found without one, then mark its upcoming events for the search drain so their cards show an all-in price. Queued by listings through the delayed scheduler (Cloud Tasks); never on a timer.",
+      "topic": "hf-fill-location-tax-rate"
+    },
     "settlements.execute-transfer": {
       "_comment": "HANDLERLESS as of the 2026-08-10 ledger cutover — the per-settlement transfer job is deleted; money moves only through settlements.run-batch. Entry retained deliberately: the topic + push subscription are Terraform-managed (infra/terraform/infracost-usage*.yml reference them), so removing it here is an INFRA change, not a code one. Follow-up: retire the topic and drop this entry together.",
       "description": "DELETED job. Topic retained pending Terraform cleanup.",
+      "noHandler": true,
       "topic": "hf-execute-settlement-transfer"
     }
   },

@@ -1,0 +1,552 @@
+# scoped-api-keys.spec.yaml
+#
+# API keys limited to one subject (an org, the holder's own account, staff
+# surfaces, or platform-wide public data), issued only after someone other than
+# the requester approves a key request.
+
+version: "1.0"
+updated: "2026-10-12"
+
+# ── Rulings (owner, 2026-10-08; full text in memory project_scoped_api_keys_on_approval.md) ──
+# R0  "we should have some org/human/admin screen limited api keys available upon
+#     approval, just takes someone submitting an ask (fucking AI)." — the feature.
+# R1  "Yes, the API key can be scoped to the orgs they have control over or a
+#     platform one both needing approval" — a key covers one subject; a human holds it;
+#     nobody mints their own.
+# R2  Q2 "Yep. What you said." — an org's other OWNERs/ADMINs approve its keys; platform
+#     staff approve the rest. Q13 "Nobody approves their own request."
+# R3  Q3 "what you said" — key scope = subject + access level (read | read-write),
+#     capped at the holder's LIVE role, checked on every call.
+# R4  Q4 "Yep" — fixed denylist, session-only whatever the scope: money movement,
+#     credentials, members/roles, deleting an account or org.
+# R5  Q5 "default deny" — a procedure is unreachable by key until it declares the
+#     key scope it accepts.
+# R6  Q6 "Yep and allow ones that never expire. And make renewing easy and
+#     automatible"; Q15 "Yep. I agree with your recommendation" — org and personal keys
+#     may be NEVER-expiring or up to 90 days; staff and platform-wide keys max 30 days.
+# R7  Q16 "Yep as proposed" — a key renews ITSELF in its last 7 days: new key, same
+#     scope, no re-approval, old key lives 24h more, approver can switch auto-renew off,
+#     audited. The one exception to R4. An expired key needs a new request.
+# R8  Q7 "Yep" — a request carries label, scope, access, expiry and a required purpose;
+#     a denial needs a reason and notifies; an unanswered request lapses at 14 days with
+#     a notice.
+# R9  Q8 "Yep" — org OWNERs/ADMINs see and revoke every key on their org; the holder
+#     sees and revokes their own; staff see all.
+# R10 Q9 "we shouldn't really have any, but yes that's wise" — every existing
+#     full-scope key is revoked at cutover, after notice; the MCP is re-issued first.
+# R11 Q10 "Yep all three" — three web screens: account, org settings, platform. No mobile.
+# R12 Q11 "Yes, personal gets access too" — a personal scope exists.
+# R13 Q12 "I think that's fine. If we wanted fine grain access control of API keys
+#     based on roles and APIs that'd be the more indepth and ideal scenario" — only org
+#     OWNERs/ADMINs may request org keys in v1. Q27 "Next step." — fine-grained
+#     role×procedure permissions are the next step after this spec.
+# R14 Q17 "Yep" — the key is minted when the holder collects it, shown once; an
+#     approved request not collected within 7 days lapses.
+# R15 Q18 "Yep" — at most 5 active keys per human per subject; 20 per org.
+# R16 Q19 "Yep" — notifications as in FR-012.
+# R17 Q20 "As written" — CONTEXT.md terms: API key, Key request, Key scope.
+# R18 Q21 "Yep" — four subjects: ORG, PERSONAL, STAFF, PLATFORM_WIDE.
+# R19 Q22 "Yep only public data"; Q24 "Yep" — a platform-wide key is read-only and
+#     sees only what a signed-out visitor sees.
+# R20 Q23 "Yep verified human, approved by staff" — anyone verified may request one.
+# R21 Q25 "b, Yeah there needs to be like a superadmin/platform owner role that is just
+#     me and it's in code" — only staff ADMINs approve STAFF and PLATFORM_WIDE keys; the
+#     PLATFORM OWNER (defined in code) is the one identity that may approve its own STAFF
+#     key, after a fresh password/passkey check, 30-day cap, auto-renew, flagged.
+# R22 Q26 "No. We can revisit this later" — read-write staff keys keep the ban action
+#     (`set_human_status`) in v1.
+# Earlier rulings that still bind: no grandfathering (feedback_no_grandfathering_debt.md);
+# derived state, never a stored flag (feedback_derived_state_never_a_stored_flag.md);
+# the gate may live at the transport (feedback_gate_may_live_at_the_transport.md);
+# docs/pro-social.md.
+# ── Rulings (owner, 2026-10-12: "I agree with your recommendations", on the seven
+#    questions put 10-12) ──
+# R23 Board picks A on all four: one list with a status column; inline request panel;
+#     show-once key inline in its row; waiting org requests as cards above the keys table.
+# R24 Org key approvals live on the org settings "API keys" screen, an accepted
+#     exception to the "work queues do not live here" rule (rare, lapse at 14 days),
+#     with a nav count and notifications.
+# R25 Store the last 4 characters of each key (`keyLast4`) so rows can be told apart.
+# R26 Platform owner = a human id constant per environment in core (dev seed id,
+#     prod id), changed only by a reviewed commit.
+# R27 Staff approval of PERSONAL keys and revoking the self-serve keys is NOT
+#     enshittification: no personal export exists to take away, only the MCP uses keys,
+#     and a denial carries a reason.
+# R28 STAFF keys may be requested by ADMIN, REVIEWER, DEVELOPER, SUPPORT; not
+#     COMMUNITY_MODERATOR in v1.
+# R29 Spec confirmed.
+# R30 (owner, 2026-10-13) "Auto-renew needs 2+ days" — auto-renew only on a term of 2 days
+#     or more; a 1-day key is requested without auto-renew. (A never-expiring key also
+#     takes no auto-renew, from FR-009/R7: it has nothing to renew.)
+# R31 (owner, 2026-10-13, picked "Close them, say why") — a password reset or a ban closes
+#     the holder's pending AND approved-but-uncollected key requests, not only their keys.
+#     The request records that it was closed for account security, so it never reads as
+#     "you withdrew"; the holder is shown why and asks again.
+#     Orchestrator reading, 10-13 (the owner may overrule): the close runs wherever keys
+#     are swept, so also on suspension, on a banned holder's mailbox alt accounts, and in
+#     the unproven-account sweep (takeover cleanup); a suspended holder who is reactivated
+#     asks again. A request that lapsed less than an hour before the sweep is closed too
+#     (a margin for in-flight writers at the lapse instant).
+# R32 (owner, 2026-10-13, picked all four) — FR-008 also covers, for every key subject:
+#     ticket transfers and resale listing/checkout; agreeing to money terms (deal terms,
+#     settlement-sheet writes, booking agreement respond/finalize/lines); checkout and
+#     payment confirmation; org creation, volunteer coordinator assignment, and push-device
+#     registration. Each is a person's yes (consent root), never a script's.
+# R33 (owner, 2026-10-13, "Block them for keys") — FR-008 also covers price writes: promo
+#     codes (create/update), comp tickets, seat price overrides, ticket type create/update.
+#     A leaked key must not be able to give tickets away. Orchestrator reading under R32:
+#     payout splits (events.updateEventSplits) and moving paid orders between events
+#     (orders.migrateEventOrders) are money terms and are denylisted too.
+#     Orchestrator reading, 10-13 (NFR-003): each call with an ORG or STAFF key makes one
+#     extra live-role probe (holder still OWNER/ADMIN of the key's org, or still holds an
+#     R28 staff role), so a demoted holder's key fails on the next call (acceptance
+#     criteria). PERSONAL and PLATFORM_WIDE keys make none.
+# R34 (owner, 2026-10-13, four picks) — (a) volunteer check-in (it fires the comp reward)
+#     and switching volunteer auto-approve on (event setting, role setting) are
+#     session-only; (b) the orchestrator's R33 extras stay blocked: promo revoke, ticket
+#     type delete, ticket-type-to-section assignment, manual tax rate, membership tier and
+#     benefit writes, volunteer reward settings and signup approval; (c) claiming a place
+#     (places.submitPlaceClaim) is session-only, like ownership transfer; (d) step 5 also
+#     tags public event search (search.autocomplete incl. placeIds, search.nearbyEvents)
+#     for PLATFORM_WIDE READ keys.
+# Rules added since 10-08 that bind this spec: Model Lifecycle Convention (CLAUDE.md,
+# owner 10-11: "often times I will want CRUD for things on platform") — see `lifecycle`;
+# No enshittification is a VETO (owner 10-12) — checked, R27.
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Any human with a verified email can mint up to five API keys by calling
+    `apiKeys.create`. Each key acts as that human everywhere (every org they belong
+    to, plus staff powers if they hold a staff role) and never expires. Nobody else
+    sees or approves it. The one key in real use is the MCP's, a staff credential
+    that can ban people and delete places.
+  solution: >
+    A key covers exactly one subject at one access level, capped at the holder's live
+    role. It exists only after someone other than the requester approves a key
+    request. Procedures refuse keys unless they opt in. Keys can expire or not
+    (by subject), renew themselves without a new approval, and are listed where the
+    people they affect can see and revoke them.
+  users:
+    - org OWNER / ADMIN (requests and approves org keys)
+    - any verified human (personal and platform-wide keys)
+    - platform staff (approve; hold staff keys)
+    - platform owner (break-glass self-approval of a staff key)
+    - automation holding a key (MCP, CI jobs, a person's AI agent)
+  surfaces:
+    - web
+    - api
+    - jobs
+    - mcp
+
+# ── Key scopes ───────────────────────────────────────────────────────────────
+# subject       | who may request            | who approves                         | access        | expiry
+# ORG           | live OWNER/ADMIN of org    | another live OWNER/ADMIN of the org; | read | rw     | NEVER or ≤90d
+#               |                            | none → any platform staff            |               |
+# PERSONAL      | any verified human         | any platform staff                   | read | rw     | NEVER or ≤90d
+# STAFF         | holder of a platform staff | a staff ADMIN who is not the         | read | rw     | ≤30d
+#               | role: ADMIN, REVIEWER,     | requester; platform owner may self-  |               |
+#               | DEVELOPER or SUPPORT (not  | approve with step-up (R21)           |               |
+#               | COMMUNITY_MODERATOR, v1)   |                                      |               |
+# PLATFORM_WIDE | any verified human         | a staff ADMIN who is not the         | read only     | ≤30d
+#               |                            | requester                            |               |
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Nobody mints a key directly. `apiKeys.create` is removed. A human submits a key
+        request with subject (and org id for ORG), access level, label, purpose
+        (required, 10–500 chars), expiry choice, and auto-renew on/off. Auto-renew is
+        offered only with a term of 2 days or more (R30, owner 10-13): not with a 1-day
+        term, and not with a never-expiring one, which has nothing to renew.
+    - id: FR-002
+      description: >
+        Request eligibility follows the scopes table above, checked at request time and
+        again at approval and collection. Email must be verified (as today).
+    - id: FR-003
+      description: >
+        Approval follows the scopes table. The approver is never the requester, with
+        one exception: the platform owner approving their own STAFF request, after a
+        fresh password or passkey check within the last 5 minutes. That key is capped
+        at 30 days, auto-renews, and is flagged `selfApproved` on every screen that
+        lists it. Because it auto-renews, its term is 2 to 30 days (R21 with R30); a
+        shorter self-approval request is refused.
+    - id: FR-004
+      description: >
+        Denying a request requires a reason (10–500 chars), which the requester sees.
+        A pending request lapses after 14 days and the requester is told. A requester
+        may withdraw a pending request.
+        It may also withdraw a lapsed, undecided one (harmless: a lapsed request holds
+        no cap slot and cannot be approved; withdrawing only skips the lapse notice).
+        Approver queues hide lapsed requests.
+    - id: FR-005
+      description: >
+        Approval does not create a key. The holder collects it once from the account
+        screen: the key is minted then, its plaintext is shown once, and only its
+        SHA-256 hash is stored (`thk_` + 32 random bytes, as today). An approved request
+        not collected within 7 days lapses. A pending or approved-uncollected request
+        closed for account security (R31) cannot be decided or collected; the holder is
+        shown that reason (never "you withdrew"), the request frees its cap slot, and
+        they ask again.
+    - id: FR-006
+      description: >
+        Every call made with a key is authorised by (a) the procedure declaring the
+        key's subject (default deny, R5), (b) the procedure's access level being at most
+        the key's, (c) the holder's live role allowing the call, (d) for ORG keys,
+        the org the call acts on being the key's org. A key can never do more than its
+        holder could do in a session, and stops working the moment the holder loses
+        the role, leaves the org, or is banned or suspended.
+    - id: FR-007
+      description: >
+        A PLATFORM_WIDE key call runs as a signed-out visitor: no actor human for
+        authorisation, so the holder's own private access never leaks through. The key
+        identifies the caller for its own rate limit and audit only.
+    - id: FR-008
+      description: >
+        No key of any subject may call the denylist (R4): money movement (payouts,
+        refunds, Stripe Connect, cash debts), credentials (API keys, passkeys,
+        passwords, sessions, 2FA), members and roles (org members, staff roles,
+        delegates, booking grants), and deleting an account or org. The one exception
+        is FR-009's self-renewal. Bans stay available to read-write STAFF keys (R22).
+    - id: FR-009
+      description: >
+        Self-renewal: in its last 7 days, a key with auto-renew on may call
+        `apiKeys.renewSelf` with itself and gets a new key with the same subject,
+        access, label and term. The old key's expiry moves to now + 24h (or stays
+        sooner). No approval is needed; the role cap still applies. Holder or approver
+        may switch auto-renew off. A NEVER-expiring key has nothing to renew.
+    - id: FR-010
+      description: >
+        Revoking: the holder revokes their own keys; an org OWNER/ADMIN revokes any key
+        on their org; staff ADMINs revoke any key. Revocation is immediate and takes an
+        optional reason, shown to the holder.
+    - id: FR-011
+      description: >
+        Caps: 5 active keys per human per subject (per org for ORG keys), 20 active
+        keys per org across holders. Pending requests count toward the caps.
+    - id: FR-012
+      description: >
+        Notifications (in-app + email): approvers when a request arrives; the requester
+        on approve, deny (with reason), lapse; the holder 7 days before a key expires
+        unless auto-renew is on, and when a key is revoked by someone else; an org's
+        OWNERs/ADMINs when a key on their org is collected or renewed.
+    - id: FR-013
+      description: >
+        Cutover (R10): before launch, count active legacy keys and their holders. The
+        MCP gets a STAFF key through the new flow and a renew-on-start step. Legacy
+        holders get an email 7 days ahead. At cutover every key without a subject is
+        revoked by migration and the legacy resolution path is deleted. Revoked legacy
+        rows are kept for the audit trail: subject, access and requestId stay nullable,
+        and the cutover adds CHECK (subject IS NOT NULL OR revokedAt IS NOT NULL) and
+        refuses new keys without a request.
+    - id: FR-014
+      description: >
+        Screens (R11): account settings "API keys" (my keys across all subjects, my
+        requests, request form, show-once collect, auto-renew toggle, revoke); org
+        settings "API keys" (every key on the org with holder, label, purpose, access,
+        last used, expiry; revoke; pending requests to approve or deny; request
+        button); platform "API keys" (request queue for PERSONAL, STAFF, PLATFORM_WIDE
+        and ORG fallbacks; all keys; revoke). Web only.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Every audit entry written during a key call records `actingApiKeyId` alongside
+        the actor, so a reviewer can tell a key's actions from its holder's.
+    - id: NFR-002
+      description: >
+        A CI test enumerates every tRPC procedure and fails when a procedure tagged for
+        keys sits in a denylisted router or path (except `apiKeys.renewSelf`), and when
+        a mutation is tagged read-level.
+    - id: NFR-003
+      description: >
+        Key resolution adds at most one indexed query to a request (the key row joined
+        to holder status, as today); live-role checks reuse the existing authz calls.
+    - id: NFR-004
+      description: >
+        PLATFORM_WIDE keys get their own per-key rate-limit bucket (start: 60 req/min,
+        enforce mode) on the existing `rate-limit` port.
+    - id: NFR-005
+      description: >
+        The procedure tag names a permission per procedure (not just a subject), so
+        the next step's fine-grained model (R13) is a rule change, not a re-tag.
+    - id: NFR-006
+      description: >
+        Notification sends that swallow failures declare `reportError` per the Sentry
+        convention in CLAUDE.md.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: request-api-key
+        description: Validate eligibility + caps, create a pending key request, notify approvers.
+        input: actorHumanId, subject, orgId?, access, label, purpose, expiry, autoRenew
+        output: requestId
+        idempotent: false
+        money: false
+      - name: decide-api-key-request
+        description: >
+          Approve or deny. Re-checks eligibility; enforces "not your own" except the
+          platform-owner step-up path. Denial needs a reason.
+        input: actorHumanId, requestId, decision, reason?, stepUpProof?
+        output: request status
+        idempotent: true
+        money: false
+      - name: withdraw-api-key-request
+        description: Requester withdraws a pending request.
+        input: actorHumanId, requestId
+        output: ok
+        idempotent: true
+        money: false
+      - name: collect-api-key
+        description: Mint the key for an approved, uncollected, unlapsed request; return plaintext once.
+        input: actorHumanId, requestId
+        output: id, key (plaintext, once), expiresAt
+        idempotent: false
+        money: false
+      - name: renew-api-key-self
+        description: Key renews itself in its last 7 days (FR-009).
+        input: apiKeyId (from context)
+        output: new key (plaintext, once), expiresAt
+        idempotent: false
+        money: false
+      - name: revoke-api-key
+        description: Holder, org OWNER/ADMIN, or staff ADMIN revokes. Replaces today's revoke.
+        input: actorHumanId, keyId, reason?
+        output: ok
+        idempotent: true
+        money: false
+      - name: set-api-key-auto-renew
+        description: Holder or approver toggles auto-renew.
+        input: actorHumanId, keyId, autoRenew
+        output: ok
+        idempotent: true
+        money: false
+      - name: list-my-api-keys / list-org-api-keys / list-platform-api-key-queue
+        description: The three screens' reads. Replaces today's list.
+        input: actorHumanId (+ orgId | filters)
+        output: keys + requests, never hashes
+        idempotent: true
+        money: false
+      - name: sweep-api-key-lifecycle
+        description: Daily job; sends 14-day lapse, 7-day collection lapse and 7-day expiry notices. Lapse itself is derived from timestamps, not written.
+        input: now
+        output: counts
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - repos.apiKeys (extended; adds key-request methods)
+      - repos.audit
+      - authz (live org role, staff role)
+      - rate-limit
+      - notifications / email
+      - reporter
+  adapters:
+    new: []
+    existing:
+      - packages/adapters/src/db/prisma/api-keys.ts (scope columns, requests, renew)
+      - packages/adapters/src/authn/better-auth-authn-adapter.ts (ensureAuthedHumanFromApiKey returns the key scope too)
+  transport:
+    trpc_procedures:
+      - apiKeys.request, apiKeys.decide, apiKeys.withdraw, apiKeys.collect,
+        apiKeys.renewSelf (key-only), apiKeys.revoke, apiKeys.setAutoRenew,
+        apiKeys.listMine, apiKeys.listOrg, apiKeys.listPlatform
+      - apiKeys.create REMOVED
+      - new key-scope middleware in packages/transport/trpc/src/guard.ts, reading a
+        per-procedure key tag (subject + permission + level); context.ts carries the
+        resolved key scope next to actorHumanId
+    webhooks: []
+  ui:
+    pages:
+      - apps/web/src/app/account/settings → "API keys" section
+      - apps/web/src/app/admin/[slug]/settings → "API keys" section
+      - apps/web/src/app/platform/api-keys
+    components:
+      - key request form, key list row, show-once key reveal, approve/deny panel
+      - (design board first, built from the real settings components)
+  other:
+    - apps/mcp: use a STAFF key; call apiKeys.renewSelf on start when in the renewal window
+    - platform owner identity: a constant in core (per environment), not grantable in DB or UI
+    - CONTEXT.md: API key, Key request, Key scope (R17)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - name: ApiKeyRequest
+      fields: >
+        id, requesterHumanId, subject (enum ApiKeySubject), orgId?, access (enum
+        ApiKeyAccess: READ | READ_WRITE), label, purpose, expiryDays? (null = never),
+        autoRenew, createdAt, decidedAt?, decision? (APPROVED | DENIED),
+        decidedByHumanId?, denialReason?, selfApproved, withdrawnAt?,
+        withdrawalReason? (enum ApiKeyRequestWithdrawal: REQUESTER | ACCOUNT_SECURITY;
+        column withdrawal_reason; R31), collectedAt?, lapseNotifiedAt?
+      notes: >
+        Pending / lapsed / uncollected are derived from timestamps, never stored.
+        autoRenew requires expiryDays >= 2 (R30, owner 10-13; NULL expiryDays cannot
+        auto-renew). lapseNotifiedAt records that the lapse notice was sent (a send marker, not a
+        status; precedent Event.addressRevealNotifiedAt). withdrawalReason records who
+        or what withdrew the request (R31): REQUESTER on a pending request the
+        requester withdrew; ACCOUNT_SECURITY on a pending or approved-but-uncollected
+        request closed by a password reset or a ban, so it never reads as "you
+        withdrew".
+  modified_models:
+    - name: ApiKey
+      fields_added: >
+        requestId, subject, orgId?, access, expiresAt?, autoRenew, renewedFromKeyId?,
+        revokedByHumanId?, revokeReason?, keyLast4 (R25; shown on every list as
+        "thk_…ab12"), expiryNotifiedAt? (records that the 7-day expiry notice was
+        sent; a send marker, not a status)
+  migrations_needed: true
+  foreign_keys: >
+    ApiKey.humanId and ApiKeyRequest.requesterHumanId CASCADE with the human (as
+    ApiKey does today). ApiKey.orgId and ApiKeyRequest.orgId CASCADE with the org, the
+    same as other org-owned rows (BookingTag, Announcement). decidedByHumanId and
+    revokedByHumanId SET NULL, so removing an approver keeps the key's history.
+    A key's scope is bound to its request by composite FKs, (requestId, humanId,
+    subject, access) and (requestId, orgId), both CASCADE.
+  db_guards: >
+    Migrations 20261012120100_scoped_api_keys_guards, 20261012120200 (v2),
+    20261012120300 (v3) and 20261012120400 (v4) (full list in the /// comments on ApiKey and
+    ApiKeyRequest). They stop a buggy writer, not a hostile one (a table owner can
+    disable triggers). Key expiry cap (STAFF / PLATFORM_WIDE within 30 days, ORG /
+    PERSONAL never or within 90); selfApproved matches whether the decider is the
+    requester; keyLast4 required on scoped keys; the composite scope FKs above; one
+    collect per request; a renewal belongs to a request, and a renewed key cannot be
+    deleted on its own. Triggers: the clock (LOCALTIMESTAMP in functions pinned to
+    UTC) stamps a key's createdAt and first revokedAt and a request's createdAt,
+    decidedAt and withdrawnAt; no key is born revoked, notified or used; a request
+    is inserted pending, a decision names its decider, and approval is refused
+    after the 14-day lapse (denial still allowed); collect needs an APPROVED
+    request, once, within 7 days of the decision, and the trigger is the only
+    writer of collectedAt; renewal needs auto-renew on the request and the parent
+    key, a parent in its last 7 days with the same label, and no other live key on
+    the request, so an approval has at most 2 live keys and each key renews at
+    most once (this, not the 7-day window, stops a short-term key chaining), and
+    auto-renew needs a term of 2+ days (R30, owner 10-13) so a renewed key always
+    has 24h or more to renew in after its parent's overlap ends; the
+    trigger is the only writer of the parent's 24-hour expiry cut; key scope,
+    identity and the renewal link are fixed, revoke is terminal, expiry only moves
+    earlier; request content is fixed, auto-renew only switches off, decision and
+    withdraw are final; the decider and revoker are cleared only by their FKs
+    (only once the referenced Human row is gone, v4).
+    Auto-renew counts as on only when both the key and its request are on; the
+    approver's switch-off is written to the request.
+    Migration 20261013120000_scoped_api_keys_closed_for_security (R31): CHECK
+    api_key_requests_withdrawal_reason_shape (withdrawalReason is set exactly
+    when withdrawnAt is); CHECK api_key_requests_withdrawn_shape replaced
+    (REQUESTER only on an undecided request; ACCOUNT_SECURITY on an undecided
+    or an APPROVED-and-uncollected one); both guards replaced, every v4 rule
+    kept: withdrawnAt and withdrawalReason are final once set, a withdrawn
+    request is never decided, a request is inserted without a reason, and no
+    key (collect or renewal) is minted under a withdrawn request. A password
+    reset or a ban (revokeAllForHuman) closes the holder's pending and
+    approved-but-uncollected requests with ACCOUNT_SECURITY in the same
+    transaction that revokes their keys.
+
+# ── Lifecycle (Model Lifecycle Convention, CLAUDE.md) ─────────────────────────
+lifecycle:
+  ApiKeyRequest:
+    create: built (request-api-key)
+    read: built (list-my / list-org / list-platform-queue)
+    update: >
+      built only as state moves: decide, withdraw, collect, and the account-security
+      close (R31: a password reset, ban, suspension or unproven-account sweep closes
+      pending and approved-uncollected requests). Label, purpose, scope and
+      expiry are NOT editable after sending; the requester withdraws and asks again,
+      because the approver approved what they read.
+    remove: >
+      not built. Append-only like orders and audit rows: a decided, withdrawn or
+      lapsed request is the record of who asked for what and who said yes. Removed
+      only by CASCADE when the requester or the org is deleted.
+  ApiKey:
+    create: built, only through collect-api-key and renew-api-key-self (never direct).
+    read: built (the three list use cases; the hash is never returned).
+    update: >
+      built for auto-renew only (set-api-key-auto-renew). Scope, access and label are
+      fixed for the key's life; a different scope is a new request.
+    remove: >
+      revoke = soft remove (revokedAt, revokedByHumanId, revokeReason); rows are kept
+      for the audit trail. Hard delete only by CASCADE with the holder or the org.
+  platform_page: >
+    /platform/api-keys lists and revokes keys and decides requests but does not
+    create keys, by rule R1/R2 (nobody mints a key; a key exists only after an
+    approved request). Same shape as the standing category example: removable on
+    /platform, created only by approving a request. Approving IS the create.
+  migration_notes: >
+    Additive columns, nullable. Decided 2026-10-13 (orchestrator): subject, access and
+    requestId stay nullable for good. The cutover migration (FR-013) revokes every row
+    with a null subject, adds CHECK (subject IS NOT NULL OR revokedAt IS NOT NULL),
+    and makes the api_keys guard refuse inserts without a request; revoked legacy rows
+    are kept for the audit trail.
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      ORG binding: many org procedures take an eventId or placeId, not an orgId. A key
+      tag that trusts an input orgId would let an ORG key act on another org.
+    severity: HIGH
+    mitigation: >
+      The middleware compares the key's org with the org the procedure's existing
+      authz check resolved, never with raw input. Procedures that cannot report a
+      resolved org are not taggable for ORG keys (default deny covers the rest).
+  - risk: >
+      Role cap drift: a key keeps working after its holder is demoted.
+    severity: HIGH
+    mitigation: >
+      The cap is the live role on every call (R3), never a copy stored on the key.
+  - risk: >
+      A stolen key renews itself forever.
+    severity: MEDIUM
+    mitigation: >
+      Renewals are audited and announced to org admins (FR-012); the approver can
+      switch auto-renew off or revoke; the role cap and ban check still apply.
+  - risk: >
+      Platform-wide keys used for bulk scraping.
+    severity: MEDIUM
+    mitigation: >
+      Public data only, per-key rate limit, staff approval with a stated purpose,
+      revocable.
+  - risk: >
+      Platform owner break-glass abused or the constant edited.
+    severity: MEDIUM
+    mitigation: >
+      Fresh password/passkey check, 30-day cap, `selfApproved` flag shown to every
+      staff ADMIN, audit entry; the constant changes only through a reviewed commit.
+
+open_questions: []  # all answered 10-12 (R23–R29)
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Fine-grained role×procedure permissions on keys — the NEXT STEP (R13).
+  - Making bans session-only — revisit later (R22).
+  - Org key requests from roles other than OWNER/ADMIN (R13).
+  - Writes on PLATFORM_WIDE keys, including bulk community listings (R19).
+  - Mobile and scanner screens (R11).
+  - OAuth / third-party app consent flows.
+  - Requesting a key on someone else's behalf (requester is always the holder).
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - Calling the old `apiKeys.create` is impossible; a key exists only after a decided, collected request.
+  - A sole-owner org's request appears in the platform queue; nobody can approve their own request except the platform owner's STAFF break-glass, which demands a fresh step-up.
+  - An ORG READ key gets FORBIDDEN on every mutation, on another org's procedures, and on any untagged procedure.
+  - Demoting the holder from ADMIN to VIEWER (or removing them from the org) makes their ORG key fail on the next call.
+  - A PLATFORM_WIDE key returns exactly what a signed-out visitor sees for the same call, and is rate-limited per key.
+  - No key can call any denylisted procedure; the NFR-002 test fails when one is tagged.
+  - A key in its last 7 days with auto-renew on renews itself; the old key works for 24h, then fails.
+  - The collected key plaintext is shown once; reloading the page cannot show it again.
+  - Every action taken with a key shows the key id in the audit log.
+  - After cutover, zero keys without a subject remain and the MCP works on its STAFF key.

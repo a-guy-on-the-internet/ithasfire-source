@@ -1,0 +1,135 @@
+# checkout-panel.component.yaml
+meta:
+  goal: Build a reusable, framework-agnostic CheckoutPanel UI for Ticket Hunter using Tamagui from @th/ui.
+  file: packages/ui/src/ui/tamagui/components/CheckoutPanel.tsx
+  export: named CheckoutPanel
+  tech:
+    - React 18
+    - Tamagui
+    - No Stripe SDK inside component (parent injects payment element)
+    - No data fetching inside component (pure presentational + callbacks)
+
+props:
+  required:
+    - items: Array<{ id: string; name: string; qty: number; unitPriceCents: number; lineTotalCents: number }>
+    - currency: string # ISO 4217, e.g., "usd"
+    - totals: { subtotalCents: number; feesCents: number; discountCents: number; grandTotalCents: number }
+    - onApplyCoupon(code: string): void | Promise<void>
+    - onRemoveCoupon(code: string): void | Promise<void>
+    - onPay(): void | Promise<void> # parent will call Stripe confirm with existing clientSecret
+  optional:
+    - coupons: Array<{ code: string; appliedCents: number }>
+    - paymentElement?: React.ReactNode # parent mounts Stripe PaymentElement (or other)
+    - disabled?: boolean
+    - loading?: boolean # show skeleton/disabled states during createCheckout
+    - error?: { message: string; code?: string }
+    - testIdBase?: string # data-testid base; default "checkout"
+    - embedded?: boolean # compact layout for embeds
+    - theme?: "light" | "dark"
+    - notes?: string # footer note (refund policy, etc.)
+
+layout:
+  structure:
+    - Container (Card)
+      - Header: title "Checkout", optional event title slot
+      - ItemsList:
+        - Row per item: name, qty stepper, unit price, line total
+        - Qty change emits `onQtyChange?(id, qty)` if provided (keep optional)
+      - CouponRow:
+        - Input + "Apply" button
+        - List of applied coupons with removable badges
+      - FeesSummary:
+        - Subtotal
+        - Platform Fees
+        - Discounts (negative)
+        - Divider
+        - Grand Total (emphasized)
+      - PaymentSection:
+        - If paymentElement provided: render inside a styled Box
+        - Else: show placeholder hint “Payment method appears here”
+      - Actions:
+        - Pay button (primary, full width), disabled when: disabled||loading||!paymentElement
+        - ErrorAlert (if error)
+      - Footer:
+        - Small print: notes || default copy about secure payments
+
+interactions:
+  qty_controls:
+    - Optional prop `onQtyChange?(id: string, qty: number)`; if not provided, hide steppers.
+  coupon_apply:
+    - Trim, uppercase (UI), call onApplyCoupon; optimistic “applying” state; handle errors via `error` prop (parent owns).
+  coupon_remove:
+    - Call onRemoveCoupon(code)
+  pay:
+    - Click calls onPay(); show loading state on button until promise settles.
+  disabled_rules:
+    - Entire panel respects `disabled` prop; inputs and buttons disabled.
+
+states:
+  - default
+  - loading: skeleton rows for items & summary
+  - disabled: opacity + pointer-events none on inputs, button disabled
+  - error: inline Alert with `error.message`
+  - embedded: tighter paddings, condensed typography
+
+a11y:
+  - Button labels: “Apply coupon”, “Pay now”
+  - Totals region has aria-live="polite" for grand total changes
+  - Inputs have visible labels (visually hidden okay)
+  - Keyboard: coupon apply on Enter
+  - Currency announced with formatted amounts
+
+formatting:
+  - Use a local utility `formatPrice(cents: number, currency: string): string` (no i18n lib dependency)
+  - Right-align numeric cells; monospaced digits for totals
+
+test_hooks:
+  data_testids:
+    - container: "${testIdBase}-panel"
+    - item_row: "${testIdBase}-item-${id}"
+    - item_qty: "${testIdBase}-item-${id}-qty"
+    - coupon_input: "${testIdBase}-coupon-input"
+    - coupon_apply: "${testIdBase}-coupon-apply"
+    - coupon_tag: "${testIdBase}-coupon-${code}"
+    - summary_subtotal: "${testIdBase}-subtotal"
+    - summary_fees: "${testIdBase}-fees"
+    - summary_discounts: "${testIdBase}-discounts"
+    - summary_total: "${testIdBase}-total"
+    - payment_box: "${testIdBase}-payment"
+    - pay_button: "${testIdBase}-pay"
+    - error_alert: "${testIdBase}-error"
+  attributes:
+    - Use both data-testid and data-test for compatibility.
+
+styling:
+  - Tamagui primitives (Card, XStack, YStack, Button, Input, Separator, Text, Theme)
+  - Respect `theme` prop by wrapping with <Theme name={theme}> if provided
+  - Variants:
+      - size: "default" | "compact" (compact when embedded=true)
+      - tone: "default" | "success" | "danger" (for alerts)
+
+edge_cases:
+  - Empty items → render disabled state + message “No tickets selected”
+  - coupons exists but discountCents=0 → still show tags, discount line stays 0
+  - Very long item names → truncate with tooltip/title
+
+stories:
+  - Default: 2 items, coupon applied, paymentElement placeholder
+  - Loading: loading=true
+  - Error: error={message:"Card declined"}
+  - Embedded: embedded=true
+  - Disabled: disabled=true
+  - NoPaymentElement: paymentElement undefined
+
+examples_parent_usage:
+  - Parent does createCheckout → gets {orderId, clientSecret} → mounts Stripe <PaymentElement/> in `paymentElement` slot → sets onPay={() => stripe.confirmPayment({ … })}
+
+non_goals:
+  - No network/Stripe calls inside component
+  - No currency conversion logic
+  - No persistence of coupons; parent owns state
+
+quality:
+  - Strict TypeScript props
+  - Minimal re-renders (memoize price computations)
+  - No external CSS; Tamagui only

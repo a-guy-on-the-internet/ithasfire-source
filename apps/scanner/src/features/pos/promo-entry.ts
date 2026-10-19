@@ -34,20 +34,15 @@ export type PromoApplication = PromoPreviewOutput["applications"][number];
 export type PromoTicketSelection = { ticketTypeId: string; qty: number };
 
 /**
- * The ONLY shape we ever send to `promos.preview` from the door.
- *
- * `pricing: "DOOR"` is not optional here and is deliberately a literal type,
- * not `"STANDARD" | "DOOR"`: the server defaults to `STANDARD` (the online
- * price), and previewing at the online price while the sale charges the door
- * price would quote the operator a discount that differs from the one they
- * collect against — visibly so for PERCENT promos.
+ * The ONLY shape we ever send to `promos.preview` from the door. There is no
+ * pricing mode: the door sells at the same price as online checkout, so the
+ * preview and the sale price the cart identically.
  */
 export type PromoPreviewRequest = {
   eventId: string;
   codes: string[];
   ticketSelections: PromoTicketSelection[];
   source: "manual";
-  pricing: "DOOR";
 };
 
 export type PromoPreviewFn = (
@@ -171,9 +166,10 @@ const SALE_ERROR_COPY: Record<string, string> = {
   ...PROMO_ERROR_COPY,
   TICKET_TYPE_SOLD_OUT: "That ticket type just sold out.",
   TICKET_TYPE_TEMPORARILY_HELD:
-    "Someone else is mid-sale on the last of these. Try again in a moment.",
+    "These tickets are held in someone else's checkout. If they don't finish, they go back on sale.",
   seat_unavailable: "Those seats were just taken. Try again.",
-  AMOUNT_MUST_BE_POSITIVE: "Use Cash to record a $0 comp — a card can't be charged for nothing.",
+  AMOUNT_MUST_BE_POSITIVE:
+    "Nothing to charge to a card. Take it through Cash as a $0 sale.",
   PAYEE_CHARGES_DISABLED:
     "This organisation can't take card payments yet. Use Cash.",
   PAYEE_NOT_CONNECTED:
@@ -183,10 +179,14 @@ const SALE_ERROR_COPY: Record<string, string> = {
   SCANNER_TERMS_REQUIRED: "Accept the scanner terms in Settings first.",
   INSUFFICIENT_ROLE: "You don't have permission to sell for this event.",
   EVENT_NOT_ORG_OWNED: "Door sales aren't available for this event.",
+  // The Sell screen answers these two with its own notices (sale-attempt.ts)
+  // and never shows a banner for them; kept as a fallback for other callers.
   IDEMPOTENCY_LOCK_IN_PROGRESS:
-    "That sale is still processing. Check the last sale before retrying.",
-  IDEMPOTENCY_KEY_CONFLICT:
-    "That sale is still processing. Check the last sale before retrying.",
+    "Still being processed. Wait a moment, then try again.",
+  IDEMPOTENCY_KEY_CONFLICT: "This sale may already be recorded.",
+  CASH_AMOUNT_SHORT: "That's less than the cash total.",
+  TAX_RATE_UNAVAILABLE:
+    "Tax can't be worked out right now, so the sale was refused. Nothing was charged.",
 };
 
 const FALLBACK_SALE_ERROR = "Couldn't complete that sale. Try again.";
@@ -241,39 +241,21 @@ function errorMessageFrom(
 // Totals
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type CartTotals = {
-  /** Door-price subtotal, integer cents. */
-  subtotalCents: number;
-  /** Clamped to the subtotal — a discount can zero a cart, never invert it. */
-  discountCents: number;
-  /** What the buyer owes: subtotal − discount. */
-  totalCents: number;
-  /**
-   * True when codes are applied but the displayed discount was computed
-   * against a different cart (or a preview is in flight). The sale CTAs stay
-   * disabled while this is true.
-   */
-  isStale: boolean;
-};
-
-export function selectCartTotals(args: {
-  subtotalCents: number;
-  cartKey: string;
-  promo: PromoState;
-}): CartTotals {
-  const { subtotalCents, cartKey, promo } = args;
-  const discountCents = Math.max(
-    0,
-    Math.min(promo.totalDiscountCents, subtotalCents),
-  );
-  const hasCodes = promo.codes.length > 0;
-  return {
-    subtotalCents,
-    discountCents: hasCodes ? discountCents : 0,
-    totalCents: Math.max(0, subtotalCents - (hasCodes ? discountCents : 0)),
-    isStale:
-      hasCodes && (promo.isPreviewing || promo.previewedCartKey !== cartKey),
-  };
+/**
+ * Is the promo state a proven answer for THIS cart?
+ *
+ * The codes ride on `pos.quoteCart` and on the sale, so a code that is still
+ * being previewed, or was previewed against a different cart, must not reach
+ * either: the quote would price codes the operator hasn't seen confirmed, and
+ * the per-code chips would describe another cart. While this is false the
+ * quote reads "updating" and both tenders stay off.
+ *
+ * The TOTAL is not computed here any more: the server quote carries the
+ * discount, fees and tax (`sell-quote.ts`).
+ */
+export function isPromoSettled(promo: PromoState, cartKey: string): boolean {
+  if (promo.isPreviewing) return false;
+  return promo.codes.length === 0 || promo.previewedCartKey === cartKey;
 }
 
 /**
@@ -416,7 +398,6 @@ export function createPromoController(opts: {
           .filter((line) => line.qty > 0)
           .map((line) => ({ ticketTypeId: line.ticketTypeId, qty: line.qty })),
         source: "manual",
-        pricing: "DOOR",
       });
       if (stamp !== generation) return; // superseded
       set({

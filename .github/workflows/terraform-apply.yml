@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   # Shared group with deploy-{env} so a manual terraform-apply and a
@@ -26,35 +27,75 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Terraform override drift guard — section 5 of
+  # apps/jobs/src/scripts/validate-manifest.ts: every `jobs_scheduler_overrides`
+  # entry in infra/terraform/envs/*/*.tfvars must be declared on its manifest
+  # entry, because the staff console reports the MANIFEST schedule. Same job as
+  # deploy-dev.yml / deploy-prod.yml carry; it is here because deploy-dev's
+  # terraform comment sends operators to THIS workflow when an apply is
+  # blocked, and an escape hatch with no guard is a hole in the guard. Kept out
+  # of `apply` so a dependency install never shares a job with the OIDC
+  # credential.
+  manifest_drift_guard:
+    name: Jobs manifest / Terraform override drift guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install apps/jobs and its workspace dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts --filter jobs...
+
+      - name: Validate jobs manifest and Terraform override drift
+        run: pnpm -C apps/jobs validate:manifest
+
   apply:
     name: Apply (${{ inputs.environment }})
+    needs: [manifest_drift_guard]
+    # A failed drift guard blocks the apply outright; `success()` keeps the
+    # default all-needs-succeeded rule explicit alongside it.
+    if: success() && needs.manifest_drift_guard.result == 'success'
     runs-on: ubuntu-latest
     # Use GitHub Environments to require approval before execution.
     environment: ${{ inputs.environment }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v4
+        uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.6
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
         id: setup_gcloud
         # Retried below — see the note at the first occurrence in deploy-dev.yml.
         continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Setup gcloud (retry)
         if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
@@ -191,22 +232,23 @@ jobs:
     # on every apply.
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
         id: setup_gcloud
         # Retried below — see the note at the first occurrence in deploy-dev.yml.
         continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Setup gcloud (retry)
         if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
@@ -222,10 +264,10 @@ jobs:
           echo "DATABASE_URL=${url}" >> "$GITHUB_ENV"
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@v4
 
       - name: Setup Node
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v4
         with:
           node-version: 22
 

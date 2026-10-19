@@ -1,8 +1,16 @@
 {
-  "mcpServers": {
-    "appium": {
-      "type": "stdio",
-      "command": "/Users/somehuman/.nvm/versions/node/v24.8.0/bin/appium-mcp"
-    }
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"$CLAUDE_PROJECT_DIR/scripts/dev/gate/bypass-guard.pl\"; [ -f \"$f\" ] || exit 0; exec perl \"$f\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
   }
 }

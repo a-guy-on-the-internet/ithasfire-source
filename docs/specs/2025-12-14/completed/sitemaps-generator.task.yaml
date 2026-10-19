@@ -1,0 +1,48 @@
+# Copilot Task: Implement sitemap shard generator
+context:
+  references:
+    - ../platform/sitemaps-architecture.spec.yaml
+    - ../platform/sitemaps-observability.spec.yaml
+  packages:
+  - apps/jobs
+    - packages/ports
+    - packages/test-utils
+  data_sources:
+    - Postgres read models (events, organizers, collections)
+    - @th/core date helpers for canonical formatting
+  storage: gcs bucket `seo-sitemaps`
+goal: |
+  Build the job that queries canonical datasets, chunks URLs according to the architecture spec,
+  streams XML, and uploads both `.xml` and `.xml.gz` per shard plus the sitemap index.
+requirements:
+  - Create `apps/jobs/src/sitemaps/generate.ts` exposing `generateSitemaps({ trigger })`.
+  - Support streaming output (no loading entire shard in memory).
+  - Enforce shard naming rules and limits (45k URL guard rails, suffixing for overflow).
+  - Write index manifest referencing every shard with `lastmod` from dataset max updated_at.
+  - Upload to temp key then atomically promote (rename/move) to avoid partial files.
+  - Emit metrics/logs defined in observability spec.
+  - Provide unit tests with Prisma fakes verifying chunking and XML schema.
+  - Provide integration test (flagged) that writes to local filesystem (mocking GCS) to cover gzip + index layout.
+inputs:
+  trigger:
+    type: object
+    fields:
+      - name: reason
+        values: ["nightly", "event_update", "organizer_update", "manual"]
+      - name: shard_scope
+        optional: true
+        description: Limit to specific shard(s) for targeted rebuild.
+  config:
+    - bucket: from `@th/config`
+    - tmp_prefix: `sitemaps/tmp/`
+    - active_prefix: `sitemaps/`
+implementation_notes:
+  - Reuse existing XML builder helpers if available; otherwise, add lightweight builder with escape handling.
+  - Use node streams or generator functions to keep memory usage low.
+  - Deterministically sort URLs for stable diffs.
+validation:
+  - pnpm -C apps/jobs vitest --run
+  - Optional: manual run writing to ./tmp and inspecting index.
+handoff:
+  - Update README in `apps/jobs` with usage instructions.
+  - Link PR back to this task and architecture spec.

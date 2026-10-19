@@ -1,0 +1,190 @@
+status: complete
+# Spec: Ithas Fire Place Layout Architecture
+meta:
+  owner: marketplace-platform
+  status: draft
+  reviewers:
+    - core
+    - ui
+    - data-eng
+    - ops
+  last_updated: 2025-11-14
+summary: |
+  Define the end-to-end system for ingesting venue seating layouts, persisting
+  geometry and metadata, and serving performant place layout experiences across web,
+  mobile, and scanner clients. The architecture must cover data ingestion,
+  normalization, storage, APIs, rendering contracts, and operational tooling so
+  that seat selection and inventory management scale to arena-sized venues while
+  honoring availability, holds, and accessibility requirements.
+objectives:
+  - Provide a deterministic pipeline for importing and editing venue seating layouts in under 30 minutes per venue.
+  - Serve place layout geometry and status data in <300 ms p95 from the API edge for up to 20k seats per venue.
+  - Support cross-platform rendering (web canvas, Expo Skia, scanner views) with a shared glyph contract and spatial index guidance.
+  - Keep seat availability synchronized with core checkout holds and ticket issuance flows, including real-time updates when possible.
+  - Ship observability, tooling, and runbooks so Ops can audit layouts, diagnose stale holds, and rollback problematic imports quickly.
+scope:
+  in_scope:
+    - Data ingestion sources (CAD/SVG, CSV, manual editor) and validation.
+    - Database schema changes to persist seat geometry, transforms, and metadata.
+    - API/transport layer contracts that deliver place layout payloads to clients.
+    - Rendering contract definition (glyph format, hit-testing hints, theming tokens).
+    - Operational tooling (admin UI, CLI) for importing, editing, and versioning layouts.
+    - Observability, metrics, and alerting for ingestion jobs, APIs, and client surfacing.
+  out_of_scope:
+    - Pricing logic, fee calculation, or seat grouping discounts (covered elsewhere).
+    - Non-seated general admission flows (handled by existing ticket quantity UI).
+    - Offline kiosk hardware integrations (future work once mobile parity validated).
+personas:
+  - venue_ops: Imports and maintains accurate seating layouts, runs validation reports.
+  - organizer_admin: Configures pricing, seat locks, and monitors availability per event.
+  - buyer: Selects seats on web/mobile with responsive, accessible UX.
+  - scanner_agent: Verifies seat assignments during entry with lightweight views.
+success_metrics:
+  - Import turnaround: 95% of new venues ingested and published within 1 business day.
+  - API performance: `/place-layouts/:eventId` responds in <200 ms p50 / <300 ms p95 (excluding network) with payload size <1.5 MB for 10k seats.
+  - Client FPS: Seat selection interaction maintains 45+ FPS on mid-tier devices (iPad Air, Pixel 6, MacBook Air).
+  - Data fidelity: <0.5% discrepancy between seats sold/held vs geometry dataset (monitored nightly).
+  - Error budget: <1% of place layout requests return 5xx or stale data (>2 minutes drift).
+flags:
+  - name: feature.placeLayout
+    default: false
+    rollout: per-organizer
+    note: gates API routes, admin tooling, and client UI entry points until full parity delivered.
+datasets:
+  seats:
+    owner: core
+    schema_changes:
+      - Add `geometry` JSONB column storing `{ x, y, width, height, rotation, anchor }` per seat.
+      - Add `layout_version` UUID referencing latest published place layout snapshot.
+      - Extend `SeatStatus` enum with `UNPLACED` for ingestion staging.
+  seat_sections:
+    schema_changes:
+      - Add `origin`, `rotation`, `scale`, `z_index` properties for transforms.
+      - Track `layout_version`, `blueprint_ref` (file path in object storage).
+  place_layout_versions:
+    schema: |
+      id UUID PK, venue_id UUID, event_id UUID NULL, status ENUM(draft,published,archived),
+      source ENUM(cad,csv,manual), checksum TEXT, created_by, created_at, notes TEXT,
+      diff_summary JSONB, metadata JSONB (e.g., default_zoom, min_zoom, max_zoom).
+    behavior:
+      - New version created on every import/edit publish. Immutable once published.
+      - Link to associated blueprint assets (SVG, CAD, screenshot) in object storage.
+intake_pipeline:
+  sources:
+    - cad_svg: Upload raw CAD (DXF) or SVG; parse via server-side worker into seat polygons.
+    - csv_template: Structured CSV with columns (section,row,seat,x,y,rotation,width,height,tier,notes).
+    - manual_editor: Browser-based editor enabling drag/drop adjustments, seat cloning, and snapping.
+  process:
+    1. Upload blueprint assets to object storage (`place-layouts/raw/{venue}/{timestamp}/`).
+    2. Parser service normalizes geometry into canonical units (meters) and aligns to section origins.
+    3. Validation suite checks: seat count parity, duplicate IDs, overlaps >1 cm, stray seats outside section bounds, labeling gaps.
+    4. Produce draft `place_layout_version` with diffs vs last published version.
+    5. Ops reviews & annotates diff (web UI). Approve → promote to published, or request edits.
+  tooling:
+    - Web admin app (Route: `apps/web/src/app/admin/place-layouts`) using Canvas preview + seat inspector.
+    - CLI (`packages/tools/src/place-layouts/import.ts`) for batch imports from CSV/SVG.
+    - Snapshot generator writes PNG thumbnails for quick visual diffing.
+  rollback:
+    - Keep last 10 published versions; allow one-click rollback by reassigning `venue.current_layout_version`.
+api_contracts:
+  place_layout_get:
+    path: GET /place-layouts/:eventId
+    transport: Fastify (apps/api) + tRPC procedure `placeLayouts.get`
+    auth:
+      - public fetch allowed; embed seat availability statuses by role (buyer vs organizer).
+    response:
+      schema:
+        - layout: { id, version, venueId, eventId?, publishedAt, metadata }
+        - sections: Array<{ id, name, colorToken, transform: { origin, rotation, scale }, bounds }>
+        - glyphs: Array<PlaceLayoutGlyph>
+        - legend: Array<{ status, label, colorToken }>
+        - pricingTiers: Array<{ tierId, label, colorToken, priceCents }>
+      PlaceLayoutGlyph:
+        id: string (seat UUID)
+        sectionId: string
+        position: { x: number; y: number; width: number; height: number; rotation: number }
+        status: "AVAILABLE" | "HELD" | "SOLD" | "BLOCKED" | "UNKNOWN"
+        label: string (row-seat label)
+        tierId?: string
+        attrs: { accessible?: boolean; companionSeatIds?: string[] }
+      metadata:
+        defaultViewport: { center: { x, y }; zoom: number }
+        minZoom: number
+        maxZoom: number
+        stagePolygons: Array<Array<{ x, y }>>
+        seatIndexHints: { gridSize: number; bucketSize: number }
+  place_layout_updates:
+    path: GET /place-layouts/:eventId/stream (SSE/WebSocket)
+    transport: TBD (pilot via SSE)
+    payload:
+      - events: seat_status_changed, seat_hold_expiring, layout_version_published
+      - shape: { seatId, status, holdExpiresAt?, orderId?, source }
+    notes: optional Phase 2; fallback to polling `place-layouts.status` endpoint every 15s.
+  admin_api:
+    - POST /place-layouts/:venueId/import (multipart)
+    - POST /place-layouts/:layoutId/publish
+    - POST /place-layouts/:layoutId/rollback
+    - GET /place-layouts/:layoutId/diff
+renderer_contract:
+  glyph_contract:
+    - Required fields as above.
+    - Provide `atlasKey` for sprite batching; default derived from status+tier.
+    - Provide `hitbox` separate from visual shape for accessible selection radius.
+  spatial_index:
+    - Clients should build RBush (web) or Flatbush index with `minX, minY, maxX, maxY` computed from glyph position.
+    - Provide recommended `gridSize` for partitioning (e.g., 16x16 units) to align with server-provided hints.
+  interactions:
+    - Seat selection atomic; backend expects seat IDs array in checkout items.
+    - Provide seat hold metadata in glyph updates (expiresAt) to sync countdown components.
+performance_targets:
+  payload_size:
+    - Hard limit 1.5 MB gzipped for 10k seats; include `compressedGlyphs` optional field using delta encoding (Phase 2).
+  caching:
+    - CDN cache for 30s (buyers) with `ETag` reflecting layout version + inventory checksum.
+    - Organizers bypass CDN via auth header; ensure 1s stale tolerance.
+  computation:
+    - Precompute glyph arrays upon publish; store in Redis / object storage as binary blobs for fast fetch.
+    - API loads precomputed blob, merges dynamic statuses from `Seat` table (HELD/SOLD) within transaction.
+security_privacy:
+  - Layout metadata not sensitive; ensure private sections flagged `visibility = internal` are hidden from buyers.
+  - Admin endpoints require org-level `manage_event` role.
+  - Audit imports, publishes, rollbacks with actor, checksum, affected seats count.
+  - Validate uploaded files (MIME, size < 25 MB) and scan via existing AV pipeline.
+observability:
+  metrics:
+    - placeLayout.import.duration_ms
+    - placeLayout.import.seats_processed
+    - placeLayout.import.validation_errors
+    - placeLayout.api.payload_bytes
+    - placeLayout.api.cache_hit_ratio
+    - placeLayout.client.fps (reported via RUM sample)
+  logs:
+    - Structured logs for import + publish actions with layoutId, version, checksum.
+    - API access logs include layoutVersion, seatsReturned, cacheHit flag.
+  tracing:
+    - Wrap `/place-layouts/*` routes with distributed tracing to measure merge latency.
+rollout_plan:
+  phases:
+    - phase_0: Schema migration + hidden admin import UI, test with internal sandbox venue.
+    - phase_1: Enable read-only place layout rendering for buyers (no selection) to validate payload + perf.
+    - phase_2: Enable selection + checkout integration for pilot organizers (feature flag).
+    - phase_3: Roll out organizer admin tooling + SSE updates, monitor metrics for 2 weeks.
+    - phase_4: Enable scanner-specific view, finalize docs/runbooks, remove feature flag default.
+open_questions:
+  - Do we need seat adjacency metadata for accessibility pairing beyond companion seats?
+  - Should pricing tiers live in a dedicated table or remain derived from ticket types per event?
+  - How aggressively should we prune historical layout versions to control storage costs?
+  - Is WebSocket fan-out necessary Day 1 or can we rely on short polling + replays?
+dependencies:
+  - Postgres migrations for new columns/tables (packages/db).
+  - Object storage bucket `place-layouts` for raw assets + precomputed glyph blobs.
+  - Worker infrastructure (queues) for async parsing and validation jobs.
+  - Admin UI resourcing (design + frontend) under `apps/web`.
+  - Feature flag service updates to include `feature.placeLayout` targeting.
+references:
+  - ../../engineering-standards.md
+  - ../../hot-paths.md
+  - ../../design/component-library.md
+  - ../../layers.md#ui
+  - ../../layers.md#core
+  - ../../specs/ui/ui.pattern.md

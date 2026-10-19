@@ -1,0 +1,398 @@
+status: complete
+# unified-scan-resolver.spec.yaml
+#
+# Collapse the scanner Home into a single "Scan" entry that auto-routes any
+# Ithas Fire QR (ticket code or volunteer token) to the correct flow, and
+# enrich each result with cross-context information (volunteer holds a
+# ticket; ticket-holder is also volunteering).
+
+version: "1.0"
+updated: "2026-04-25"
+related:
+  - docs/specs/2026-04-24/scanner-foundation.spec.yaml
+  - docs/specs/2026-04-24/volunteer-scanner-check-in.spec.yaml
+  - docs/specs/2026-03-23/volunteering.spec.md
+
+scope_note: >
+  This spec unifies the scanner UX at the resolver / result-screen layer
+  only. It does NOT change credential formats: ticket QRs remain opaque DB
+  codes (looked up via `tickets.getByCode`); volunteer QRs remain signed
+  human+event tokens minted by `mintVolunteerScanToken`. They keep separate
+  audit trails, separate idempotency keys, separate role gates on writes.
+  What changes: a single `resolveScanPayload` use case dispatches by
+  payload shape; the scanner app collapses two Home buttons into one
+  "Scan"; the result screen shows cross-context affordances.
+
+dependencies:
+  hard:
+    - existing `scanTicket` use case
+      (packages/core/src/use-cases/tickets/scan-ticket.ts)
+    - existing volunteer scan token plumbing
+      (packages/core/src/use-cases/volunteering/volunteer-scan-tokens.ts)
+    - existing `checkInVolunteer` mutation
+    - VolunteerScanTokenPort (signed token verify)
+  soft:
+    - combined badge/wallet print (out-of-spec for this slice; future)
+
+summary:
+  problem: >
+    The scanner currently shows two top-level buttons ("Ticket admission"
+    vs "Volunteer check-in"), forcing operators to know in advance what
+    kind of QR they're about to see. Patrons who are both ticketed and
+    volunteering end up carrying two QRs and getting routed through two
+    independent flows. Door staff lose useful context: they don't know
+    a ticket-holder is also on shift, or that a checked-in volunteer also
+    has a ticket.
+  solution: >
+    Introduce a single `resolveScanPayload({ eventId, raw, actorHumanId })`
+    use case that:
+      1. Tries to verify `raw` as a signed volunteer scan token first.
+         If signature + scope (eventId) check out, route to volunteer.
+      2. Otherwise, treat `raw` as a ticket code and route to
+         `tickets.getByCode`.
+      3. Returns a discriminated union with cross-context enrichment
+         (`alsoHoldsTicket` on volunteer results, `alsoVolunteering` on
+         ticket results).
+    Write paths (`scanTicket` and `checkInVolunteer`) stay untouched and
+    keep their independent idempotency, audit, and RBAC.
+    Scanner Home collapses into one "Scan" button; result screen surfaces
+    the cross-context chip and an explicit secondary action when the
+    scanned human has both a valid ticket AND an eligible volunteer
+    signup.
+  users:
+    - Scanner operators with `ORG_SCAN_ROLES` (door staff, gate)
+    - Operators with `ORG_EDIT_ROLES` (also do volunteer check-in writes)
+  surfaces:
+    - scanner
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        The scanner Home must show a single primary "Scan" button instead
+        of two separate ticket / volunteer entry points. Tapping it opens
+        a unified camera surface in the currently selected event context.
+        A secondary "Search by name / email" affordance remains as the
+        manual fallback for both kinds of resolution.
+
+    - id: FR-002
+      description: >
+        On a successful camera decode (or manual paste), the app calls a
+        new tRPC procedure `scan.resolvePayload({ eventId, raw })` which
+        invokes the `resolveScanPayload` use case. The client never has
+        to disambiguate ticket vs volunteer ahead of time.
+
+    - id: FR-003
+      description: >
+        `resolveScanPayload` dispatch order:
+          a. Attempt `volunteerScanToken.verify(raw)`. On success AND
+             `payload.eventId === input.eventId`, return
+             `{ kind: "volunteer", ... }`.
+          b. On signature failure OR event-scope mismatch with a
+             cryptographically valid token, fall through to (c).
+          c. Validate `raw` matches ticket-code shape (6-64 char,
+             upper-cased) and call `tickets.getByCode`. If found and
+             `eventId` matches, return `{ kind: "ticket", ... }`.
+          d. Otherwise return `{ kind: "unknown", reason }`.
+
+    - id: FR-004
+      description: >
+        Hard-prefer volunteer-token branch. If `raw` somehow validates as
+        a signed volunteer token AND also matches a ticket-code shape,
+        treat it as volunteer. (In practice the signing keys make
+        collisions cryptographically negligible; this is defense in depth.)
+
+    - id: FR-005
+      description: >
+        Off-event QR handling MUST be uniform across both branches. If a
+        cryptographically-valid volunteer token has a different `eventId`,
+        OR a ticket code resolves to a ticket on a different event, return
+        `{ kind: "wrong_event", scannedEventId, scannedEventTitle? }`. The
+        scanner UI surfaces a single string: "This QR is for a different
+        event."
+
+    - id: FR-006
+      description: >
+        Volunteer branch enrichment (`alsoHoldsTicket`):
+        For the resolved `humanId` + `eventId`, look up tickets via a new
+        repo method `tickets.findByEventAndHuman(eventId, humanId)` and
+        return a list of `{ ticketId, ticketCode, status, holderDisplay }`
+        for tickets in status `VALID` OR `SCANNED`. `VALID` shows
+        "Also has a ticket — admit?" CTA; `SCANNED` shows
+        "Already admitted at <time>" badge (no CTA).
+
+    - id: FR-007
+      description: >
+        Ticket branch enrichment (`alsoVolunteering`):
+        For the resolved ticket's holder `humanId` (when known) + `eventId`,
+        call `getVolunteerContextForTicketScan` and return its
+        `VolunteerCheckInCandidate[]` (filtered to APPROVED / CHECKED_IN /
+        NO_SHOW). Same window classifier (early/within/late) and
+        `scanWindowNote` apply. The UI shows "Also volunteering — check
+        in?" CTA when at least one candidate is APPROVED in-window.
+
+    - id: FR-008
+      description: >
+        RBAC reconciliation:
+          - `resolveScanPayload` requires `ORG_SCAN_ROLES` (read-only).
+          - The cross-context lookups (`alsoHoldsTicket`,
+            `alsoVolunteering`) are read-only enrichment and must succeed
+            for `ORG_SCAN_ROLES` actors. Relax
+            `getVolunteerContextForTicketScan` from `ORG_EDIT_ROLES` to
+            `ORG_SCAN_ROLES` for read; keep `ORG_EDIT_ROLES` on the
+            `checkInVolunteer` write.
+          - The ticket admit write (`scanTicket`) keeps `ORG_SCAN_ROLES`.
+          - The volunteer check-in write (`checkInVolunteer`) keeps
+            `ORG_EDIT_ROLES`. If an `ORG_SCAN_ROLES`-only operator scans
+            a volunteer token, they see the result and ticket enrichment
+            but the "Check in" CTA is disabled with tooltip "Edit role
+            required to check in volunteers."
+
+    - id: FR-009
+      description: >
+        No auto-fire of both writes on a single tap. Even when both an
+        admit-eligible ticket and an in-window APPROVED volunteer signup
+        are present, each write requires explicit operator confirmation
+        (one tap on "Admit", one tap on "Check in"). Audit trails stay
+        clean and intentional.
+
+    - id: FR-010
+      description: >
+        Idempotency keys are independent per write:
+          - Ticket admit reuses existing 10s + 2s-bucket idempotency
+            keyed off `(scanTicket, ticketId, actorHumanId, time-bucket)`.
+          - Volunteer check-in reuses existing
+            `checkInVolunteer` idempotency.
+          - The resolver itself is read-only; no idempotency needed.
+        A single client `clientKey` MUST NOT be reused across both writes.
+
+    - id: FR-011
+      description: >
+        Manual search fallback in the unified surface:
+          - Operator taps "Search by name / email" → search input.
+          - Submission fans out in parallel to
+            `searchOrgTickets` (existing) and
+            `searchVolunteerSignupsForCheckIn` (existing).
+          - Results render in a single sectioned list ("Tickets" /
+            "Volunteers"), each row tappable into the same per-kind
+            result screen the QR path uses, including cross-context
+            enrichment.
+
+    - id: FR-012
+      description: >
+        Combined badge / wallet print (volunteer + ticket) is OUT OF SCOPE
+        for this slice. Patrons continue to carry up to two QRs; the
+        resolver makes the choice invisible to operators.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Resolver latency p95 < 150ms when the payload is a volunteer
+        token (signature verify + 1 indexed query for enrichment). p95
+        < 250ms when the payload is a ticket code (1 indexed lookup +
+        1 enrichment query).
+
+    - id: NFR-002
+      description: >
+        Volunteer-token signature verify MUST happen before any DB read
+        on the volunteer-resolution path so a malformed / wrong-issuer
+        token costs zero DB I/O.
+
+    - id: NFR-003
+      description: >
+        Telemetry: emit `scan.resolve.attempt` with
+        `{ kind: "volunteer" | "ticket" | "unknown" | "wrong_event",
+        crossContext: { hasAlsoTicket, hasAlsoVolunteering } }`. Do NOT
+        log the raw payload or token contents.
+
+    - id: NFR-004
+      description: >
+        Standard money/PII discipline: the resolver returns
+        display-safe strings only (volunteer first name + last initial,
+        ticket-holder first name + last initial). Full email / phone is
+        NOT included in resolver output even if the actor has edit role.
+        Edit-role surfaces fetch full details from existing edit-only
+        endpoints.
+
+contracts:
+  use_case:
+    name: resolveScanPayload
+    location: packages/core/src/use-cases/scanning/resolve-scan-payload.ts
+    rbac: ORG_SCAN_ROLES
+    input:
+      schema: |
+        z.object({
+          actorHumanId: z.string().min(1),
+          eventId: z.string().min(1),
+          raw: z.string().min(1).max(4096),
+        })
+    output:
+      discriminated_union: |
+        | { kind: "volunteer";
+            humanId: string;
+            displayName: string;
+            candidates: VolunteerCheckInCandidate[];
+            alsoHoldsTicket: Array<{
+              ticketId: string;
+              ticketCode: string;
+              status: "VALID" | "SCANNED";
+              scannedAt?: string;
+            }>;
+          }
+        | { kind: "ticket";
+            ticketId: string;
+            ticketCode: string;
+            status: TicketStatus;
+            holderDisplay: string;
+            holderHumanId?: string;
+            alsoVolunteering: VolunteerCheckInCandidate[];
+          }
+        | { kind: "wrong_event";
+            scannedEventId: string;
+            scannedEventTitle?: string;
+            payloadKind: "volunteer" | "ticket";
+          }
+        | { kind: "unknown";
+            reason: "malformed" | "ticket_not_found" | "signature_failed";
+          }
+    errors:
+      - code: invalid_input
+      - code: forbidden
+      - code: rate_limited
+
+  port_additions:
+    - name: tickets.findByEventAndHuman
+      location: packages/ports/src/repos/tickets.port.ts
+      signature: |
+        findByEventAndHuman(
+          eventId: string,
+          humanId: string,
+        ): Promise<Array<{
+          ticketId: string;
+          ticketCode: string;
+          status: TicketStatus;
+          scannedAt: Date | null;
+        }>>
+      adapter_impl:
+        location: packages/adapters/src/db/prisma/tickets-repo.ts
+        notes: >
+          Index check: ensure `(event_id, holder_human_id, status)` is
+          covered by an index on `tickets`. Add a Prisma migration if
+          missing. Filter to status in (VALID, SCANNED). Do NOT include
+          PENDING_TRANSFER / CANCELLED / REFUNDED.
+
+  rbac_relaxation:
+    - target: getVolunteerContextForTicketScan
+      from: ORG_EDIT_ROLES
+      to: ORG_SCAN_ROLES
+      rationale: >
+        Read-only enrichment of a ticket scan. The scan role already
+        sees the ticket-holder identity; surfacing volunteer status for
+        the same human at the same event does not expand sensitive
+        data beyond what the operator already has. Edit role remains
+        required for the actual `checkInVolunteer` mutation.
+
+  transport:
+    - router: scan
+      location: packages/transport/trpc/src/routers/scan.ts (new)
+      procedures:
+        - name: resolvePayload
+          kind: query
+          input: ResolveScanPayloadInput
+          output: ResolveScanPayloadOutput
+        - name: searchUnified
+          kind: query
+          notes: >
+            Thin fan-out over searchOrgTickets +
+            searchVolunteerSignupsForCheckIn for the manual fallback.
+
+scanner_ui:
+  home:
+    - Replace the two buttons (`open-ticket-admission-button`,
+      `open-volunteer-check-in-button`) with one `open-scan-button`
+      labeled "Scan".
+    - Keep `open-search-button` for the manual fallback.
+    - Test IDs to add:
+      - `scan-result-kind-volunteer`
+      - `scan-result-kind-ticket`
+      - `scan-result-kind-wrong-event`
+      - `scan-result-kind-unknown`
+      - `scan-result-also-holds-ticket-cta`
+      - `scan-result-also-volunteering-cta`
+      - `scan-result-admit-button`
+      - `scan-result-check-in-button`
+
+  result_screen:
+    layout: >
+      Header strip: kind chip ("Ticket" | "Volunteer") + holder name.
+      Primary CTA: kind-specific (Admit / Check in).
+      Secondary CTA (only if cross-context present): the other action.
+      Status / window note rendered below CTAs.
+      Wrong-event surface uses a dedicated full-screen error state
+      with the same copy regardless of payload kind.
+
+telemetry:
+  events:
+    - scan.resolve.attempt
+    - scan.resolve.result   # tagged with kind + crossContext booleans
+    - scan.resolve.wrong_event
+    - scan.cross_context.cta_tapped  # which secondary action
+
+test_plan:
+  core_unit:
+    - resolve-scan-payload.test.ts:
+      - volunteer token, valid signature, matching event → kind=volunteer
+      - volunteer token, valid signature, mismatched event → kind=wrong_event
+      - volunteer token, bad signature → falls through; if also looks like
+        ticket code, treated as ticket
+      - ticket code, valid → kind=ticket with alsoVolunteering populated
+      - ticket code, valid, scanned → kind=ticket with status=SCANNED
+      - ticket code, valid, wrong event → kind=wrong_event
+      - garbage payload → kind=unknown reason=malformed
+      - ticket code valid AND signature also somehow valid → hard-prefer
+        volunteer (FR-004)
+      - alsoHoldsTicket includes both VALID and SCANNED, excludes
+        CANCELLED / PENDING_TRANSFER (FR-006)
+      - RBAC: ORG_SCAN_ROLES actor gets volunteer enrichment (FR-008)
+      - PII: resolver output never includes raw email / phone (NFR-004)
+  adapter:
+    - tickets-repo.test.ts:
+      - findByEventAndHuman returns expected statuses, ordered by
+        createdAt desc
+      - empty result on no match (not null)
+  transport:
+    - scan-router.test.ts:
+      - resolvePayload happy paths for each kind
+      - input validation via Zod
+  scanner_e2e (Appium):
+    - Update existing scan-flow spec to use the new single button.
+    - Add a search-mode coverage spec asserting unified results render
+      both Tickets and Volunteers sections (real QR decode still
+      unavailable on simulator).
+
+rollout:
+  feature_flag: scanner.unified_scan_resolver
+  default: off in production until scanner-foundation rolls forward
+  migration:
+    - Add `tickets.findByEventAndHuman` port + adapter (no schema
+      change if index exists; ship migration if not).
+    - Add `resolveScanPayload` use case + tests.
+    - Relax RBAC on `getVolunteerContextForTicketScan` (read).
+    - Add `scan.resolvePayload` tRPC procedure.
+    - Wire scanner Home → single Scan button behind the flag.
+    - Cut over Appium specs.
+    - Remove the two old buttons + their dedicated routes once the flag
+      is on by default for one release.
+
+open_questions:
+  - Combined badge print (one QR encoding both ticket + volunteer
+    context, or a side-by-side dual-QR badge) — deferred. Tracking in a
+    follow-up spec.
+  - Should ticket-holder lookups ever cover transferred tickets where
+    the original holder is no longer the bearer? (Today
+    `findByEventAndHuman` keys off current `holder_human_id`, which is
+    correct.)
+  - Volunteer check-in to a SPECIFIC shift on a multi-shift signup —
+    out of scope here; the existing disambiguation picker in
+    `volunteer-scanner-check-in.spec.yaml` continues to apply on the
+    secondary CTA path.

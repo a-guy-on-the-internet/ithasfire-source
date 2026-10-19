@@ -1,0 +1,117 @@
+title: use-case | place-layouts.get-place-layout
+owner: core
+file: packages/core/src/use-cases/place-layouts/get-place-layout.ts
+goal: >
+  Return the currently published place layout glyphs, section metadata, and live
+  availability for a given event (or venue fallback) so clients can render a
+  layout with consistent geometry, coloring, and hold countdown data.
+
+ports:
+  - PlaceLayoutRepo
+  - PlaceLayoutBlobRepo
+  - PlaceLayoutStatusRepo
+  - AuthzRepo
+  - FeatureFlagPort
+  - CachePort (etag + blob caching)
+  - Clock
+  - Logger
+  - Metrics
+
+invariants:
+  - Feature flag `feature.placeLayout` must be enabled for the organizer or event.
+  - Actor must have access to the event's org; anonymous actors limited to buyer-safe
+    data (redacted metadata and organizer-only sections).
+  - A canonical place layout must exist for the venue; if absent, return `not_found` until
+    first import completes.
+  - Response checksum combines layout checksum + availability checksum to support
+    caching and optimistic rendering.
+  - Every glyph returned must have a matching availability entry; missing item is a
+    `dependency_failed` error.
+
+input_schema:
+  eventId: uuid # required
+  actor:
+    kind: enum[ANONYMOUS,HUMAN]
+    humanId?: uuid
+    orgContext?: { orgId: uuid; roles: string[] }
+  includeOrganizationalMetadata?: boolean # default false, ignored unless actor has organizer role
+  clientEtag?: string # optional; used for conditional fetch
+
+preconditions:
+  - Validate `eventId` via zod; reject empty/invalid uuid with `invalid_input`.
+  - Fetch event + venue context; capture venueId for PlaceLayoutRepo lookups.
+  - Use AuthzRepo to ensure actor may view organizer metadata when requested.
+
+execution:
+  1. Retrieve canonical place layout for event via `PlaceLayoutRepo.getForEvent(eventId)`;
+    fallback to venue layout when event override absent.
+  2. Attempt cache lookup using key `placeLayout:${layout.checksum}:availability:${availabilityChecksum}`.
+  3. On cache miss:
+    a. Load glyph snapshot blob from PlaceLayoutBlobRepo.
+    b. Load availability + hold expirations from PlaceLayoutStatusRepo.
+    c. Merge glyph metadata with dynamic statuses, respecting actor access (e.g., hide internal sections for anonymous callers).
+    d. Compute response checksum + etag.
+    e. Write assembled payload to CachePort with 30s TTL for buyer view / 5s for organizer view.
+  4. Populate metrics (latency, cache hit, seat counts) and structured log entry.
+  5. Return DTO.
+
+output_schema:
+  placeLayout:
+    venueId: uuid
+    checksum: string
+    metadata: record # defaultViewport, minZoom, maxZoom, section overlays, notes
+    stage:
+      polygon?: Array<{ x: number; y: number }>
+      center: { x: number; y: number }
+      lookAt?: { x: number; y: number }
+      label?: string
+    seatIndexBounds: { minX: number; minY: number; maxX: number; maxY: number }
+  sections: array
+    - id: uuid
+      name: string
+      colorToken: string
+      transform: { origin: { x: number; y: number }; rotation: number; scale: number }
+      geometry?: { polygons: Array<Array<{ x: number; y: number }>> }
+      bounds: { minX: number; minY: number; maxX: number; maxY: number }
+      visibility: enum[PUBLIC, ORGANIZER_ONLY]
+      stageAnchor?: { facingAngle?: number; point?: { x: number; y: number } }
+  glyphs: array<PlaceLayoutGlyph>
+  legend: array<{ status: SeatStatus; label: string; colorToken: string }>
+  pricingTiers?: array<{ tierId: string; label: string; colorToken: string; priceCents?: bigint }>
+  availabilityChecksum: string
+  expiresAt: datetime # now + cache_ttl
+  etag: string
+
+caching:
+  - Response includes `etag` derived from `${layoutChecksum}:${availabilityChecksum}`.
+  - Buyers: set `Cache-Control: public, max-age=30`; Organizers: `private, max-age=5`.
+  - Conditional requests returning 304 if `clientEtag` matches current `etag`.
+
+side_effects:
+  - Reads from PlaceLayoutRepo, PlaceLayoutBlobRepo, PlaceLayoutStatusRepo.
+  - Cache writes (optional).
+  - Metrics increments: `placeLayout.get.hit`, `placeLayout.get.cache_hit`, payload bytes histogram.
+  - Audit log: none (read-only) but log structured trace for observability.
+
+errors:
+  - invalid_input(422): malformed uuid, missing event, feature flag disabled.
+  - not_found(404): no published layout for event/venue.
+  - forbidden(403): actor requesting organizer metadata without role.
+  - dependency_failed(424): missing glyph blob, availability mismatch, cache failure (non-transient).
+  - conflict(409): layout version published but seat statuses stale beyond threshold (>2m).
+  - transient(503): upstream timeouts, cache backend unavailable.
+
+notes:
+  - PlaceLayoutStatusRepo should surface hold expirations and orderId for organizer context; redact for anonymous.
+  - Include `seatIndexBounds` so clients can rebuild RBush when needed without fetching full layout.
+  - Place layout glyph geometry must include `{ x, y }` and optional `radius`, `width`, `height`, `rotation`, `facingAngle`; treat radius fallback when size omitted.
+  - Event overrides may later provide alternate layouts; file remains future-friendly but default is venue layout.
+  - If seat count > 12k, consider streaming chunked payload (phase 2) but maintain same contract.
+
+tests:
+  - happy path buyer request with cache miss + subsequent cache hit.
+  - organizer request returning organizer-only sections/metadata.
+  - stage metadata includes polygon + facing vectors for seats.
+  - missing place layout row returns not_found.
+  - missing glyph blob triggers dependency_failed.
+  - stale availability checksum triggers conflict and includes hint to retry after rebuild.

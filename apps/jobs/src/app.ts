@@ -13,113 +13,36 @@ import {
   resolveMigrationsDir,
 } from "@th/adapters/infra/migration-drift";
 import { type AppErrorCode, fromLegacyCode, isAppError } from "@th/errors";
+import type { RerunJobFromDlqResult } from "@th/ports/job-diagnostics";
+import { isTriggeredJobName } from "@th/ports/job-trigger";
 
 import { Sentry } from "./instrument";
 import { buildContainer } from "./lib/container";
+import {
+  DEFAULT_CRON_TZ,
+  describeCron,
+  nextCronRun,
+} from "./lib/cron-schedule";
+import { resolveModerationCategoryThresholds } from "./lib/moderation-config";
 import { allJobs, getJob } from "./jobs";
 import {
   isScheduledTask,
   type JobContext,
-  type ScheduledTaskDefinition,
+  type JobMetadata,
 } from "./lib/define-job";
 import type { RunEntry } from "./lib/job-run-tracker";
 import type { RedisJobDiagnosticsAdapter } from "@th/adapters/job-diagnostics/redis-dlq-adapter";
 import { buildCloudLoggingUrl, fireDiscordAlert } from "./lib/discord-alerts";
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Cron helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** Human-readable label for a cron expression. */
-function describeCron(cron: string): string {
-  const parts = cron.split(/\s+/);
-  if (parts.length !== 5) return cron;
-  const [min, hour, dom, mon, dow] = parts;
-
-  if (
-    min?.startsWith("*/") &&
-    hour === "*" &&
-    dom === "*" &&
-    mon === "*" &&
-    dow === "*"
-  ) {
-    return `Every ${min.slice(2)} minutes`;
-  }
-  if (
-    min !== "*" &&
-    hour === "*" &&
-    dom === "*" &&
-    mon === "*" &&
-    dow === "*"
-  ) {
-    return `At minute ${min} of every hour`;
-  }
-  if (
-    min !== "*" &&
-    hour !== "*" &&
-    dom === "*" &&
-    mon === "*" &&
-    dow === "*"
-  ) {
-    return `Daily at ${hour!.padStart(2, "0")}:${min!.padStart(2, "0")}`;
-  }
-  if (hour?.startsWith("*/")) {
-    return `Every ${hour.slice(2)} hours at minute ${min}`;
-  }
-  return cron;
-}
-
-/** Compute the next occurrence of a cron expression (approximate). */
-function nextCronRun(cron: string, _timezone?: string): string | null {
-  try {
-    const now = new Date();
-    const parts = cron.split(/\s+/);
-    if (parts.length !== 5) return null;
-    const [minPart, hourPart] = parts;
-
-    // "*/N * * * *" (every N minutes)
-    if (minPart?.startsWith("*/")) {
-      const interval = parseInt(minPart.slice(2), 10);
-      if (!interval || interval <= 0) return null;
-      const currentMin = now.getMinutes();
-      const nextMin = Math.ceil((currentMin + 1) / interval) * interval;
-      const next = new Date(now);
-      next.setSeconds(0, 0);
-      next.setMinutes(nextMin);
-      if (next <= now) next.setMinutes(next.getMinutes() + interval);
-      return next.toISOString();
-    }
-
-    // "M H * * *" (daily at H:M)
-    if (
-      minPart &&
-      hourPart &&
-      !minPart.includes("*") &&
-      !hourPart.includes("*") &&
-      !hourPart.includes("/")
-    ) {
-      const m = parseInt(minPart, 10);
-      const h = parseInt(hourPart, 10);
-      const next = new Date(now);
-      next.setHours(h, m, 0, 0);
-      if (next <= now) next.setDate(next.getDate() + 1);
-      return next.toISOString();
-    }
-
-    // "M * * * *" (hourly at minute M)
-    if (minPart && !minPart.includes("*") && hourPart === "*") {
-      const m = parseInt(minPart, 10);
-      const next = new Date(now);
-      next.setMinutes(m, 0, 0);
-      if (next <= now) next.setHours(next.getHours() + 1);
-      return next.toISOString();
-    }
-
-    return null;
-  } catch {
-    return null;
-  }
-}
+import {
+  DLQ_RERUN_CLAIM_HEADER,
+  DLQ_RERUN_OF_HEADER,
+  isDlqRerunNoAnswer,
+} from "./lib/dlq-rerun";
+import {
+  DrainFlights,
+  isDrainWakeUp,
+  resultHasMore,
+} from "./lib/drain-flights";
 
 /**
  * Resolve the stable, machine-readable {@link AppErrorCode} for a failed job,
@@ -155,16 +78,70 @@ function resolveJobErrorCode(err: unknown): AppErrorCode | null {
   return null;
 }
 
-function jobScheduleInfo(job: { name: string; description?: string }) {
-  const scheduled = isScheduledTask(job as any);
-  if (!scheduled) return null;
-  const def = job as unknown as ScheduledTaskDefinition;
+/**
+ * Log-safe view of a bookkeeping error (run tracker, DLQ). Never pass the raw
+ * error to the logger: ioredis attaches `command.args` and `previousErrors`
+ * (the zadd member, i.e. the run entry or the full request body) and pino's
+ * default `err` serializer writes every enumerable property out.
+ */
+function logSafeError(err: unknown): { name: string; message: string } {
+  return err instanceof Error
+    ? { name: err.name, message: err.message }
+    : { name: "NonError", message: String(err) };
+}
+
+/**
+ * `POST /dlq/:queue/:jobId/rerun` answers for a rerun that did not run. The
+ * entry is kept in every case; `error` is the machine-readable code.
+ */
+const DLQ_RERUN_NOT_RUN: Record<
+  Extract<RerunJobFromDlqResult, { outcome: "not_run" }>["reason"],
+  { error: string; message: string }
+> = {
+  disabled: {
+    error: "job_paused",
+    message:
+      "This job is disabled, so nothing ran and the entry was kept. Enable the job, then rerun the entry.",
+  },
+  coalesced: {
+    error: "run_in_flight",
+    message:
+      "A run of this job was already in flight and took this request into its next pass, so the entry was kept. Rerun or delete it once that run has finished.",
+  },
+  unconfirmed: {
+    error: "run_unconfirmed",
+    message:
+      "The jobs service did not confirm that the job ran, so the entry was kept.",
+  },
+  claimed: {
+    error: "rerun_in_progress",
+    message:
+      "Someone else is rerunning this entry right now, so nothing ran and the entry was kept. Wait for that run to finish, then check the entry.",
+  },
+};
+
+/** The adapter's `not_found`: the DLQ entry named in the URL does not exist. */
+function isDlqEntryNotFound(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    err.name === "JobDiagnosticsError" &&
+    (err as { code?: unknown }).code === "not_found"
+  );
+}
+
+function jobScheduleInfo(job: JobMetadata) {
+  if (!isScheduledTask(job)) return null;
+  const { schedule } = job;
+  // Resolve the zone ONCE and feed it to all three fields, so the reported
+  // `timezone`, the human description and the computed `nextRun` can never
+  // disagree about which midnight is meant.
+  const timezone = schedule.timezone ?? DEFAULT_CRON_TZ;
   return {
-    cron: def.schedule.cron,
-    timezone: def.schedule.timezone ?? "Etc/UTC",
-    enabled: def.schedule.enabled ?? true,
-    cronDescription: describeCron(def.schedule.cron),
-    nextRun: nextCronRun(def.schedule.cron, def.schedule.timezone),
+    cron: schedule.cron,
+    timezone,
+    enabled: schedule.enabled ?? true,
+    cronDescription: describeCron(schedule.cron, timezone),
+    nextRun: nextCronRun(schedule.cron, timezone),
   };
 }
 
@@ -305,35 +282,86 @@ export async function createApp() {
   let driftReported = false;
 
   /**
+   * Job modules whose import failure has already been reported to Sentry, by
+   * module id. Same one-shot discipline as `driftReported`, and for the same
+   * reason.
+   *
+   * A handler module that will not import is almost always PERMANENT — a bad
+   * barrel export, or a dependency lost to `pnpm deploy --legacy`'s re-resolve
+   * (see apps/jobs/Dockerfile; that has bitten this image before). Since the
+   * registry never imports a handler, such a build BOOTS: /health is 200, the
+   * revision promotes, and only the owning job fails. A job on an
+   * every-two-minute cron would then capture ~720 Sentry events a day for one
+   * unchanging fault.
+   *
+   * Keyed by MODULE, not by job: two jobs in one file share one import, so one
+   * broken file is one issue, not N. The un-cached retry in
+   * `jobs/registry.ts` is deliberately left alone — a transient failure must
+   * still get a fresh attempt; this only bounds the REPORTING.
+   */
+  const reportedModuleLoadFailures = new Set<string>();
+
+  /**
+   * One in-flight run per write-triggered drain per instance. A wake-up
+   * (Pub/Sub push) that arrives while its drain is already running is acked
+   * at once and folded into ONE follow-up pass of the running request, so a
+   * burst of RSVPs is a handful of drain runs, not one per RSVP. See
+   * lib/drain-flights.ts.
+   */
+  const drainFlights = new DrainFlights();
+
+  /**
    * Why the blocked run route answers 503 (not 4xx, not 200):
    *
    *  - 5xx is the truthful class. The request is well-formed and the caller is
-   *    blameless; the SERVER cannot service it. A 4xx would tell Cloud
-   *    Scheduler / Pub-Sub the message is permanently undeliverable and is
-   *    simply wrong.
-   *  - No retry storm. `infra/terraform/generated-jobs.tf:143` declares the
-   *    schedulers with NO `retry_config`, so Cloud Scheduler's default
-   *    `retryCount = 0` applies: the attempt is recorded as failed and the job
-   *    waits for its next cron tick. That is exactly the cadence we want —
-   *    visible, bounded, self-resuming once the schema is fixed.
+   *    blameless; the SERVER cannot service it. A 4xx would blame the caller,
+   *    which is wrong. (Not a retry lever: Cloud Scheduler and Pub/Sub retry
+   *    any non-2xx, 4xx included.)
+   *  - No retry storm. The schedulers in `infra/terraform/generated-jobs.tf`
+   *    retry twice (30s, then 60s; none for a manifest entry with
+   *    `"retry": false`), so a blocked revision takes at most 3 attempts per
+   *    tick, then the job waits for its next cron tick. That is the cadence
+   *    we want: visible, bounded, self-resuming once the schema is fixed.
    *  - It stays visible. A failed attempt shows up in Cloud Scheduler's job
    *    status and Cloud Monitoring; answering 200 with `{skipped:true}` (the
    *    shape used for a DISABLED job) would hide a schema mismatch behind a
    *    success, which is how this class of bug stayed alive for 90 days.
    *  - It agrees with `/health`. Same condition, same code, so probe and
    *    traffic tell operators the same story.
-   *  - `Retry-After: 300` is defence in depth, not a fix for a retry policy
-   *    that exists today. No scheduler currently reaching this route has one
-   *    (the `db-backup` module's `retry_count = 1` targets the Cloud Run Admin
-   *    API, not `POST /jobs/:name`). It is here so that if a `retry_config` is
-   *    ever added to `generated-jobs.tf`, or a manual/Pub-Sub caller retries, a
-   *    stuck revision cannot be hot-looped.
+   *  - `Retry-After: 300` is defence in depth. Cloud Scheduler follows its own
+   *    `retry_config` backoff, not this header; it is here so that a manual or
+   *    Pub/Sub caller that honours it cannot hot-loop a stuck revision.
    */
 
   const app = Fastify({
     logger: false,
     disableRequestLogging: true,
   });
+
+  // Unwrapped Pub/Sub pushes (`no_wrapper` subscriptions in generated-jobs.tf,
+  // the write-triggered drain wake-ups) deliver the message data as the raw
+  // body, and Google does not promise `Content-Type: application/json` on
+  // them. Fastify only parses application/json and text/plain out of the box
+  // and answers anything else 415 BEFORE the route runs — Pub/Sub would retry
+  // and drop it, and the drain would silently fall back to its safety-net
+  // cron. This catch-all reads any other (or missing) content type as JSON;
+  // an empty body is `{}`. application/json keeps Fastify's own parser, and
+  // the catch-all delegates to that same parser (not a bare JSON.parse), so
+  // it keeps Fastify's __proto__ / constructor-poisoning rejection and its
+  // 400 on malformed JSON.
+  const defaultJsonParser = app.getDefaultJsonParser("error", "error");
+  app.addContentTypeParser(
+    "*",
+    { parseAs: "string" },
+    (request, body, done) => {
+      const text = String(body ?? "");
+      if (text.trim() === "") {
+        done(null, {});
+        return;
+      }
+      defaultJsonParser(request, text, done);
+    },
+  );
 
   // ─────────────────────────────────────────────────────────────────────────
   // Auth — every route except /health requires one of:
@@ -410,6 +438,19 @@ export async function createApp() {
     });
   }
 
+  // Backstop for the drain single-flight: whatever path a request that opened
+  // a flight takes out of the run route (including a throw from the enabled
+  // read, which the route's own try does not cover), its flight closes once the
+  // response is sent. Identity-checked, so it never closes a newer flight.
+  const openedFlights = new WeakMap<
+    object,
+    { name: string; flight: import("./lib/drain-flights").DrainFlight }
+  >();
+  app.addHook("onResponse", async (request) => {
+    const opened = openedFlights.get(request);
+    if (opened) drainFlights.end(opened.name, opened.flight);
+  });
+
   // Graceful shutdown
   app.addHook("onClose", async () => {
     await container.close();
@@ -448,7 +489,7 @@ export async function createApp() {
       allJobs.map(async (job) => ({
         name: job.name,
         description: job.description ?? null,
-        scheduled: isScheduledTask(job as any),
+        scheduled: isScheduledTask(job),
         schedule: jobScheduleInfo(job),
         enabled: await tracker.isEnabled(job.name),
       })),
@@ -469,7 +510,7 @@ export async function createApp() {
         return {
           name: job.name,
           description: job.description ?? null,
-          scheduled: isScheduledTask(job as any),
+          scheduled: isScheduledTask(job),
           schedule: jobScheduleInfo(job),
           enabled,
           lastRun,
@@ -478,6 +519,50 @@ export async function createApp() {
     );
 
     return { jobs };
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Image-moderation configuration: which provider is LIVE, and the thresholds
+  // it decides with.
+  //
+  // This lives here and NOT in apps/api because apps/api has no Azure adapter
+  // and no AZURE_CONTENT_SAFETY_* / IMAGE_MODERATION_* env at all — answering
+  // from there would render a confident lie. The jobs container is the process
+  // that actually picked an adapter, so it is the only honest source.
+  //
+  // AUTH: no route-level guard, because there is nothing extra to add — this
+  // route inherits EXACTLY what `/jobs/status` gets, and nothing more.
+  //
+  // Precisely: the `onRequest` hook above is installed only inside
+  // `if (apiKey)`. When `JOBS_API_KEY` IS set (every deployed environment, and
+  // the reason that branch also logs `auth_enabled`) the hook rejects
+  // everything except `/health`, so this sits behind the same API-key /
+  // Cloud Run OIDC gate as every other route here. When it is UNSET — the
+  // documented local-dev default, which logs `auth_disabled` — no hook is
+  // installed at all and the whole service is open, this route included. That
+  // is the service's existing posture, not something this endpoint introduces,
+  // and it is why `JOBS_API_KEY` is required in production.
+  //
+  // If that hook ever grows a second `/health`-style exemption, this route must
+  // not be on it.
+  //
+  // The response carries the endpoint's THREE fields and nothing else. Never
+  // add the Azure endpoint URL or the API key: "which provider" is an
+  // operational fact, "where and with what credential" is a secret.
+  // ─────────────────────────────────────────────────────────────────────────
+  app.get("/moderation/config", async () => {
+    return {
+      provider: container.moderationProvider,
+      reviewThreshold: container.imageModerationReviewThreshold,
+      // FULLY resolved: the container deliberately passes a partial override
+      // map (an absent key must fall back to reviewThreshold, never to 0), so
+      // reporting it raw would show blanks where an enforced number exists.
+      // This mirrors `exceedsCategoryThreshold`'s per-category fallback.
+      categoryThresholds: resolveModerationCategoryThresholds(
+        container.imageModerationReviewThreshold,
+        container.imageModerationCategoryThresholds,
+      ),
+    };
   });
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -616,11 +701,30 @@ export async function createApp() {
         });
     }
 
+    // A wake-up for a drain that is already running here: fold it into the
+    // running request's follow-up pass and ack. Before the enabled check on
+    // purpose — the running request already passed it, and a coalesced
+    // wake-up should cost nothing, the database included.
+    const wakeUp = isDrainWakeUp(name, request.body);
+    if (wakeUp && drainFlights.coalesce(name)) {
+      logger.info("job_coalesced", { job: name });
+      return reply.send({ success: true, coalesced: true });
+    }
+    // Registered in the SAME synchronous step as the check above, before any
+    // await: a burst of wake-ups arriving together must see this flight, or
+    // they all slip past the check while the first one awaits the enabled
+    // read (observed: 5 concurrent wake-ups, 5 runs). Every path below
+    // releases it; `DrainFlights` also expires a flight older than any run
+    // can live, so a missed release cannot swallow wake-ups for long.
+    const flight = isTriggeredJobName(name) ? drainFlights.begin(name) : null;
+    if (flight) openedFlights.set(request, { name, flight });
+
     // Check if disabled (allow manual trigger with ?force=true)
     const force = request.query.force === "true";
     if (!force) {
       const enabled = await tracker.isEnabled(name);
       if (!enabled) {
+        if (flight) drainFlights.end(name, flight);
         logger.info("job_skipped_disabled", { job: name });
         return reply.send({
           success: false,
@@ -645,18 +749,104 @@ export async function createApp() {
       jobLogger.info("job_start", { runId, payload: request.body });
     }
 
+    // The error the request's input was rejected with, if it was (see
+    // `parseInput` below).
+    let inputRejection: unknown = null;
     try {
-      const input = job.input.parse(request.body ?? {});
+      // FIRST touch of this job's handler module. The registry carries metadata
+      // only, so everything above — the 404, the drift short-circuit, the
+      // enabled check, the start alert — ran without importing a single use
+      // case. `load()` imports the owning module (once per process, memoized)
+      // and hands back the real definition.
+      //
+      // Deliberately INSIDE the try: a module that cannot be imported raises a
+      // typed JOB_MODULE_LOAD_FAILED, which the catch below records, DLQs,
+      // reports to Sentry and answers 503 — for this job alone. The service
+      // and every other job stay up.
+      const definition = await job.load();
 
-      const result = await (
-        job.handler as (args: {
-          input: unknown;
-          ctx: JobContext;
-        }) => Promise<unknown>
-      )({
-        input,
-        ctx: { ...container, logger: jobLogger, runId },
-      });
+      // Every parse of REQUEST input goes through here, and a rejection is
+      // remembered by identity. The catch below answers 400 `invalid_input`
+      // for any ZodError, but a handler can throw one too (a use case that
+      // ends in a raw output-schema `.parse` and meets one bad row), and that
+      // is a failed run that must be reported, not a bad request. A flag set
+      // "after the input was parsed" could not tell them apart: the payload of
+      // a coalesced follow-up pass is parsed below, after the handler ran.
+      const parseInput = (body: unknown) => {
+        try {
+          return definition.input.parse(body);
+        } catch (parseErr) {
+          inputRejection = parseErr;
+          throw parseErr;
+        }
+      };
+
+      const input = parseInput(request.body ?? {});
+
+      const invoke = (parsed: unknown) =>
+        (
+          definition.handler as (args: {
+            input: unknown;
+            ctx: JobContext;
+          }) => Promise<unknown>
+        )({
+          input: parsed,
+          ctx: { ...container, logger: jobLogger, runId },
+        });
+
+      let result = await invoke(input);
+
+      if (flight && isTriggeredJobName(name)) {
+        // Wake-ups that arrived while this run was draining. Each follow-up
+        // pass drains until empty again, so rows committed after this run's
+        // last fetch are covered without a second request.
+        //
+        // Only a WAKE-UP request runs them. A scheduled (or manual) run is
+        // held to Cloud Scheduler's attempt deadline and must stay one
+        // pass-loop long, so any wake-ups it absorbed are handed to a fresh
+        // request (`capped` → re-wake below) instead of lengthening it.
+        const reruns = wakeUp
+          ? await drainFlights.drainReruns(name, flight, (payload) =>
+              invoke(parseInput(payload)),
+            )
+          : { results: [] as unknown[], capped: flight.rerun };
+        drainFlights.end(name, flight);
+        if (reruns.results.length > 0) {
+          result = {
+            first: result,
+            coalescedReruns: reruns.results.length,
+            last: reruns.results[reruns.results.length - 1],
+          };
+        }
+        // Stopped on its time/pass budget, or still being woken when the
+        // rerun cap hit: hand the rest to a FRESH request rather than holding
+        // this one open or waiting for the scheduled safety net.
+        const lastResult = reruns.results.length > 0
+          ? reruns.results[reruns.results.length - 1]
+          : (result as unknown);
+        if (
+          (resultHasMore(lastResult) || reruns.capped) &&
+          container.jobTrigger
+        ) {
+          try {
+            await container.jobTrigger.trigger(name);
+            jobLogger.info("job_rekicked", { runId });
+          } catch (kickErr) {
+            // Deliberate swallow: the rows stay queued and the scheduled
+            // safety-net run drains them. Reported so a broken re-kick path
+            // is visible (CLAUDE.md reporter rule).
+            jobLogger.error("job_rekick_failed", { runId, err: kickErr });
+            try {
+              container.reportError?.(kickErr, {
+                tags: { area: "job-trigger", job: name, phase: "rekick" },
+                extra: { runId },
+              });
+            } catch {
+              // best-effort only
+            }
+          }
+        }
+      }
 
       const finishedAt = new Date();
       const entry: RunEntry = {
@@ -668,7 +858,29 @@ export async function createApp() {
         status: "success",
         resultSummary: JSON.stringify(result)?.slice(0, 500),
       };
-      await tracker.record(entry);
+      // Run history is BOOKKEEPING and must never decide the job's outcome.
+      // This sits inside the same `try` as the handler, so before the Redis
+      // client gained a 500ms `commandTimeout` (2026-09-14) a blip here just
+      // sat in ioredis's offline queue and eventually landed. Bounded, it
+      // rejects — and an unguarded rejection would jump to the catch below,
+      // which relabels this ALREADY-SUCCESSFUL run as `status: "error"`, DLQs
+      // it, and answers 5xx so the caller re-runs a job that already did its
+      // work. For settlements that means re-issuing transfers.
+      try {
+        await tracker.record(entry);
+      } catch (trackerErr) {
+        // Deliberate swallow (bookkeeping never decides the outcome), so
+        // reported: apps/jobs has no Sentry pino integration.
+        jobLogger.error("job_run_record_failed", { runId, error: logSafeError(trackerErr) });
+        try {
+          container.reportError?.(trackerErr, {
+            tags: { area: "job-run-tracker", job: name, phase: "success" },
+            extra: { runId },
+          });
+        } catch {
+          // best-effort only
+        }
+      }
 
       if (job.notify) {
         await logAndAlert({
@@ -698,6 +910,7 @@ export async function createApp() {
         result,
       });
     } catch (err) {
+      if (flight) drainFlights.end(name, flight);
       const finishedAt = new Date();
       const errorMessage =
         err instanceof Error
@@ -725,10 +938,120 @@ export async function createApp() {
         errorMessage,
         errorCode,
       };
-      await tracker.record(entry);
+      // Same reasoning as the success path, plus: a throw here would escape
+      // the catch entirely and replace the REAL failure with a Redis error,
+      // losing the diagnosis and skipping the DLQ push below.
+      try {
+        await tracker.record(entry);
+      } catch (trackerErr) {
+        // Deliberate swallow (bookkeeping never decides the outcome), so
+        // reported: apps/jobs has no Sentry pino integration.
+        jobLogger.error("job_run_record_failed", { runId, error: logSafeError(trackerErr) });
+        try {
+          container.reportError?.(trackerErr, {
+            tags: { area: "job-run-tracker", job: name, phase: "error" },
+            extra: { runId },
+          });
+        } catch {
+          // best-effort only
+        }
+      }
+
+      // A rerun from the DLQ names the entry it came from and carries the
+      // claim token the rerun route holds on that entry. Its failure is
+      // written onto THAT entry (a compare-and-swap, so a rewrite racing a
+      // delete still leaves at most one), instead of being pushed as a second
+      // entry. `false` means the entry is gone (deleted meanwhile, or the
+      // header names nothing): then this run is pushed as a new entry below.
+      // A failed run therefore always ends with at least one entry, and with
+      // exactly one unless the rewrite threw (next comment).
+      //
+      // The entry is rewritten only when the token IS the live claim on it.
+      // The rerun route lets one rerun per entry through at a time, and this
+      // check holds a direct caller to the same rule: `X-Dlq-Rerun-Of` with no
+      // token, a stale one or a wrong one is an ordinary failed run and gets
+      // its own entry below.
+      const rerunOfHeader = request.headers[DLQ_RERUN_OF_HEADER];
+      const rerunOf =
+        typeof rerunOfHeader === "string" && rerunOfHeader.length > 0
+          ? rerunOfHeader
+          : null;
+      const rerunClaimHeader = request.headers[DLQ_RERUN_CLAIM_HEADER];
+      const rerunClaim =
+        typeof rerunClaimHeader === "string" && rerunClaimHeader.length > 0
+          ? rerunClaimHeader
+          : null;
+      let holdsClaim = false;
+      if (dlq && rerunOf && rerunClaim) {
+        try {
+          holdsClaim = await dlq.holdsRerunClaim({
+            queue: name,
+            jobId: rerunOf,
+            token: rerunClaim,
+          });
+        } catch (claimErr) {
+          // Deliberate swallow: without an answer the claim counts as not
+          // held, and the plain push below still gives this failure an entry.
+          // Reported for the same reason as `dlq_push_failed` (CLAUDE.md
+          // reporter rule). The adapter's error is sanitised (op, key hash,
+          // Redis error code) and the token is in neither line.
+          jobLogger.error("dlq_rerun_claim_check_failed", {
+            runId,
+            error: logSafeError(claimErr),
+          });
+          try {
+            container.reportError?.(claimErr, {
+              tags: { area: "job-dlq", job: name, phase: "rerun-claim-check" },
+              extra: { runId },
+            });
+          } catch {
+            // best-effort only
+          }
+        }
+      }
+      if (dlq && rerunOf && !holdsClaim) {
+        // Says why this run gets an entry of its own. The header's value is
+        // the caller's text, so it is not logged.
+        jobLogger.warn("dlq_rerun_claim_not_held", {
+          runId,
+          hasToken: rerunClaim !== null,
+        });
+      }
+      let recordedOnEntry = false;
+      if (dlq && rerunOf && holdsClaim) {
+        try {
+          recordedOnEntry = await dlq.recordRerunFailure({
+            queue: name,
+            jobId: rerunOf,
+            runId,
+            failedAt: finishedAt.toISOString(),
+            error: { message: errorMessage, code: errorCode },
+          });
+        } catch (recordErr) {
+          // Deliberate swallow: falls back to the plain push below, so the
+          // failure still has an entry. If Redis applied the rewrite and only
+          // its reply was lost, that push makes a second entry; too many
+          // entries is the safe side of that doubt. Reported for the same
+          // reason as `dlq_push_failed` (CLAUDE.md reporter rule). The adapter
+          // throws sanitised errors here (op, key hash, Redis error code), so
+          // neither the log line nor the report can carry an entry's payload.
+          jobLogger.error("dlq_rerun_record_failed", {
+            runId,
+            error: logSafeError(recordErr),
+          });
+          try {
+            container.reportError?.(recordErr, {
+              tags: { area: "job-dlq", job: name, phase: "rerun-record" },
+              extra: { runId },
+            });
+          } catch {
+            // best-effort only
+          }
+        }
+      }
 
       // Push to DLQ
-      if (dlq) {
+      if (dlq && !recordedOnEntry) {
         try {
           await dlq.pushToDLQ({
             ref: { queue: name, id: runId },
@@ -738,12 +1061,43 @@ export async function createApp() {
             error: { message: errorMessage, code: errorCode },
           });
         } catch (dlqErr) {
-          jobLogger.error("dlq_push_failed", { dlqErr });
+          // Deliberate swallow: the DLQ push must never replace the real job
+          // failure handled below. Reported because apps/jobs has no Sentry
+          // pino integration, so the log line alone never reaches Sentry and a
+          // broken DLQ would lose failed jobs silently (CLAUDE.md reporter rule).
+          jobLogger.error("dlq_push_failed", { runId, error: logSafeError(dlqErr) });
+          try {
+            container.reportError?.(dlqErr, {
+              tags: { area: "job-dlq", job: name, phase: "push" },
+              extra: { runId },
+            });
+          } catch {
+            // best-effort only
+          }
         }
       }
 
       if (err instanceof ZodError) {
         const issues = err.issues ?? [];
+        if (err !== inputRejection) {
+          // Not the request's input: the HANDLER threw this (see
+          // `parseInput`). The status, the body and the warn line below stay
+          // as they are for callers that read them, but a 400 and a warn reach
+          // nobody, so a job failing this way every night would stay silent.
+          // Count only at error level; the warn line carries the issues.
+          jobLogger.error("job_handler_schema_error", {
+            runId,
+            issueCount: issues.length,
+          });
+          try {
+            container.reportError?.(err, {
+              tags: { area: "job-run", job: name, phase: "handler-zod-error" },
+              extra: { runId },
+            });
+          } catch {
+            // best-effort only
+          }
+        }
         if (job.notify) {
           await logAndAlert({
             logger: jobLogger,
@@ -767,38 +1121,88 @@ export async function createApp() {
 
       if (typeof err === "object" && err !== null && "code" in err) {
         const typed = err as { code: string; message?: string };
+
+        // A repeating, permanent module-import failure must not flood Sentry.
+        // Latch the CAPTURE per module (first tick reports, every tick still
+        // logs); see `reportedModuleLoadFailures`. Every other typed error is
+        // reported on every occurrence, exactly as before.
+        const failedModule =
+          typed.code === "JOB_MODULE_LOAD_FAILED"
+            ? String(
+                (err as { meta?: { module?: unknown } }).meta?.module ?? name,
+              )
+            : null;
+        const suppressCapture =
+          failedModule !== null && reportedModuleLoadFailures.has(failedModule);
+        if (failedModule !== null) reportedModuleLoadFailures.add(failedModule);
+
         // Capture regardless of `job.notify` — an unhandled job error is
-        // always incident-worthy. logAndReport always logs + captures; the
-        // Discord alert stays gated on `job.notify`. Passing buildSentryUrl
-        // appends a clickable "Sentry" link to the "Job failed" embed.
+        // always incident-worthy. logAndReport logs, and captures when given a
+        // `report`; the Discord alert stays gated on `job.notify`. Passing
+        // buildSentryUrl appends a clickable "Sentry" link to the "Job failed"
+        // embed.
         await logAndReport({
           logger: jobLogger,
           level: "error",
           message: "job_error",
-          extra: { runId, appCode, code: typed.code, message: typed.message },
-          report: {
-            captureException: Sentry.captureException,
-            // Typed domain errors are usually PLAIN OBJECTS `{ code, message }`
-            // (no stack) — passing them straight to Sentry yields a low-signal
-            // "Non-Error exception captured" event. Synthesize a real Error for
-            // a proper stack + grouping; the raw code/message live in `extra`.
-            // Mirrors apps/api/src/plugins/trpc.ts.
-            error: new Error(typed.message ?? typed.code),
-            context: {
-              tags: { job: name, runId, appCode: appCode ?? undefined },
-              extra: {
-                errorCode,
-                code: typed.code,
-                message: typed.message,
-                logsUrl: buildCloudLoggingUrl(runId) ?? undefined,
-              },
-            },
-            buildSentryUrl: sentryIssueUrl,
+          extra: {
+            runId,
+            appCode,
+            code: typed.code,
+            message: typed.message,
+            // Makes the suppressed ticks self-explaining in Cloud Logging:
+            // "already reported, this is not a new fault".
+            ...(suppressCapture ? { captureSuppressed: true } : {}),
           },
+          report: suppressCapture
+            ? undefined
+            : {
+                captureException: Sentry.captureException,
+                // Typed domain errors are usually PLAIN OBJECTS
+                // `{ code, message }` (no stack) — passing them straight to
+                // Sentry yields a low-signal "Non-Error exception captured"
+                // event. Synthesize a real Error for a proper stack +
+                // grouping; the raw code/message live in `extra`.
+                // Mirrors apps/api/src/plugins/trpc.ts.
+                error: new Error(typed.message ?? typed.code),
+                context: {
+                  tags: { job: name, runId, appCode: appCode ?? undefined },
+                  extra: {
+                    errorCode,
+                    code: typed.code,
+                    message: typed.message,
+                    logsUrl: buildCloudLoggingUrl(runId) ?? undefined,
+                  },
+                },
+                buildSentryUrl: sentryIssueUrl,
+              },
           alert: job.notify
             ? createJobLifecycleAlert(name, "failed", runId, entry.durationMs)
             : undefined,
         });
+
+        // Why a handler module that would not import answers 503, not 400:
+        //
+        //  - 5xx is the truthful class. The request is well-formed and the
+        //    caller is blameless; the SERVER cannot service it.
+        //  - It agrees with the migration-drift 503 above — same shape of
+        //    fault (this build cannot run this job right now), same code.
+        //  - It stays visible. A failed attempt shows in Cloud Scheduler's job
+        //    status and Cloud Monitoring, distinguishable from a 400.
+        //
+        // It buys a bounded retry. As documented at the drift 503, the
+        // generated schedulers retry at most twice (30s, then 60s), so a
+        // broken module costs at most 3 attempts per tick, never a hot loop.
+        // `Retry-After` is defence in depth for parity with that 503: it is
+        // the correct hint to any caller that honours it.
+        const isLoadFailure = typed.code === "JOB_MODULE_LOAD_FAILED";
+        if (isLoadFailure) {
+          return reply
+            .status(503)
+            .header("Retry-After", "60")
+            .send({ error: typed.code, runId, message: typed.message });
+        }
+        // Cloud Scheduler retries this 400 too: it retries any non-2xx.
         return reply
           .status(400)
           .send({ error: typed.code, runId, message: typed.message });
@@ -882,12 +1286,137 @@ export async function createApp() {
     Body: { payloadOverride?: unknown };
   }>("/dlq/:queue/:jobId/rerun", async (request, reply) => {
     if (!dlq) return reply.status(501).send({ error: "dlq_not_configured" });
-    const result = await dlq.rerunFromDLQ({
-      queue: request.params.queue,
-      jobId: request.params.jobId,
-      payloadOverride: request.body?.payloadOverride,
+    const { queue, jobId } = request.params;
+
+    // The run route is the one authority on whether the job is paused: no
+    // enabled check here, and a rerun is never forced. Logs name the entry and
+    // the outcome, never the payload.
+    let result: RerunJobFromDlqResult;
+    try {
+      result = await dlq.rerunFromDLQ({
+        queue,
+        jobId,
+        payloadOverride: request.body?.payloadOverride,
+      });
+    } catch (err) {
+      if (isDlqEntryNotFound(err)) {
+        logger.warn("dlq_rerun", { queue, jobId, outcome: "not_found" });
+        return reply.status(404).send({ error: "not_found" });
+      }
+      if (isDlqRerunNoAnswer(err)) {
+        // A 5xx that is not the jobs service's own answer: a gateway gave up
+        // on the request (Cloud Run's 504 past 300s, when `JOBS_SELF_URL`
+        // points through it) while the run may still
+        // be going. Not a refusal and not a failed run, so it is not worded as
+        // either; the adapter kept the claim. Logged and reported here
+        // because the backstop below only answers 500.
+        logger.error("dlq_rerun_no_answer", {
+          queue,
+          jobId,
+          status: err.runRouteStatus,
+        });
+        try {
+          container.reportError?.(err, {
+            tags: { area: "job-dlq", phase: "rerun-no-answer" },
+            extra: { queue, jobId, status: err.runRouteStatus },
+          });
+        } catch {
+          // best-effort only
+        }
+      }
+      // The run route could not be reached, the request to it broke off, or
+      // Redis failed while claiming the entry or looking it up, or a gateway
+      // answered for the run route (above). The entry is untouched and the
+      // Fastify backstop answers 500. This does NOT mean nothing ran: when the
+      // request broke off after the run route accepted it, the run may still
+      // be in progress.
+      throw err;
+    }
+
+    if (result.outcome === "ran") {
+      // `entryDeleted: false`: the job ran but its entry is still listed (the
+      // adapter logged and reported why). Still a 200 `ran`, so nobody reruns
+      // a job that already did its work.
+      logger[result.entryDeleted ? "info" : "warn"]("dlq_rerun", {
+        queue,
+        jobId,
+        outcome: result.outcome,
+        runId: result.runId,
+        entryDeleted: result.entryDeleted,
+      });
+      return reply.send({
+        outcome: "ran",
+        runId: result.runId,
+        entryDeleted: result.entryDeleted,
+      });
+    }
+
+    if (result.outcome === "not_run") {
+      logger.warn("dlq_rerun", {
+        queue,
+        jobId,
+        outcome: result.outcome,
+        reason: result.reason,
+      });
+      return reply.status(409).send({
+        outcome: "not_run",
+        reason: result.reason,
+        entryKept: true,
+        ...DLQ_RERUN_NOT_RUN[result.reason],
+      });
+    }
+
+    logger.warn("dlq_rerun", {
+      queue,
+      jobId,
+      outcome: result.outcome,
+      runId: result.runId,
+      status: result.status,
+      errorCode: result.error.code,
     });
-    return result;
+
+    // No run id: the run route turned the request away before a run started
+    // (401 on the self-call, a 500 from the enabled check), so its catch,
+    // which reports a failed run, never ran. This answer goes back to the
+    // console as data, so nothing downstream reports it either. Not for a 404
+    // (the job no longer exists; the answer says so) and not for the
+    // migration-drift 503, which the run route reports once per process.
+    // A gateway's 5xx never arrives here: the rerun callback throws for it
+    // (`DlqRerunNoAnswerError`, handled above), so `runId: null` here is the
+    // jobs service's own answer, given before a run started.
+    const refusedBeforeRun =
+      result.runId === null &&
+      result.status !== 404 &&
+      !(result.status === 503 && result.error.code === "migration_drift");
+    if (refusedBeforeRun) {
+      logger.error("dlq_rerun_refused", {
+        queue,
+        jobId,
+        status: result.status,
+        errorCode: result.error.code,
+      });
+      try {
+        container.reportError?.(
+          new Error(`DLQ rerun refused before the run started: HTTP ${result.status}`),
+          {
+            tags: { area: "job-dlq", phase: "rerun-refused" },
+            extra: { queue, jobId, status: result.status },
+          },
+        );
+      } catch {
+        // best-effort only
+      }
+    }
+
+    return reply.status(409).send({
+      outcome: "failed",
+      error: "rerun_failed",
+      runId: result.runId,
+      status: result.status,
+      runError: result.error,
+      entryKept: true,
+      message: "The rerun failed. The entry was kept.",
+    });
   });
 
   return { app, container };

@@ -9,6 +9,9 @@ const resolveFromPackages = (...segments: string[]) =>
 // tsconfig presets that aren't resolvable in Vitest's runtime).
 export default defineConfig({
   test: {
+    // Queue for a machine-wide light slot (scripts/dev/gate); watch mode takes none.
+    // Absolute: a relative entry resolves against vitest's root (cwd), not this file.
+    globalSetup: [path.resolve(__dirname, "../../scripts/dev/gate/vitest-global-setup.mjs")],
     include: ["test/**/*.test.ts"],
     environment: "node",
   },

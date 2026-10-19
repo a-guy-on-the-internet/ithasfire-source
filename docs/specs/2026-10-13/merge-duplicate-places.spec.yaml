@@ -1,0 +1,413 @@
+# merge-duplicate-places.spec.yaml
+#
+# A platform admin merges two Place rows that are the same real place. One row
+# survives; the other's events, reviews, followers and URL move to it, and the
+# other row is deleted.
+
+version: "1.0"
+updated: "2026-10-15" # step 1b + review rounds 1-2: owners, grants, locks, audit redaction
+
+# ── Rulings ──
+# R1  owner, 2026-10-13: "We need to merge them" — about the duplicate pairs the
+#     2026-10-06 import of 493 Nashville places created (Springwater /
+#     Springwater Supper Club; Cobra Nashville / The Cobra).
+# R2  owner, 2026-10-15: "Do NOT refuse merges with booking or operations
+#     data. Merge the booking data into the surviving place's default
+#     calendars." Also: no in-app undo (the audit row carries what a manual
+#     reversal needs); no duplicate sweep. Closes Q1–Q3.
+#
+# Orchestrator decisions (session of 2026-10-13, not the owner's; the owner may
+# overturn any of them, see open_questions):
+# D1  The admin picks which row survives. Nothing is chosen automatically.
+# D2  Survivor's values win. A field the survivor leaves empty is filled from
+#     the merged row. Address fields move as ONE group (never mix two
+#     addresses), and only when the survivor has no coordinates.
+# D3  The merged row is hard-deleted after everything is re-pointed. Its public
+#     URL keeps working: its EntityPage slug (and that page's slug history) is
+#     recorded in PageSlugHistory against the survivor's page, and
+#     /places/<old-slug> already redirects through that table.
+# D4  Booking and operations data MOVES (R2, owner 2026-10-15, replacing the
+#     v1 refusal). The merged default calendar and Main Space fold into the
+#     survivor's; every other merged calendar and space is a separate room and
+#     moves whole. A merge never cascade-deletes booking data: every row that
+#     references the merged Place, its calendars or its spaces is moved before
+#     the delete. What remains blocked is a real conflict a person must settle
+#     first (FR-006). Decisions per table are in FR-003b and `conflicts`.
+# D5  Not undoable in-app. The audit row stores the merged row's full field set,
+#     its page slug, and the ids of every row that moved, so a reversal is
+#     possible by a deliberate later build. Only ADMIN staff may merge.
+# D6  Refused when the two rows' address privacy differs (locationMode or
+#     radius). Pro-social principle 4, protect the weaker side: a merge must not
+#     publish a hidden house address by inheriting a public row's mode.
+# D7  Accepted from the build and review rounds (2026-10-14/15): a refusal is
+#     error CONFLICT with meta reason PLACE_MERGE_BLOCKED and the blocker list;
+#     a deadlock is CONFLICT with reason PLACE_MERGE_RETRY; moved events'
+#     public location is re-projected from the survivor; closed verification
+#     requests move to the survivor (trust history); a survivor with no page
+#     takes the merged page (TRANSFER_PAGE) instead of losing it; the merged
+#     page's own stored images are queued for deletion.
+# D8  Step 1b (2026-10-15), orchestrator rulings relayed by the coordinator:
+#     two live lines (or two confirmed holds) on the same calendar-day block
+#     (BOOKING_HOLDS_OVERLAP), even though only the confirmed case is a DB
+#     index: the line code assumes one hold per position; the survivor's
+#     active waiver stays authoritative; booking standards per intent: the
+#     survivor's list wins; payout default slots per R-rule in FR-003b.
+
+summary:
+  problem: >
+    The 2026-10-06 bulk import created near-duplicate places. Visitors see two
+    pages for one room, events split between them, and search shows both.
+    There is no supported way to fix it; deleting one by hand orphans its page,
+    its URL and its events, and skips the search reindex.
+  solution: >
+    `mergePlaces` use case + a "Merge into…" action on /platform/places. It
+    re-points every reference to the merged row inside one transaction,
+    redirects its URL, marks search reindex for both rows and every moved
+    event, writes one audit row, and deletes the merged row.
+  users:
+    - platform admin (runs the merge)
+    - visitors (one page per place, old links redirect)
+    - followers of the merged page (now follow the survivor)
+  surfaces: [api, web]
+
+lifecycle:
+  # Model Lifecycle Convention: a merge is an operation on Place, not a new
+  # persisted model. No table is added.
+  create: not applicable (no new model)
+  read: preview — `previewPlaceMerge` returns what would move and what blocks
+  update: not applicable
+  remove: the merged Place row is hard-deleted after re-pointing (D3)
+  undo: not built (D5); the audit row carries what a reversal needs
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        `mergePlaces({ actorHumanId, survivorId, mergedId })`. ADMIN staff only
+        (STAFF_ONLY otherwise). survivorId ≠ mergedId. Both rows must exist.
+        Runs in ONE transaction; any refusal or error leaves both rows as they
+        were.
+    - id: FR-002
+      description: >
+        `previewPlaceMerge` (same auth, read-only) returns both rows' fields,
+        the counts that would move per table, the fields that would be filled
+        from the merged row, and the blocking reasons (FR-006). The UI shows it
+        before the admin confirms.
+    - id: FR-003
+      description: >
+        Re-pointed from mergedId to survivorId: Event.placeId (and
+        Event.venueConfirmedPlaceId where it equals mergedId, so a
+        confirmation is not silently voided); Event.calendarId / spaceId where
+        they point at the merged row's default calendar / Main Space → the
+        survivor's default calendar / Main Space; AttendeeReview,
+        PostEventPrompt, MembershipBenefit, SavedLocation, PlaceReview,
+        PlaceReviewSession (on a [sessionToken, placeId] collision the merged
+        row's session is dropped), VolunteerAsk(PLACE), EntityReport(PLACE)
+        (pending-report collision → merged one dropped), FeaturedItem(PLACE)
+        (collision → merged one dropped), Embed(place) (collision → refuse,
+        FR-006), PlaceOwnership (FR-006 rules), ImageModerationRecord
+        (subjectType PLACE, subjectId; ids in the audit row). Every row a
+        collision drops is kept in full in the audit row (FR-007).
+    - id: FR-003b
+      description: >
+        Booking and operations rows (D4, R2), inside the same transaction,
+        after events have left the merged default calendar / Main Space.
+        Fold (both places have a default calendar): BookingHold.calendarId,
+        BookingRequest.calendarId, PlaceBookingGrant.calendarId,
+        CalendarAvailability.calendarId and CALENDAR-owned booking standards
+        on the merged default calendar move to the survivor's default
+        calendar; BookingHold / BookingRequest / Event spaceId on the merged
+        Main Space move to the survivor's Main Space. Calendars that move
+        whole and joined or used the merged Main Space get a join to (and,
+        if it was their primary, a primary of) the survivor's Main Space. The
+        rooms the merged default calendar scheduled into join the survivor's
+        default calendar. The emptied merged default calendar and Main Space
+        are then deleted (their full rows, joins included, are in the audit
+        row). A survivor with NO default calendar takes the merged one and its
+        Main Space whole, still default (this replaces the old
+        SURVIVOR_LACKS_DEFAULT_CALENDAR refusal). Every other merged
+        Calendar and Space moves whole (placeId → survivor) with its holds,
+        requests, events, availability and standards untouched.
+        Place-scoped rows re-point placeId: BookingRequest (CASCADE),
+        PlaceBookingGrant (CASCADE), CalendarAvailability (CASCADE; place-wide
+        rows stay place-wide), PlaceWaiver (CASCADE), PlaceLayout (CASCADE),
+        Agreement (SET NULL, would orphan silently), PosReader (SET NULL,
+        likewise), PLACE-owned BookingStandardItem / BookingPitchExample (no
+        FK, would orphan). EventSeries.defaults, EventTemplate.defaults and
+        EventSeriesOccurrence.overrides naming the merged place in
+        location.placeId are rewritten to the survivor, archived / inactive
+        rows included (the JSON holds no calendar or space id). Hold status,
+        position and every other column are never edited. Payout default
+        slots, per kind: survivor empty → takes the merged id (shown as a
+        filled field); same id → nothing; different ids → refused. PayoutTerms
+        rows are never deleted (Place only points at them).
+        Owner compatibility. The owners are compatible when the survivor has
+        no active owner (the merged PlaceOwnership rows move to it under
+        FR-006, so whoever wrote the merged settings comes with them; this
+        includes both rows ownerless), or when every active owner of the
+        merged row is an active owner of the survivor. When they are not (an
+        owned survivor and an unowned merged row, or a merged owner the
+        survivor lacks, which FR-006 refuses anyway), nothing the merged side
+        decided is carried into the survivor's name; the payout slots are not
+        filled (the merged ids are in the audit row, warning
+        PAYOUT_DEFAULTS_NOT_CARRIED), the merged waivers move inactive
+        (WAIVERS_DEACTIVATED) and the merged active grants are revoked
+        (revokedAt = merge time, warning GRANTS_ENDED). None of this blocks;
+        an admin can always clear it by hand afterwards.
+        Whole-place grants. A merged grant with no calendar (it covered the
+        whole merged place) is split, so it never widens to the survivor's
+        own rooms. It is narrowed to the first calendar the merged place
+        brought (the survivor's default calendar when the default folds,
+        otherwise the merged default that moved whole) and copied, same
+        grantee, permissions, dates and granter, once per other calendar that
+        moved whole. Holds that named the original grant on a copied calendar
+        follow to that calendar's copy. Warning GRANTS_SPLIT; the original row
+        and the new ids are in the audit row. Revoked grants are not split.
+        A merged place with NO calendar has nothing to split onto, and moved
+        as is a whole-place grant would cover every survivor room, so its
+        live whole-place grants are revoked instead (revokedAt = merge time,
+        in the audit row's revoked grants, warning GRANTS_ENDED).
+        Ownership transfer. When the survivor has no active owner and the
+        merged place has some, those owners become the survivor's (FR-006)
+        and take over its open booking requests (PENDING, VIEWED, ACCEPTED)
+        and live agreements (DRAFT, PROPOSED, COUNTERED, ACCEPTED, DISPUTED).
+        Warning OWNERSHIP_TRANSFERS, never a block, carries the owner keys
+        (ownerType and ownerId) and those two counts so the admin sees who
+        gains what before confirming.
+
+    - id: FR-004
+      description: >
+        Page: EntityFollow and EntityEventNotice move to the survivor's page,
+        dropping rows that would collide on their unique keys (a person who
+        followed both keeps one follow). The merged page's PageSlugHistory rows
+        and its current slug are recorded against the survivor's page. The
+        merged page is then deleted (its blocks, theme and drafts go with it;
+        the survivor's page content is kept as is).
+    - id: FR-005
+      description: >
+        Derived rows: the merged row's PlaceStats and ReviewAggregate(PLACE)
+        rows are deleted; the survivor's PlaceStats row is marked stale so the
+        scheduled recompute rebuilds it. ReviewAggregate has no stale mark: the
+        weekly sweep rebuilds every subject with reviews, the survivor included (the delay is deliberate, it protects reviewer
+        anonymity). Search: `markForSearchReindex` inside the transaction for
+        both places and every moved event; `reindexAfterMutation` after
+        commit for the survivor.
+    - id: FR-006
+      description: >
+        Refused, naming every reason, when: an active PlaceVerificationRequest
+        is open on the merged row (HAS_ACTIVE_VERIFICATION_REQUEST); its
+        verification is above the survivor's (VERIFICATION_ABOVE_SURVIVOR,
+        pick the verified row to keep); it has an owner the survivor lacks
+        while the survivor has one (OWNER_CONFLICT — a merge does not settle
+        an ownership dispute); an Embed collides with the survivor's
+        (EMBED_COLLISION); address privacy differs (LOCATION_PRIVACY_DIFFERS,
+        D6); it accepts community listings, the survivor does not, and it has
+        community listings (COMMUNITY_LISTINGS_CONSENT_DIFFERS — the flag is
+        never OR-ed); the survivor is not ACTIVE (SURVIVOR_NOT_ACTIVE); the
+        two rows name different default payout terms of the same kind
+        (DEFAULT_PAYOUT_TERMS_CONFLICT — two money deals are not merged
+        silently); a merged default-calendar hold shares a calendar-day with
+        a survivor default-calendar hold where both are live (ACTIVE /
+        CHALLENGED) or both CONFIRMED (BOOKING_HOLDS_OVERLAP, names up to 20
+        merged hold ids); an open (PENDING / VIEWED) merged booking request
+        would collide with an open survivor request from the same performer
+        or contact email (BOOKING_REQUESTS_OPEN_DUPLICATE, up to 20 ids). A
+        merged row whose owners match the survivor's, or whose owner the
+        survivor lacks, moves its PlaceOwnership rows. Removed by R2:
+        HAS_BOOKING_REQUESTS, HAS_AGREEMENTS, HAS_BOOKING_GRANTS, HAS_WAIVERS,
+        HAS_POS_READERS, HAS_LAYOUTS, HAS_EXTRA_SPACES, HAS_EXTRA_CALENDARS,
+        HAS_CALENDAR_AVAILABILITY, HAS_BOOKING_HOLDS,
+        HAS_EVENTS_ON_OTHER_CALENDARS_OR_SPACES, HAS_BOOKING_STANDARDS,
+        HAS_BOOKING_PITCH_EXAMPLES, HAS_DEFAULT_PAYOUT_TERMS,
+        HAS_SERIES_OR_TEMPLATES, SURVIVOR_LACKS_DEFAULT_CALENDAR.
+        Warnings (FR-002, never block): AVAILABILITY_OVERLAP,
+        PLACE_WIDE_AVAILABILITY_MOVED, HOLDS_SAME_NIGHT (one side confirmed,
+        the other live, same day), BOOKING_STANDARDS_REPLACED,
+        NAMES_SUFFIXED, WAIVER_BECOMES_ACTIVE, WAIVERS_DEACTIVATED,
+        PAYOUT_DEFAULTS_NOT_CARRIED, GRANTS_ENDED, GRANTS_SPLIT,
+        OWNERSHIP_TRANSFERS.
+        DEFAULT_PAYOUT_TERMS_CONFLICT is raised only when the owners are
+        compatible (FR-003b); otherwise no merged deal is carried, so there
+        is nothing to conflict.
+    - id: FR-007
+      description: >
+        One AuditLog row, entity "Place", entityId survivorId, action
+        "place.merged", data: actorHumanId, mergedId, the merged row's full
+        field set, its page slug, filled fields with the survivor's values
+        before the fill, the ids moved per table, and `operations` (FR-003b):
+        full id lists (uncapped — this row is the reversal record) of moved
+        holds, requests, grants, availability, waivers (with each one's prior
+        isActive), agreements, readers, layouts, standards and examples, and
+        which of them had their calendarId / spaceId folded; the re-parented
+        calendar and space ids; every rename (old and new name / slug); the
+        CalendarSpace rows created and deleted; the full snapshots of the
+        deleted default calendar, Main Space and dropped standards rows; the
+        rewritten series / template / occurrence ids; the payout decision
+        (survivor's slots before, merged slots, slots filled, whether the
+        merged slots were carried); whether the owners were compatible; the
+        grants revoked and each split grant (its original row, the calendar
+        it kept, the new grant ids, the holds that moved grant); the
+        ownership repoint pairs; the full rows of every dropped
+        PlaceReviewSession, EntityReport, FeaturedItem, PlaceOwnership,
+        EntityFollow and EntityEventNotice; the ImageModerationRecord ids
+        re-pointed; the warnings. Redaction, since AuditLog.data is readable
+        by REVIEWER staff. A dropped PlaceReviewSession collided on
+        (sessionToken, placeId), so its token is still live on the
+        survivor's row; its snapshot keeps sessionTokenSha256 and hadEmail
+        in place of sessionToken and email. A dropped PlaceOwnership keeps
+        only proof.kind, never the claimant's email or other proof fields.
+        A venue confirmation moves only on events whose placeId is the merged
+        row; a lapsed stamp (event already moved elsewhere) is left as it is,
+        so a merge never confirms an event at a place whose owner did not.
+    - id: FR-008
+      description: >
+        /platform/places: a "Merge into…" action on a place's detail panel
+        opens a place picker for the survivor, shows the FR-002 preview, and
+        confirms. Blocking reasons are shown in plain words and the confirm
+        button is disabled while any exist. Copy says "place", never "venue".
+
+  non_functional:
+    - Re-pointing goes through repo methods inside the use case's tx; no raw SQL
+      outside the adapter.
+    - >-
+      Locks, in this order. First the hold-line advisory locks
+      (booking_hold_line, the key every hold placement and renumber takes)
+      on both default calendars for every day the merged default calendar
+      holds live or confirmed, in sortLineKeys order; hold-line before
+      everything is the global order (save-event-shared LOCK ORDER note 4).
+      Then the event-location advisory locks on both places. Then FOR
+      UPDATE, each set in id order, on Place, Calendar, Space, the live and
+      confirmed BookingHold rows on the locked lines only (the only lines
+      whose membership changes; a re-parented calendar keeps its lines and
+      the Main Space fold changes spaceId only), PlaceWaiver and
+      EntityPage. Then the booking-standards
+      advisory locks (the replace-all keys) for both places and both default
+      calendars, every table and intent, in sorted key order. The line set
+      is re-read under the row locks; a day that appeared in between is
+      CONFLICT / PLACE_MERGE_RETRY, as is a deadlock (D7). The overlap
+      blockers are computed under all of these locks. The standards locks
+      protect only saves that commit before the merge; a save already
+      waiting can still write to a deleted owner (follow-up in
+      manage-booking-standards, outside this spec). Known inversion, out of
+      scope: saving an existing PUBLISHED event takes place_location and then
+      the settle's line locks (marked LATENT in save-event-shared); against a
+      merge it can deadlock, which surfaces as PLACE_MERGE_RETRY.
+    - >-
+      Search marks, in the tx, for both places, every moved or re-projected
+      event and every event on a calendar that moved whole.
+    - The merged row's claim email challenges are dropped with it (transient).
+
+# Conflict decisions (FR-003b / FR-006), each with its reason.
+conflicts:
+  - table: Calendar
+    key: Calendar_placeId_slug_key (placeId, slug); Calendar_placeId_default_key
+    rule: >
+      A moved calendar whose slug the survivor has gets `-2`, `-3`… (the
+      manage-calendars rule, 64-char limit); a taken name (case-insensitive)
+      gets " (from <merged place>)". The merged default either folds or, when
+      the survivor has none, moves still default, so one default per place
+      holds.
+    reason: Slugs are unique per place; two "Patio" rooms on one place read as one.
+  - table: Space
+    key: none on name
+    rule: Taken name → " (from <merged place>)".
+    reason: Same as Calendar names.
+  - table: PlaceLayout
+    key: place_layouts_place_id_name_key (placeId, name)
+    rule: Taken name → " (from <merged place>)"; events and seat sections keep the layout id.
+    reason: The unique key; a seat map is referenced by events, never dropped.
+  - table: BookingHold
+    key: >
+      BookingHold_confirmed_line_key, _live_request_date_key,
+      _live_holder_org_line_key, _live_holder_human_line_key; position unique
+      per live line in code only
+    rule: >
+      Both default calendars live on one day, or both confirmed → refused
+      (BOOKING_HOLDS_OVERLAP). Confirmed on one side, live on the other →
+      moved, warning HOLDS_SAME_NIGHT. Holds on calendars that move whole
+      never meet the survivor's lines.
+    reason: >
+      Two position-1 acts or two confirmed bookings for one night is a person's
+      decision; renumbering or releasing would silently edit a hold (D8).
+  - table: BookingRequest
+    key: BookingRequest_open_pair_key, BookingRequest_open_anon_pair_key
+    rule: Open duplicate → refused (BOOKING_REQUESTS_OPEN_DUPLICATE).
+    reason: A request carries messages, holds and acts; it is never dropped.
+  - table: PlaceBookingGrant
+    key: none
+    rule: >
+      All move; a grantee with grants on both keeps both. A whole-place
+      merged grant is split per calendar the merged place brought (FR-003b,
+      GRANTS_SPLIT); with no calendar to split onto it is revoked
+      (GRANTS_ENDED). Owners not compatible → merged active grants are
+      revoked (GRANTS_ENDED).
+    reason: >
+      No unique key; the authz lookup already picks deterministically among
+      several grants. A whole-place grant moved as is would cover the
+      survivor's own rooms, which nobody granted; a grant given by owners
+      the survivor does not have is not theirs to keep.
+  - table: CalendarAvailability
+    key: none
+    rule: >
+      All move; place-wide rows stay place-wide (warning
+      PLACE_WIDE_AVAILABILITY_MOVED); overlaps with the survivor's default
+      calendar are a warning (AVAILABILITY_OVERLAP).
+    reason: No constraint forbids overlap and the duplicate pair is one building.
+  - table: PlaceWaiver
+    key: none (getActiveForPlace = highest active version)
+    rule: >
+      Survivor has an active waiver, or the owners are not compatible →
+      merged waivers move inactive (warning WAIVERS_DEACTIVATED). Survivor
+      has none and the owners are compatible → they move as they were
+      (warning WAIVER_BECOMES_ACTIVE; recorded owner question). Prior
+      isActive is in the audit row.
+    reason: >
+      The survivor's waiver stays authoritative (D8). Nothing references a
+      PlaceWaiver by id (WaiverAcceptance keys on the template), so
+      deactivating is safe. Keeping the merged one active when the survivor
+      has none avoids leaving the place with no waiver.
+  - table: BookingStandardItem / BookingPitchExample
+    key: none (replace-all per owner + intent, capped 12 / 3 in core)
+    rule: >
+      Per intent. Merged place-owned rows are dropped when the survivor's
+      place has a list for that intent. The folded default calendar's rows
+      are dropped when the survivor's default calendar OR its place has one
+      (the place list already covers that calendar). Dropped rows are kept
+      in full in the audit row (warning BOOKING_STANDARDS_REPLACED);
+      otherwise they move.
+    reason: Concatenating breaks the cap and mixes two checklists; nothing references these rows.
+  - table: Place.defaultPrimaryPayoutTermsId / defaultResalePayoutTermsId
+    key: one slot per kind
+    rule: >
+      Owners compatible → empty survivor slot takes the merged id; same id
+      nothing; different ids refused. Owners not compatible → nothing filled
+      (PAYOUT_DEFAULTS_NOT_CARRIED), never refused.
+    reason: >
+      Money; the PayoutTerms row is never deleted, only pointed at. A deal
+      set by owners the survivor does not have must not become the
+      survivor's default.
+  - table: CalendarSpace
+    key: (calendarId, spaceId); Calendar_primary_space_joined_fkey (deferred)
+    rule: >
+      Joins and primaries on the folded Main Space are recreated on the
+      survivor's Main Space (skipped when the join exists), then the old join
+      rows are deleted; all recorded.
+    reason: Calendar.primarySpaceId blocks the Space delete; the joined check is deferred to commit.
+  - table: PlaceReviewSession / EntityReport / FeaturedItem / PlaceOwnership / EntityFollow / EntityEventNotice
+    key: their unique keys (FR-003, FR-004, FR-006)
+    rule: >
+      The merged row is dropped on a collision; its full row goes in the
+      audit row, except a PlaceReviewSession's sessionToken and email
+      (stored as sessionTokenSha256 and hadEmail) and a PlaceOwnership's
+      proof beyond its kind.
+    reason: >
+      The audit row is the reversal record (D5), and REVIEWER staff can read
+      it; a live review token or a claimant email does not belong there.
+
+open_questions: []
+# Closed 2026-10-15 by the owner (R2):
+#   Q1 (refuse merges with booking data?) → no: merge it into the survivor's
+#      default calendars (D4, FR-003b).
+#   Q2 (in-app undo?) → no; the audit row carries what a manual reversal
+#      needs (D5, FR-007).
+#   Q3 (sweep for more duplicates?) → no.

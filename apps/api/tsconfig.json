@@ -2,6 +2,19 @@
   "extends": "../../packages/config/tsconfig/base.json",
   "compilerOptions": {
     "noEmit": false,
+    // Incremental so a re-run that follows no source change is near-instant.
+    // The build info lives in node_modules/.cache (already gitignored) instead
+    // of beside the tsconfig, so it never shows up as untracked.
+    //
+    // GOTCHA: `tsc --incremental` never stats its own outputs, so deleting
+    // `dist/` while this build info survives makes `pnpm build` exit 0 having
+    // emitted NOTHING. If you cleaned dist by hand, delete the file below too.
+    // Harmless in the deploy path — the Dockerfile discards tsc's output and
+    // the image runs the esbuild bundle (`dist/bundle`, written by
+    // scripts/bundle-service.mjs, which tsc never touches) — but it will
+    // cost you twenty minutes at a terminal.
+    "incremental": true,
+    "tsBuildInfoFile": "../../node_modules/.cache/tsc-daemon/apps-api.tsbuildinfo",
     "outDir": "dist",
     "baseUrl": ".",
     "paths": {

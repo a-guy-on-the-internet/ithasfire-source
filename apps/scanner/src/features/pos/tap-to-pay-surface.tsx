@@ -5,6 +5,10 @@
  *   discovering → connecting → ready → collecting → confirming → finalizing → success
  *                                                                          ↘ error
  *
+ * The step sequence (and the "was the card charged?" phase that decides
+ * the error copy) lives in `tap-to-pay-flow.ts`, where it is tested
+ * without the native SDK; this file renders its stages.
+ *
  * This file is ONLY mounted when:
  *   - `binarySupportsTapToPay()` is true (entitlement declared at build)
  *   - The parent has wrapped us in <StripeTerminalProvider>
@@ -30,39 +34,43 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AccessibilityInfo,
-  ActivityIndicator,
   Pressable,
   StyleSheet,
   View,
 } from "react-native";
-import {
-  useStripeTerminal,
-  type Reader,
-  type StripeError,
-} from "@stripe/stripe-terminal-react-native";
+import { useStripeTerminal } from "@stripe/stripe-terminal-react-native";
 
 import { Text } from "@th/ui";
 
 import { getAppEnv } from "../../lib/capabilities";
+import { reportPosIssue } from "../../lib/report";
 import { trpc } from "../../trpc";
 import { useColors, useThemedSheet, type NativePalette } from "@th/ui-native";
 import { LoadingState } from "../../ui/loading-state";
 
-type Stage =
-  | { kind: "initializing" }
-  | { kind: "discovering" }
-  | { kind: "connecting"; reader: Reader.Type }
-  | { kind: "retrieving" }
-  | { kind: "collecting" }
-  | { kind: "confirming" }
-  | { kind: "finalizing"; attempt: number }
-  | { kind: "success" }
-  | { kind: "error"; message: string; recoverable: boolean };
+import type { CompletedSale } from "./sale-attempt";
+import { SupportNotice } from "./sale-notices";
+import { formatMoney } from "./sell-quote";
+import {
+  DEFAULT_TIMING,
+  runTapToPayFlow,
+  type FlowStage,
+} from "./tap-to-pay-flow";
+
+type Stage = FlowStage;
 
 export type TapToPaySurfaceProps = {
   orderId: string;
   clientSecret: string;
+  /** What the reader asks for: `startSale.amountCents`, the server's charge. */
   amountCents: number;
+  /**
+   * The card total the quote showed before the sale started, or null when
+   * there was none. When it differs from `amountCents` the screen says so
+   * before the buyer taps.
+   */
+  quotedCents: number | null;
+  currency: string;
   /**
    * Stripe Terminal Location ID (`tml_...`) on the platform account.
    * Required by the SDK for Tap to Pay. When omitted, the surface
@@ -84,19 +92,19 @@ export type TapToPaySurfaceProps = {
    * branches without rebuilding.
    */
   simulatedTestCardNumber?: string;
-  /** Called when the order finalises (status SUCCEEDED). */
-  onSuccess: (orderId: string) => void;
+  /** Called with the server's read of the order once it is SUCCEEDED. */
+  onSuccess: (sale: CompletedSale) => void;
   /** Called when the operator backs out before completing. */
   onCancel: () => void;
 };
 
-const COMPLETE_POLL_INTERVAL_MS = 1_000;
-const COMPLETE_POLL_MAX_ATTEMPTS = 30;
 
 export function TapToPaySurface({
   orderId,
   clientSecret,
   amountCents,
+  quotedCents,
+  currency,
   locationId,
   merchantDisplayName = "Ithas Fire",
   simulatedTestCardNumber,
@@ -130,196 +138,62 @@ export function TapToPaySurface({
     return () => {
       cancelledRef.current = true;
       // Best-effort cleanup; the SDK cancels in-flight ops cleanly.
-      void sdkRef.current?.cancelDiscovering();
-      void sdkRef.current?.cancelCollectPaymentMethod();
-      void sdkRef.current?.cancelConfirmPaymentIntent();
+      cancelInFlight(sdkRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function runFlow() {
-    if (!locationId) {
-      setStage({
-        kind: "error",
-        message:
-          "Tap to Pay isn't configured for this environment yet (missing Stripe Terminal Location). Use Cash, or contact support.",
-        recoverable: false,
-      });
-      return;
-    }
-
-    try {
-      // ── Step 0: initialize the native SDK ────────────────────────
-      // <StripeTerminalProvider> mounts the bridge but does NOT call
-      // Terminal.getInstance() — on Android that fails the first SDK
-      // call with "First initialize the Stripe Terminal SDK". Calling
-      // `initialize()` is idempotent; safe to repeat on retry.
-      setStage({ kind: "initializing" });
-      const initResult = await sdkRef.current.initialize();
-      if (cancelledRef.current) return;
-      if (initResult.error) {
-        setStage(errorFromStripe(initResult.error, true));
-        return;
-      }
-
-      // Stripe blocks the production Tap to Pay reader when Android
-      // Developer Options is enabled (common on test devices used
-      // with `adb`). Fall back to the simulated reader for non-prod
-      // builds so preview/development APKs can still drive the flow.
-      const useSimulatedReader = getAppEnv() !== "production";
-
-      // Simulator-only: pick which test card the next tap will use.
-      // Stripe's default is 4242 (Visa, success); operators can pick
-      // a decline / insufficient-funds PAN from the SellScreen dev
-      // picker to exercise error branches. Real readers ignore this.
-      if (useSimulatedReader && simulatedTestCardNumber) {
-        await sdkRef.current.setSimulatedCard(simulatedTestCardNumber);
-        if (cancelledRef.current) return;
-      }
-
-      // ── Step 1+2: discover & connect ─────────────────────────────
-      // The Terminal SDK keeps its native connection alive across this
-      // component unmounting (StripeTerminalProvider is mounted higher
-      // up). On a second sale we may still be connected to the
-      // previous reader — calling `discoverReaders` in that state
-      // errors with "You must disconnect from reader before
-      // discovering readers." Reuse the existing connection instead;
-      // it's the same device.
-      const alreadyConnected = sdkRef.current.connectedReader;
-      if (!alreadyConnected) {
-        setStage({ kind: "discovering" });
-        const discoverResult = await sdkRef.current.discoverReaders({
-          discoveryMethod: "tapToPay",
-          simulated: useSimulatedReader,
-        });
-        if (cancelledRef.current) return;
-        if (discoverResult.error) {
-          setStage(errorFromStripe(discoverResult.error, true));
-          return;
-        }
-
-        // The SDK populates `discoveredReaders` over time; for tapToPay
-        // there is exactly one (the local device). Wait briefly if needed.
-        const reader = await waitForReader(() => sdkRef.current, 5_000);
-        if (cancelledRef.current) return;
-        if (!reader) {
-          setStage({
-            kind: "error",
-            message: "Couldn't find a Tap to Pay reader on this device.",
-            recoverable: true,
-          });
-          return;
-        }
-
-        setStage({ kind: "connecting", reader });
-        const connectResult = await sdkRef.current.connectReader({
-          discoveryMethod: "tapToPay",
-          reader,
-          locationId,
-          merchantDisplayName,
-        });
-        if (cancelledRef.current) return;
-        if (connectResult.error) {
-          setStage(errorFromStripe(connectResult.error, true));
-          return;
-        }
-      }
-
-      // ── Step 3: retrieve PI from server-side clientSecret ────────
-      setStage({ kind: "retrieving" });
-      const retrieveResult =
-        await sdkRef.current.retrievePaymentIntent(clientSecret);
-      if (cancelledRef.current) return;
-      if (retrieveResult.error || !retrieveResult.paymentIntent) {
-        setStage(
-          retrieveResult.error
-            ? errorFromStripe(retrieveResult.error, true)
-            : {
-                kind: "error",
-                message: "Couldn't load the payment intent.",
-                recoverable: true,
-              },
-        );
-        return;
-      }
-
-      // ── Step 4: collect (the Tap to Pay native UI surfaces here) ─
-      setStage({ kind: "collecting" });
-      const collectResult = await sdkRef.current.collectPaymentMethod({
-        paymentIntent: retrieveResult.paymentIntent,
-        // FR-014: Ithas Fire NEVER prompts for tip. Hard-coded.
-        skipTipping: true,
-      });
-      if (cancelledRef.current) return;
-      if (collectResult.error || !collectResult.paymentIntent) {
-        setStage(
-          collectResult.error
-            ? errorFromStripe(collectResult.error, true)
-            : {
-                kind: "error",
-                message: "Card collection cancelled.",
-                recoverable: true,
-              },
-        );
-        return;
-      }
-
-      // ── Step 5: confirm ──────────────────────────────────────────
-      setStage({ kind: "confirming" });
-      const confirmResult = await sdkRef.current.confirmPaymentIntent({
-        paymentIntent: collectResult.paymentIntent,
-      });
-      if (cancelledRef.current) return;
-      if (confirmResult.error) {
-        setStage(errorFromStripe(confirmResult.error, true));
-        return;
-      }
-
-      // ── Step 6: poll the server for finalisation ────────────────
-      // Stripe's `payment_intent.succeeded` webhook drives our
-      // finalize-from-payment-intent (which mints tickets + auto-admits
-      // per FR-013). We poll `pos.completeSale` until status SUCCEEDED.
-      for (let attempt = 1; attempt <= COMPLETE_POLL_MAX_ATTEMPTS; attempt++) {
-        if (cancelledRef.current) return;
-        setStage({ kind: "finalizing", attempt });
-        const result = await completeQuery.refetch();
-        if (cancelledRef.current) return;
-        const data = result.data as { status?: string } | undefined;
-        if (data?.status === "SUCCEEDED") {
-          setStage({ kind: "success" });
-          onSuccess(orderId);
-          return;
-        }
-        await sleep(COMPLETE_POLL_INTERVAL_MS);
-      }
-
-      setStage({
-        kind: "error",
-        message:
-          "Charge confirmed but the server hasn't finalised the order yet. The receipt + tickets will arrive shortly — check the orders list.",
-        recoverable: false,
-      });
-    } catch (err) {
-      if (cancelledRef.current) return;
-      setStage({
-        kind: "error",
-        message: err instanceof Error ? err.message : "Tap to Pay failed.",
-        recoverable: true,
-      });
-    }
+  function runFlow() {
+    return runTapToPayFlow(
+      {
+        clientSecret,
+        locationId,
+        merchantDisplayName,
+        // Stripe blocks the production Tap to Pay reader when Android
+        // Developer Options is enabled (common on test devices used with
+        // `adb`). Non-prod builds use the simulated reader so preview and
+        // development builds can still drive the flow.
+        useSimulatedReader: getAppEnv() !== "production",
+        simulatedTestCardNumber,
+      },
+      {
+        sdk: () => sdkRef.current,
+        isCancelled: () => cancelledRef.current,
+        setStage,
+        fetchOrder: async () => (await completeQuery.refetch()).data,
+        onSuccess,
+        report: (error, context) => {
+          if (__DEV__) {
+            console.warn(`[tap-to-pay] ${error.message}`, context.tags);
+          }
+          reportPosIssue(error, { ...context, orderId });
+        },
+      },
+    );
   }
 
   const handleCancel = () => {
     cancelledRef.current = true;
-    void sdkRef.current?.cancelDiscovering();
-    void sdkRef.current?.cancelCollectPaymentMethod();
-    void sdkRef.current?.cancelConfirmPaymentIntent();
+    cancelInFlight(sdkRef.current);
     onCancel();
   };
 
+  // The reader asks for the server's number. If that moved after the
+  // operator read the quote out, the buyer is about to tap for a total nobody
+  // told them. No cause is given: a tax rate update is one, a price or fee
+  // change is another, and the screen can't tell which.
+  const moved = quotedCents !== null && quotedCents !== amountCents;
+
   return (
     <View style={styles.root} testID="sell-tap-to-pay-surface">
-      <Text style={styles.amount}>${(amountCents / 100).toFixed(2)}</Text>
+      <Text style={styles.amount}>{formatMoney(amountCents, currency)}</Text>
+      {moved && (
+        <SupportNotice testID="sell-tap-to-pay-total-moved">
+          The total changed since the quote. The reader is asking for{" "}
+          {formatMoney(amountCents, currency)}. Tell the buyer before they
+          tap.
+        </SupportNotice>
+      )}
       <View style={styles.body}>
         <StageView stage={stage} />
       </View>
@@ -361,7 +235,7 @@ function StageView({ stage }: { stage: Stage }) {
       case "confirming":
         return "Confirming payment…";
       case "finalizing":
-        return `Finalising order… (${stage.attempt}/${COMPLETE_POLL_MAX_ATTEMPTS})`;
+        return `Finalising order… (${stage.attempt}/${DEFAULT_TIMING.pollMaxAttempts})`;
       case "success":
         return "Charged.";
       case "error":
@@ -390,13 +264,27 @@ function StageView({ stage }: { stage: Stage }) {
 
   if (stage.kind === "error") {
     return (
-      <Text
-        accessibilityLiveRegion="polite"
-        style={[styles.status, { color: colors.dangerSoft }]}
-        testID="sell-tap-to-pay-status"
-      >
-        {message}
-      </Text>
+      <View style={styles.errorBlock}>
+        <Text
+          accessibilityLiveRegion="polite"
+          style={[styles.status, { color: colors.dangerSoft }]}
+          testID="sell-tap-to-pay-status"
+        >
+          {message}
+        </Text>
+        {/* The SDK's code (never its message), for whoever the operator
+            asks for help. */}
+        {stage.code !== null && (
+          <Text
+            variant="caption"
+            color={colors.colorMuted}
+            style={styles.errorCode}
+            testID="sell-tap-to-pay-error-code"
+          >
+            Reader code: {stage.code}
+          </Text>
+        )}
+      </View>
     );
   }
 
@@ -414,36 +302,15 @@ function StageView({ stage }: { stage: Stage }) {
   );
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────
-
-function errorFromStripe(error: StripeError, recoverable: boolean): Stage {
-  return {
-    kind: "error",
-    message: error.message ?? `Stripe error: ${error.code ?? "unknown"}`,
-    recoverable,
-  };
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function waitForReader(
-  // The hook return value is recreated on every render, so we need a
-  // getter that resolves through the parent's ref. Reading `.discoveredReaders`
-  // off a captured snapshot returns the array from the moment the polling
-  // started — even though `didUpdateDiscoveredReaders` has since populated
-  // a new array on the latest render's hook object.
-  getSdk: () => ReturnType<typeof useStripeTerminal>,
-  timeoutMs: number,
-): Promise<Reader.Type | null> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const readers = getSdk().discoveredReaders;
-    if (readers && readers.length > 0) return readers[0]!;
-    await sleep(100);
-  }
-  return null;
+/**
+ * Stop whatever the reader is doing. Each cancel rejects when the SDK isn't
+ * initialized yet (Back during "Starting the card reader…"); there is then
+ * nothing to cancel, and an unhandled rejection would only be Sentry noise.
+ */
+function cancelInFlight(sdk: ReturnType<typeof useStripeTerminal> | undefined) {
+  sdk?.cancelDiscovering().catch(() => {});
+  sdk?.cancelCollectPaymentMethod().catch(() => {});
+  sdk?.cancelConfirmPaymentIntent().catch(() => {});
 }
 
 const makeSheet = (colors: NativePalette) =>
@@ -455,9 +322,19 @@ const makeSheet = (colors: NativePalette) =>
       alignItems: "center",
       gap: 32,
     },
-    amount: { fontSize: 56, fontWeight: "800", color: colors.color },
+    // An explicit lineHeight: `@th/ui` Text's default body line box (24pt)
+    // clips 56pt digits. Same ratio as the other big amounts in this folder.
+    amount: {
+      fontSize: 56,
+      lineHeight: 66,
+      fontWeight: "800",
+      color: colors.color,
+      fontVariant: ["tabular-nums"],
+    },
     body: { flex: 1, alignItems: "center", justifyContent: "center", gap: 16 },
     status: { fontSize: 18, textAlign: "center", color: colors.color },
+    errorBlock: { alignItems: "center", gap: 12 },
+    errorCode: { textAlign: "center", fontVariant: ["tabular-nums"] },
     cancel: {
       minHeight: 52,
       paddingVertical: 14,

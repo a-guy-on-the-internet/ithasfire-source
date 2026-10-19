@@ -1,0 +1,412 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Venue hierarchy — Spaces, Calendars, calendar availability, booking threads.
+//
+// See docs/specs/2026-08-18/completed/venue-hierarchy-and-holds.spec.yaml (near-term
+// scope; the Hold layer is DEFERRED — nothing here models holds).
+//
+// Space    = the concrete physical resource conflicts resolve to (child of
+//            Place, NEVER of Calendar). Physical attributes (capacity, tech
+//            specs) live here and only here.
+// Calendar = a named, public-facing programming stream ("Social Club",
+//            "Drkmttr Live Music") that owns availability windows and
+//            scheduling defaults, joined M:N to Spaces via CalendarSpace.
+//            Calendar rendering filters on Event.calendarId — NEVER via the
+//            space join (FR-005: a shared space must not bleed one stream's
+//            events onto another's calendar).
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Space {
+  id        String      @id @default(uuid())
+  placeId   String
+  name      String
+  capacity  Int?
+  sortOrder Int         @default(0)
+  status    SpaceStatus @default(ACTIVE)
+
+  place          Place           @relation("SpacePlace", fields: [placeId], references: [id], onDelete: Cascade)
+  calendarSpaces CalendarSpace[]
+  /// Calendars whose PRIMARY space this is (Calendar.primarySpaceId). NoAction
+  /// on both sides is deliberate — see the Calendar model comment.
+  primaryFor     Calendar[]      @relation("CalendarPrimarySpace")
+  // SetNull on space deletion — deleting a space must never delete events.
+  events         Event[]         @relation("EventSpace")
+  // SetNull on space deletion — a hold outlives its room.
+  bookingHolds   BookingHold[]   @relation("BookingHoldSpace")
+  // SetNull on space deletion — a RENT/USE request names the room it wants;
+  // deleting the room never deletes the request.
+  bookingRequests BookingRequest[] @relation("BookingRequestSpace")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([placeId, status])
+  /// Referenced by Calendar's composite FK on (primarySpaceId,
+  /// primarySpaceStatus) — the target of a composite FK must be a unique key,
+  /// so this index is what makes the ≥1-ACTIVE-space-per-calendar invariant
+  /// expressible as a constraint. Do not drop it.
+  @@unique([id, status])
+}
+
+model Calendar {
+  id          String  @id @default(uuid())
+  placeId     String
+  name        String
+  slug        String
+  description String?
+  isDefault   Boolean @default(false)
+
+  /// Wall-clock default start time ("HH:mm") for events created on this
+  /// calendar. Resolved through Place.timezone (FR-004) — never a timestamp.
+  defaultStartTime  String?
+  defaultCategoryId String?
+  /// Prefill defaults for events minted from this calendar (quick-create /
+  /// FR-009 title template). Json blob — no rich template editor in v1.
+  eventTemplate     Json?
+
+  // ── Booking config layer (venue-confirmation-and-booking-intents spec,
+  // docs/specs/2026-08-27) ──────────────────────────────────────────────────
+  // The Calendar is the CONFIG layer: which intents it accepts, a flat rental
+  // rate per booking (a day or a stated slot), and whether that rate is shown
+  // publicly. The SPACE is what a booking blocks — never the calendar.
+  /// Accepts PERFORM (pitch a show) requests. Default true preserves today.
+  acceptsPerform    Boolean     @default(true)
+  /// Accepts RENT requests (hire a space for a window).
+  acceptsRent       Boolean     @default(false)
+  /// Accepts USE requests (non-transactional use of a space).
+  acceptsUse        Boolean     @default(false)
+  /// Flat rental rate per booking, integer minor units in `rentalRateCurrency`.
+  /// Null = no stated rate (the venue quotes in the thread).
+  rentalRateCents   Int?
+  rentalRateCurrency String?    @db.VarChar(3)
+  /// Whether `rentalRateCents` is shown on the public request form.
+  rentalRateVisible Boolean     @default(false)
+  /// REQUEST for this spec; INSTANT is reserved (see the enum).
+  rentalMode        RentalMode  @default(REQUEST)
+
+  // ── The ≥1-ACTIVE-space invariant, as a CONSTRAINT (owner ruling 2026-09-24) ─
+  /// The ACTIVE Space this calendar is guaranteed to have. Required — a
+  /// Calendar structurally cannot exist without one (see the model comment).
+  primarySpaceId     String
+  /// MIRROR of `Space.status`, pinned to ACTIVE by a CHECK constraint, and the
+  /// second leg of the composite FK below. NEVER written by application code:
+  /// the CHECK makes `ACTIVE` the only value the column can ever hold, so the
+  /// column default is the whole story. It exists solely so the FK can name a
+  /// Space row whose status is literally ACTIVE.
+  primarySpaceStatus SpaceStatus @default(ACTIVE)
+
+  place           Place                  @relation("CalendarPlace", fields: [placeId], references: [id], onDelete: Cascade)
+  /// Composite FK → Space(id, status). NoAction on BOTH sides, deliberately:
+  /// - onUpdate: Cascade would propagate a retire into `primarySpaceStatus`
+  ///   and surface as the CHECK failing instead of the FK, which is a worse
+  ///   error and a worse story.
+  /// - NoAction (not Restrict) is what lets `DELETE FROM "Place"` cascade both
+  ///   Calendar and Space away in one statement: NO ACTION is checked at END
+  ///   of statement, by which time both rows are gone.
+  primarySpace    Space                  @relation("CalendarPrimarySpace", fields: [primarySpaceId, primarySpaceStatus], references: [id, status], onDelete: NoAction, onUpdate: NoAction)
+  defaultCategory Category?              @relation("CalendarDefaultCategory", fields: [defaultCategoryId], references: [id], onDelete: SetNull)
+  calendarSpaces  CalendarSpace[]
+  /// Composite FK → CalendarSpace(calendarId, spaceId) on (id, primarySpaceId):
+  /// THE PRIMARY MUST BE ONE OF THIS CALENDAR'S OWN JOINED ROOMS (owner ruling
+  /// 2026-09-24, second half; migration
+  /// 20260924160000_calendar_primary_space_joined). Because the referencing
+  /// side's first column is the Calendar's own `id`, one constraint says both
+  /// "the join row is mine" and "its space is my primary".
+  ///
+  /// The FK is `DEFERRABLE INITIALLY DEFERRED` in SQL, which Prisma CANNOT
+  /// express (prisma/prisma#8807 — introspection only flags the model as having
+  /// "non-default deferring rules"). The migration hand-writes the DDL. It is
+  /// declared HERE anyway, with an explicit `map:`, because Prisma must own the
+  /// name: VERIFIED with `migrate diff` that a schema omitting this relation
+  /// emits `DROP CONSTRAINT "Calendar_primary_space_joined_fkey"`, so SQL-only
+  /// would mean the next `db push` deletes the invariant. Also VERIFIED that
+  /// the differ reads the DEFERRABLE form in a live database as satisfying this
+  /// declaration, so `db push` will not de-deferrablise it either.
+  ///
+  /// DEFERRED IS LOAD-BEARING, not tidiness: Calendar and CalendarSpace
+  /// reference each other, so no statement order satisfies both at once when a
+  /// calendar is born. Anything creating a Calendar must create its primary's
+  /// join row in the SAME TRANSACTION — in autocommit each statement is its own
+  /// transaction and the deferred check still fires at the end of it.
+  ///
+  /// One-to-many, not one-to-one: 1:1 would make Prisma demand a redundant
+  /// `@@unique([id, primarySpaceId])` on a table whose `id` is already the
+  /// primary key. NoAction on both sides matches Prisma's own rendering and
+  /// keeps `DELETE FROM "Place"` cascading — the deferred check at commit finds
+  /// the referencing Calendar row already gone.
+  primaryJoin     CalendarSpace          @relation("CalendarPrimaryJoin", fields: [id, primarySpaceId], references: [calendarId, spaceId], onDelete: NoAction, onUpdate: NoAction, map: "Calendar_primary_space_joined_fkey")
+  availability    CalendarAvailability[]
+  // SetNull on calendar deletion — deleting a calendar must never delete events.
+  events          Event[]                @relation("EventCalendar")
+  bookingRequests BookingRequest[]       @relation("BookingRequestCalendar")
+  // Restrict — a calendar with holds can't be deleted until a delete path
+  // decides what to do with them (see BookingHold.calendar).
+  bookingHolds    BookingHold[]          @relation("BookingHoldCalendar")
+  // Cascade — a calendar-scoped grant dies with its calendar.
+  bookingGrants   PlaceBookingGrant[]    @relation("PlaceBookingGrantCalendar")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ── THE ≥1-ACTIVE-SPACE-PER-CALENDAR INVARIANT IS A DB CONSTRAINT ─────────
+  // Owner ruling 2026-09-24: this stopped being "guarded by application code
+  // under a cooperative advisory lock" and became a real constraint. Three
+  // pieces, only two of which Prisma can see:
+  //
+  //   1. `primarySpaceId` is NOT NULL and the composite FK
+  //      "Calendar_primarySpaceId_primarySpaceStatus_fkey"
+  //      (primarySpaceId, primarySpaceStatus) → Space(id, status) — declared
+  //      above, so Prisma owns its name and its DDL. Its target is the
+  //      `@@unique([id, status])` on Space.
+  //   2. SQL-ONLY: `CHECK ("primarySpaceStatus" = 'ACTIVE')`, constraint name
+  //      "Calendar_primary_space_active_check", added by migration
+  //      20260924120000_calendar_primary_space. Prisma cannot express CHECK
+  //      constraints (same posture as "BookingRequest_intent_shape_check" in
+  //      agreement.prisma and the partial unique noted below) — it is what
+  //      turns the FK from "references some Space" into "references an ACTIVE
+  //      Space", and therefore what makes a roomless Calendar unrepresentable.
+  //   3. The FK's row locks are what serialize a retire against a concurrent
+  //      space reassignment. That is why `lockCalendarSpaceGuard` (an advisory
+  //      lock) was DELETED on 2026-09-24 rather than kept alongside.
+  //
+  //   4. JOINED-NESS — that `primarySpaceId` is among the calendar's own
+  //      CalendarSpace joins — is the second composite FK
+  //      "Calendar_primary_space_joined_fkey" on `primaryJoin` above, added by
+  //      migration 20260924160000_calendar_primary_space_joined. It is
+  //      DEFERRABLE INITIALLY DEFERRED in SQL only (Prisma can express the FK
+  //      but not its deferrability), because the two tables reference each
+  //      other. Until 2026-09-24 this was a write-ordering convention in
+  //      packages/core/src/use-cases/places/_shared/calendar-active-space.ts;
+  //      that ordering STAYS, because it is what produces the friendly typed
+  //      errors, but it is no longer the thing the invariant rests on.
+  //
+  // The ≥1-CalendarSpace-JOIN rule (venue-confirmation-and-booking-intents
+  // spec) is still application-only — a join table cannot express "at least
+  // one row". `CalendarsRepo.create` takes `spaceIds` min 1 and `setSpaces`
+  // refuses an empty set; migration 20260902120000_venue_confirmation_and_
+  // booking_intents backfilled the pre-existing rows.
+  @@unique([placeId, slug])
+  @@index([placeId])
+  // FK maintenance on category deletion (SetNull scans by defaultCategoryId).
+  @@index([defaultCategoryId])
+  // NOTE: a partial unique index "Calendar_placeId_default_key" on (placeId)
+  // WHERE "isDefault" exists in SQL only (migration
+  // 20260818120000_venue_hierarchy_rooms_calendars) — Prisma can't express
+  // partial indexes (same pattern as "BookingRequest_open_pair_key",
+  // agreement.prisma). It backstops the one-default-calendar-per-place rule:
+  // a racing second default surfaces as P2002 on that index name.
+}
+
+/// M:N join — a Calendar schedules into one or more Spaces; a Space can serve
+/// many Calendars (FR-003).
+model CalendarSpace {
+  id         String @id @default(uuid())
+  calendarId String
+  spaceId    String
+
+  calendar Calendar @relation(fields: [calendarId], references: [id], onDelete: Cascade)
+  space    Space    @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  /// Back-relation of "Calendar_primary_space_joined_fkey": the calendar (at
+  /// most one, since the FK's first column is the Calendar's own `id`) whose
+  /// PRIMARY space this join row is. Declared as a list only because Prisma
+  /// would otherwise demand a redundant `@@unique([id, primarySpaceId])` on
+  /// Calendar — see `Calendar.primaryJoin`. Nothing reads it; it exists so
+  /// Prisma owns the constraint and `db push` cannot drop it.
+  primaryOfCalendars Calendar[] @relation("CalendarPrimaryJoin")
+
+  createdAt DateTime @default(now())
+
+  // The @@unique is calendarId-leading, so it also serves calendar → spaces
+  // lookups; @@index([spaceId]) covers the reverse direction. It is ALSO the
+  // TARGET of "Calendar_primary_space_joined_fkey" (a composite FK needs a
+  // unique key to reference), which is what makes the primary-is-joined
+  // invariant expressible at all. Do not drop it.
+  @@unique([calendarId, spaceId])
+  @@index([spaceId])
+}
+
+/// Availability windows + blackouts for a place's calendars (FR-007). THIS is
+/// the only model availability is read from OR written to: weekly windows
+/// (dayOfWeek) + specific-date exceptions, with an isOpen flag. It superseded
+/// the Place-level `PlaceAvailability` model, whose editor stack was retired on
+/// 2026-08-20, whose last reader (the public booking date picker
+/// `getPlaceBookingAvailability`) moved here, and whose table was dropped on
+/// 2026-08-21 by migration 20260821140000_drop_place_availability. Legacy rows
+/// were migrated here with `calendarId: null` by
+/// apps/api/src/scripts/backfill/done/backfill-venue-defaults.ts. See
+/// docs/specs/2026-08-18/completed/venue-hierarchy-and-holds.spec.yaml.
+///
+/// `calendarId` NULL = PLACE-WIDE row: applies to EVERY calendar of the place
+/// (venue closed = one blackout row, not N copies). `placeId` is always
+/// required so place-wide and per-calendar rows share one query path.
+model CalendarAvailability {
+  id         String  @id @default(uuid())
+  placeId    String
+  calendarId String?
+
+  dayOfWeek Int? // 0=Sun..6=Sat (null = specific date only)
+  date      DateTime? // specific date (null = recurring weekday)
+  startTime String? // "19:00" wall-clock in Place.timezone
+  endTime   String? // "23:00"
+  isOpen    Boolean   @default(true) // false = explicitly blocked (blackout)
+  note      String?
+
+  place    Place     @relation("CalendarAvailabilityPlace", fields: [placeId], references: [id], onDelete: Cascade)
+  calendar Calendar? @relation(fields: [calendarId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([placeId])
+  @@index([calendarId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Booking standards (docs/specs/2026-09-25/venue-booking-standards.spec.yaml)
+//
+// What a venue expects in a pitch, per intent: an ordered checklist
+// (BookingStandardItem) plus up to three example pitches
+// (BookingPitchExample). Owned by a CALENDAR (its own list) or a PLACE (the
+// default every calendar without rows for that intent inherits); with neither,
+// the platform defaults apply — those are code constants in core, not rows.
+// Resolution is `resolveBookingStandards` in
+// packages/core/src/use-cases/booking-standards/.
+//
+// OWNER PAIR IS POLYMORPHIC, NO FK — the (ownerType, ownerId) pattern of
+// EntityPage / InviteList / VolunteerAsk. The spec's "cascade on owner
+// delete" is therefore NOT enforced by the database. What happens today:
+//   - Calendar has no delete path anywhere in the app.
+//   - A Place is removed only by `PlacesRepo.deletePlace` (no core caller) and
+//     by the e2e reset routes' raw `place.deleteMany`; both cascade the
+//     place's Calendars in SQL, where no adapter hook could see them.
+// So rows can orphan. That is harmless — every read is BY owner id, and a
+// uuid never comes back — but ANY FUTURE hard-delete of a Calendar or Place
+// must delete that owner's rows here (both tables, every intent) in the same
+// transaction.
+//
+// Caps (≤ 12 items, ≤ 3 examples per owner + intent) are enforced in core,
+// not SQL. Writes are replace-all per (owner, intent), so sortOrder is always
+// 0..n-1 within one.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One line of a venue's "what a pitch must include" list (FR-001).
+model BookingStandardItem {
+  id          String                     @id @default(uuid())
+  ownerType   BookingStandardOwnerType
+  /// Place.id or Calendar.id per `ownerType`. Plain id, no FK (see above).
+  ownerId     String
+  intent      BookingIntent
+  field       BookingStandardField
+  /// The venue's wording — what the requester reads, and what an unmet
+  /// REQUIRED item's error says. Plain text (NFR-001), sanitized in core.
+  label       String                     @db.VarChar(80)
+  /// Optional guidance under the label. Plain text, no links (NFR-001).
+  hint        String?                    @db.VarChar(240)
+  /// SQL-only CHECK "BookingStandardItem_custom_is_suggested_check":
+  /// field = CUSTOM ⇒ requirement = SUGGESTED (D2a). Prisma cannot express
+  /// it; migration 20260925170000_booking_standards adds it.
+  requirement BookingStandardRequirement
+  sortOrder   Int
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Serves every read (owner-keyed, one intent or all, in display order) and
+  // the replace-all delete.
+  @@index([ownerType, ownerId, intent, sortOrder])
+}
+
+/// A venue-written example pitch (FR-002). Platform examples are NOT rows —
+/// they live in core as i18n keys and are appended after these at resolution.
+model BookingPitchExample {
+  id        String                   @id @default(uuid())
+  ownerType BookingStandardOwnerType
+  /// Place.id or Calendar.id per `ownerType`. Plain id, no FK (see above).
+  ownerId   String
+  intent    BookingIntent
+  title     String                   @db.VarChar(80)
+  /// Plain multi-line text (NFR-001), sanitized in core.
+  body      String                   @db.VarChar(1500)
+  sortOrder Int
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerType, ownerId, intent, sortOrder])
+}
+
+/// Two-party conversation on a booking request — the request IS the thread
+/// (no separate thread row; lastMessageAt is denormalized onto
+/// BookingRequest). Modeled on SupportMessage (support.prisma); see
+/// docs/specs/2026-07-14/completed/booking-conversation-and-event-step.spec.yaml FR-001.
+///
+/// Since the system-entry migration this table is also the booking's LEDGER:
+/// human messages interleave with SYSTEM rows recording every lifecycle
+/// transition (request opened/viewed/expired, agreement countered/accepted,
+/// event created/modified). A SYSTEM row is identified by
+/// `authorSide = SYSTEM` AND a non-null `systemKind`.
+model BookingRequestMessage {
+  id               String @id @default(uuid())
+  bookingRequestId String
+
+  authorSide BookingMessageAuthorSide
+
+  /// The human who authored the message, when applicable. Null for anonymous
+  /// performer-side messages. No FK relation — kept as a plain id (mirrors
+  /// SupportMessage.authorHumanId) so system/guest messages never couple to a
+  /// Human row.
+  ///
+  /// SYSTEM rows DO populate this when a human caused the transition ("pulled
+  /// back by Dana"): `authorSide` stays SYSTEM (that is what keeps the row out
+  /// of unread counts and out of mine/theirs bubble alignment) while this
+  /// column answers "who". Null on machine-caused entries — the expiry sweep,
+  /// a webhook, a backfill.
+  authorHumanId String?
+
+  /// Human message text. EMPTY STRING on SYSTEM rows, deliberately: an entry's
+  /// sentence is rendered from `systemKind` + `systemData` through the en/es
+  /// i18n catalogs. A hardcoded English sentence in this column would be
+  /// unlocalizable and could not carry links to the agreement/event or
+  /// locale-formatted dates.
+  body String @db.Text
+
+  /// SYSTEM-entry discriminator, e.g. "booking_agreement.countered". Null on
+  /// every human message (which is why the migration needs no backfill).
+  ///
+  /// A PLAIN STRING validated in app code (union + zod map in
+  /// packages/core/.../messages/_shared/system-entries.ts), NOT a Prisma enum
+  /// — the same house style as ImageModerationRecord.kind,
+  /// PendingObjectDeletion.status and Settlement.status. It keeps the taxonomy
+  /// in code, so adding a kind (e.g. the deferred `booking_hold.*` family) is a
+  /// pure data addition with no migration and no deploy-ordering hazard.
+  systemKind String?
+
+  /// The params an entry's copy interpolates, e.g.
+  /// `{ "agreementId": "...", "actorSide": "VENUE" }`. Shape is per-kind and
+  /// zod-validated on write by the single append helper; nothing else may
+  /// write this column. Null on human messages.
+  ///
+  /// Timestamps inside are ISO-8601 STRINGS (Json has no date type) — the
+  /// per-kind schemas use `z.string().datetime()` so write and read agree.
+  systemData Json?
+
+  /// Simple read receipt — set when the counterparty has seen the message.
+  /// NEVER stamped on SYSTEM rows: since the system-entry migration a system
+  /// entry can never be unread (unread means "a human is waiting on you"), so
+  /// both `markRead` and `countUnreadByRequest` exclude SYSTEM entirely and
+  /// this column stays null on them for the row's whole life.
+  readAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  bookingRequest BookingRequest @relation(fields: [bookingRequestId], references: [id], onDelete: Cascade)
+
+  // Thread reads are always "this request, chat order" — the timeline renders
+  // the WHOLE thread and never filters by kind, so this one index still serves
+  // every read. DELIBERATELY NO INDEX ON systemKind: it would add write cost
+  // for zero readers. If a future emitter needs "log this transition at most
+  // once" it should ask for a PARTIAL UNIQUE index on
+  // (bookingRequestId, systemKind) WHERE "systemKind" IS NOT NULL — an
+  // idempotency constraint, not a lookup index — and that is a decision for
+  // the kind that needs it, not a speculative index now.
+  @@index([bookingRequestId, createdAt])
+}

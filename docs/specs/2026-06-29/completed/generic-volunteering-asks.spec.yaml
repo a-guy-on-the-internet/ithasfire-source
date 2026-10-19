@@ -1,0 +1,542 @@
+# generic-volunteering-asks.spec.yaml
+#
+# Standalone (non-event) volunteering asks that a Place, Org, or Human can post,
+# plus volunteer groups with a per-group assigned coordinator.
+
+version: "1.0"
+updated: "2026-06-29"
+status: draft
+priority: P2 # High Value
+depends_on:
+  - packages/db/prisma/volunteer.prisma # EventVolunteerRole, EventVolunteerShift, VolunteerSignup, VolunteerRoleTemplate
+  - packages/db/prisma/place.prisma # Place, PlaceOwnership
+  - packages/db/prisma/org.prisma # Organization, OrgMember (OrgRole)
+  - packages/db/prisma/auth.prisma # Human, HumanDelegate
+  - docs/specs/2026-04-24/volunteer-shift-schedule-timeline.spec.yaml # existing event volunteering
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Volunteering today is hard-coupled to a single Event: roles, shifts, and
+    signups all hang off `eventId`. But venues and organizers recruit volunteers
+    for things that aren't one event — a Place needs a standing pool of
+    door/bar/setup help across its whole calendar, an org runs an ongoing
+    street-team, and an individual host (Human) wants a few hands for a recurring
+    living-room series. There is no way to post a generic "we need volunteers"
+    ask against a Place, Org, or Human, and no way to organize the people who
+    respond into manageable groups with someone other than a full org admin
+    running them.
+  solution: >
+    Introduce a generic `VolunteerAsk` whose subject is polymorphic
+    (PLACE | ORG | HUMAN | EVENT). Roles and signups generalize to hang off an
+    ask instead of strictly an event; the existing event volunteering tables
+    become the EVENT-subject case of the same model so there is one signup
+    inbox, one review flow, one waiver path. Add `VolunteerGroup` — a named
+    bucket of volunteers within an ask — with a single assigned coordinator
+    (a Human) who can review and manage that group's signups without holding
+    org-wide admin rights, enforced by a scoped authz check. Round out the
+    coordination story with the tooling a standing pool actually needs: one-way
+    roster/group broadcasts, a derived per-volunteer reliability rollup
+    (checked-in vs no-show history) to guide assignment, automatic no-show
+    marking, and `.ics` calendar export. (Volunteer comp/perk tickets are a
+    deliberate sibling spec — they touch the money path.)
+  users:
+    - Place owners / venue managers recruiting standing help
+    - Organizers (Org) running ongoing programs or street teams
+    - Individual hosts (Human) recruiting for a recurring series
+    - Volunteers responding to an ask (logged-in or contact-email-only)
+    - Coordinators managing a single group without org-admin access
+  surfaces:
+    - web
+    - mobile # responder + coordinator check-in views reuse existing volunteer screens
+
+# ── Decisions (carry into implementation) ─────────────────────────────────────
+
+decisions:
+  generalize_not_fork: >
+    We do NOT build a parallel volunteering stack. `VolunteerAsk` becomes the
+    container; event volunteering is the `subjectType = EVENT` case. Existing
+    `EventVolunteerRole` / `VolunteerSignup` rows get an `askId` and are
+    backfilled by a one-time migration that creates an EVENT-subject ask per
+    event that currently has `volunteeringEnabled = true`.
+  polymorphic_subject: >
+    Subject is `(subjectType, subjectId)` rather than four nullable FKs, matching
+    the existing `BookingRequest.performerOwnerType/OwnerId` precedent in
+    agreement.prisma. `orgId` is denormalized onto the ask (nullable) so org-owned
+    asks get fast permission checks and appear in org dashboards.
+  one_coordinator_v1: >
+    A group has at most ONE coordinator (`coordinatorHumanId`, nullable), matching
+    the literal request ("a particular coordinator"). Multi-coordinator is an
+    explicit open question, not built now. A coordinator need not be an OrgMember.
+  coordinator_scope: >
+    Coordinator authority is a new authz scope, NOT an OrgRole. A coordinator can
+    review/approve/reject/withdraw/check-in/assign signups WITHIN their group and
+    read that group's roster. They cannot edit the ask, create roles, create other
+    groups, or touch signups outside their group.
+  signup_assignment: >
+    A signup is assigned to a group via `groupId` (nullable). Assignment is a
+    separate step from approval — unassigned approved volunteers sit in the ask's
+    general pool until an admin or any coordinator pulls them into a group.
+  contact_email_first: >
+    Reuse the existing pattern: `contactEmail` is the primary identifier captured
+    before account linkage; `humanId` is filled in when/if the responder has or
+    creates an account. Uniqueness moves from `(eventId, roleId, contactEmail)` to
+    `(askId, roleId, contactEmail)`.
+  cadence: >
+    Asks carry a `cadence` (ONE_TIME | ONGOING | RECURRING) and optional
+    `startsAt`/`endsAt`. ONGOING asks have no end and stay OPEN until closed.
+    Shifts remain an EVENT-subject concern for v1 (no generic scheduling yet).
+  broadcast_messaging: >
+    Coordinators and owners can broadcast a message to a roster. Scope mirrors
+    authz: an owner can message the whole ask (any role/group/pool); a coordinator
+    can message ONLY their group. Broadcasts go out over MailerPort + the in-app
+    Notification model, respect NotificationPreference, and are logged as a
+    `VolunteerBroadcast` row for audit + idempotency. Replies are out of scope v1
+    (one-way announce, reply-to set to the sender's org/ask contact).
+  reliability_derived: >
+    A volunteer's reliability is DERIVED, not a stored trust score: computed from
+    their own signup history (checked-in vs no-show vs withdrawn over the last N
+    completed signups). We cache a lightweight rollup on the signup's Human for
+    fast roster display, recomputed by the same job that auto-marks no-shows. It
+    is an organizer-facing assignment aid, never shown to other volunteers.
+  auto_no_show: >
+    `NO_SHOW` becomes automatic: a cron flips APPROVED (not CHECKED_IN) signups to
+    NO_SHOW once their shift/ask window has ended plus a grace period, then nudges
+    the reliability rollup. Admins/coordinators can still override back to
+    CHECKED_IN. This is what makes the reliability number trustworthy.
+  ics_export: >
+    Every signup with a time window exposes an `.ics` (per-signup, and an
+    aggregate "all my volunteering" feed). Pure server-side generation — no new
+    port. Reduces no-shows and pairs with the existing reminder job.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        A Place owner, Org member (EDITOR+), or a Human (for themselves, or a
+        delegate acting for them) can create a `VolunteerAsk` with a title,
+        description, cadence, optional date window, optional capacity, and the
+        knobs that exist today on Event (autoApprove, waiverRequired, smsOptIn,
+        a JSON application form / `answers` schema).
+    - id: FR-002
+      description: >
+        An ask has one or more `VolunteerRole`s (name, description, capacity,
+        optional waiver template). Roles generalize the current
+        `EventVolunteerRole`; org-level `VolunteerRoleTemplate`s can seed them.
+    - id: FR-003
+      description: >
+        Anyone with the ask's public link can submit a signup against a role with
+        contactEmail (required), contactName, contactPhone, smsOptIn, free-form
+        answers, and waiver acceptance when required. Logged-in users auto-link
+        `humanId`.
+    - id: FR-004
+      description: >
+        Ask owners can create `VolunteerGroup`s (name, description, optional
+        capacity) under an ask and assign exactly one coordinator Human to each.
+        Assigning a coordinator who has no account yet sends an invite by email.
+    - id: FR-005
+      description: >
+        Approved signups can be assigned to / moved between / removed from groups.
+        A coordinator can pull unassigned approved signups in the ask's general
+        pool into their own group, and can release members back to the pool.
+    - id: FR-006
+      description: >
+        A coordinator can list, review (approve/reject), withdraw, and check in
+        the signups that belong to THEIR group, and read that group's roster and
+        contact details. They cannot act on signups outside their group or edit
+        the ask/roles/groups.
+    - id: FR-007
+      description: >
+        Owners see the whole ask: every role, every group, the general pool, and
+        per-group coordinator and fill counts. Closing/pausing an ask stops new
+        signups but preserves the roster.
+    - id: FR-008
+      description: >
+        Notifications: responder gets a confirmation + decision email; an assigned
+        coordinator gets notified when a new signup lands in their group (or in the
+        general pool if the ask has groups but no assignment yet); a newly assigned
+        coordinator gets an "you're coordinating <group>" email. Reuse MailerPort
+        and the in-app Notification model; respect NotificationPreference.
+    - id: FR-009
+      description: >
+        Roster broadcast: an owner can send a one-way announcement to a whole ask
+        or a chosen role/group/general-pool; a coordinator can send only to their
+        group. Delivery is email + in-app, respects NotificationPreference, and is
+        recorded as a VolunteerBroadcast (sender, scope, subject, body, counts).
+    - id: FR-010
+      description: >
+        Volunteer reliability + history: organizers and a group's coordinator can
+        see a volunteer's cross-event history (signups, hours, checked-in / no-show
+        counts) and a derived reliability rollup, surfaced inline on roster rows to
+        aid group assignment. Never exposed to other volunteers (NFR-003).
+    - id: FR-011
+      description: >
+        Auto no-show: a scheduled job marks APPROVED-but-not-CHECKED_IN signups as
+        NO_SHOW after the shift/ask window ends + a grace period, and recomputes the
+        reliability rollup. Owners/coordinators can override back to CHECKED_IN.
+    - id: FR-012
+      description: >
+        Calendar export: each time-bound signup exposes a per-signup `.ics`, and a
+        volunteer can subscribe to an aggregate "my volunteering" `.ics` feed of all
+        their upcoming shifts. Server-generated, token-authenticated for the feed.
+  non_functional:
+    - id: NFR-001
+      description: >
+        Migration is backward compatible: existing event volunteering UI/queries
+        keep working. The backfill creates one EVENT-subject ask per
+        volunteering-enabled event and stamps `askId` onto its roles and signups
+        in a single transaction with a dry-run + idempotent re-run guard.
+    - id: NFR-002
+      description: >
+        Coordinator authz is enforced in core use cases (not just UI). Every
+        coordinator action verifies the actor coordinates the group the target
+        signup belongs to, in the same `repos.tx()` that performs the mutation.
+    - id: NFR-003
+      description: >
+        No PII leakage across groups: a coordinator query never returns signups,
+        contact emails, or answers for groups they don't coordinate.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: create-volunteer-ask
+        description: Create an ask against a PLACE | ORG | HUMAN | EVENT subject.
+        input: "{ actorHumanId, subjectType, subjectId, title, description, cadence, startsAt?, endsAt?, capacity?, autoApprove?, waiverRequired?, formSchema? }"
+        output: "{ ok: true, askId: uuid }"
+        idempotent: false
+        money: false
+      - name: update-volunteer-ask
+        description: Edit ask fields; change status (DRAFT|OPEN|PAUSED|CLOSED|ARCHIVED).
+        input: "{ actorHumanId, askId, patch }"
+        output: "{ ok: true }"
+      - name: add-volunteer-role
+        description: Add/edit a role under an ask (optionally from a role template).
+        input: "{ actorHumanId, askId, name, description?, capacity?, waiverTemplateId? }"
+        output: "{ ok: true, roleId: uuid }"
+      - name: create-volunteer-group
+        description: Create a group under an ask.
+        input: "{ actorHumanId, askId, name, description?, capacity? }"
+        output: "{ ok: true, groupId: uuid }"
+      - name: assign-group-coordinator
+        description: Set/replace/clear the single coordinator on a group; invite if no account.
+        input: "{ actorHumanId, groupId, coordinatorHumanId | coordinatorEmail | null }"
+        output: "{ ok: true }"
+      - name: submit-volunteer-signup
+        description: Public-facing signup against a role (generalizes existing event signup).
+        input: "{ actorHumanId?, askId, roleId, contactEmail, contactName?, contactPhone?, smsOptIn?, answers?, waiverAccepted?, ipAddress?, userAgent? }"
+        output: "{ ok: true, signupId: uuid }"
+        idempotent: true # keyed on (askId, roleId, contactEmail)
+      - name: review-volunteer-signup
+        description: Approve/reject a signup. Actor is ask owner OR coordinator of the signup's group.
+        input: "{ actorHumanId, signupId, decision: APPROVED|REJECTED, notes? }"
+        output: "{ ok: true }"
+      - name: assign-signup-to-group
+        description: Move a signup into / between / out of a group; enforces coordinator scope.
+        input: "{ actorHumanId, signupId, groupId | null }"
+        output: "{ ok: true }"
+      - name: check-in-volunteer
+        description: Mark a group member checked-in / no-show. Owner or that group's coordinator.
+        input: "{ actorHumanId, signupId, state: CHECKED_IN|NO_SHOW }"
+        output: "{ ok: true }"
+      - name: list-ask-roster
+        description: Owner view — roles, groups, general pool, fill counts.
+        input: "{ actorHumanId, askId }"
+        output: "{ ask, roles[], groups[], generalPool[] }"
+      - name: list-coordinator-roster
+        description: Coordinator view — only the actor's group(s) for the ask.
+        input: "{ actorHumanId, askId }"
+        output: "{ groups[] }"
+      - name: broadcast-to-roster
+        description: One-way announcement to a scoped audience; owner=any scope, coordinator=own group only.
+        input: "{ actorHumanId, askId, scope: { roleId? | groupId? | pool? | all }, subject, body }"
+        output: "{ ok: true, broadcastId: uuid, recipientCount: int }"
+        idempotent: true # keyed on broadcastId to prevent double-send on retry
+      - name: get-volunteer-reliability
+        description: Cross-event history + derived reliability rollup for a Human (organizer/coordinator only).
+        input: "{ actorHumanId, targetHumanId, askId }"
+        output: "{ signupsCompleted, hoursTotal, checkedIn, noShows, withdrawn, reliability }"
+      - name: export-signup-ics
+        description: Generate a per-signup .ics for a time-bound signup.
+        input: "{ actorHumanId?, signupId, token? }"
+        output: "{ icsBody: string }"
+      - name: export-my-volunteering-ics
+        description: Token-authenticated aggregate .ics feed of a volunteer's upcoming shifts.
+        input: "{ humanId, feedToken }"
+        output: "{ icsBody: string }"
+  ports:
+    new:
+      - VolunteerAskRepo # CRUD asks
+      - VolunteerGroupRepo # CRUD groups, coordinator assignment, membership moves
+    existing:
+      - VolunteerSignupRepo # extend for askId/groupId
+      - VolunteerRoleRepo # generalize EventVolunteerRole access
+      - AuthZPort # add coordinator-scope check helper
+      - MailerPort
+      - NotificationRepo
+      - IdempotencyPort
+      - ClockPort
+  adapters:
+    new:
+      - packages/adapters/src/db/prisma/volunteer-ask-repo.ts
+      - packages/adapters/src/db/prisma/volunteer-group-repo.ts
+    modified:
+      - packages/adapters/src/db/prisma/volunteer-signup-repo.ts # askId, groupId
+  transport:
+    trpc_procedures:
+      - volunteering.createAsk
+      - volunteering.updateAsk
+      - volunteering.addRole
+      - volunteering.createGroup
+      - volunteering.assignCoordinator
+      - volunteering.submitSignup # public
+      - volunteering.reviewSignup
+      - volunteering.assignSignupToGroup
+      - volunteering.checkIn
+      - volunteering.askRoster
+      - volunteering.coordinatorRoster
+      - volunteering.broadcast
+      - volunteering.volunteerReliability
+      - volunteering.signupIcs # public, token-auth
+      - volunteering.myVolunteeringIcs # public, feed-token-auth
+  ui:
+    pages:
+      - apps/web/src/app/(dashboard)/places/[placeId]/volunteers # place-owned asks
+      - apps/web/src/app/(dashboard)/orgs/[slug]/volunteers # org-owned asks
+      - apps/web/src/app/(dashboard)/me/volunteers # human-owned asks
+      - apps/web/src/app/v/[askId] # public signup page (generic; mirrors event signup)
+      - apps/web/src/app/(dashboard)/volunteers/coordinate/[askId] # coordinator console
+    components:
+      - VolunteerAskForm
+      - VolunteerGroupCard # name, coordinator, fill count, member list
+      - CoordinatorPicker # search Human or invite by email
+      - SignupReviewRow # reused across owner + coordinator views; shows reliability chip
+      - GroupAssignmentMenu # move signup between groups / pool
+      - BroadcastComposer # subject + body + scope picker (owner: any; coordinator: own group)
+      - VolunteerReliabilityChip # checked-in/no-show ratio + history popover on roster rows
+      - AddToCalendarButton # per-signup .ics download + subscribe-to-feed link
+
+# ── Data Model ───────────────────────────────────────────────────────────────
+
+data:
+  new_enums:
+    - >
+      VolunteerSubjectType { PLACE  ORG  HUMAN  EVENT }
+    - >
+      VolunteerAskStatus { DRAFT  OPEN  PAUSED  CLOSED  ARCHIVED }
+    - >
+      VolunteerAskCadence { ONE_TIME  ONGOING  RECURRING }
+  new_models:
+    - >
+      VolunteerAsk
+        id           String @id @default(uuid())
+        subjectType  VolunteerSubjectType
+        subjectId    String                      // Place.id | Organization.id | Human.id | Event.id
+        orgId        String?                     // denormalized owner for org-scoped perms/dashboards
+        title        String
+        description  String?
+        status       VolunteerAskStatus  @default(DRAFT)
+        cadence      VolunteerAskCadence @default(ONE_TIME)
+        startsAt     DateTime?
+        endsAt       DateTime?
+        capacity     Int?
+        autoApprove     Boolean @default(false)
+        waiverRequired  Boolean @default(false)
+        smsOptInEnabled Boolean @default(false)
+        formSchema   Json    @default("{}")      // application questions
+        createdAt DateTime @default(now())
+        updatedAt DateTime @updatedAt
+        roles  VolunteerRole[]
+        groups VolunteerGroup[]
+        // @@index([subjectType, subjectId])
+        // @@index([orgId, status])
+    - >
+      VolunteerGroup
+        id              String  @id @default(uuid())
+        askId           String
+        name            String
+        description     String?
+        capacity        Int?
+        coordinatorHumanId String?               // single coordinator (v1)
+        createdAt DateTime @default(now())
+        updatedAt DateTime @updatedAt
+        ask         VolunteerAsk @relation(fields: [askId], references: [id], onDelete: Cascade)
+        coordinator Human?       @relation("VolunteerGroupCoordinator", fields: [coordinatorHumanId], references: [id], onDelete: SetNull)
+        members     VolunteerSignup[]
+        // @@index([askId])
+        // @@index([coordinatorHumanId])
+    - >
+      VolunteerBroadcast — audit + idempotency ledger for roster announcements.
+        id            String  @id @default(uuid())
+        askId         String
+        senderHumanId String
+        scopeType     String                       // ALL | ROLE | GROUP | POOL
+        scopeId       String?                       // roleId | groupId when scoped
+        subject       String
+        body          String
+        recipientCount Int    @default(0)
+        createdAt DateTime @default(now())
+        ask    VolunteerAsk @relation(fields: [askId], references: [id], onDelete: Cascade)
+        sender Human        @relation("VolunteerBroadcastSender", fields: [senderHumanId], references: [id], onDelete: Cascade)
+        // @@index([askId, createdAt])
+        // @@index([senderHumanId])
+  modified_models:
+    - >
+      VolunteerSignup — add `askId String?` (FK -> VolunteerAsk, onDelete Cascade),
+      `groupId String?` (FK -> VolunteerGroup, onDelete SetNull). Make `eventId`
+      NULLABLE (was required). New uniqueness `@@unique([askId, roleId, contactEmail])`
+      alongside the legacy event one during transition. Add `@@index([askId, status])`
+      and `@@index([groupId])`.
+    - >
+      EventVolunteerRole — add nullable `askId` so a role can be owned by a generic
+      ask; rename/alias toward a shared `VolunteerRole` view. Event roles keep
+      `eventId`; generic roles set `askId`.
+    - >
+      Human — add back-relation `coordinatingGroups VolunteerGroup[] @relation("VolunteerGroupCoordinator")`
+      and `volunteerBroadcasts VolunteerBroadcast[] @relation("VolunteerBroadcastSender")`. Add a
+      reliability rollup cache: `volunteerSignupsCompleted Int @default(0)`,
+      `volunteerNoShows Int @default(0)`, `volunteerCheckedIn Int @default(0)`,
+      `volunteerReliabilityUpdatedAt DateTime?`. Add an `.ics` feed token:
+      `volunteerIcsFeedToken String? @unique` (lazily minted on first subscribe).
+      Rollup fields are a DERIVED cache (NFR), recomputed by the auto-no-show job —
+      never the source of truth, never user-editable.
+    - >
+      Place / Organization — optional convenience back-relations to asks via the
+      polymorphic subject are resolved in the repo layer (no hard FK, matching
+      BookingRequest precedent).
+  migrations_needed: true
+  migration_plan: >
+    (1) Add new enums + VolunteerAsk + VolunteerGroup tables, additive columns on
+    VolunteerSignup/EventVolunteerRole (all nullable). (2) Backfill: for each Event
+    with volunteeringEnabled = true, create one VolunteerAsk(subjectType=EVENT,
+    subjectId=event.id, orgId=event.orgId), stamp askId on its roles and signups.
+    Idempotent (skip events that already have an EVENT-subject ask). (3) Leave
+    eventId populated for backward-compatible queries; new code reads via askId.
+
+# ── Jobs / Pipelines ─────────────────────────────────────────────────────────
+
+jobs:
+  - name: volunteers.auto-no-show
+    schedule: every 15 min
+    description: >
+      Find APPROVED signups whose shift/ask window ended more than <grace> ago and
+      that were never CHECKED_IN; mark them NO_SHOW. Idempotent (only transitions
+      APPROVED→NO_SHOW). After each batch, recompute the affected Humans' reliability
+      rollup (volunteerSignupsCompleted / volunteerNoShows / volunteerCheckedIn).
+    location: apps/jobs/src/jobs/volunteers.ts # extend existing volunteer jobs file
+    note: >
+      Reliability is recomputed by this job rather than on every status write, so the
+      rollup may lag check-in by up to one tick — acceptable for an assignment aid.
+
+# ── Authorization ────────────────────────────────────────────────────────────
+
+authz:
+  ownership_by_subject:
+    PLACE: actor has PlaceOwnership on subjectId, OR is OrgMember(EDITOR+) of the place's org
+    ORG: actor is OrgMember(EDITOR+) of subjectId
+    HUMAN: actor is subjectId, OR a HumanDelegate acting for subjectId
+    EVENT: actor can manage the event (existing event-manage check)
+  coordinator_scope:
+    grant: VolunteerGroup.coordinatorHumanId == actorHumanId
+    may: [list group roster, review signup in group, assign/move within own group, pull from general pool, check-in group member]
+    may_not: [edit ask, create/edit roles, create groups, assign coordinators, act on other groups' signups, read other groups' rosters]
+  note: >
+    Coordinator scope is checked inside each use case against the target signup's
+    `groupId`. A coordinator pulling from the general pool is allowed only to move a
+    signup INTO their own group (never another group).
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A Place owner can create an OPEN ongoing ask with two roles and receive a public link.
+  - An Org EDITOR can create an org-subject ask; it shows on the org dashboard.
+  - A Human can create an ask for themselves; a delegate can create one on their behalf.
+  - A logged-out visitor can submit a signup with contactEmail; resubmitting the same email to the same role is idempotent (no duplicate).
+  - An owner can create a group, assign a coordinator who has no account, and that coordinator receives an invite email.
+  - The assigned coordinator can approve and check in members of their group but gets `forbidden` when acting on another group's signup or editing the ask.
+  - A coordinator can pull an unassigned approved signup from the general pool into their group, and cannot move it into a different group.
+  - list-coordinator-roster returns only the actor's group(s); no other group's PII appears.
+  - The backfill migration creates exactly one EVENT-subject ask per volunteering-enabled event and is safe to re-run.
+  - Existing event volunteering pages and queries continue to function unchanged after migration.
+  - An owner can broadcast to the whole ask and a coordinator can broadcast only to their group; a coordinator targeting another group/scope gets `forbidden`.
+  - Each broadcast writes one VolunteerBroadcast row with an accurate recipientCount and never double-sends on retry.
+  - A roster row shows a volunteer's checked-in/no-show counts and reliability; the same data is NOT returned to other volunteers.
+  - The auto-no-show job flips a past-window APPROVED signup to NO_SHOW, leaves CHECKED_IN untouched, and is safe to run repeatedly.
+  - A volunteer can download a per-signup .ics and subscribe to a token-authenticated "my volunteering" feed that lists only their upcoming shifts.
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Generalizing VolunteerSignup (nullable eventId + new askId) touches a hot,
+      already-shipped table and its unique constraints.
+    severity: HIGH
+    mitigation: >
+      Additive nullable columns + dual uniqueness during transition; backfill in a
+      single guarded tx; keep eventId populated so legacy reads never break; ship
+      behind a read-path feature check.
+  - risk: >
+      Coordinator authz scope is a new trust boundary; a missed check leaks
+      cross-group volunteer PII.
+    severity: HIGH
+    mitigation: >
+      Enforce in core (NFR-002/003), add a dedicated authz helper, and write
+      negative-path tests for every coordinator use case.
+  - risk: >
+      Polymorphic subject has no DB-level FK, so orphaned asks are possible if a
+      Place/Org/Human is hard-deleted.
+    severity: MEDIUM
+    mitigation: >
+      Resolve-and-validate subject existence on create; sweep/soft-close asks when
+      a subject is archived (subjects are archived, not hard-deleted, per status enums).
+
+open_questions:
+  - Multiple coordinators per group (join model VolunteerGroupCoordinator) — defer or build now?
+  - Should generic (non-EVENT) asks support shifts/scheduling in v1, or is the date window enough?
+  - Cross-ask reusable groups / standing volunteer pool at the Org level, or strictly ask-scoped?
+  - Do coordinators get a mobile check-in surface in v1, or web-only first?
+  - Recurrence semantics for cadence=RECURRING — do we generate occurrences, or is it just a label?
+  - Reliability window — last N completed signups, trailing 12 months, or all-time? And is there a minimum-sample threshold before a rollup is shown (to avoid judging a 1-event volunteer)?
+  - Broadcast reply handling — strictly one-way v1, or set reply-to so volunteers can respond to the organizer/coordinator out-of-band?
+  - Should the auto-no-show grace period be global or per-ask configurable?
+  - Comp/perk tickets for volunteers are intentionally OUT of this spec — see the companion volunteer-comp-tickets spec.
+
+# ── Resolutions (user decisions, 2026-07-01) ─────────────────────────────────
+# These OVERRIDE the sections above where they conflict.
+
+resolutions:
+  date: "2026-07-01"
+  decisions:
+    - id: no_show_dropped
+      resolution: >
+        The no-show concept is dropped ENTIRELY. FR-011 and the
+        volunteers.auto-no-show job are cut. The `NO_SHOW` value on
+        `VolunteerSignupStatus` stays untouched in the enum for legacy rows —
+        no new code path sets it.
+    - id: reliability_cut
+      resolution: >
+        Reliability / volunteer judging is cut. FR-010 is reduced to nothing:
+        no derived rollup, no cached Human columns
+        (volunteerSignupsCompleted / volunteerNoShows / volunteerCheckedIn /
+        volunteerReliabilityUpdatedAt), no VolunteerReliabilityChip.
+    - id: default_hours
+      resolution: >
+        Generic (ask-owned) roles get an optional owner-editable
+        `EventVolunteerRole.defaultHours Decimal(5,2)` that is stamped onto
+        `signup.hoursWorked` at check-in for ask-based roles that have no
+        shift to derive a duration from.
+    - id: scheduling_window_only
+      resolution: >
+        Scheduling v1 = the ask's optional startsAt/endsAt window plus the
+        cadence label only. No generic shift model, no occurrence generation
+        for cadence=RECURRING (it is just a label). Shifts remain
+        EVENT-subject only.
+    - id: stands_as_specced
+      resolution: >
+        Single coordinator per group, ask-scoped groups (no cross-ask pools),
+        web-only coordinator surface for v1, and one-way broadcasts all stand
+        exactly as specced.

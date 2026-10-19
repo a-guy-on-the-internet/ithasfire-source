@@ -1,0 +1,110 @@
+# Spec: Event Search Indexing + Embedding Jobs
+meta:
+  owner: search-platform
+  status: draft
+  reviewers:
+    - core
+    - adapters
+    - data
+  last_updated: 2025-11-25
+summary: |
+  Define the asynchronous pipeline that materializes event search documents, generates semantic embeddings,
+  and pushes them into the new `SearchIndexPort`. Covers both near-real-time fan-out (publish/update/delete)
+  and periodic reindex jobs for drift recovery.
+scope:
+  included:
+    - Event publish/update/delete triggers flowing through jobs package.
+    - Embedding generation (OpenAI/Text-Embedding-3-Large initially) with retry + budget tracking.
+    - Index upsert/delete batching and monitoring.
+    - Scheduled reindex for parity + backfills.
+  excluded:
+    - UI/transport wiring (handled in separate specs).
+    - Organizer-curated prompts (handled by analytics/marketing follow-up).
+    - Non-event entities (venues, organizers) — to be spec’d later if needed.
+workflow:
+  trigger_sources:
+    - prisma hooks: `events` table `AFTER INSERT/UPDATE` emits message onto `jobs.event-search-index`
+  - manual backfill CLI: `pnpm -C apps/jobs search:index --org <id>`
+    - cron reindex: nightly job ensures embeddings refreshed when model version changes
+  pipeline_steps:
+    - fetchCanonicalEvent → load joins (organizer, venue, tags) via Prisma read replica
+    - normalizeEvent → produce `SearchDocument` (per backend spec) minus embedding vector
+    - ensureEmbedding → call `EmbeddingProviderPort` with text payload, store vector + version
+    - applyBatchBoosts → read aggregated learning-to-rank weights (popularity/recency deltas) exported hourly from analytics warehouse; merge into document before upsert
+    - upsertIndex → invoke `SearchIndexPort.upsertDocuments`
+    - emitTelemetry → log success/failure, enqueue retries when needed
+  delete_flow:
+    - on `status = ARCHIVED` or `deleted_at not null`, enqueue `SearchIndexPort.deleteDocuments({ eventIds: [...] })`
+  batching:
+    - real-time queue processes single event payloads (target <5s from publish)
+    - reindex job batches by 250 events per upsert to stay under payload caps
+
+infrastructure:
+  queue:
+    name: event-search-index
+    broker: Redis Streams (same infra as other jobs)
+    retention: 7 days
+    dead_letter: `event-search-index.dlq`
+  workers:
+    - `apps/jobs/src/workers/event-search/index-worker.ts`
+    - concurrency: 8 per region
+    - backoff: exponential (2s → 2m) on `dependency_failed`
+  cron:
+    - id: `event-search-nightly`
+    - schedule: `30 * * * *` (hourly) until parity, then `0 6 * * *`
+    - job: `apps/jobs/src/workers/event-search/reindex-worker.ts`
+
+inputs:
+  prisma_views:
+    - `event_search_materialized_view` (includes organizer + venue metadata)
+  embeddings:
+    provider: openai
+    model: text-embedding-3-large (1536 dims)
+    batching:
+      size: 64 events
+      rate_limit: 60 req/min per org
+  feature_flags:
+    - `search.vector.enabled` — skip embedding call when false (lexical-only fallback)
+    - `search.indexing.enabled` — master kill switch
+
+outputs:
+  metrics:
+    - `search.index.upserts_total{status}`
+    - `search.index.latency_ms`
+    - `search.embedding.tokens_total`
+    - `search.index.retry_count`
+  logs:
+    - structured JSON with `eventId`, `orgId`, `jobId`, `embeddingVersion`, `latencyMs`
+  telemetry:
+    - trace spans per step (fetch → embed → upsert) for flamegraph debugging
+
+failure_modes:
+  - name: embedding_provider_unavailable
+    detection: non-2xx HTTP or timeout >15s
+    mitigation: switch to cached vector if `vectorCacheTTL < 30d`, else retry with exponential backoff; emit PagerDuty if >15 consecutive failures
+  - name: index_quota_exceeded
+    detection: adapter returns `forbidden`
+    mitigation: pause org-specific jobs, emit warning metric, notify account team
+  - name: schema_drift
+    detection: upsert rejects due to unknown fields
+    mitigation: block job with `dependency_failed`, alert platform, rerun once schema migrations applied
+
+acceptance_criteria:
+  - P95 publish → indexed latency < 10 seconds for single events.
+  - Nightly reindex touches 100% of active events and completes in < 45 minutes.
+  - DLQ rate < 0.1% per day; automatic retries clear 90% of transient failures.
+  - Embedding spend tracked per org with ability to cap via feature flag.
+
+runbook_highlights:
+  - To pause indexing globally: toggle `search.indexing.enabled=false` in config service; workers ack but skip upsert.
+  - To reprocess an org: `pnpm -C apps/jobs search:index --org <orgId> --since 2024-01-01`.
+  - To rotate embedding model: deploy new version, set `EMBEDDING_MODEL_VERSION`, trigger cron with `REINDEX_FORCE=true`.
+
+dependencies:
+  - `packages/ports/src/search/*` (new SearchPort spec).
+  - `packages/ports/src/embedding` (existing) or new provider spec.
+  - Redis + Prisma read replica availability.
+
+open_questions:
+  - learning_to_rank_feedback: ✅ Decided to pursue option (b) — telemetry lands in the analytics warehouse, hourly batch jobs materialize boosts that both the near-real-time worker and nightly reindex read before upserting.
+  - partial_document_updates: Supported via `mode="merge"`; when feedback only adjusts `popularityScore`/`tags`, the worker can skip the embedding step to reduce spend. Need measurement to ensure merge frequency doesn’t cause stale embeddings.

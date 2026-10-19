@@ -1,0 +1,577 @@
+# admin-search-parity.spec.yaml
+#
+# Filter/category parity for the admin spotlight search (⌘+K inside /admin/*)
+# with the consumer search's facet model — org-scoped where a facet makes
+# sense, deliberately absent where it does not. Phase A rebuilds the admin
+# spotlight on the org-truthful backend and adds the facets; Phase B carries
+# the same facets onto the full /admin/[slug]/search results page.
+#
+# REALITY CHECK ENCODED UP FRONT — the admin spotlight's current premise is
+# broken in three verified ways, and this spec is as much a correction as a
+# parity feature:
+#
+#   1. TWO BACKENDS, ONE CONTEXT. The admin spotlight overlay queries
+#      `unifiedSearch.autocompleteAdmin` (Meilisearch discovery projection —
+#      apps/web/src/components/search/SpotlightSearch.tsx:807), while the
+#      full page it hands off to (/admin/[slug]/search) queries
+#      `search.adminOrgSearch` (live repos — search-org-admin.ts). Same
+#      query, different corpus: the two admin surfaces do not agree on what
+#      exists.
+#   2. DRAFTS ARE UNFINDABLE IN THE SPOTLIGHT. The discovery index only ever
+#      contains PUBLISHED events — build-search-index.ts:241 indexes via
+#      `repos.events.listPublished`, and reindex-after-mutation.ts:368-380
+#      REMOVES any doc whose event is no longer PUBLISHED. So
+#      `publishedOnly: false` on the admin path relaxes a gate over documents
+#      that were never indexed. The Meilisearch adapter documents this
+#      itself: "Admin draft discovery does NOT flow through this path — it is
+#      served by adminOrgSearch" (multi-index-meilisearch-adapter.ts:830-835).
+#   3. THREE OF THE FOUR ADMIN PILLS ARE NOT ORG-SCOPED. The Meili org
+#      filter is `(type != "event" OR orgId = …)` (adapter :891-896) — it
+#      constrains ONLY event documents. The pills ADMIN_TYPE_LABEL renders
+#      as "Attendees" / "Venues" / "Groups" (SpotlightSearch.tsx:126-131)
+#      actually return GLOBAL public humans, GLOBAL active places, and
+#      GLOBAL orgs. An org admin typing a buyer's name gets strangers'
+#      public profiles labeled "Attendees".
+#
+# `autocompleteAdmin` itself stays: it has a second caller
+# (HumanSearchCombobox in the event builder) and its authz — including the
+# `ensureStaffSecondFactor` call in the staff owner-scope-override branch
+# (unified-search.ts router :273-295, guard.ts:519) — is untouched by this
+# spec.
+
+version: "1.0"
+updated: "2026-08-04"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The consumer search has a real facet model — entity scope, categories,
+    date presets + custom range, price/free, geo radius, seven sort modes —
+    while the admin spotlight has only four entity pills, and those pills lie
+    (see reality check: drafts unfindable, three pills globally scoped, two
+    backends disagreeing). An organizer looking for "that draft we started
+    last month" or "the buyer with this email" has no facet for status, no
+    date filter, and a spotlight whose Attendees pill searches the public
+    internet instead of their order book. Meanwhile consumer-only affordances
+    (the geo radius pill, Surprise me) render inside the admin overlay where
+    they are meaningless or actively wrong.
+  solution: >
+    Rebuild the admin spotlight on `search.adminOrgSearch` — the live-repo,
+    org-truthful backend the full admin search page already uses — extended
+    with the facets that make sense org-scoped: event status (drafts
+    included), date range (Upcoming / Past / custom), and category. Entity
+    pills become the three groups that backend actually owns (Events /
+    Attendees / Venues), each an honest server-side filter. Geo, price,
+    free-only, and discovery sorts are deliberately excluded as org-implicit
+    or consumer-only, and the geo pill + Surprise me stop rendering in admin
+    context. Entity-pill labels move from hardcoded English literals to the
+    i18n catalogs (both en and es), consumer and admin maps alike. The
+    platform context (/platform/*) keeps its consumer fall-through on
+    purpose — it searches the public discovery projection, so consumer
+    labels are accurate; a platform-wide cross-org search is explicitly not
+    this spec. Phase B carries the same facet model onto the
+    /admin/[slug]/search results page with URL-synced state.
+  users:
+    - Org admins and editors finding events (incl. drafts) fast from anywhere
+    - Finance-role staff looking up attendees/buyers by name or email
+    - Human-scope owners (personal admin) with the same needs
+    - Spanish-locale admins who currently get English-only pills
+  surfaces:
+    - web
+    - api
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+#
+# Phasing: FR-001..FR-010 are PHASE A (spotlight facets on the org-truthful
+# backend). FR-011..FR-013 are PHASE B (facet parity + URL sync on the full
+# /admin/[slug]/search results page, and order-number lookup). Phase A ships
+# alone and is useful alone.
+
+requirements:
+  functional:
+    - id: FR-001
+      phase: A
+      description: >
+        Backend switch — the admin spotlight's data source becomes
+        `search.adminOrgSearch` (live repos), replacing
+        `unifiedSearch.autocompleteAdmin` for the admin context only.
+        Consumer and platform contexts keep `search.autocomplete` untouched.
+        `autocompleteAdmin` is NOT removed or changed — HumanSearchCombobox
+        (event builder lineup search) still depends on it, and its authz
+        chain (org-role check, unpublished-requires-scope, staff
+        owner-scope override with ensureStaffSecondFactor) stays exactly as
+        is. The spotlight passes ownerType/ownerId from
+        useCurrentAdminOwner exactly as the admin search page does today.
+    - id: FR-002
+      phase: A
+      description: >
+        Use-case extension — searchOrgAdminInputSchema gains optional
+        facets, all events-only and all additive:
+          - types?: ("event" | "attendee" | "venue")[] — omit a group's
+            repo query entirely when it is filtered out (don't fetch and
+            hide).
+          - statuses?: EventStatus[] — passed through to
+            events.listByOwner's EXISTING status?: EventStatus[] param
+            (packages/types/src/repos/events.ts:811-819). Default stays
+            ALL_EVENT_STATUSES (today's behaviour).
+          - dateRange?: { from?: ISO, to?: ISO } — filters events by
+            startsAt. Requires a listByOwner extension (FR-003).
+          - categoryIds?: string[] — filters events by Event.categoryId.
+            Requires the same listByOwner extension.
+        Attendees and venues take no facets in this spec: buyers have no
+        status/category, and venue filtering is the query string. The zod
+        schema stays .strict(); unknown keys still 400.
+    - id: FR-003
+      phase: A
+      description: >
+        Repo extension — ListEventsByOwnerInput gains dateRange?: { from?:
+        Date; to?: Date } (on startsAt) and categoryIds?: string[]. Both
+        optional, both ignored-when-absent so every existing caller compiles
+        and behaves identically (the management listing, the admin page,
+        anything else on listByOwner). Prisma adapter composes them as AND
+        clauses onto the existing owner/status/query where-clause. No new
+        indexes required at launch — per-org event counts are small; add
+        (ownerId, startsAt) only if measurement demands it.
+    - id: FR-004
+      phase: A
+      description: >
+        Spotlight facet UI (admin context only) — a second pill row under
+        the entity pills, following the geo-panel expander pattern:
+          - Status: All | Drafts | Published | Past (COMPLETED) | Cancelled
+            | Archived — single-select pills mapping to statuses[] (Drafts →
+            ["DRAFT"], etc.). "All" is the default and sends no filter.
+          - Date: Upcoming | Past | Custom — Upcoming = { from: now },
+            Past = { to: now }; Custom reveals from/to date inputs
+            (reusing the consumer page's plain date-input pattern, not a
+            new datepicker).
+          - Category: a pill opening a small single-select list of the
+            platform taxonomy (same source as the consumer category chips);
+            maps to categoryIds: [id].
+        Facets apply ONLY to the Events group; Attendees/Venues groups
+        render unchanged alongside. Active facets are visually distinct
+        (pillActive treatment) and each is clearable individually.
+    - id: FR-005
+      phase: A
+      description: >
+        Facet-only search intent. Following the spotlight's existing
+        geo-as-intent precedent (`isSearching = trimmed.length >=
+        MIN_QUERY_LENGTH || !!geoLocation`, SpotlightSearch.tsx:769), an
+        active status/date/category facet with an EMPTY query triggers a
+        filtered browse: "Drafts" with no text lists the org's drafts.
+        searchOrgAdmin already accepts query: "" (schema default); the
+        events repo treats an absent query as unfiltered. Attendees/venues
+        stay query-driven — an empty query with only facets active fetches
+        events only.
+    - id: FR-006
+      phase: A
+      description: >
+        Entity pills become Events | Attendees | Venues in admin context —
+        the three groups adminOrgSearch owns. The "Groups" pill is REMOVED
+        from admin: org documents were never org-scoped (reality check #3),
+        and its admin routing dead-ended at /settings. Pill selection maps
+        to FR-002's types[] so filtered-out groups are not queried. Result
+        routing: event → /admin/[slug]/events/[id] (unchanged); attendee →
+        /admin/[slug]/orders?q=<email|name> (the exact route the admin
+        search page already uses — replacing today's audiences/dashboard
+        fallback dance); venue → /admin/[slug]/places. Suggestion rows show
+        the fields adminOrgSearch returns: event status when not PUBLISHED,
+        attendee email + capped event titles, venue address.
+    - id: FR-007
+      phase: A
+      description: >
+        Admin context sheds consumer-only affordances:
+          - The geo/location pill, geo panel, and radius slider do not
+            render in admin context. Justification: geo is org-implicit —
+            the org's events happen at the org's venues; "events within
+            25 km" is not an admin question, and the live-repo backend has
+            no geo filter to honour it anyway.
+          - "Surprise me" does not render in admin context — it rolls a
+            random PUBLISHED event from global discovery, a pure consumer
+            affordance.
+          - The cycling placeholder already excludes admin
+            (isConsumerContext) — unchanged.
+        "View all" keeps routing to /admin/[slug]/search and now carries
+        active facets as URL params (consumed in Phase B; harmless extras
+        until then).
+    - id: FR-008
+      phase: A
+      description: >
+        Deliberate facet EXCLUSIONS, decided not deferred — the consumer
+        facets that do NOT cross over, with the reasoning recorded:
+          - Geo/location + radius: org-implicit (FR-007).
+          - Price range / free-only: admins search their inventory by
+            name/status/date, not by what it costs; price is a buyer's
+            lens. adminOrgSearch carries no price data.
+          - Sort modes (popularity, featured, price asc/desc): discovery
+            ranking signals that live in the Meilisearch projection;
+            live-repo results keep the repos' deterministic ordering
+            (events newest-first). Relevance/date sorting inside the
+            spotlight list is out of scope.
+          - Tags beyond category: consumer tags are index-side event tags;
+            the admin corpus filters on categoryId only.
+        Any of these can be revisited with evidence; none ships silently.
+    - id: FR-009
+      phase: A
+      description: >
+        i18n — DECIDED: proper i18n, not literals-consistently. TYPE_LABEL
+        and ADMIN_TYPE_LABEL (SpotlightSearch.tsx:118-131) are hardcoded
+        English today, sitting NEXT TO translated chrome — an es-locale
+        user sees "Todas" beside "Events". All entity-pill labels, the new
+        facet labels (status/date/category pill text), and group headers
+        move to spotlight.* keys in BOTH apps/web/src/i18n/messages/en.ts
+        AND es.ts (the catalogs that already hold spotlight.filterAll /
+        adminPlaceholder — en.ts:7140-7145). Dual-catalog rule applies: a
+        missing key renders the RAW key string, so both locales land in the
+        same commit. The consumer TYPE_LABEL map migrates in the same
+        sweep — parity means one labeling system, not two conventions.
+        (The consumer /search page's hardcoded SORT_OPTIONS labels are a
+        pre-existing gap outside this spec's surface; noted, not fixed.)
+    - id: FR-010
+      phase: A
+      description: >
+        Platform context — DECIDED: no separate PLATFORM_TYPE_LABEL map and
+        no platform data-source change in this spec. /platform/* falls
+        through to the consumer search (`search.autocomplete`) and consumer
+        labels today, and that fall-through is CORRECT for what it queries:
+        the public discovery projection, where "People / Places / Groups"
+        are accurate names. What platform staff actually lack is a
+        cross-org ADMIN search (all orgs' drafts, any buyer) — that is a
+        different feature with its own authz surface (staff roles +
+        second-factor on every path) and is explicitly out of scope. The
+        detectContext platform branch and platformQuery store slot stay
+        as-is so that future spec has a seam to land in.
+    - id: FR-011
+      phase: B
+      description: >
+        /admin/[slug]/search facet parity — the full results page gains the
+        SAME status/date/category facets and Events/Attendees/Venues
+        sections it already has, wired to the same extended adminOrgSearch
+        input, with counts per group (the output schema already returns
+        counts). Facet state is URL-synced (?status=&from=&to=&category=&
+        type=) via a pure helper following the consumer search-url.ts
+        single-writer pattern, so spotlight "View all" hand-off (FR-007)
+        deep-links pre-filtered and back/forward works.
+    - id: FR-012
+      phase: B
+      description: >
+        Order lookup by identifier — an id-shaped query (UUID, or the order
+        short-code format if/where one exists) in admin context resolves
+        the org's own order directly and surfaces a dedicated "Order"
+        result row routing to /admin/[slug]/orders?q=<id>. Requires an
+        orders-repo lookup scoped by (org, id) — NEVER a global order-id
+        fetch (an order id must not confirm existence across tenants).
+        Finance-gated exactly like the attendees group: non-finance actors
+        get no order row and no error.
+    - id: FR-013
+      phase: B
+      description: >
+        Attendee result enrichment on the results page: order count and
+        most-recent order date per buyer (data listForOrg already touches),
+        so the orders-page hand-off is chosen, not guessed. No new PII
+        fields beyond what searchOrgAdmin already returns (name, email,
+        event titles).
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        SECOND-FACTOR POSTURE INTACT. searchOrgAdmin's authz today is
+        requireOwnerAccess (org member of any role, or the human owner
+        themself) plus finance-gated attendees — it has NO staff-override
+        path, and this spec adds none. The FR-002 extension must not widen
+        who can call it, only what filters it accepts. If any future change
+        adds a staff scope-override to this or any new admin search
+        procedure, it MUST call ensureStaffSecondFactor at the point
+        staff-ness is established, exactly as autocompleteAdmin's
+        ownerHumanId-override branch does (unified-search.ts:294,
+        guard.ts:519's documented callable form) — never via the path-level
+        allowlist, which would over-gate ordinary org members on a shared
+        procedure. A test pins that a non-member (including a staff role
+        WITHOUT the org membership) gets INSUFFICIENT_ROLE from
+        adminOrgSearch regardless of facets.
+    - id: NFR-002
+      description: >
+        Tenancy. Every result group remains scoped by requireOwnerAccess's
+        owner; facets must not create a bypass (a categoryIds/dateRange
+        filter with a foreign ownerId still yields INSUFFICIENT_ROLE before
+        any repo read). Cross-tenant negative tests per group, and FR-012's
+        order-id lookup gets its own (foreign org's order id → empty, no
+        existence signal). Attendee data (names, emails) stays
+        finance-gated: a VIEWER-role actor sees events + venues and an
+        omitted attendees group — never an error, never the data.
+    - id: NFR-003
+      description: >
+        A11y for the pill rows (entity + facet). Every pill is a real
+        <button> with aria-pressed reflecting its active state (today's
+        pills convey active state by color alone), a visible focus state,
+        and — on mobile — a ≥44px touch target (the current 4px/10px
+        padding pills are below that). Group headers and the active-facet
+        state are announced: the results container gets a polite live
+        region announcing "N events, N attendees, N venues" on settle.
+        Fix-in-passing: result rows render role="option" with no
+        role="listbox" ancestor (SpotlightSearch.tsx:1556) — the results
+        container gains the listbox role with aria-activedescendant wired
+        to the keyboard-active row. Contrast follows the existing
+        ACCENT_TEXT/ACCENT_FILL AA ladders already documented in the file.
+    - id: NFR-004
+      description: >
+        Latency budget. The input debounce stays DEBOUNCE_MS = 700ms
+        (SpotlightSearch.tsx:83) — facet work must not add a second text
+        debounce. Discrete facet toggles (status/date/category pills) fire
+        immediately — they are single clicks, not continuous controls; the
+        800ms GEO_RADIUS_DEBOUNCE_MS precedent applies only if a
+        continuous control is ever added. Queries keep keepPreviousData +
+        staleTime 30s so facet flips never blank the list. Server budget:
+        adminOrgSearch is three parallel repo queries; extended with
+        facets it stays ≤ 2 round-trips per group and p95 ≤ 500ms at
+        limit 50 against a seeded dev org — measured in a perf assertion,
+        not assumed. Filtered-out groups (FR-002 types[]) must genuinely
+        skip their repo query.
+    - id: NFR-005
+      description: >
+        Zero consumer/platform behaviour change. The consumer spotlight,
+        /search page, and platform fall-through are byte-identical in
+        behaviour after Phase A (labels now sourced from i18n render the
+        same English strings in en). A regression test pins the consumer
+        spotlight's query inputs (trpc.search.autocomplete args) unchanged.
+        HumanSearchCombobox's autocompleteAdmin usage is untouched and
+        covered by a test that its input shape still parses.
+    - id: NFR-006
+      description: >
+        Error reporting convention. Any new catch-and-fallback branch
+        (e.g. degrading a failed attendees query to an omitted group)
+        declares reportError?: ReporterPort and reports the swallow per
+        CLAUDE.md — never a bare logger.warn. searchOrgAdmin's existing
+        callOrDependencyFailed paths keep their semantics.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: search-org-admin (MODIFIED)
+        description: >
+          Input gains types[], statuses[], dateRange, categoryIds (FR-002);
+          group queries become conditional on types[]; facets forwarded to
+          events.listByOwner. Authz chain unchanged (NFR-001). Phase B adds
+          the org-scoped order-id lookup (FR-012) and attendee enrichment
+          (FR-013).
+        input: actorHumanId, ownerType, ownerId, query, limit, + facets
+        output: events[], attendees[], venues[], counts (unchanged shape;
+          Phase B adds order?)
+        idempotent: true
+        money: false
+        authz: requireOwnerAccess(ORG_ANY_ROLE) + canFinanceOrg for attendees
+
+      - name: unified-search / autocompleteAdmin (UNCHANGED)
+        description: >
+          Stays exactly as-is for HumanSearchCombobox and any future
+          discovery-projection admin need. Its staff owner-scope override
+          keeps ensureStaffSecondFactor. No longer called by the admin
+          spotlight after FR-001.
+        input: unchanged
+        output: unchanged
+        idempotent: true
+        money: false
+        authz: unchanged (org-role / staff+2FA branches)
+
+  ports:
+    new: []
+    existing:
+      - EventsRepo (ListEventsByOwnerInput gains dateRange + categoryIds —
+        FR-003; optional, ignored-when-absent)
+      - OrdersRepo (Phase B only — org-scoped find-by-id for FR-012)
+      - ReporterPort (NFR-006)
+
+  adapters:
+    new: []
+    existing:
+      - packages/adapters/src/db/prisma/ (events listByOwner where-clause
+        gains the two optional AND filters; audit every listByOwner caller
+        compiles with no behaviour change)
+      - Meilisearch/Postgres multi-index adapters — UNTOUCHED (the admin
+        spotlight simply stops querying the discovery projection)
+
+  transport:
+    trpc_procedures:
+      - search.adminOrgSearch (MODIFIED input — facets; authz posture
+        unchanged per NFR-001)
+      - search.autocompleteAdmin (unchanged)
+    webhooks: []
+
+  ui:
+    pages:
+      - apps/web/src/app/admin/[slug]/search/page.tsx (Phase B — facet
+        panel, URL sync, counts, order row)
+    components:
+      - SpotlightSearch (MODIFIED — admin branch queries adminOrgSearch;
+        Events/Attendees/Venues pills; facet pill row; geo pill + Surprise
+        me gated out of admin; attendee routing to /orders?q=; i18n'd
+        labels; listbox semantics per NFR-003)
+      - spotlight admin facet subcomponents (status pills, date expander,
+        category select — colocated, following the geo-panel expander
+        pattern)
+      - search-url-style helper for admin facet params (Phase B, pure +
+        unit-tested like search-url.ts)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  new_enums: []
+  modified_models: []
+  migrations_needed: false
+  migration_notes: >
+    None. All facets filter existing columns (Event.status, Event.startsAt,
+    Event.categoryId) through the existing owner-scoped repo path. If
+    per-org event volume ever makes the dateRange scan measurable, a
+    (ownerId, startsAt) index is a one-line follow-up migration — not
+    shipped speculatively.
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      The backend switch changes what admins SEE for the same query —
+      drafts and real buyers appear (correct), but discovery-index niceties
+      (typo tolerance, relevance ranking) disappear, since listByOwner is a
+      case-insensitive contains-filter. A fuzzy Meili match that used to
+      surface may now miss.
+    severity: MEDIUM
+    mitigation: >
+      Accepted trade: org-truthful results beat fuzzy-but-wrong ones, and
+      per-org corpora are small enough that contains-matching covers real
+      queries. The full search page already behaves this way and nobody has
+      filed it as a defect. Revisit with a per-org search projection only
+      on evidence.
+  - risk: >
+      Facet widening quietly widens who sees what — e.g. a future caller
+      passes statuses to a procedure they assume is public-only.
+    severity: HIGH
+    mitigation: >
+      NFR-001/NFR-002: authz runs before any repo read regardless of
+      facets, negative tests per group + per facet, and the input schema
+      stays .strict() so unknown keys cannot smuggle intent.
+  - risk: >
+      Removing the "Groups" pill and rerouting attendee results changes
+      muscle memory for existing admins.
+    severity: LOW
+    mitigation: >
+      The Groups pill returned global orgs and dead-ended at /settings —
+      there is no working muscle memory to break. Attendee rows now land on
+      the orders list pre-filtered, which is where the audiences/dashboard
+      fallback was gesturing anyway.
+  - risk: >
+      i18n sweep misses a literal and es renders a raw key (the documented
+      dual-catalog failure mode).
+    severity: MEDIUM
+    mitigation: >
+      FR-009 lands both catalogs in one commit; the existing i18n audit
+      (flatten + grep) runs over the touched namespace; acceptance
+      criterion checks the es locale renders no raw spotlight.* keys.
+  - risk: >
+      The FR-005 facet-only browse turns an empty spotlight into a
+      potentially large unfiltered fetch on every facet click.
+    severity: LOW
+    mitigation: >
+      limit stays capped (schema max 100, spotlight uses ≤ 50); events-only
+      fetch on facet-only intent; keepPreviousData avoids flicker;
+      NFR-004's perf assertion covers the worst case.
+
+open_questions:
+  - >
+      Should the admin spotlight ALSO offer a "My orgs" scope switcher when
+      the human belongs to several orgs, instead of being pinned to the
+      current /admin/[slug]? Deferred — the slug context is unambiguous and
+      matches every other admin surface.
+  - >
+      Does FR-012's id-shaped detection cover a human-friendly order
+      short-code, or only UUIDs? Depends on whether a short-code exists on
+      Order — verify at Phase B build time rather than assuming.
+  - >
+      Consumer /search hardcodes its SORT_OPTIONS labels in English
+      (UniversalSearchPage.tsx:277-285) — same class of gap as FR-009 but a
+      different surface. Worth a follow-up i18n sweep ticket; not this spec.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Platform (/platform/*) cross-org admin search, a platform label map, or
+    any change to detectContext — FR-010 decides the fall-through stays.
+  - Removing or reshaping unifiedSearch.autocompleteAdmin — it serves
+    HumanSearchCombobox; its authz (incl. the 2FA branch) is frozen here.
+  - Indexing DRAFT/PRIVATE events into the Meilisearch discovery
+    projection — the org-truth corpus is the live DB, full stop; putting
+    drafts in a shared public index to make a facet work is the wrong
+    architecture and a leak surface.
+  - Geo/price/free/sort facets in admin context (FR-008 records why).
+  - Consumer search changes of any kind beyond sourcing the same English
+    labels from the catalog (NFR-005 pins byte-identical behaviour).
+  - Fuzzy/typo-tolerant matching for the live-repo admin corpus (see
+    risk #1 — evidence first).
+  - Broadcast/audience integration for attendee results — the /audiences
+    routing is removed, not improved; the orders list is the hand-off.
+  - Saved searches, recent searches, or search analytics.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  # FR-001 / reality-check closure
+  - In admin context, typing a DRAFT event's title in the spotlight surfaces
+    it (status shown on the row); the same query in consumer context does
+    not. The spotlight overlay and /admin/[slug]/search return the same
+    events/attendees/venues for the same query and facets.
+  # FR-006 / reality-check #3 closure
+  - An admin-context search for a name that matches a public human profile
+    OUTSIDE the org returns no Attendees row for them; a buyer of the org's
+    events matches by name AND by email, and selecting the row lands on
+    /admin/[slug]/orders?q=<their email> pre-filtered. No "Groups" pill
+    renders in admin context.
+  # FR-002 / FR-004
+  - With the Drafts status pill active, only DRAFT events return; with a
+    Custom date range set, only events whose startsAt falls inside it
+    return; with a category selected, only that category's events return;
+    facets compose (Drafts + this-month yields the intersection).
+    Attendees and venues results are unaffected by all three facets.
+  # FR-005
+  - Activating the Drafts pill with an EMPTY query lists the org's drafts
+    (filtered browse); clearing the facet with an empty query returns the
+    idle state, and no attendees/venues fetch fires on facet-only intent.
+  # FR-007 / FR-008
+  - The geo/location pill, radius slider, and "Surprise me" are absent in
+    admin context and unchanged in consumer context; "View all" from an
+    admin spotlight with active facets opens /admin/[slug]/search carrying
+    them as params.
+  # NFR-001 / NFR-002
+  - A platform-staff actor with NO membership in the org gets
+    INSUFFICIENT_ROLE from adminOrgSearch (facets or not) — no
+    second-factor prompt, because no staff override exists on this path;
+    autocompleteAdmin's ownerHumanId staff override still demands the
+    second factor (regression-pinned, not re-implemented).
+  - A VIEWER-role org member searching with facets gets events + venues and
+    an omitted attendees group with no error; a FINANCE/OWNER actor gets
+    all three.
+  # FR-009
+  - With the es locale active, every pill and group header in both consumer
+    and admin spotlight renders translated text — zero raw spotlight.*
+    keys, zero English literals; en renders the exact strings shipped
+    today.
+  # NFR-003
+  - Every pill exposes aria-pressed matching its visual state; the results
+    list is a labelled listbox whose aria-activedescendant tracks arrow-key
+    navigation; pill touch targets measure ≥44px on a 320px viewport with
+    no horizontal overflow.
+  # NFR-004
+  - Facet pill clicks issue at most one adminOrgSearch call each with no
+    added debounce; typing keeps the single 700ms debounce; a seeded-org
+    perf assertion holds adminOrgSearch p95 ≤ 500ms at limit 50.
+  # NFR-005
+  - The consumer spotlight's autocomplete call args and the platform
+    context's behaviour are byte-identical before/after (pinned test);
+    HumanSearchCombobox still functions against unchanged
+    autocompleteAdmin.
+  # FR-011..FR-013 (Phase B)
+  - /admin/[slug]/search renders the same facets URL-synced (back/forward
+    restores them); an org's own order UUID typed in admin context yields
+    an Order row for finance actors and nothing for non-finance actors; a
+    FOREIGN org's order UUID yields nothing with no existence signal.

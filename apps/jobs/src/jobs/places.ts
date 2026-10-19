@@ -56,14 +56,15 @@ export const recalculatePlaceStatsJob = defineScheduledTask({
   handler: async ({ input, ctx }) => {
     const result = await recalculatePlaceStats(
       {
-        repos: {
-          placeReviews: ctx.repos.placeReviews,
-          placeStats: ctx.repos.placeStats,
-          events: ctx.repos.events,
-          orders: ctx.repos.orders,
-        },
+        // The full repos bag: the use case picks what it needs (it now also
+        // reads `places` to gate venue-confirmed events), and a Pick literal
+        // here would fail excess-property checks every time core widens it.
+        repos: ctx.repos,
         clock: ctx.clock,
         logger: ctx.logger,
+        // A place that throws is reported and skipped, not fatal to the batch
+        // (it would otherwise sort first forever and kill the job).
+        reportError: ctx.reportError,
       },
       input,
     );

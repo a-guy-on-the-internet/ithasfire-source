@@ -1,0 +1,185 @@
+# Spec: Navigation Shell Component
+meta:
+  owner: design-system
+  status: draft
+  reviewers:
+    - apps-web
+    - apps-mobile
+    - platform
+    - accessibility
+  last_updated: 2025-11-26
+component: navigation-shell
+summary: |
+  Define the shared navigation shell framing admin and organizer experiences across web (desktop/tablet)
+  and the mobile overlay. The shell renders the persistent top bar, left rail, collapsible drawer, and
+  contextual account switcher, emitting telemetry + accessibility hooks so individual apps only provide
+  nav items and actions. This spec covers structure, props, responsiveness, and key interactions; page
+  content lives in feature-specific flows (e.g., Admin Hub).
+objectives:
+  - Provide a single component exported from `@th/ui` that hosts top-level navigation for admin/organizer surfaces.
+  - Support both personal and org contexts, including RBAC-driven visibility for nav items.
+  - Offer consistent responsive states (full rail, compact rail, overlay drawer) from ≥1440px down to 360px.
+  - Instrument command palette, alerts, and context switching events for analytics.
+  - Keep shell render-time <16ms at P95 by memoizing derived nav sections and deferring heavy children.
+scope:
+  in_scope:
+    - Layout primitives: top bar, rail, content wrapper, drawers/modals used for nav.
+    - Interaction logic for collapsing rail, toggling drawer, switching contexts, launching quick actions.
+    - Admin + organizer personas (individual + org). Consumer-only site handled by dedicated discovery/distribution shell.
+    - Mobile overlay presentation for admin + organizer contexts only.
+  out_of_scope:
+    - Super-admin console UI (separate spec).
+    - Consumer discovery top nav (own flow spec + dedicated component).
+    - Actual nav item fetching logic (provided by host via props/transport spec).
+files:
+  - packages/ui/src/ui/shell/NavigationShell.tsx
+  - packages/ui/src/ui/shell/NavigationShell.types.ts
+  - packages/ui/src/ui/shell/components/NavigationRail.tsx
+  - packages/ui/src/ui/shell/components/NavigationTopBar.tsx
+  - packages/ui/src/ui/shell/components/NavigationDrawer.tsx
+  - packages/ui/src/ui/shell/__tests__/NavigationShell.test.tsx
+  - packages/ui/src/ui/shell/NavigationShell.stories.tsx
+exports:
+  - NavigationShell
+  - NavigationShellContext (exposes state to nested components)
+  - useNavigationShell()
+  - NavigationRail
+  - NavigationTopBar
+  - NavigationDrawer (mobile overlay)
+props:
+  required:
+    - navSections: NavigationSection[] # groups of nav items rendered in the rail/drawer
+    - currentRoute: string # used to highlight active nav item
+    - accountContext: AccountContext # currently selected personal/org context
+    - onRouteSelect: (routeId: string, meta?: RouteMeta) => void
+  optional:
+    - secondaryNav?: React.ReactNode # e.g., contextual tabs under top bar
+    - quickActions?: QuickActionConfig[] # define buttons shown in top bar
+    - alerts?: AlertSummary[] # drive badge counts + alert tray entry point
+    - onOpenCommandPalette?: () => void # triggered by cmd+k
+    - onContextSwitch?: (nextContextId: string) => Promise<void> | void
+    - onInviteTeammate?: () => void
+    - railBehavior?: "auto" | "expanded" | "collapsed"
+    - drawerBreakpoint?: number # px width at which rail collapses into drawer (default 960)
+    - environmentBadge?: "staging" | "development" | null
+    - analytics?: NavigationShellAnalyticsConfig
+    - loading?: boolean # skeleton state for shell
+    - testIdBase?: string
+interfaces:
+  NavigationSection:
+    - id: string
+    - label: string
+    - icon: ReactNode
+    - items: NavigationItem[]
+    - featureFlag?: string
+    - rbac?: OrgRole[] # optional roles required to show section
+  NavigationItem:
+    - id: string
+    - label: string
+    - route: string
+    - icon?: ReactNode
+    - badgeCount?: number
+    - tone?: "default" | "danger" | "success"
+    - disabled?: boolean
+    - featureFlag?: string
+    - rbac?: OrgRole[]
+    - children?: NavigationItem[] # collapsible sub-nav (max depth 1)
+  AccountContext:
+    - id: string
+    - label: string
+    - type: "personal" | "org"
+    - avatarUrl?: string
+    - role?: OrgRole
+    - defaultRoute?: string
+  QuickActionConfig:
+    - id: string
+    - label: string
+    - icon: ReactNode
+    - onSelect: () => void
+    - rbac?: OrgRole[]
+layout_structure:
+  desktop (≥1200px):
+    - Fixed left rail width 256px (theme token) with sections + footer (settings/logout).
+    - Top bar spans remaining width, containing breadcrumbs/secondary nav slot.
+    - Content area hosts children, padded with `space.6` tokens.
+  tablet (960-1199px):
+    - Rail collapses to icon-only width 80px; labels appear on hover/tooltips.
+    - Account switcher moves into top bar.
+  mobile (<960px):
+    - Rail hidden; hamburger button toggles overlay drawer (NavigationDrawer) sliding from left.
+    - Top bar condenses quick actions into overflow menu.
+    - Optional "Hub" floating action to return to root.
+  overlay state:
+    - Drawer uses Tamagui `Sheet` component with trap focus; swiping closes on mobile.
+responsive_rules:
+  - use `useMedia` hook from Tamagui for breakpoints and `useLayoutEffect` guard for SSR.
+  - Provide `NavigationShellContext` with `layout: "desktop" | "compact" | "mobile"` for child components.
+config_controls:
+  - appearance_toggle:
+      description: Rail footer surfaces a light/dark toggle that wraps the shell in a Tamagui `Theme`, persists preference to `localStorage` (`th:navShell:appearance`), and defaults to system `prefers-color-scheme`.
+      references:
+        - docs/design/design-system-v2.md (respect system theming preferences)
+  - density_toggle (future):
+      description: Planned control to switch between Comfortable and Compact spacing, mapping to tokens documented in `docs/design/style-guide.md`.
+  - reduced_motion_toggle (future):
+      description: Honor the reduced-motion guidance from `docs/design/style-guide.md` by exposing a user-facing toggle in addition to `prefers-reduced-motion` detection.
+system_behaviors:
+  - Command palette: listens for `cmd+k` / `ctrl+k`, prevents default, fires callback.
+  - Context switcher: opens popover list (searchable). On selection, call `onContextSwitch`; show inline spinner until promise resolves.
+  - Alerts bell: displays badge with unread count; clicking shows slot-provided tray.
+  - Rail collapse toggle persists choice via `localStorage` key `th:navShell:railState`.
+  - Feature flag + RBAC gating evaluated before rendering sections/items; provide fallback message if shell ends up empty.
+mobile_overlay:
+  - Drawer houses same sections but groups quick actions at top.
+  - Optimized purely for admin/org tasks; consumer contexts should mount the discovery/distribution shell instead.
+  - Provide CTA footer (Scan Ticket, Support) only when specified via props (no implicit consumer mode toggles).
+gestures:
+  - Native mobile surfaces expose a 28px edge swipe zone (left side) wired to `react-native-gesture-handler` that triggers the drawer without requiring the hamburger tap.
+  - The drawer surface itself supports pan-to-close gestures; release thresholds consider both translation distance (>30% width) and velocity so quick flicks dismiss reliably.
+  - The mobile bottom navigation bar listens for horizontal swipes to move between adjacent routes and, when swiping beyond the last surfaced item, opens the drawer "More" overflow. Web keeps gestures disabled but still shows the same UI affordances.
+states:
+  loading:
+    - Render skeleton for rail (stacked blocks) and shimmer top bar placeholders.
+    - Avoid firing analytics until first `ready` frame.
+  error:
+    - If navSections empty due to fetch failure, show inline error with retry button slot.
+  offline:
+    - Show banner inside top bar; disable context switching.
+  focus_trap:
+    - Drawer trap focus, close on ESC, ensure screen readers informed via `aria-modal=true`.
+a11y:
+  - Rail uses `<nav aria-label="Primary">` with list semantics.
+  - Command palette button exposes `aria-keyshortcuts="Control+K"` / `meta+k`.
+  - Context switcher popover announces selection + role.
+  - Drawer announces open/close via `aria-live` polite region.
+  - Provide `skip to content` link that jumps to content container.
+analytics:
+  - navigationShell.view (properties: layout, contextType)
+  - navigationShell.route_select (routeId, via)
+  - navigationShell.context_switch (from, to, latencyMs)
+  - navigationShell.quick_action (actionId)
+  - navigationShell.rail_toggle (state)
+implementation_notes:
+  - Pure component (no fetch) – host injects nav data via props; pair with transport spec for payload shape.
+  - Memoize derived nav tree; only recompute when `navSections` reference changes.
+  - Use `@th/ui` Icon + Avatar primitives for visuals.
+  - Provide CSS variables or Tamagui tokens for width, colors, spacing.
+  - Export Storybook stories covering desktop, compact, mobile, and loading states.
+  - Add integration tests verifying RBAC gating + keyboard navigation.
+  - Persisted nav configuration is static until the portal/config framework lands; host should import nav tables/constants rather than user-defined drag/drop changes.
+  - Do not expose drag-and-drop affordances or user-editable nav ordering—product decision is to ship fixed tiles per org/persona for now.
+testing:
+  - Vitest: simulate keyboard navigation (arrow keys, enter) through rail items.
+  - Storybook interaction tests for drawer open/close, context switching spinner.
+  - Visual tests for staging badge + alert badges.
+  - Contract test ensuring analytics callbacks invoked with expected payloads.
+decisions:
+  - Drag-and-drop nav customization is explicitly **out** for v1; shells render static nav order defined in `@th/transport` payloads.
+  - Consumer-facing contexts will mount a dedicated discovery/distribution shell; this component never attempts to morph into the consumer nav.
+  - Nav configuration remains static and sourced from local config/transport payloads until the portal/remote-config effort ships; document import path in the transport spec.
+open_questions:
+  - None for v1; revisit once portal configuration primitives land.
+next_steps:
+  - Align with Platform team on `navSections` payload shape (transport spec).
+  - Build Tamagui components + stories.
+  - Partner with design for tokenized spacing + hover/focus visuals across themes.

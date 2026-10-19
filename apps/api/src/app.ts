@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import * as Sentry from "@sentry/node";
+import { safeReporter } from "@th/ports/reporter";
 
 import { buildDeps, type AppDeps } from "./lib/dep";
 import { env } from "./lib/env";
@@ -13,11 +14,13 @@ import { validateJwks } from "./auth/validate-jwks";
 import cors from "./plugins/cors";
 import securityHeaders from "./plugins/security-headers";
 import originGuard from "./plugins/origin-guard";
+import verifiedClientIp from "./plugins/verified-client-ip";
 import authRateLimit from "./plugins/auth-rate-limit";
 import betterAuth from "./plugins/better-auth";
 import devRequestLogging from "./plugins/dev-request-logging";
 import rawBody from "./plugins/raw-body";
 import trpc from "./plugins/trpc";
+import { installErrorHandler } from "./plugins/error-handler";
 import health from "./routes/health";
 import cart from "./routes/cart";
 import accountEmailChange from "./routes/account/email-change";
@@ -65,7 +68,9 @@ export async function createApp() {
       readExpectedMigrations(resolveMigrationsDir()),
     listAppliedMigrations: () => readAppliedMigrations(deps.prisma),
     logger: deps.logger,
-    reportError: Sentry.captureException,
+    // `safeReporter`, as in dep.ts: a throwing capture must never take the
+    // drift monitor — and with it the health gate — down with it.
+    reportError: safeReporter(Sentry.captureException),
   });
 
   const app = Fastify({
@@ -99,6 +104,14 @@ export async function createApp() {
 
   app.decorate("deps", deps);
 
+  // Before ANY route: Fastify binds a route to the error handler in force
+  // when it is added. Scrubs production 5xx bodies on non-tRPC routes
+  // (security review F14); see plugins/error-handler.ts.
+  installErrorHandler(app, {
+    logger: deps.logger,
+    isProduction: process.env.NODE_ENV === "production",
+  });
+
   app.addHook("onClose", async (instance) => {
     await instance.deps.close();
   });
@@ -109,6 +122,11 @@ export async function createApp() {
   // Origin-secret guard — see plugins/origin-guard.ts and the trustProxy
   // note above. No-ops outside production; /health stays exempt.
   await app.register(originGuard);
+  // Strips any inbound `x-th-verified-client-ip`, then stamps it from a valid
+  // signed web → API forward. MUST stay ahead of authRateLimit, betterAuth
+  // and trpc: they trust that header only because this hook owns it. See
+  // plugins/verified-client-ip.ts.
+  await app.register(verifiedClientIp);
   await app.register(rawBody);
 
   // ATOMIC guess-space rate limiting for /api/auth/*. MUST be registered

@@ -1,0 +1,15 @@
+-- Composite index supporting the unified scan resolver lookup
+-- `tickets.findByEventAndHuman(eventId, humanId)` (FR-009b).
+--
+-- The existing `Ticket_eventId_idx` and `Ticket_ownerHumanId_idx` are
+-- preserved; this composite enables an index-only scan for the common
+-- two-column equality predicate without forcing the planner to AND-join
+-- two single-column indexes.
+--
+-- `Ticket` is a hot table — a plain `CREATE INDEX` would take a SHARE
+-- lock and block writes for the duration of the build. We use
+-- `CONCURRENTLY` so production deploys don't stall ticket issuance /
+-- scan writes. `CONCURRENTLY` cannot run inside a transaction; this
+-- file is intentionally kept to a single statement so Prisma migrate
+-- can execute it without an implicit BEGIN/COMMIT.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "Ticket_eventId_ownerHumanId_idx" ON "Ticket"("eventId", "ownerHumanId");

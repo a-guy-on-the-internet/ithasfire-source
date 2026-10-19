@@ -40,6 +40,13 @@ const block = (name: string): string => {
 const createdTables = (): string[] =>
   [...SRC.matchAll(/CREATE TABLE IF NOT EXISTS\s+(\w+)/g)].map((m) => m[1]!);
 
+/** The table names in a `const NAME = [...] as const` list. */
+const tableList = (name: string): string[] => {
+  const match = new RegExp(`const ${name} = \\[([^\\]]*)\\]`).exec(SRC);
+  expect(match, `${name} not found`).not.toBeNull();
+  return [...match![1]!.matchAll(/"(\w+)"/g)].map((m) => m[1]!);
+};
+
 describe("clearAll covers every table migrate() creates", () => {
   it("finds the tables at all (guards the guard)", () => {
     const tables = createdTables();
@@ -51,21 +58,34 @@ describe("clearAll covers every table migrate() creates", () => {
     expect(tables.length).toBeGreaterThanOrEqual(6);
   });
 
-  it("deletes from each one on sign-out", () => {
-    const purge = block("clearAll");
+  it("lists each one in a wipe list, and sign-out wipes both lists", () => {
+    const wiped = [...tableList("ATTENDEE_TABLES"), ...tableList("QUEUE_TABLES")];
     for (const table of createdTables()) {
       // `_fts_probe` is created and dropped inside `probeFts5` in the same
       // statement; it never outlives the probe.
       if (table === "_fts_probe") continue;
       expect(
-        new RegExp(`DELETE FROM ${table}\\b`).test(purge),
-        `clearAll() does not purge \`${table}\` — a sign-out would leave it on a shared device`,
-      ).toBe(true);
+        wiped,
+        `no wipe list holds \`${table}\` — a sign-out would leave it on a shared device`,
+      ).toContain(table);
     }
+    expect(block("clearAll")).toContain(
+      "wipeTables([...ATTENDEE_TABLES, ...QUEUE_TABLES])",
+    );
+  });
+
+  it("the access-denied wipe leaves the scan queue, and only that", () => {
+    expect(tableList("QUEUE_TABLES").sort()).toEqual(["dropped_scans", "scan_queue"]);
+    expect(block("clearAttendeeData")).toContain("wipeTables(ATTENDEE_TABLES)");
   });
 
   it("purges the FTS index too", () => {
-    expect(block("clearAll")).toContain("DELETE FROM people_fts");
+    // `'delete-all'`, never `DELETE FROM people_fts`: SQLite refuses a DELETE
+    // on a contentless FTS5 table. `local-db-people.test.ts` runs it for real.
+    expect(SRC).toContain(
+      "INSERT INTO people_fts(people_fts) VALUES('delete-all')",
+    );
+    expect(SRC).not.toContain("DELETE FROM people_fts");
   });
 });
 

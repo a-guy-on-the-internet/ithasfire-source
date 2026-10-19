@@ -1,0 +1,28 @@
+# Copilot Task: Backfill and pruning tooling
+context:
+  references:
+    - ../platform/sitemaps-architecture.spec.yaml
+    - sitemaps-generator.task.yaml
+  packages:
+  - apps/jobs
+    - packages/config
+  goal: |
+    Provide command-line tooling to rebuild all sitemap shards on demand, prune archive
+    directories past retention, and validate manifest integrity.
+requirements:
+  - Add CLI entrypoint (`pnpm -C apps/jobs sitemap:backfill`) that invokes generator for all shards.
+  - Support options: `--scope <shard|type>`, `--dry-run`, `--output-dir` (local filesystem fallback).
+  - Add pruning utility removing archive files older than 180 days (configurable).
+  - Validate resulting index is cohesive (all referenced shards exist & are under limits).
+  - Emit summary report printed to stdout + JSON artifact saved to `/tmp/sitemaps-run.json`.
+  - Ensure command respects feature flag and configuration availability.
+implementation_notes:
+  - Reuse generator module rather than duplicating logic.
+  - Provide mocks for storage when writing locally.
+  - Hook into observability metrics where appropriate (count backfilled shards).
+validation:
+  - Vitest unit coverage for CLI argument parsing and pruning filters.
+  - Manual smoke: run `pnpm -C apps/jobs sitemap:backfill --dry-run --output-dir=./tmp/sitemaps`.
+  - Document cleanup actions and potential risk before deletion (confirmation prompt).
+handoff:
+  - Update `apps/jobs/README.md` with usage instructions and env requirements.

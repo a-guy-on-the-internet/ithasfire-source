@@ -14,7 +14,7 @@ specs:
   [
     "2026-03-23/completed/volunteering",
     "2026-06-10/completed/volunteer-system-gaps",
-    "2026-07-27/volunteer-role-packs",
+    "2026-07-27/completed/volunteer-role-packs",
   ]
 ---
 
@@ -22,15 +22,17 @@ Events can recruit volunteers directly on the public event page. You define role
 
 ## Before you start
 
-In the event builder, open the **Volunteering** section and switch on **Accept volunteers**. This shows a volunteer sign-up section on the public event page once the event is published and at least one role exists. Three more settings live here:
+Volunteer roles and sign-ups are only available on events run by an organisation, not on events on your personal profile.
+
+Open your event in the admin dashboard, choose **Volunteers** under **Manage** in the event's side menu, and switch on **Accept volunteers**. This shows a volunteer sign-up section on the public event page once the event is published and at least one role exists. Three more settings live here:
 
 - **Auto-approve sign-ups** — approve new volunteers instantly instead of reviewing each application.
 - **Intro text for the volunteer page** — meeting points, dress code, perks; volunteers see it at the top of the sign-up sheet.
-- **Require waiver** — volunteers must accept the event's waiver when signing up. This only takes effect when the event [has a waiver assigned](/help/organising-events/require-a-waiver); until then the builder shows a hint and the setting does nothing.
+- **Require waiver** — volunteers must accept the event's waiver when signing up. This only takes effect when the event [has a waiver assigned](/help/organising-events/require-a-waiver); until then the builder shows a hint and the setting does nothing. Only events run by an organisation can have a waiver, so on an event on your personal profile this setting never takes effect.
 
 ## Set up roles and shifts
 
-Open your event in the admin dashboard and go to **Volunteers** → **Roles & shifts** tab. Click **Add role**, then either:
+Open your event in the admin dashboard and choose **Roles & shifts** under **Volunteers** in the event's side menu. Click **Add role**, then either:
 
 - **From template** — the **Pick templates** dialog lists your organisation's reusable role templates (managed under **Volunteer Roles**, in the **Door & Crew** section of the admin sidebar) alongside ready-made roles from Ithas Fire's own catalogue, marked **From Ithas Fire**. Tick any mix of the two; each becomes a role on this event. You don't have to customise a catalogue role first — it can be applied as it is.
 - **Custom** — define a one-off role: title, optional description, **Slots needed** (leave blank for unlimited), and a signup-approval choice for this role — **Event default** (inherits the event-level setting), **Always approve**, or **Always review**.
@@ -55,7 +57,7 @@ Archiving a customised copy brings the original catalogue row back into the list
 
 If your organisation already has a template with the same name that isn't a copy of that catalogue role, **Customise** stops and asks you to **Choose a different name** rather than overwrite your own work. It suggests "_name_ (copy)"; pick anything unused and both survive.
 
-Only owners and admins see **Customise**, **Start from a pack**, and **New template**. Editors and viewers see the same list, read-only.
+Only owners and admins see **Customise**, **Start from a pack**, and **New template**. Everyone else on your team sees the same list, read-only.
 
 ### Start from a pack
 
@@ -81,7 +83,7 @@ The same control exists on a single event's shifts. In the **Quick add shifts** 
 
 ### Times use the event's timezone
 
-Template shifts resolve in the **event's** timezone, not your browser's, so an organiser in another timezone still schedules against the venue's clock. Because the composer's date-and-time fields are native browser controls, they read in your local time — when the two differ, a caption under each field shows the same moment on the event's clock (e.g. "Jun 15, 6:00 PM CDT"). Trust the caption; don't "correct" the field back.
+Template shifts resolve in the **event's** timezone, not your browser's, so an organiser in another timezone still schedules against the place's clock. Because the composer's date-and-time fields are native browser controls, they read in your local time — when the two differ, a caption under each field shows the same moment on the event's clock (e.g. "Jun 15, 6:00 PM CDT"). Trust the caption; don't "correct" the field back.
 
 ## How approval and capacity work
 
@@ -96,7 +98,7 @@ Volunteers are emailed when you approve or reject them.
 
 ## Review sign-ups
 
-The **Signups** tab lists every application with filters for status, role, and shift. Per row you can **Approve**, **Reject** (with an optional note to the volunteer), **Check in**, or **Withdraw** on the volunteer's behalf.
+The **Signups** page (also under **Volunteers** in the event's side menu) lists every application with filters for status, role, and shift. Per row you can **Approve**, **Reject** (with an optional note to the volunteer), **Check in**, or **Withdraw** on the volunteer's behalf.
 
 To work in bulk, tick pending rows and use **Approve selected** / **Reject selected**. If some rows fail — for example a shift filled up mid-batch — the rest still succeed, and failed rows are marked inline so you can fix the cause and retry.
 
@@ -106,7 +108,9 @@ Rows where the volunteer accepted the event waiver show a **Waiver ✓** chip; h
 Approving past capacity is blocked with "Shift is full — raise the shift capacity to approve more volunteers" (same for full roles). Raise the capacity on the shift or role first, then approve.
 :::
 
-When an approved volunteer withdraws from a shift that still has pending applicants, org admins get a "spot opened" notification linking back to the Signups tab. Promoting someone from the waitlist stays your decision — nobody is auto-approved into the freed spot.
+If approving shows "New volunteers can't be added right now", taking on volunteers is paused for this event. You can still reject applications, and volunteers you already approved keep their place.
+
+When an approved volunteer withdraws from a shift that still has pending applicants, org admins get a "spot opened" notification linking to the event's **Volunteers** page. Promoting someone from the waitlist stays your decision — nobody is auto-approved into the freed spot.
 
 ## Track hours and export
 
@@ -124,6 +128,6 @@ By default the cross-event totals include every sign-up regardless of status, so
 - **An Ithas Fire role disappeared from Volunteer Roles** — somebody customised it. Your organisation's copy is in the list under the same name; edit that. The original comes back only if you archive the copy.
 - **A role in Pick templates is greyed out** — one of its shifts is anchored to a time this event doesn't have: "This date has no end time, so a shift anchored to it can't be scheduled" (common on a recurring occurrence with no end time), or the event has no start time at all. Give the event or that date an end time, or add the role and set its shifts by hand. Greyed-out rows can't be ticked and are skipped even if they were ticked before the event changed.
 - **"2 shifts weren't scheduled" after creating roles from templates** — the roles were created, but those shifts couldn't be placed against this event for the same reason, so they were left out rather than guessed at. The message names them; add them in the composer.
-- **Require waiver does nothing** — no waiver is assigned to the event yet. Assign one in the event's waiver settings first.
+- **Require waiver does nothing** — no waiver is assigned to the event yet. Assign one in the event's waiver settings first. If the event is on your personal profile, it can't have a waiver, so the setting has no effect there.
 - **Can't delete a role or shift** — roles and shifts with existing sign-ups can't be deleted while those sign-ups exist.
-- **A volunteer says they got no texts** — SMS only goes out when the volunteer entered a phone number and ticked the SMS opt-in; volunteers who replied STOP to any Ithas Fire text are opted out globally. Email reminders (24 hours and 1 hour before the shift) go out regardless.
+- **A volunteer says they got no texts** — reminders go only to approved volunteers, 24 hours and 1 hour before their shift, or before the event starts for a role without shifts. A volunteer on a role with shifts who didn't pick a shift gets none. Texts also need Ithas Fire to be offering them, a US phone number, and the text box ticked, at sign-up or later. Replying STOP to any Ithas Fire text turns them all off ([how texts come back](/help/account/notification-settings#text-messages)); email reminders still go out.

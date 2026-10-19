@@ -47,6 +47,11 @@ import { parseArgs } from "node:util";
 import { randomUUID } from "node:crypto";
 
 import { getPrisma } from "@th/db";
+// Fallback minimum when no GLOBAL FeePolicy exists. IMPORTED, not
+// re-declared: a local literal here is exactly the drift that lets a script,
+// the batch and the staff "Payouts owed" view disagree about which payees
+// get paid.
+import { DEFAULT_PAYOUT_MINIMUM_CENTS } from "@th/core/use-cases/settlements";
 import { isReservedTestEmail } from "@th/adapters/comms/mail";
 import type { PaymentProcessorPort } from "@th/ports/payment-processor-port";
 import type { LoggerPort } from "@th/ports/logger";
@@ -171,9 +176,6 @@ if (looksProd && force) {
 // so we use the shared @th/db singleton (same DATABASE_URL).
 const prisma = getPrisma();
 
-/** Fallback minimum when no GLOBAL FeePolicy exists (mirrors run-batch). */
-const DEFAULT_PAYOUT_MINIMUM_CENTS = 1000;
-
 async function main() {
   const startedAtMs = Date.now();
 
@@ -257,9 +259,12 @@ async function main() {
     // makes it payable this instant. The synthetic orderId matches no Order
     // row, so the payable query's dispute/claim exclusions cannot fire and
     // `orders.getKindsByIds` classifies it as neither ticketing nor
-    // membership — no reserve, no Connect fee, just a clean transfer.
+    // membership — no reserve, no Connect fee, just a clean transfer. It
+    // must still be a real UUID: the notifier looks the order up by id, and
+    // a prefixed string fails the Postgres uuid cast (and reports to Sentry)
+    // instead of simply returning null.
     const availableAt = new Date(now.getTime() - 60_000); // 1 min ago → matured
-    const syntheticOrderId = `payout-test-${randomUUID()}`;
+    const syntheticOrderId = randomUUID();
     const creditKey = `settlement-credit:${syntheticOrderId}:${payee.id}`;
     // Snapshot the cached rollup so cleanup can restore it exactly.
     const balanceRow = await prisma.payeeLedgerBalance.findUnique({

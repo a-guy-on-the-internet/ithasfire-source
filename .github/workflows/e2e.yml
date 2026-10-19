@@ -1,0 +1,500 @@
+# Playwright e2e against a stack this job boots itself, on a THROWAWAY
+# database. Opt-in and non-blocking: nothing `needs:` this job, it never runs
+# on push, and no deploy waits on it.
+#
+# Why it exists: no other workflow runs Playwright, so every spec under
+# apps/web/e2e only ever ran by hand. This starts with a small ALLOWLIST
+# (see E2E_ALLOWLIST below) and grows one spec at a time as each is proven
+# green here.
+#
+# How the stack comes up (apps/web/playwright.config.ts, the default branch —
+# E2E_USE_LIVE_STACK is deliberately NOT set):
+#   1. Playwright's API webServer runs scripts/wait-api-healthy.cjs, which runs
+#      `pnpm -w db:reset:remote` (prisma migrate reset --force), seeds with
+#      apps/api/src/scripts/seed/seed-data.ts, starts the API detached
+#      (`pnpm api:bg` → tsx watch on :3001) and polls /health, /api/auth/get-session
+#      and POST /e2e/reset.
+#   2. The web webServer entry has reuseExistingServer: true, so this job starts
+#      `pnpm web:dev:local` (next dev on :3000) ITSELF, earlier, and warms the
+#      routes the allowlist hits. Playwright then reuses it. Reason: the
+#      config's 120s webServer budget has to cover a cold Turbopack compile on
+#      a shared VM, and a first-page compile there is the likeliest thing to
+#      blow it. Starting it ourselves also puts the web log in an artifact.
+#
+# THE RESET WIPES WHATEVER DATABASE_URL POINTS AT. Every URL the harness might
+# read is pinned to the `postgres` service container below, and the "Refuse
+# anything but the throwaway database" step fails the job before any of that
+# runs unless the target is that container and is empty.
+#
+# Prisma's AI-agent guardrail: `migrate reset` refuses when it detects an agent
+# via env (CLAUDECODE, GEMINI_CLI, CURSOR_AGENT, OR_APP_NAME=Aider,
+# REPLIT_CLI, CODEX_SANDBOX=seatbelt — prisma 7.1.0 build/index.js). None of
+# those exist on a runner, so the reset runs non-interactively with --force.
+# NEVER set PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION here; the preflight
+# fails the job if anything does.
+name: E2E (Playwright)
+
+on:
+  workflow_dispatch:
+    inputs:
+      specs:
+        description: "Space-separated spec paths relative to apps/web (e.g. e2e/foo.spec.ts). Empty = the allowlist."
+        required: false
+        default: ""
+      project:
+        description: "Playwright project"
+        type: choice
+        required: false
+        default: chromium
+        options:
+          - chromium
+          - guest
+      runner:
+        description: "gate-runner = vars.CI_GATE_RUNNER (self-hosted; ubuntu-latest if unset)"
+        type: choice
+        required: false
+        default: gate-runner
+        options:
+          - gate-runner
+          - ubuntu-latest
+  schedule:
+    # 09:17 UTC nightly (early morning US). Off the hour on purpose: GitHub
+    # delays/drops top-of-hour cron under load.
+    - cron: "17 9 * * *"
+
+# Global group, not per-ref: the job binds fixed host ports (3000/3001/3101
+# plus the service ports) and the self-hosted runner is single-capacity.
+# No cancel-in-progress: a nightly must not kill a dispatched run mid-install
+# (a SIGKILL during a pnpm store write corrupts the store for every later job —
+# see runner-smoke.yml).
+concurrency:
+  group: e2e-playwright
+  cancel-in-progress: false
+
+# Authenticates to nothing. No secrets are read anywhere in this file.
+#
+# NEVER add a real secret (repo secret, real Stripe key, real DB URL) to this
+# job. On failure it uploads Playwright traces (cookies, request bodies) and
+# the raw API/web logs as an artifact, and ::add-mask:: does not apply to
+# artifacts — anything real in this job's env or logs would be downloadable
+# for 7 days. The only secrets here are generated per run and die with it.
+permissions:
+  contents: read
+
+env:
+  # Paths relative to apps/web. Grow this one proven-green spec at a time.
+  E2E_ALLOWLIST: >-
+    e2e/slug-history-redirect.spec.ts
+
+jobs:
+  e2e:
+    name: Playwright (${{ inputs.project || 'chromium' }})
+    # Nightly runs ONLY on the self-hosted runner. With CI_GATE_RUNNER cleared
+    # (Mac off/asleep) the schedule is skipped rather than silently billing
+    # ~20 metered hosted minutes a night. A manual dispatch may still fall
+    # back to ubuntu-latest.
+    if: github.event_name != 'schedule' || vars.CI_GATE_RUNNER != ''
+    # ONE label, same indirection as deploy-dev.yml's quality_gate (a
+    # "self-hosted,hf-linux" string is one literal label and never matches).
+    # `inputs.runner` is a closed choice (a free-text label on a dispatch
+    # form is how a job ends up queued 24h on a label nobody serves).
+    runs-on: ${{ inputs.runner == 'ubuntu-latest' && 'ubuntu-latest' || vars.CI_GATE_RUNNER || 'ubuntu-latest' }}
+    # A hang on a single-capacity runner blocks every job on the label.
+    timeout-minutes: 45
+    env:
+      TZ: UTC
+      CI: "true"
+      NEXT_TELEMETRY_DISABLED: "1"
+
+      # ── The throwaway database ─────────────────────────────────────────
+      # Non-default host ports and a dedicated DB name, so this can only ever
+      # be the service container below: nothing else on the box answers on
+      # 55432 with a database called th_e2e_ci. playwright.config.ts resolves
+      # PLAYWRIGHT_DATABASE_URL → E2E_DATABASE_URL → DATABASE_URL, so all three
+      # are pinned (a stray runner-level PLAYWRIGHT_DATABASE_URL would
+      # otherwise win).
+      DATABASE_URL: postgresql://postgres:postgres@localhost:55432/th_e2e_ci?schema=public
+      PLAYWRIGHT_DATABASE_URL: postgresql://postgres:postgres@localhost:55432/th_e2e_ci?schema=public
+      E2E_DATABASE_URL: postgresql://postgres:postgres@localhost:55432/th_e2e_ci?schema=public
+      E2E_EXPECT_DB_PORT: "55432"
+      E2E_EXPECT_DB_NAME: th_e2e_ci
+
+      # Redis backs idempotency (IDEMPOTENCY_BACKEND defaults to redis), the
+      # atomic auth rate limiter, and the email-verification send path.
+      REDIS_URL: redis://localhost:56379
+      PLAYWRIGHT_REDIS_URL: redis://localhost:56379
+
+      # Mailpit sink. The API only sends verification mail when SMTP + Redis
+      # are both configured; pointing SMTP at a real listener keeps sign-up
+      # from depending on an ECONNREFUSED being swallowed. PLAYWRIGHT_E2E=1
+      # (set by the config) already forces plain SMTP.
+      SMTP_HOST: 127.0.0.1
+      SMTP_PORT: "11025"
+      SMTP_SECURE: "0"
+      SMTP_DEFAULT_FROM_EMAIL: no-reply@ithasfire.local
+
+      # Explicit, matching the config's defaults. `localhost`, not 127.0.0.1:
+      # the Better Auth cookie domain follows the request host (auth.setup.ts).
+      PLAYWRIGHT_BASE_URL: http://localhost:3000
+      PLAYWRIGHT_API_BASE_URL: http://localhost:3001
+
+      # wait-api-healthy.cjs polls the detached API for this long after
+      # `api:bg` (default 30s in webServer mode). The outer API webServer
+      # budget (PLAYWRIGHT_API_WEBSERVER_TIMEOUT_MS below) is the binding
+      # limit; this just stops the inner poll firing first on a cold tsx boot.
+      API_HEALTH_TIMEOUT_MS: "80000"
+      # The config's API webServer budget (reset + seed + boot + poll). Local
+      # default stays 120s; the shared VM gets 5 min. Read by
+      # apps/web/playwright.config.ts.
+      PLAYWRIGHT_API_WEBSERVER_TIMEOUT_MS: "300000"
+
+      # Surfaces wait-api-healthy.cjs output (reset, seed, boot) in the job log.
+      DEBUG: pw:webserver
+
+      PRISMA_CLIENT_ENGINE_TYPE: library
+
+      # Same public values quality_gate builds with. Not secrets.
+      NEXT_PUBLIC_TILESERVER_URL: "https://tiles-dev.ithasfire.com"
+      NEXT_PUBLIC_GEOAPIFY_API_KEY: ${{ vars.NEXT_PUBLIC_GEOAPIFY_API_KEY }}
+
+      # BETTER_AUTH_SECRET and E2E_RESET_SECRET are generated per run in the
+      # "Generate throwaway secrets" step — never stored anywhere.
+      # STRIPE_SECRET_KEY is deliberately UNSET: the API falls back to
+      # MissingStripePaymentProcessor. Specs that need Stripe cannot join the
+      # allowlist until a stripe-mock service is added here.
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: th_e2e_ci
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres" --health-interval=5s --health-timeout=2s --health-retries=10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 56379:6379
+        options: >-
+          --health-cmd="redis-cli ping" --health-interval=5s --health-timeout=2s --health-retries=10
+      mailpit:
+        image: axllent/mailpit:v1.31.2
+        ports:
+          - 11025:1025
+
+    steps:
+      # A persistent runner fills up monotonically, and a full disk surfaces as
+      # a job that dies with no logs (runner-smoke.yml). Enforced on
+      # self-hosted only; hosted images have less free space by design.
+      - name: Runner facts + disk headroom
+        run: |
+          echo "env=$RUNNER_ENVIRONMENT arch=$(uname -m) cpus=$(nproc)"
+          free -h || true
+          df -h / | tail -1
+          if [ "$RUNNER_ENVIRONMENT" = "self-hosted" ]; then
+            free_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+            [ "$free_gb" -ge 15 ] || { echo "::error::Under 15G free (${free_gb}G) — prune the runner first."; exit 1; }
+          fi
+
+      # Copied from deploy-dev.yml quality_gate — see the notes there. Must
+      # precede checkout: lfs:true shells out to git-lfs, and a reused
+      # workspace's core.hooksPath=.githooks makes `git lfs install --local`
+      # collide with the tracked .githooks/pre-push.
+      - name: Ensure git-lfs (self-hosted runner)
+        run: |
+          if ! git lfs version >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq git-lfs
+          fi
+          git lfs version
+          if [ -d "${GITHUB_WORKSPACE}/.git" ]; then
+            git -C "${GITHUB_WORKSPACE}" config --unset-all core.hooksPath || true
+          fi
+
+      # clean:true (the default) runs `git clean -ffdx`, which also removes
+      # ignored leftovers from other jobs in this shared workspace: .env*,
+      # .tmp/ (api pid + e2e DB lock), .next/, playwright/.auth/.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      # Reused workspace: `lfs: true` fetches objects but leaves pointer stubs
+      # in place (deploy-dev.yml quality_gate). Cheap, local, idempotent.
+      - name: Materialise LFS files (reused workspace)
+        run: git -C "${GITHUB_WORKSPACE}" lfs checkout
+
+      # Before the safety gate, which needs Node: the hf-linux VM has NO system
+      # Node (runner-smoke.yml). corepack ships with Node, so setup-node comes
+      # first. Neither step touches a database.
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Enable corepack and pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.16.1 --activate
+
+      # ── Safety gate: nothing below may run against a real database ──────
+      - name: Refuse anything but the throwaway database
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+
+          # 1. Every URL the harness can resolve must be the service container.
+          node - <<'NODE'
+          const want = { port: process.env.E2E_EXPECT_DB_PORT, db: process.env.E2E_EXPECT_DB_NAME };
+          for (const key of ["DATABASE_URL", "PLAYWRIGHT_DATABASE_URL", "E2E_DATABASE_URL"]) {
+            const raw = process.env[key];
+            if (!raw) { console.error(`::error::${key} is empty`); process.exit(1); }
+            const u = new URL(raw);
+            const db = u.pathname.replace(/^\//, "");
+            if (!["localhost", "127.0.0.1"].includes(u.hostname) || u.port !== want.port || db !== want.db) {
+              console.error(`::error::${key} must be localhost:${want.port}/${want.db}, got host=${u.hostname} port=${u.port} db=${db}`);
+              process.exit(1);
+            }
+            console.log(`${key}: host=${u.hostname} port=${u.port} db=${db} OK`);
+          }
+          const r = new URL(process.env.REDIS_URL);
+          if (!["localhost", "127.0.0.1"].includes(r.hostname)) {
+            console.error(`::error::REDIS_URL host must be local, got ${r.hostname}`); process.exit(1);
+          }
+          NODE
+
+          # 2. Env files something in the boot path loads. Checkout's clean
+          #    should have removed them; prove it. Loaders:
+          #    - apps/api/src/index.ts: apps/api/.env.local with override:TRUE
+          #      (would REPLACE DATABASE_URL), then root .env.local
+          #    - prisma.config.ts, scripts/db-reset.ts: root .env (dotenv/config), .env.local
+          #    - start-api-detached / wait-api-healthy: root + apps/api .env(.local)
+          #    - run-web-dev.cjs, playwright.config.ts: apps/{web,api}/.env.local
+          #    - seed-data.ts: root .env.local, apps/api/.env.local
+          #    - next dev (apps/web): .env, .env.local, .env.development(.local)
+          for f in .env .env.local \
+                   apps/api/.env apps/api/.env.local \
+                   apps/web/.env apps/web/.env.local apps/web/.env.development apps/web/.env.development.local \
+                   packages/db/.env; do
+            [ ! -e "$f" ] || fail "$f exists in the workspace — refusing to run with a local env file present."
+          done
+
+          # 3. Harness modes / overrides that change what gets reset or reused.
+          [ -z "${E2E_USE_LIVE_STACK:-}" ]    || fail "E2E_USE_LIVE_STACK is set"
+          [ -z "${E2E_ALLOW_LIVE_RESET:-}" ]  || fail "E2E_ALLOW_LIVE_RESET is set"
+          [ -z "${PLAYWRIGHT_SKIP_WEB_SERVER:-}" ] || fail "PLAYWRIGHT_SKIP_WEB_SERVER is set"
+          [ -z "${THC_RESET_ALLOW_REMOTE_DB:-}" ]  || fail "THC_RESET_ALLOW_REMOTE_DB is set"
+          [ -z "${THC_SEED_ALLOW_REMOTE_DB:-}" ]   || fail "THC_SEED_ALLOW_REMOTE_DB is set"
+          [ -z "${PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION:-}" ] || fail "PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION must never be set"
+          [ "${NODE_ENV:-}" != "production" ] || fail "NODE_ENV=production (the /e2e routes would not register)"
+
+          # 4. The target is the fresh service container: reachable, and EMPTY.
+          #    A real database has tables; a just-created container has none.
+          command -v psql >/dev/null || fail "psql missing — install postgresql-client on the runner"
+          for _ in $(seq 1 20); do
+            if pg_isready -h localhost -p "$E2E_EXPECT_DB_PORT" -U postgres; then break; fi
+            sleep 3
+          done
+          pg_isready -h localhost -p "$E2E_EXPECT_DB_PORT" -U postgres
+          n=$(PGPASSWORD=postgres psql -h localhost -p "$E2E_EXPECT_DB_PORT" -U postgres -d "$E2E_EXPECT_DB_NAME" -tAc \
+            "select count(*) from information_schema.tables where table_schema not in ('pg_catalog','information_schema')")
+          [ "$n" = "0" ] || fail "Target database already has $n tables — not a fresh service container. Refusing."
+          echo "Throwaway database confirmed: localhost:${E2E_EXPECT_DB_PORT}/${E2E_EXPECT_DB_NAME}, 0 tables."
+
+          # 5. Nothing already listening where the stack will bind. The web
+          #    webServer has reuseExistingServer: true, so a leftover :3000
+          #    from another job would be silently REUSED.
+          command -v ss >/dev/null || fail "ss missing — cannot prove ports 3000/3001/3101 are free"
+          busy=$(ss -ltnH '( sport = :3000 or sport = :3001 or sport = :3101 )' || true)
+          [ -z "$busy" ] || { echo "$busy"; fail "Ports 3000/3001/3101 are already in use on this runner."; }
+
+      - name: Generate throwaway secrets
+        run: |
+          # Per-run random values, masked. They die with the job.
+          # BETTER_AUTH_SECRET: shared by the API (Better Auth) and web
+          # (event-unlock cookie), as in local dev.
+          # E2E_RESET_SECRET: gates the API's /e2e/* routes; read by the
+          # harness, auth.setup.ts and the fixtures.
+          bas=$(openssl rand -hex 32)
+          ers=$(openssl rand -hex 24)
+          echo "::add-mask::$bas"
+          echo "::add-mask::$ers"
+          {
+            echo "BETTER_AUTH_SECRET=$bas"
+            echo "E2E_RESET_SECRET=$ers"
+          } >> "$GITHUB_ENV"
+
+      - name: Resolve specs
+        id: specs
+        env:
+          INPUT_SPECS: ${{ inputs.specs }}
+          INPUT_PROJECT: ${{ inputs.project }}
+        run: |
+          set -euo pipefail
+          # Input arrives via env, never interpolated into the script.
+          raw="${INPUT_SPECS:-}"
+          [ -n "${raw// /}" ] || raw="$E2E_ALLOWLIST"
+          out=""
+          for s in $raw; do
+            [[ "$s" =~ ^e2e/[A-Za-z0-9._/-]+\.spec\.ts$ ]] || { echo "::error::Bad spec path: $s"; exit 1; }
+            [[ "$s" != *..* ]] || { echo "::error::Bad spec path: $s"; exit 1; }
+            [ -f "apps/web/$s" ] || { echo "::error::No such spec: apps/web/$s"; exit 1; }
+            out="$out $s"
+          done
+          project="${INPUT_PROJECT:-chromium}"
+          case "$project" in chromium|guest) ;; *) echo "::error::Bad project: $project"; exit 1;; esac
+          echo "list=${out# }" >> "$GITHUB_OUTPUT"
+          echo "project=$project" >> "$GITHUB_OUTPUT"
+          echo "Specs: ${out# }  (project: $project)"
+
+      - name: Install dependencies
+        id: install
+        run: pnpm install --frozen-lockfile
+
+      # Client generation only — no DB touch. The harness does the reset.
+      - name: Prisma generate
+        run: pnpm exec prisma generate
+
+      # @th/ui-email resolves through its BUILT dist (package main/exports);
+      # the API's mailer adapters import it at boot.
+      - name: Build @th/ui-email
+        run: pnpm -F @th/ui-email run build
+
+      - name: Resolve Playwright version
+        id: pw
+        working-directory: apps/web
+        run: echo "version=$(pnpm exec playwright --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ steps.pw.outputs.version }}
+
+      # The browser download is a no-op on a cache hit / warm self-hosted box.
+      #
+      # System libraries: on a HOSTED runner, `install-deps` (sudo apt) every
+      # run is normal. On the SELF-HOSTED VM it is NOT run: apt on the
+      # persistent deploy box every night mutates it and flakes on the dpkg
+      # lock. Nothing else on that VM runs a browser today (no other workflow
+      # uses Playwright; the vitest suites are jsdom), so the libraries are a
+      # ONE-TIME MANUAL PREREQUISITE there. The VM has no system Node, so the
+      # simplest route is: let this job fail once, copy the `apt-get install …`
+      # line the failure message prints (`install-deps --dry-run`), and run it
+      # on the VM with sudo. (Equivalent, with the runner's tool-cache Node on
+      # PATH, from a checkout after `pnpm install`:
+      #   cd apps/web && sudo env "PATH=$PATH" pnpm exec playwright install-deps chromium
+      # .) The launch
+      # probe turns a missing library into that instruction instead of a
+      # cryptic mid-test crash.
+      - name: Install Playwright chromium
+        working-directory: apps/web
+        run: |
+          set -euo pipefail
+          pnpm exec playwright install chromium
+          if [ "$RUNNER_ENVIRONMENT" != "self-hosted" ]; then
+            pnpm exec playwright install-deps chromium
+          fi
+          if ! node -e "require('@playwright/test').chromium.launch().then(b => b.close()).catch(e => { console.error(e.message); process.exit(1); })"; then
+            echo "::error::Chromium cannot launch on this runner — system libraries missing. One-time fix on the VM (see the comment on this step). Apt command Playwright would run:"
+            pnpm exec playwright install-deps --dry-run chromium || true
+            exit 1
+          fi
+          echo "Chromium launch probe OK"
+
+      # See the header: started here so the cold compile happens outside the
+      # config's 120s webServer budget. Same command and API base the config
+      # would use (`pnpm --dir ../.. web:dev:local`). setsid → own process
+      # group, so teardown can stop exactly this tree by PGID.
+      - name: Start web (next dev) and warm routes
+        env:
+          NODE_OPTIONS: "--max-old-space-size=4096"
+          WEB_API_BASE_URL: http://localhost:3001
+          NEXT_PUBLIC_API_BASE_URL: http://localhost:3001
+          PLAYWRIGHT_E2E: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/e2e-logs"
+          setsid nohup pnpm web:dev:local > "$RUNNER_TEMP/e2e-logs/web-dev.log" 2>&1 < /dev/null &
+          echo $! > "$RUNNER_TEMP/web-dev.pgid"
+          echo "web dev pgid=$(cat "$RUNNER_TEMP/web-dev.pgid")"
+
+          # Wait for :3000 to answer at all (any HTTP status), up to 5 min.
+          deadline=$(( $(date +%s) + 300 ))
+          until code=$(curl -s -o /dev/null -w '%{http_code}' -m 240 http://localhost:3000/) && [ "$code" != "000" ]; do
+            if ! kill -0 "$(cat "$RUNNER_TEMP/web-dev.pgid")" 2>/dev/null; then
+              echo "::error::next dev exited"; tail -n 100 "$RUNNER_TEMP/e2e-logs/web-dev.log"; exit 1
+            fi
+            [ "$(date +%s)" -lt "$deadline" ] || { echo "::error::web did not answer within 300s"; tail -n 100 "$RUNNER_TEMP/e2e-logs/web-dev.log"; exit 1; }
+            sleep 3
+          done
+          echo "GET / -> $code"
+
+          # Compile the routes the allowlist touches. The API is not up yet,
+          # so statuses here are meaningless — this is only about compiling.
+          for p in /sign-in /account /events/event/ci-warmup /events/checkout/event/ci-warmup; do
+            c=$(curl -s -o /dev/null -w '%{http_code}' -m 240 "http://localhost:3000$p" || true)
+            echo "warm $p -> $c"
+          done
+
+      # CWD apps/web: the config's webServer commands are relative to it.
+      # Flags passed straight to the binary (`pnpm exec`), never through
+      # `pnpm run … --`, which silently drops them.
+      - name: Run Playwright
+        working-directory: apps/web
+        env:
+          SPECS: ${{ steps.specs.outputs.list }}
+          PROJECT: ${{ steps.specs.outputs.project }}
+        run: |
+          # shellcheck disable=SC2086 # SPECS is a validated, space-separated list
+          pnpm exec playwright test $SPECS --project="$PROJECT"
+
+      # failure() alone misses the 45-min timeout, which is a CANCELLATION —
+      # exactly the hang whose logs are most needed.
+      - name: Upload Playwright report, traces and stack logs
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: warn
+          # playwright/.auth (session storageState) is deliberately NOT uploaded.
+          path: |
+            apps/web/playwright-report/
+            apps/web/test-results/
+            logs/dev/api/
+            ${{ runner.temp }}/e2e-logs/
+
+      # Our own processes only: the web tree by the PGID we recorded, the API
+      # through its pid file. Never a pattern kill on a shared machine.
+      # (globalTeardown also runs api:bg:stop; both are idempotent.)
+      #
+      # CAVEAT: api:bg:stop (scripts/stop-api-detached.cjs) sends SIGTERM to
+      # the recorded pid only — `process.kill(pid)`, not the group — and that
+      # pid is the `pnpm -F api dev` leader, so the tsx-watch/node children
+      # may outlive it. The real backstop is the runner's end-of-job orphan
+      # process cleanup, which kills everything the job spawned. Not changed
+      # here: the script is shared with local dev.
+      - name: Stop the stack
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/web-dev.pgid" ]; then
+            pgid=$(cat "$RUNNER_TEMP/web-dev.pgid")
+            kill -TERM -- "-$pgid" 2>/dev/null || true
+            sleep 3
+            kill -KILL -- "-$pgid" 2>/dev/null || true
+          fi
+          pnpm api:bg:stop || true
+
+      # A cancelled/killed install can leave a truncated blob in the persistent
+      # store that fails every later --frozen-lockfile (runner-smoke.yml).
+      # Keyed to the INSTALL step, not the job: a red test run says nothing
+      # about the store, and a cancelled install must still prune. Only
+      # 'failure'/'cancelled': an install that never ran reports 'skipped'
+      # (or nothing) and has nothing to repair.
+      - name: Prune the pnpm store if install failed or was cancelled
+        if: always() && (steps.install.outcome == 'failure' || steps.install.outcome == 'cancelled')
+        run: pnpm store prune || true

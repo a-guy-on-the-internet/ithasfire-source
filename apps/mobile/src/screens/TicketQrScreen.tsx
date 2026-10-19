@@ -27,6 +27,8 @@ import {
   type NativePalette,
 } from "@th/ui-native";
 
+import { EmailVerificationPrompt } from "@/features/auth/EmailVerificationPrompt";
+import { EmailVerificationScroll } from "@/features/auth/EmailVerificationScroll";
 import { useOrderTickets } from "@/features/tickets/use-order-tickets";
 import {
   formatTicketCode,
@@ -176,8 +178,16 @@ export const TicketQrScreen = ({ route, navigation }: Props) => {
   useKeepAwake();
   useFullBrightness();
 
-  const { tickets, source, cachedAt, isLoading, errorMessage, refetch } =
-    useOrderTickets(orderId);
+  const {
+    tickets,
+    source,
+    cachedAt,
+    isLoading,
+    errorMessage,
+    verificationRequired,
+    isFetching,
+    refetch,
+  } = useOrderTickets(orderId);
 
   /**
    * Selection is by ticket ID, never by array position.
@@ -227,6 +237,24 @@ export const TicketQrScreen = ({ route, navigation }: Props) => {
   useEffect(() => {
     if (eventName) navigation.setOptions({ title: eventName });
   }, [eventName, navigation]);
+
+  // Before the loading branch: the latch holds through a refetch.
+  if (verificationRequired) {
+    return (
+      <ScreenSurface testID="ticket-qr-screen">
+        <SafeAreaView style={styles.safe} edges={["bottom"]}>
+          <EmailVerificationScroll
+            contentContainerStyle={styles.verifyContent}
+            refreshing={isFetching}
+            onRefresh={refetch}
+            testID="ticket-qr-verify"
+          >
+            <EmailVerificationPrompt context="ticket" />
+          </EmailVerificationScroll>
+        </SafeAreaView>
+      </ScreenSurface>
+    );
+  }
 
   if (isLoading) {
     return (
@@ -418,6 +446,14 @@ const makeSheet = (c: NativePalette) =>
       alignItems: "center",
       paddingHorizontal: 20,
       gap: 12,
+    },
+    // Stretches the prompt card, unlike `centered`, and scrolls so the
+    // keyboard can push the code field into view.
+    verifyContent: {
+      flexGrow: 1,
+      justifyContent: "center",
+      paddingHorizontal: 20,
+      paddingVertical: 24,
     },
     headerRow: {
       width: "100%",

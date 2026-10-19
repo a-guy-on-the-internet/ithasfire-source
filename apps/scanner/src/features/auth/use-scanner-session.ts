@@ -1,12 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import * as Sentry from "@sentry/react-native";
 
 import {
   authClient,
   magicLinkCallbackUrl,
   magicLinkErrorUrl,
 } from "./better-auth-client";
-import { clearAuthToken, loadSessionToken } from "./auth-token-store";
+import {
+  clearAuthToken,
+  getSessionTokenSync,
+  loadSessionToken,
+} from "./auth-token-store";
 import { subscribeAuthInvalidated } from "./auth-invalidation-bus";
+import {
+  createAuthInvalidatedHandler,
+  runSignOutTeardown,
+  trackSessionUser,
+} from "./sign-out-teardown";
 import {
   loadScannerPreferences,
   saveScannerPreferences,
@@ -423,53 +434,79 @@ export const useScannerSession = () => {
     }
   }, []);
 
+  // Set once a sign-out has cleared the token (explicit or remote wipe), so
+  // the 401s that follow — stragglers from the revoked session, or a query
+  // the cache purge re-creates before the session store reports "no user" —
+  // don't trigger a second sign-out. Only reset on a *fresh* sign-in (a
+  // previously-empty humanId becoming defined), by `trackSessionUser`.
+  const signedOutRef = useRef(false);
+  const lastHumanIdRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    trackSessionUser(
+      { signedOut: signedOutRef, lastHumanId: lastHumanIdRef },
+      humanId,
+    );
+  }, [humanId]);
+
+  const queryClient = useQueryClient();
+
   const signOut = useCallback(async () => {
-    const previousHumanId = humanId;
-    // Wipe the local SQLite cache (people PII, tickets, events, scan queue,
-    // recent scans) BEFORE clearing the auth session. Sign-out is the one
-    // operation that must always purge cached operator data — centralising
-    // it here covers every call site (home screen, access-denied screen,
-    // any future surface) without each one needing to remember.
-    try {
-      clearLocalDb();
-    } catch (err) {
-      if (__DEV__) {
-        console.warn("[scanner] clearLocalDb on sign-out failed", err);
-      }
+    // Before the teardown: it ends with a server call that can wait up to 5s,
+    // and the next operator may already be signing in by then.
+    if (humanId) {
+      bootstrapReportedFor.delete(humanId);
     }
-    // Release the cached feedback-tone players alongside the data purge —
-    // nothing should hold decoded audio for a session that has ended.
-    releaseFeedbackAudio();
-    await authClient.signOut();
-    await clearAuthToken();
-    await updatePreferences(emptyPreferences);
-    if (previousHumanId) {
-      bootstrapReportedFor.delete(previousHumanId);
-    }
-  }, [humanId, updatePreferences]);
+    // Sign-out is the one operation that must always purge the departing
+    // operator's data: SQLite (people PII, tickets, events, scan queue,
+    // recent scans) AND the in-memory React Query cache. Centralising it
+    // here covers every call site (home, settings, access-denied, remote
+    // wipe). Order and guards are documented in `sign-out-teardown.ts`.
+    await runSignOutTeardown({
+      queryClient,
+      clearLocalDb,
+      releaseFeedbackAudio,
+      getSessionToken: getSessionTokenSync,
+      // The captured bearer goes in explicitly: the local token is gone by
+      // now, and the next operator's may already be in its place.
+      signOutServer: (capturedSessionToken) =>
+        authClient.signOut(
+          capturedSessionToken
+            ? {
+                fetchOptions: {
+                  headers: { Authorization: `Bearer ${capturedSessionToken}` },
+                },
+              }
+            : undefined,
+        ),
+      clearAuthToken,
+      markSignedOut: () => {
+        signedOutRef.current = true;
+      },
+      resetPreferences: () => updatePreferences(emptyPreferences),
+      reportError: (err, step, level) => {
+        Sentry.captureException(err, {
+          level,
+          tags: { feature: "auth", branch: `sign_out_${step}` },
+        });
+      },
+    });
+  }, [humanId, queryClient, updatePreferences]);
 
   // Server-side session revocation → 401 from any tRPC call → forced sign-out.
   // This is the "remote wipe" mechanism: an admin revokes the operator's auth
   // session, the device picks it up on its next request, and `signOut` wipes
-  // the local SQLite cache. `signedOutRef` is only reset on a *fresh* sign-in
-  // (a previously-empty humanId becoming defined), so straggling 401s after
-  // sign-out completes don't trigger a redundant second sign-out.
-  const signedOutRef = useRef(false);
-  const lastHumanIdRef = useRef<string | undefined>(undefined);
+  // SQLite and the query cache.
   useEffect(() => {
-    if (humanId && !lastHumanIdRef.current) {
-      signedOutRef.current = false;
-    }
-    lastHumanIdRef.current = humanId;
-  }, [humanId]);
-  useEffect(() => {
-    return subscribeAuthInvalidated(() => {
-      if (signedOutRef.current) return;
-      signedOutRef.current = true;
-      const friendly = friendlyError({ data: { code: "UNAUTHORIZED" } });
-      showErrorToast(friendly.title, friendly.message);
-      return signOut();
-    });
+    return subscribeAuthInvalidated(
+      createAuthInvalidatedHandler({
+        signedOut: signedOutRef,
+        notifyOperator: () => {
+          const friendly = friendlyError({ data: { code: "UNAUTHORIZED" } });
+          showErrorToast(friendly.title, friendly.message);
+        },
+        signOut,
+      }),
+    );
   }, [signOut]);
 
   const isBootstrapping =

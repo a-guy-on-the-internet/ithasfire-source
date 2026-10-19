@@ -1,0 +1,329 @@
+# place-editor-and-entity-page-batch.spec.yaml
+#
+# Six related UX gaps on the place (venue) editor and entity pages, scoped
+# together because they touch the same surfaces (PageFieldsEditor, the place
+# /edit form, the CAB, and entity-page blocks) even though they ship as
+# independent, separately-reviewable changes.
+
+version: "1.0"
+updated: "2026-08-18"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Six accumulated rough edges across the entity-page editor and the venue
+    (Place) admin surfaces: avatar upload has no crop step anywhere in the
+    app; the entity-page "Page details" settings form has weak IA and mixed
+    save semantics; a claimed venue's public page never names its owner; the
+    place details editor (/edit) is not CAB-aware and shows an irrelevant
+    generic CAB while Save lives inline; requesting place verification means
+    leaving the editor for a separate route with no in-editor affordance;
+    platform staff have no dedicated "waive verification" action or search on
+    the places queue; and the place address fields are six plain text inputs
+    with no autocomplete despite a geocoding integration already existing.
+  solution: >
+    Six scoped fixes, each reusing existing infrastructure rather than
+    building new plumbing: crop lands once in the shared avatar upload
+    control (benefits HUMAN/PLACE/ORGANIZATION simultaneously); the Page
+    details card gets IA/grouping work, not a rebuild; owner display adds one
+    new read path joining PlaceOwnership → Organization/Human name; the place
+    editor gets a real CAB config with Save promoted into the dock; the
+    verification-request flow already has full doc-upload logic (
+    submit-place-verification.ts / VerificationSection.tsx) — it gets
+    presented as a modal from /edit instead of a separate route; platform
+    waive reuses the existing staff-bypass use case
+    (update-place-verification-status.ts) with clearer copy plus a new search
+    box; and address entry gets a debounced autocomplete built on the
+    existing Geoapify integration.
+  users:
+    - Organization / venue owner-admins editing their own place
+    - Musicians / organizations editing their own entity page (avatar crop)
+    - Platform staff (ADMIN/REVIEWER) reviewing and waiving verification
+    - Public visitors to a claimed venue's page (owner display)
+  surfaces:
+    - web
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    # 1. Avatar crop
+    - id: FR-001
+      description: >
+        The shared `usePageImageUpload` / `PageImageControl` path (
+        PageFieldsEditor.tsx) gains a client-side crop step between file
+        selection and presigned upload: a modal crop UI with a fixed square
+        aspect ratio for avatars (matching the existing 96×96 preview) and
+        the existing 3:1 aspect for banners. Cropping happens before the
+        presigned PUT (no server-side transform exists or is added). Applies
+        uniformly to HUMAN, PLACE, and ORGANIZATION — one implementation,
+        three beneficiaries, per the shared-component precedent already in
+        place for the plain upload.
+    - id: FR-002
+      description: >
+        The account-settings quick-avatar widget (ProfileSection.tsx,
+        HUMAN-only today) gets the same crop step for consistency, since it
+        writes to the same EntityPage.avatarUrl field.
+
+    # 2. Page details settings redesign
+    - id: FR-003
+      description: >
+        PageFieldsEditor's "Page details" card is regrouped into clear
+        subsections (Identity: name/slug; Images: avatar/banner; Bio;
+        Visibility) with subheadings, replacing the current flat
+        undifferentiated field stack.
+    - id: FR-004
+      description: >
+        Image fields (avatar/banner) are visually marked as auto-saving
+        (e.g. a persistent "saved" state indicator) distinct from the
+        explicit-Save fields (name/slug/bio/visibility), so the two save
+        models in one card are no longer ambiguous.
+    - id: FR-005
+      description: >
+        The slug row is redesigned so the `/p/` prefix, input, and
+        availability indicator (spinner/check/✕) read as one coherent
+        field, with the taken-slug error rendered inline rather than in a
+        detached block below.
+    - id: FR-006
+      description: >
+        The Visibility select gains one line of helper copy per option
+        (PUBLIC/UNLISTED/PRIVATE) describing discoverability, matching the
+        hint-copy pattern already used elsewhere in PageEditorView (e.g.
+        peStandardTemplateHint).
+
+    # 3. Venue owner display
+    - id: FR-007
+      description: >
+        A new lightweight read path resolves the display name of a claimed
+        venue's verified owner (join PlaceOwnership → Organization.name or
+        the owning Human's profile name), exposed via the existing claim-
+        eligibility query or a small new public procedure.
+    - id: FR-008
+      description: >
+        On the canonical public venue page (/places/:slug via
+        EntityPageShell), when a venue is already claimed
+        (venueAlreadyClaimed), render the owner's display name inline in the
+        page body on the same line/row as the "Request transfer" action
+        (currently CAB-overflow-only) — e.g. "Owned by {name} · Request
+        transfer". Unclaimed venues show neither.
+    - id: FR-009
+      description: >
+        Reconcile the divergent claim-UI between the canonical entity page
+        (no claim badge at all today) and the legacy /places/id/[placeId]
+        route (has ClaimVenueCta but never names the owner) — the canonical
+        page becomes the one source of truth for this display.
+
+    # 4. CAB-aware place editor
+    - id: FR-010
+      description: >
+        Add a new CAB route rule for `/admin/:slug/places/:placeId/edit`
+        (currently absent, falls through to the irrelevant generic
+        catch-all). New config registers a primary Save CTA (mirroring the
+        event builder's ebSave/ebShowSave/ebSaving pattern:
+        useCABData/useCABAction for dirty-state gating and pending state),
+        promoting Save from the current inline-only button into the CAB.
+    - id: FR-011
+      description: >
+        The in-page Save button may remain as a mobile/no-JS fallback (CAB
+        collapses below 600px per existing convention) but the CAB Save is
+        the primary desktop affordance going forward.
+
+    # 5. Verification request modal + platform waive
+    - id: FR-012
+      description: >
+        Add a "Request Verification" button on the place /edit page (near
+        Save) that opens a modal presenting the EXISTING verification-request
+        flow (document upload, reuse-docs-on-resubmit toggle — the same logic
+        currently in VerificationSection.tsx / submit-place-verification.ts),
+        rather than navigating to the separate /verify route. The /verify
+        route may remain for deep-linking but is no longer the only entry
+        point.
+    - id: FR-013
+      description: >
+        Reconcile the two parallel org-side verification-request paths (the
+        full doc-upload flow vs. PlacesTable.tsx's simpler status-flip-to-
+        PENDING row action) so the modal is the one path org admins use going
+        forward; the PlacesTable row action either opens the same modal or is
+        removed in favor of it.
+    - id: FR-014
+      description: >
+        On /platform/places, add a "Waive verification" action alongside the
+        existing staff "Verify" action, reusing
+        update-place-verification-status.ts's staff-bypass path
+        (ADMIN/REVIEWER only, per hasStaffRole). Distinct copy from "Verify"
+        even if the underlying status transition is the same, so staff
+        understand they're skipping document review rather than approving
+        submitted documents.
+    - id: FR-015
+      description: >
+        Add a search box to /platform/places (PlatformVerificationQueue /
+        PlaceDetailPanel) to find a place by name/slug — not present today.
+
+    # 6. Standardized address input
+    - id: FR-016
+      description: >
+        Build a debounced address-autocomplete input on top of the existing
+        Geoapify integration (lib/maps/geocoding.ts), replacing the six
+        independent plain-text address fields on the place /edit page with
+        a single search-as-you-type field that resolves to structured
+        addrLine1/city/region/postcode/country + lat/lng, with a manual-entry
+        fallback (mirroring the LocationFields.tsx fallback pattern already
+        used in the place-review flow) for addresses Geoapify can't resolve.
+    - id: FR-017
+      description: >
+        Address autofill happens at selection time (choosing a suggestion),
+        not only on save — lat/lng are populated immediately rather than
+        the current save-time-only forwardGeocode call.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Crop UI honors reduced-motion and is keyboard-operable (drag handles
+        need an arrow-key/input fallback per WCAG).
+    - id: NFR-002
+      description: >
+        Address autocomplete debounces requests (target ~300ms) and never
+        fires on every keystroke against Geoapify — matches the existing
+        forward-geocode util's own "not on every keystroke" constraint, now
+        satisfied via debounce instead of submit-only.
+    - id: NFR-003
+      description: >
+        Owner-name display (FR-007/008) never leaks a HUMAN owner's identity
+        beyond what's already public on their entity page (no email/contact
+        info) — display name only, same as any other public profile link.
+    - id: NFR-004
+      description: >
+        Waive verification (FR-014) is audit-logged the same way the
+        existing staff-verify path already is (reuses
+        update-place-verification-status.ts's existing audit behavior — do
+        not fork a separate un-audited code path).
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: get-place-owner-display (new, or extend get-place-claim-eligibility)
+        description: >
+          Resolves the verified owner's display name for a claimed place by
+          joining PlaceOwnership → Organization/Human. Public-safe (name
+          only).
+        input: "placeId"
+        output: "{ ownerDisplayName: string } | null"
+        idempotent: true
+        money: false
+      - name: update-place-verification-status (existing, reused)
+        description: >
+          Staff-only bypass already sets Place.verification directly;
+          FR-014 adds a "waive" call site with distinct copy, same use case.
+        input: "placeId, staff actor"
+        output: "updated Place.verification"
+        idempotent: true
+        money: false
+      - name: submit-place-verification (existing, reused)
+        description: >
+          Existing doc-upload submission logic, invoked from the new modal
+          (FR-012) instead of only from /verify.
+        input: "placeId, documents, source"
+        output: "PlaceVerificationRequest"
+        idempotent: false
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - FileStoragePort (avatar/banner crop upload — unchanged presign flow)
+
+  adapters:
+    new: []
+    existing:
+      - Cloudflare R2 / S3 file-storage adapters (crop output uploads through
+        the same presigned-PUT path, no adapter changes)
+
+  transport:
+    trpc_procedures:
+      - "places.getOwnerDisplay (new) OR extend places.getPlaceClaimEligibility to include ownerDisplayName"
+      - "platform.waivePlaceVerification (new, or reuse platform.updatePlaceVerificationStatus with a `reason: \"waived\"` discriminator)"
+    webhooks: []
+
+  ui:
+    pages:
+      - "apps/web/src/app/admin/[slug]/places/[placeId]/edit/page.tsx (CAB registration, verification modal trigger, address autocomplete)"
+      - "apps/web/src/app/platform/places/_components/PlaceDetailPanel.tsx (waive action)"
+      - "apps/web/src/app/platform/places/_components/PlatformVerificationQueue.tsx (search box)"
+    components:
+      - "New: AvatarCropModal (or similar) — shared by PageImageControl and ProfileSection's quick-avatar widget"
+      - "New: AddressAutocompleteInput — debounced Geoapify search + manual-entry fallback"
+      - "New: RequestVerificationModal — wraps existing VerificationSection form logic"
+      - "Modified: PageFieldsEditor.tsx (IA regroup, FR-003..006)"
+      - "Modified: PlaceHero.tsx or a new inline owner-display row (FR-008)"
+      - "Modified: bar-configs.ts (new admin-place-edit-editor CAB config, FR-010)"
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+  # Place already has addrLine1/addrLine2/city/region/postcode/country/lat/lng
+  # (place.prisma) — FR-016/017 are UI-only against existing columns.
+  # PlaceOwnership already has ownerType/ownerId (place.prisma) — FR-007 is a
+  # new read/join, not a new column.
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Crop modal shared across 3 owner types could regress the existing
+      no-crop upload flow's HEIC handling (prepareImageForUpload) if crop
+      output isn't re-validated through the same pipeline.
+    severity: MEDIUM
+    mitigation: >
+      Crop must produce a File/Blob that re-enters the existing
+      usePageImageUpload validation path unchanged, not bypass it.
+  - risk: >
+      Reconciling the two verification-request paths (FR-013) could break an
+      org-admin muscle-memory workflow if the PlacesTable row action is
+      removed outright.
+    severity: LOW
+    mitigation: >
+      Prefer "row action opens the same modal" over deletion.
+  - risk: >
+      Moving Save into the CAB (FR-010) changes an established interaction
+      for anyone with the place /edit page already open/bookmarked mid-edit.
+    severity: LOW
+    mitigation: >
+      Keep the inline Save as a fallback per FR-011; this is additive, not a
+      removal.
+  - risk: >
+      Geoapify's autocomplete endpoint (separate from the forward-geocode
+      endpoint already wired) may need a new API scope/rate-limit check.
+    severity: LOW
+    mitigation: >
+      Verify Geoapify plan/quota covers autocomplete before building; same
+      provider, so no new vendor integration risk.
+
+open_questions:
+  - "Exact copy for the 'Waive verification' action (FR-014) — needs a one-line explanation distinguishing it from 'Verify' for platform staff."
+  - "Should ownerDisplayName (FR-007) link to the owner's own entity page, or render as plain text? (Recommend: link, consistent with how organizer/artist names link elsewhere.)"
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - "PLACE-owned membership tiers (would require ownerPlaceId on MembershipTier + core changes) — deferred per 2026-08-17 decision; venues use their Organization entity page for memberships in the meantime."
+  - "In-page membership block itself is a separate spec (see membership-entity-page-block.spec.yaml in this same batch)."
+  - "Server-side image transforms/CDN-side cropping — crop stays client-side pre-upload, no adapter/port changes."
+  - "New geocoding provider (Google Places/Mapbox) — FR-016 builds on the existing Geoapify integration only."
+  - "Reworking the /verify route itself or the platform review queue's approve/reject logic beyond adding waive + search."
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - "Uploading a new avatar (HUMAN, PLACE, or ORGANIZATION) presents a crop step before upload; the cropped result is what appears in the 96×96 preview and on the public page."
+  - "The Page details card shows clearly separated Identity/Images/Bio/Visibility groupings, with image fields visibly marked as already-saved."
+  - "A claimed venue's public page shows the owner's display name on the same row as the Request transfer action; an unclaimed venue shows neither."
+  - "Visiting /admin/:slug/places/:placeId/edit shows a CAB with a Save action (not the generic Dashboard/Events/Create-Event catch-all), reflecting dirty/pending state."
+  - "Clicking 'Request Verification' on /edit opens a modal with the real document-upload form; submitting it creates a PlaceVerificationRequest identical to what /verify produces today."
+  - "A platform ADMIN/REVIEWER can search /platform/places by name/slug and waive verification on a place without requiring submitted documents; the action is audit-logged."
+  - "Typing a street address on /edit shows live suggestions; selecting one populates addrLine1/city/region/postcode/country/lat/lng immediately, with a manual-entry fallback still available."

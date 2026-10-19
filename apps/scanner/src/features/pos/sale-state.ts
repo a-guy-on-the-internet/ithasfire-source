@@ -1,6 +1,6 @@
 /**
  * Per-tier sale-window copy for the Sell screen
- * (docs/specs/2026-08-10/time-based-ticket-pricing.spec.yaml FR-010).
+ * (docs/specs/2026-08-10/completed/time-based-ticket-pricing.spec.yaml FR-010).
  *
  * WHY THIS EXISTS. Phase 2a armed the till to REFUSE a tier outside its sales
  * window — `assertTicketTypeOnSale` runs inside `startPosSale` and

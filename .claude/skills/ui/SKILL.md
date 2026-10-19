@@ -17,7 +17,7 @@ Use this skill for Ithas Fire UI implementation and design review. It packages t
 - `AGENTS.md`: strict Swiss content rules, soft chrome exception, token discipline.
 - `docs/design/style-guide.md`: typography, spacing, motion, voice. **Its palette and
   "Dark Mode" sections are SUPERSEDED by design-system-v2.md — do not take colors from it.**
-- `docs/prompts/ui.md`: UI architecture, tRPC/data rules, component workflow, QA expectations.
+- `docs/layers.md#ui`: UI architecture, tRPC/data rules, component workflow, QA expectations.
 - `packages/ui/src/ui/tamagui`: canonical components, tokens, themes, and shared primitives.
 - `packages/ui-email/src/theme`: email-safe UI tokens and typography.
 
@@ -35,13 +35,15 @@ Do not use this skill for pure core/business logic, adapters, database migration
 
 ## UI Build Workflow
 
-1. **Classify the surface.** Identify whether this is web, mobile/scanner, shared UI, email, or documentation. Read adjacent files before editing.
-2. **Map the data contract.** UI consumes typed tRPC/server helpers. Never call Prisma, adapters, Stripe, Redis, or core repos directly from UI components.
-3. **Pick existing patterns first.** Reuse `@th/ui`, local form primitives, route shells, existing hooks, and nearby styling conventions before adding a new abstraction.
-4. **Design the states.** Include normal, loading, empty, error, disabled, permission-denied, and success states where the workflow can enter them.
-5. **Implement with tokens.** Use Tamagui/theme tokens and shared primitives. Add tokens only when existing ones cannot express the need.
-6. **Verify ergonomics.** Check keyboard/focus, responsive layout, text fit, reduced motion, and mobile tap targets. Verify colors resolve on the **Stub** (default light) theme — including the SSR/first-paint fallback, not just the hydrated value.
-7. **Validate narrowly.** Run the smallest test/build/typecheck command that covers the changed surface; use Playwright for high-risk browser workflows.
+1. **Classify the surface.** Identify whether this is web, mobile/scanner, shared UI, email, or documentation. Read adjacent files before editing, then the matching sections of [`TRAPS.md`](TRAPS.md): the Tamagui, component, layering and copy defects this codebase has already shipped.
+2. **Board before build.** A change with a visual identity (new surface, redesign, new component) starts as a published artifact of the options, drawn from the real components you just read, never invented UI. The owner picks; record the pick as a ruling before building. A subagent whose delegation names no picked board publishes the board and returns the options to the orchestrator.
+3. **Map the data contract.** UI consumes typed tRPC/server helpers. Never call Prisma, adapters, Stripe, Redis, or core repos directly from UI components.
+4. **Pick existing patterns first.** Reuse `@th/ui`, local form primitives, route shells, existing hooks, and nearby styling conventions before adding a new abstraction.
+5. **Design the states.** Include normal, loading, empty, error, disabled, permission-denied, and success states where the workflow can enter them.
+6. **Implement with tokens.** Use Tamagui/theme tokens and shared primitives. Add tokens only when existing ones cannot express the need.
+7. **Verify ergonomics.** Check keyboard/focus, responsive layout, text fit, reduced motion, and mobile tap targets. Verify colors resolve on the **Stub** (default light) theme — including the SSR/first-paint fallback, not just the hydrated value.
+8. **Validate narrowly.** Run the smallest test/build/typecheck command that covers the changed surface (Validation Guide below).
+9. **Run it.** Drive the real page on the running dev stack at `http://localhost:3000` (the orchestrator delegates this to the `browser-driver` agent; a subagent uses the chrome-devtools MCP tools itself, under the same rules as `.claude/agents/browser-driver.md`): exercise the interaction, check zero new console errors and that React hydrated, and check 320px. Unit tests mock the design system away, so accessible-name collisions, hydration failures and narrow-width overflow only show here. Put the screenshot beside the board when there is one and compare the treatment, not just the fit. The step is done when you have looked at the 320px screenshot yourself.
 
 ## Ithas Fire Design Rules
 
@@ -85,8 +87,8 @@ Chrome is the frame around the work: navbar controls, profile/avatar buttons, no
 **Full contract: `docs/design/design-system-v2.md`. The essentials:**
 
 - Canonical token VALUES: `packages/ui/src/ui/tamagui/tokens/colors.ts`.
-- **Stub (warm paper, light) is the shipped default theme.** Ember (navy, dark) exists but is
-  currently inert — the theme injector pins stub. Don't assume dark mode works.
+- **Stub (warm paper, light) is the shipped default theme.** Ember (navy, dark) is live behind
+  the light/dark toggle, so check every UI change in both themes. Embeds are locked to light.
 - **Theme keys are `stub` / `swiss` / `ember` — NOT `light` / `dark`.** Detect dark with
   `useThemeName() === "ember"` (`@/hooks/useIsDarkTheme`). `startsWith("dark")` never matches
   and has already shipped as dead code once.
@@ -174,7 +176,7 @@ Choose the narrowest useful validation:
 - Web build smoke: `pnpm -F web build` for broad Next.js routing or server/client boundary changes.
 - Shared UI: package-specific tests or Storybook checks when available.
 - Mobile/scanner: `pnpm -F scanner exec vitest --run` or `pnpm -F mobile exec vitest --run` for touched logic; Expo smoke when native config changes.
-- E2E: `pnpm -F web exec playwright test e2e/<spec>.spec.ts --project=chromium` for high-risk browser workflows. Report generated videos when Playwright runs.
+- E2E: `cd apps/web && E2E_USE_LIVE_STACK=1 pnpm exec playwright test e2e/<spec>.spec.ts --project=chromium --reporter=list` against the running dev stack. Without `E2E_USE_LIVE_STACK=1` the harness runs `prisma migrate reset --force` and wipes the dev DB every session shares. Add `--workers=1` when two specs touch the same account. A spec that throws `Refusing to wipe the database of a live stack` calls `resetE2eState()`: report it and check that surface by hand in the browser. `E2E_ALLOW_LIVE_RESET=1`, or a run without `E2E_USE_LIVE_STACK`, deletes every order, event, org and user every session is driving; use either only when your prompt names it. Report generated videos.
 
 ## Output Format
 

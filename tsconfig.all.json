@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "./tsconfig.base.json",
+  // Full monorepo solution config. Prefer `pnpm typecheck` for day-to-day work.
+  "files": [],
+  "include": [],
+  "references": [
+    { "path": "./packages/types" },
+    { "path": "./packages/ports" },
+    { "path": "./packages/schema" },
+    { "path": "./packages/db" },
+    { "path": "./packages/test-utils" },
+    { "path": "./packages/locale" },
+    { "path": "./packages/web-rn-shims" },
+    { "path": "./packages/ui" },
+    { "path": "./packages/ui-email" },
+    { "path": "./packages/adapters" },
+    { "path": "./packages/core" },
+
+    { "path": "./packages/transport/trpc" },
+
+    { "path": "./apps/api" },
+    { "path": "./apps/web" },
+    { "path": "./apps/mobile" },
+    { "path": "./apps/scanner" },
+    { "path": "./apps/jobs" },
+    { "path": "./apps/audio-transcoder" }
+  ]
+}

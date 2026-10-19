@@ -1,6 +1,6 @@
 ---
 name: codex-delegate
-description: "Delegate a task to Codex (OpenAI GPT) non-interactively for cross-model diversity — a second-opinion code review, cheap/mechanical offload, or UI verification against a screenshot. Use when you want an INDEPENDENT model's perspective on a high-stakes diff, want to offload bulk mechanical work off the Claude subagent budget, or need a vision check on a rendered UI. Always runs through the hang/crash watchdog. Use when asked to 'get a second opinion', 'have GPT/codex review this', 'cross-check with another model', or 'verify this UI with codex'."
+description: "Run a task on Codex (the newest GPT, which the owner calls Astra) through the watchdog wrapper: ideas and fact-clearing in a grill or discussion, a second-opinion review of a high-stakes diff, mechanical offload, or a vision check of a screenshot. Use when asked to ask Astra, for a second opinion or a cross-model check, or to hand work to GPT/Codex."
 ---
 
 # Codex Delegate (cross-model GPT)
@@ -22,8 +22,13 @@ a computer-use runner.
 
 Everything goes through **`scripts/codex-headless.sh`** — never call `codex`
 directly. The wrapper exists because `codex exec` can hang and this Mac has no
-`timeout`/`gtimeout`. It runs on **`gpt-5.6-terra`** by default (`gpt-5.6-luna`
-for fast/cheap bulk work).
+`timeout`/`gtimeout`. It runs on the **newest GPT model** by default: the lowest-`priority`
+listed model in `~/.codex/models_cache.json` (owner ruling 10-07:
+always the latest, never a pinned slug). If the account rejects the auto-picked model
+(stale cache: "not supported when using Codex with a ChatGPT account"), the wrapper falls through to the
+next listed model, but only when the rejection is a codex `error`/`turn.failed` event and the run did
+no work yet; an explicit `--model` is never retried, and `--cap-seconds` is a total across attempts. Pass `--model` only when a task needs a
+cheaper tier from the same file.
 
 **The watchdog investigates; it does not reflexively kill.** A big reasoning
 model legitimately goes quiet for minutes mid-reasoning, so a stall is not a
@@ -39,9 +44,10 @@ never `pkill`/`killall` by name (shared machine, other sessions run `codex`).
 
 | Use case | Recipe | Notes |
 |----------|--------|-------|
-| **Second-opinion review** (high-stakes diff: money, auth/RBAC, migrations, concurrency) | `--review-uncommitted` or `--review-base main` | Run *alongside* the `reviewer` agent; reconcile both sets of findings. Different model → catches different classes. |
+| **Second-opinion review** (high-stakes diff: money, auth/RBAC, migrations, concurrency) | plain prompt that runs `git diff -- <paths>` (recipe below) | Run *alongside* the `reviewer` agent; reconcile both sets of findings. Different model → catches different classes. |
 | **Mechanical offload** (bulk boilerplate, rote edits with a fully-specified diff) | `--sandbox workspace-write` in an isolated `git worktree` | Frees the Claude subagent budget. Prefer a worktree so it can't clobber the shared tree's concurrent WIP. |
 | **Mechanical UI check ONLY** (is the element present? did it regress? — NOT "does it look good") | `--image shot.png -- "confirm the X button and Y table are present …"` | Claude owns all UI taste/design (see the hard rule above). Use this only for element-presence/regression facts, never the aesthetic verdict. |
+| **Ideas and fact-clearing** in a grill or discussion ("ask Astra") | the Astra pass in `.claude/skills/grilling/ASTRA.md` | Astra clears fact questions and proposes options; owner questions and taste stay where they are. |
 | **Computer-use** (read/drive live Mac apps: click, type, read a window) | `--computer-use -- "…"` | Sets the authorized bypass to clear the MCP elicitation gate. Scope the prompt tightly (bypass drops the sandbox). |
 
 For anything needing **structured, harness-tracked, context-sharing** results,
@@ -50,38 +56,39 @@ blob if you pass `--schema`) over a shell boundary, not a native schema object.
 
 ## Recipes
 
-Second opinion on the current uncommitted diff (read-only; it never edits):
+Set `SCRATCH` to your session's scratchpad directory before running these (`SCRATCH=<scratchpad path>`); unset, the paths resolve to `/` and fail. Screenshots come from `.playwright-mcp/`.
+
+Second opinion on a diff (read-only sandbox; it never edits). Name the paths:
+the working tree always carries other sessions' WIP, and `--review-uncommitted`
+/ `--review-base` reject a prompt anyway (the current `codex exec review` errors
+on `--uncommitted` + a positional prompt).
 
 ```bash
-scripts/codex-headless.sh --review-uncommitted -- \
-  "Focus on money math, RBAC gaps, and idempotency. Flag anything a reviewer should block on."
+scripts/codex-headless.sh -- \
+  "Run \`git diff -- packages/core/src/use-cases/orders/refund.ts packages/core/src/use-cases/orders/__tests__/refund.test.ts\` and review ONLY that diff; ignore the rest of the tree. Focus on money math, RBAC gaps, and idempotency. Flag anything a reviewer should block on."
 ```
 
-Review a branch's changes against main:
-
-```bash
-scripts/codex-headless.sh --review-base main -- "Security-focused pass."
-```
+For committed work, swap in `git show <sha> -- <paths>` or `git diff <base>..<sha> -- <paths>`.
 
 UI verification from a screenshot, with a structured verdict:
 
 ```bash
-cat > /tmp/ui-verdict.schema.json <<'JSON'
+cat > $SCRATCH/ui-verdict.schema.json <<'JSON'
 { "type":"object","required":["matches","issues"],
   "properties":{ "matches":{"type":"boolean"},
     "issues":{"type":"array","items":{"type":"string"}} } }
 JSON
-scripts/codex-headless.sh --image /tmp/roles-page.png --schema /tmp/ui-verdict.schema.json -- \
+scripts/codex-headless.sh --image .playwright-mcp/roles-page.png --schema $SCRATCH/ui-verdict.schema.json -- \
   "This is the /platform/roles page. Verify against: table with role badges, per-row grant dropdown, ADMIN-only revoke. List any mismatches."
 ```
 
 Mechanical offload in an isolated worktree (so it can edit safely):
 
 ```bash
-git worktree add /tmp/codex-wt HEAD
-scripts/codex-headless.sh --cd /tmp/codex-wt --sandbox workspace-write --cap-seconds 600 -- \
+git worktree add $SCRATCH/codex-wt HEAD
+scripts/codex-headless.sh --cd $SCRATCH/codex-wt --sandbox workspace-write --cap-seconds 600 -- \
   "Add a JSDoc block to every exported function in packages/foo/src that lacks one. No behavior changes."
-# then review /tmp/codex-wt's diff, cherry-pick what's good, and: git worktree remove /tmp/codex-wt
+# then review $SCRATCH/codex-wt's diff, cherry-pick what's good, and: git worktree remove $SCRATCH/codex-wt
 ```
 
 ## Reading the result
@@ -97,17 +104,19 @@ scripts/codex-headless.sh --cd /tmp/codex-wt --sandbox workspace-write --cap-sec
 
 ## Options worth knowing
 
-- `--cap-seconds N` (default 600) — hard ceiling; this is the "10-minute check."
-- `--stall-seconds N` (default 180) — kill if no output for N seconds (hang).
+- `--cap-seconds N` (default 600) — hard ceiling, a total across model fallback
+  attempts; this is the "10-minute check."
+- `--stall-seconds N` (default 180) — trips the watchdog if no output for N seconds
+  (diagnose, leave alive unless `--kill-on-cap`).
 - `--sandbox read-only|workspace-write|danger-full-access` (default read-only).
 - `--cd DIR`, `--model NAME`, `--image FILE` (repeatable), `--schema FILE`.
 
 ## Honest caveats — do not oversell
 
-- **Model:** `gpt-5.6-terra` (balanced everyday, default) or `gpt-5.6-luna`
-  (fast/cheap) — pass `--model`. Reasoning effort up to `ultra`
-  (`-c model_reasoning_effort=…`). Older tiers `gpt-5.5`/`gpt-5.4` still valid;
-  check `~/.codex/models_cache.json` for the live list.
+- **Model:** newest listed in `~/.codex/models_cache.json` unless `--model`
+  overrides; the wrapper prints which one it chose. Reasoning effort via
+  `-c model_reasoning_effort=…` (each model's supported levels are in the same
+  file).
 - **Computer-use works headlessly via `--computer-use`** (verified — read a live
   Safari window). It requires `--dangerously-bypass-approvals-and-sandbox` (the
   `--computer-use` flag sets it) to get past Codex's interactive MCP elicitation

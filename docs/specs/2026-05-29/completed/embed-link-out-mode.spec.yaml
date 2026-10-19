@@ -1,0 +1,208 @@
+status: complete
+# embed-link-out-mode.spec.yaml
+#
+# Per-embed "link-out" mode — turn an embed into a discovery surface that opens
+# the real Ithas Fire event page in a new tab instead of running the in-iframe
+# checkout.
+
+version: "1.0"
+updated: "2026-05-29"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The embed widget always runs the full ticket-selection + checkout flow inside
+    the iframe on the host page. Some organizers don't want to host payment inside
+    a third-party site — they want the embed to act purely as a promotional /
+    discovery surface that drives buyers to the canonical Ithas Fire event page
+    (richer layout, SEO, sharing, full series support). Until now there was no way
+    to opt an embed out of in-iframe checkout.
+  solution: >
+    Add a per-embed boolean `linkOut` (default false). When true, the widget keeps
+    the event detail (and the series date switcher) but replaces the in-iframe
+    ticket selection + checkout with a single "Get Tickets on Ithas Fire" CTA that
+    opens the selected event's public page in a NEW TAB. Organization-embed grid
+    cards likewise open the event page in a new tab instead of expanding to the
+    in-iframe detail. The admin embeds builder gains a per-embed In-page ↔ New-tab
+    toggle. `linkOut = false` preserves the existing in-iframe checkout + series
+    flow unchanged. Modeled exactly on the existing `requireAuth` boolean.
+  users:
+    - organizer / org editor (chooses in-page checkout vs link-out per domain)
+    - end user (ticket buyer)
+  surfaces:
+    - embed
+    - web (admin embeds builder)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Embeds carry a `linkOut` boolean (default false), settable per embed
+        (i.e. per allow-listed domain) via `embeds.upsert`, and surfaced on
+        `embeds.list` and `embeds.getForWidget`.
+    - id: FR-002
+      description: >
+        Event embed + `linkOut = true`: render the event detail and (for series
+        events) the date switcher, but hide the stepper, ticket-type list, order
+        summary, sticky Continue button, and mobile CTA bar. Render a single
+        "Get Tickets on Ithas Fire" CTA.
+    - id: FR-003
+      description: >
+        The CTA opens `${siteUrl}/events/{slug ?? id}` in a NEW TAB
+        (`target="_blank" rel="noopener noreferrer"`). It is series-aware: the href
+        derives from the currently selected event, so switching the date pill
+        updates the destination to that date's event page.
+    - id: FR-004
+      description: >
+        Organization embed + `linkOut = true`: the events grid still renders, but
+        clicking a card opens that event's Ithas Fire page in a new tab
+        (`window.open(url, "_blank", "noopener,noreferrer")`) instead of morphing
+        into the in-iframe detail panel.
+    - id: FR-005
+      description: >
+        `linkOut = false` (default) leaves the in-iframe ticket selection,
+        checkout, and series date switching flow completely unchanged.
+    - id: FR-006
+      description: >
+        The admin embeds builder renders a per-embed two-segment toggle
+        ("In-page checkout" ↔ "Open Ithas Fire in a new tab") on each active embed
+        card. Toggling re-upserts the same `(subjectType, subjectId, domain)` with
+        the new `linkOut` value and preserves `requireAuth`.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        The widget runs in an iframe on third-party domains. Link-out MUST open a
+        real new tab and MUST NEVER navigate the iframe's top frame
+        (no `window.top` / `parent` navigation). The destination origin comes from
+        `getSiteUrl()` (the Ithas Fire origin), never the embedding parent.
+    - id: NFR-002
+      description: >
+        The admin toggle is accessible: `role="group"`, `aria-pressed` per segment,
+        disabled while the mutation is pending.
+    - id: NFR-003
+      description: >
+        The runtime CTA follows the embed Swiss design tokens
+        (`embed-theme.ts`: STEEL_BLUE / TEXT / BORDER / SURFACE, `borderRadius: 0`,
+        uppercase bold label). No hardcoded hex.
+    - id: NFR-004
+      description: >
+        All user-facing strings are localized in both `en.json` and `es.json`.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - upsert-embed (input/output schema, tx upsert call, audit data, returned DTO)
+      - list-embeds (item schema + mapping)
+      - get-embed-for-widget (output `embed` schema + `embedBase` — the runtime config source)
+
+  ports:
+    new: []
+    existing:
+      - EmbedsRepo.upsert input gains `linkOut?: boolean`
+
+  adapters:
+    new: []
+    existing:
+      - PrismaEmbedsRepo — EMBED_SELECT, EmbedSelectResult, mapEmbed, upsert create/update (mirror requireAuth)
+
+  transport:
+    trpc_procedures:
+      - embeds.upsert (input flows through upsertEmbedInputSchema; output embedDtoSchema gains linkOut)
+      - embeds.list (embedDtoSchema gains linkOut)
+      - embeds.getForWidget (embed object gains linkOut)
+    webhooks: []
+
+  ui:
+    components:
+      - name: EmbedsView + EmbedCard
+        location: apps/web/src/app/admin/[slug]/embeds/_components/EmbedsView.tsx
+        description: >
+          Per-embed In-page ↔ New-tab toggle backed by a dedicated `embeds.upsert`
+          mutation (own toast, invalidates `embeds.list`). Preserves requireAuth.
+      - name: Embed runtime page
+        location: apps/web/src/app/embed/[embedId]/page.tsx
+        description: >
+          Reads `data.embed.linkOut`; adds `buildEventUrl(slugOrId)` =>
+          `${getSiteUrl()}/events/{slugOrId}`; threads `linkOut` + `buildEventUrl`
+          into the grid and detail.
+      - name: EmbedEventGrid
+        location: apps/web/src/app/embed/[embedId]/_components/EmbedEventGrid.tsx
+        description: >
+          In link-out mode, card click opens the event in a new tab.
+      - name: EmbedEventDetail
+        location: apps/web/src/app/embed/[embedId]/_components/EmbedEventDetail.tsx
+        description: >
+          In link-out mode, keeps EventDetail + series switcher, hides
+          stepper/tickets/summary/Continue/mobile CTA, renders the
+          "Get Tickets on Ithas Fire" CTA.
+    pages: []
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models:
+    - name: Embed
+      change: >
+        Add `linkOut Boolean @default(false)` (profile.prisma), mirroring the
+        existing `requireAuth` column.
+  migrations_needed: true
+  migration: >
+    20260601010000_embed_link_out —
+    `ALTER TABLE "Embed" ADD COLUMN "linkOut" BOOLEAN NOT NULL DEFAULT false;`
+    Additive and non-breaking (default backfills existing rows).
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      An iframe could be coerced into navigating its parent / top frame, enabling
+      a redirect-hijack of the host page.
+    severity: HIGH
+    mitigation: >
+      Link-out only ever opens a new tab (anchor target="_blank" rel="noopener
+      noreferrer", or window.open with "noopener,noreferrer"). No top/parent
+      navigation. Destination origin is always `getSiteUrl()`.
+  - risk: >
+      Toggling linkOut via re-upsert could clobber requireAuth.
+    severity: MEDIUM
+    mitigation: >
+      The adapter `update` only sets keys that are provided
+      (`...(linkOut !== undefined ? { linkOut } : {})`), and the toggle omits
+      requireAuth, so the stored value is preserved. Covered by upsert-embed tests.
+  - risk: >
+      An event may have a null slug, breaking the link-out URL.
+    severity: LOW
+    mitigation: >
+      `buildEventUrl` falls back to the event id when slug is null.
+
+open_questions: []
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - In-iframe checkout and the in-iframe series date switcher (already shipped).
+  - Modal mode, JS SDK, postMessage bridge, URL theme overrides (separate specs).
+  - Per-event override of link-out within a single org embed (link-out is per embed/domain).
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - linkOut threads through prisma → port → type → adapter → use cases → tRPC DTOs.
+  - With linkOut=true on an event embed, the widget shows the event detail + series
+    switcher and a "Get Tickets on Ithas Fire" CTA, and hides the in-iframe checkout.
+  - The CTA opens the selected event's page in a new tab; switching the series date
+    updates the CTA href to that date's event page. (Verified in browser:
+    Jun 5 → /events/...-date-1, Jun 12 → /events/...-date-2.)
+  - With linkOut=true on an org embed, grid card clicks open the event in a new tab.
+  - linkOut=false leaves the existing in-iframe checkout + series flow unchanged.
+  - The admin embeds builder exposes a per-embed In-page ↔ New-tab toggle that
+    preserves requireAuth.
+  - Strings localized in en + es. tsc clean; 59 embed use-case tests pass
+    (incl. 3 new linkOut cases).

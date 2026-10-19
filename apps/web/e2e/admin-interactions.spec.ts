@@ -77,13 +77,16 @@ async function waitForAudiencesPage(page: import("@playwright/test").Page) {
 }
 
 /**
- * Wait for the Payments page to load.
- * Uses "Stripe Connect" text which is unique to the page content
- * (avoids collision with sidebar "Payments" nav).
+ * Wait for the Payouts page (formerly Payments) to load.
+ * Uses the "Stripe account" section heading — a heading role, so the rail
+ * child link of the same name never matches.
  */
 async function waitForPaymentsPage(page: import("@playwright/test").Page) {
+  // Payments merged into Payouts (2026-10-05). The "Stripe account" section
+  // heading renders in every Stripe state (the card has no heading of its
+  // own since 2026-10-06).
   await expect(
-    page.getByRole("heading", { name: "Stripe Connect" }),
+    page.getByRole("heading", { name: "Stripe account" }),
   ).toBeVisible({ timeout: 15_000 });
 }
 
@@ -149,8 +152,9 @@ test.describe("Admin Interactions", () => {
       // Stat cards should show non-zero values from our seed data.
       await expect(page.getByText("Total Orders")).toBeVisible();
       await expect(page.getByText("Pending Payout")).toBeVisible();
-      // "Recent Orders" appears as both a stat card label and a section
-      // heading — just verify the heading version exists.
+      await expect(page.getByText("Orders, last 7 days")).toBeVisible();
+      // "Recent Orders" is the section heading (the stat tile is "Orders, last
+      // 7 days") — verify the heading exists.
       await expect(
         page.getByRole("heading", { name: "Recent Orders" }),
       ).toBeVisible();
@@ -230,9 +234,10 @@ test.describe("Admin Interactions", () => {
       await page.goto(`/admin/${seed.orgSlug}`);
       await waitForDashboard(page);
 
-      // The EventCalendar component should be somewhere on the page.
-      // It may show month/week controls or event dots.
-      // Just confirm the section loads without console errors (fixtures handle that).
+      // The dashboard mounts the calendar engine (DashboardCalendar →
+      // CalendarEngine, docs/specs/2026-09-02) in its "01. schedule" section.
+      // Just confirm the section loads without console errors (fixtures handle
+      // that) — venue-calendar.spec.ts is where the engine itself is driven.
       await page.waitForTimeout(1_000);
     });
   });
@@ -449,18 +454,20 @@ test.describe("Admin Interactions", () => {
 
   test.describe("Payments page", () => {
     test("renders the Stripe Connect status card", async ({ page }) => {
-      await page.goto(`/admin/${seed.orgSlug}/payments`);
+      await page.goto(`/admin/${seed.orgSlug}/payouts`);
 
       await waitForPaymentsPage(page);
 
-      // Should show a connection status badge.
-      const connected = page.getByText("Connected", { exact: true });
-      const notConnected = page.getByText("Not connected");
-      await expect(connected.or(notConnected)).toBeVisible();
+      // The connection badge sits on the section heading's row. Scoped by
+      // test id so the assertion names the badge, not any other copy on the
+      // page that may mention the connection.
+      await expect(page.getByTestId("stripe-connection-badge")).toHaveText(
+        /^(Connected|Incomplete|Not connected)$/,
+      );
     });
 
     test("shows onboarding CTA when not connected", async ({ page }) => {
-      await page.goto(`/admin/${seed.orgSlug}/payments`);
+      await page.goto(`/admin/${seed.orgSlug}/payouts`);
       await waitForPaymentsPage(page);
 
       // Since the seed org has no Stripe account, the "Not connected" badge
@@ -477,11 +484,11 @@ test.describe("Admin Interactions", () => {
     });
 
     test("refresh status button works without errors", async ({ page }) => {
-      await page.goto(`/admin/${seed.orgSlug}/payments`);
+      await page.goto(`/admin/${seed.orgSlug}/payouts`);
       await waitForPaymentsPage(page);
 
       const refreshBtn = page.getByRole("button", {
-        name: /refresh status/i,
+        name: /^refresh$/i,
       });
       await expect(refreshBtn).toBeVisible();
 
@@ -491,7 +498,7 @@ test.describe("Admin Interactions", () => {
 
       // Page should still be stable.
       await expect(
-        page.getByRole("heading", { name: "Stripe Connect" }),
+        page.getByRole("heading", { name: "Stripe account" }),
       ).toBeVisible();
     });
   });

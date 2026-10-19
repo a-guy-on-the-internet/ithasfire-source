@@ -1,0 +1,455 @@
+# Not built yet (2026-10-08 docs consolidation): Venue-side standards editor UI (no admin page/component references bookingStandards; only the request forms read them)
+# venue-booking-standards.spec.yaml
+#
+# A venue states what a booking pitch must include, per calendar (with a
+# place-level default and platform defaults underneath), and the request form
+# prompts the requester with those standards and example pitches while they
+# write — required items block submit with the venue's own wording.
+#
+# Four axis decisions taken 2026-09-25 are stamped D1–D4 below. Pairs with
+# lineup-booking-requests-v3.spec.yaml (same form, separable build).
+#
+# v1.1 (2026-09-25, later the same day): fitted into the booking flow as it
+# runs. Standards stay a hard gate at send (the venue's filter) and gain a
+# conversation on the thread: typed, saved asks ("Ask for…") whose answers land
+# on the agreement or the event. Adds pitch outlines, a help article and an
+# expanded booking block; rules on coverage. Decisions V1–V12 below (V9–V12
+# from round 2); FR-004 and FR-008 changed; FR-009–FR-012 new. Night-booking decisions live in
+# docs/specs/2026-09-25/booking-the-night.spec.yaml.
+
+version: "1.1"
+updated: "2026-09-25"
+design: https://claude.ai/artifact/QVdGnAjDwxNyTPa5L5LnMz (boards S, E, C, T, K)
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    A venue's expectations for a pitch live nowhere the requester can see
+    them while writing one. The `booking_info` block is free text on the
+    public page; the form asks the same eleven fields of every venue and
+    every night. Venues get thin pitches, requesters guess, and the thread
+    opens with "can you send links?".
+  solution: >
+    Booking standards on the CALENDAR (D1): an ordered checklist of items the
+    venue expects, each marked required or suggested (D2), plus example
+    pitches (D4: platform-written per intent, venue can add its own). The
+    place holds a default every calendar inherits; platform defaults apply
+    when a venue has set nothing. The request form shows "What {venue}
+    expects" beside the fields, ticks items live as they are satisfied,
+    offers the examples, and refuses submit on unmet REQUIRED items using
+    the venue's wording — server-enforced on the same effective list.
+  users:
+    - Venue admins (author standards and examples; per calendar or place-wide)
+    - Requesters (see the standards while writing; blocked only by required items)
+  surfaces:
+    - web (place-page request dialog, calendar settings, venue settings)
+    - embed (both modes — the standards ride the booking-options read)
+
+# ── Decisions (owner, 2026-09-25) ────────────────────────────────────────────
+
+decisions:
+  - id: D1
+    text: Standards live per CALENDAR; the PLACE holds a default every calendar inherits unless it sets its own.
+  - id: D2
+    text: Each item is REQUIRED or SUGGESTED; required items block submit with the venue's wording; suggested items are prompts.
+  - id: D3
+    text: (lineup spec) —
+  - id: D4
+    text: Example pitches are platform-written per intent; a venue can add its own.
+  - id: D2b
+    text: >
+      (2026-09-26, build) Fields the create schema already requires (message,
+      preferred dates; purpose, requested window) and CUSTOM can only be
+      SUGGESTED — a REQUIRED toggle on them would check nothing. BILL as a
+      standard means "at least one act other than the sender", so a venue that
+      only books full bills can require it.
+  - id: D2c
+    text: >
+      (2026-09-26, build) A calendar or place that has its own rows for an
+      intent wins even if some of its items stop applying; the fallback is then
+      the platform defaults (suggested-only), never the place's list.
+  - id: D2a
+    text: >
+      Only KNOWN pitch fields can be REQUIRED (a field the form has and the
+      server can check). CUSTOM items ("send a stage plot", "no covers
+      nights") are guidance-only: a required custom item would need a
+      self-attested checkbox, which is theatre. Confirmed by the owner
+      2026-09-25 (V6).
+
+  # ── v1.1 decisions (owner, 2026-09-25) ──
+  - id: V1
+    stage: request
+    text: >
+      The hard block stays. REQUIRED items refuse send; this is the venue's
+      meaningful filter. No soft "missing X" path.
+  - id: V2
+    stage: request
+    text: >
+      No snapshot of the standards on the request. With a hard block the pitch
+      always met the REQUIRED items at send; suggested items are read live by
+      "Ask for…" (V3).
+  - id: V3
+    stage: thread
+    text: >
+      The thread composer gets a "+" menu beside Send. Items: "Attach a file"
+      (VENUE and PERFORMER sides) and "Ask for…" (venue side only). The menu is
+      built to take more items; saved ask templates come later; reuse in
+      support chat is out of scope. The read-only ACT side gets no menu.
+      SUPERSEDED IN PART by V9 (round 2): an ask is a typed, stateful card with
+      a saved answer, not a prefilled message.
+  - id: V4
+    stage: request
+    text: >
+      A pitch OUTLINE is the shape of a pitch (examples stay finished pitches).
+      "Start from an outline" beside the message field drops short bracketed
+      prompts into it (board T1), and shows only while the message is empty.
+      Platform-written per intent; venues write examples, not outlines.
+      Round 2: the sender's saved "Pitch message template"
+      (PerformerBookingDefaults.messageTemplate, BookingDefaultsEditor.tsx
+      :399-413) keeps prefilling the message (RequestToPlayForm.tsx:444-446,
+      SignedInBookingPanel.tsx:245); "template" means only that saved kind.
+      Several named templates are a separate spec.
+  - id: V5
+    stage: request
+    text: >
+      A help article, "Writing a booking pitch", carries a generic example
+      annotated line by line. The form and the booking block link to it.
+  - id: V6
+    stage: request
+    text: D2a stands. Custom lines are guidance only; "Ask for…" is how a venue chases one after send.
+  - id: V7
+    stage: request
+    text: >
+      Coverage, right on purpose: standards do not gate TO_PERFORMER requests
+      (the act is the recipient), nor event-first requests (the event exists;
+      the venue is endorsing it). The embed checks the default calendar's
+      standards because it files the inquiry on that calendar
+      (embeds/create-booking-inquiry.ts:443-457).
+  - id: V8
+    stage: request
+    text: >
+      Unclaimed venues take no requests at all (owner, 2026-09-25), so the
+      parked-venue fallback to platform defaults goes away. See the 08-27
+      amendment in docs/specs/2026-08-27/venue-confirmation-and-booking-intents.spec.md.
+
+  # ── Round 2 (owner, 2026-09-25, after auditing the boards against the code) ──
+  - id: V9
+    stage: thread → agreement / event
+    text: >
+      An ask is a typed request from the venue for something the night needs,
+      with a saved answer. Kinds: IMAGE (e.g. "Poster"), FILE (tech rider,
+      stage plot), LINK (a video), TEXT (a bio), SET_LENGTH. It is a card in
+      the thread with the right input for its kind, open until answered.
+      "Ask for without a file is just text you could type" (owner): the value
+      is the saved, typed answer.
+  - id: V10
+    stage: thread → agreement / event
+    text: >
+      Answers map onto what the night uses. IMAGE marked "Use as the event
+      image" becomes the event's hero image when the event is created, or at
+      once if the event exists and has no hero image, through image
+      moderation. SET_LENGTH fills the agreement's end time while the terms
+      are a draft. FILE, LINK and TEXT stay on the request and are listed
+      under "From the booking" on the agreement and the event. The event has
+      no bio, links, set-time or rider fields; adding any is its own decision.
+  - id: V11
+    stage: thread
+    text: >
+      Only the venue asks. The venue's own house facts (stage plot, backline,
+      load-in) belong on its page — the tech_specs, house_rules and
+      capacity_info blocks already exist (entity-pages/block-config.ts
+      :751-829). The sender's side of the thread links to the venue's
+      tech_specs block when it has one.
+  - id: V12
+    stage: request
+    text: >
+      The booking block is not mandatory. A venue sets it up by hand today,
+      later in a venue setup wizard (its own spec). The request dialog's
+      standards panel (FR-005) is the one place every requester is guaranteed
+      to see the venue's standards and examples.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        New model BookingStandardItem: id, ownerType (PLACE | CALENDAR),
+        ownerId, intent (PERFORM | RENT | USE), field (enum of KNOWN pitch
+        fields: message, preferredDates, expectedDraw, genre, lineupSize,
+        setLengthMinutes, techNeeds, fee, linkMusic, linkVideo, linkSocial,
+        linkEpk, bill, purpose, expectedAttendance, requestedWindow — or
+        CUSTOM), label (≤ 80, the venue's wording), hint (≤ 240, optional),
+        requirement (REQUIRED | SUGGESTED; CUSTOM ⇒ SUGGESTED enforced by a
+        CHECK), sortOrder. ≤ 12 per (owner, intent). The owner pair is
+        polymorphic with NO foreign key (as built, 2026-09-26): rows are only
+        ever read by owner id, so an orphan left by a deleted calendar or place
+        is inert. A future hard-delete path for Calendar/Place must remove its
+        rows; today neither has one in core.
+    - id: FR-002
+      description: >
+        New model BookingPitchExample: ownerType/ownerId (PLACE | CALENDAR),
+        intent, title (≤ 80), body (≤ 1500 plain text), sortOrder; ≤ 3 per
+        (owner, intent). Platform examples are code constants in the i18n
+        catalog (two per intent, written for this product's voice), not rows.
+    - id: FR-003
+      description: >
+        Resolution ("effective standards" for a calendar + intent), in core,
+        one function used by every reader: calendar rows if any exist for
+        that intent → else the place's rows → else the platform defaults for
+        the intent. Examples resolve the same way but are ADDITIVE (venue
+        examples first, then platform's). Pure, unit-tested.
+    - id: FR-004
+      description: >
+        `places.getBookingOptions` (the read the dialog and both embed modes
+        already consume) gains per calendar `standards[]` and `examples[]`
+        (effective, resolved server-side, intent-keyed). Output stays
+        byte-identical for callers that ignore the new keys. CHANGED in v1.1
+        (V8): an unclaimed place returns no bookable options, so the
+        `isParkableUnclaimedPlace` branch in load-effective-booking-standards.ts
+        :165 is removed with parking.
+    - id: FR-005
+      description: >
+        Form prompting: a "What {venue} expects" panel beside the fields
+        (desktop: a rail; phone: above the fields, collapsible after first
+        view), each item with a live tick once its field is satisfied, the
+        venue's hint under it, and "See an example pitch" opening the
+        examples. Required unmet items render as inline field errors on
+        submit using the venue's label. Switching calendar or intent swaps
+        the list. Reuses `request-to-play-form.helpers` for the field ↔ item
+        mapping so the panel, the errors and the server agree. v1.1 (board S1):
+        the rail needs the dialog wider than today's 520px
+        (BookingRequestDialog.tsx:74), about 880px on desktop; the progress
+        count ("1 of 3 done") counts required and suggested known fields only,
+        never custom lines (always satisfied); a link field the venue requires
+        drops its hard-coded "· Optional" (RequestToPlayForm.tsx:946). The panel
+        uses the venue's wording, the fields keep their own labels.
+    - id: FR-006
+      description: >
+        Server enforcement: createBookingRequest resolves the effective
+        standards for the routed calendar + intent and rejects unmet REQUIRED
+        items with STANDARDS_UNMET { items: [{ field, label }] }. The embed
+        inquiry path enforces the same list. `bill` as a field means
+        "≥ 1 act on the bill other than the sender" (D2b; lineup spec).
+    - id: FR-007
+      description: >
+        Authoring: the calendar editor (CalendarsSection) gains a "What a
+        pitch must include" section per intent the calendar accepts — the
+        item list (add from the known fields or a custom line, label, hint,
+        required/suggested toggle, reorder) and up to three examples. The
+        place-level default lives in the venue settings route (the merge
+        route when it lands; until then, on the existing /edit page) with
+        "Use the venue default" shown on each calendar that has no rows.
+        Authz = whoever may edit the calendar (place booking authority /
+        org edit roles), same as the rate fields. v1.1 (board E2): the editor
+        lives in the calendar edit form under "Spaces & availability"
+        (CalendarsSection.tsx; CalendarsManager.tsx:85), not under Bookings. Each
+        known field is one row with a segment "Off / Suggest / Require" (not
+        "Ask": that word now means a thread ask, V9); MESSAGE and PREFERRED_DATES
+        show Require disabled ("Always asked by the form"); custom lines show Off
+        / Suggest only; rows that are on get a drag handle, so FR-001's sortOrder
+        stays editable. An inheriting calendar shows "Using {venue}'s venue
+        default" read-only with "Set this calendar's own list"; a calendar with
+        its own list shows "Reset to the venue default".
+    - id: FR-008
+      description: >
+        Public page: the `booking_info` block, on a venue that accepts
+        requests, lists the place-default REQUIRED items in one line
+        ("A pitch here needs: dates, a music link, expected draw") so the
+        expectation is visible before the dialog opens. No new block kind.
+        CHANGED in v1.1 (board K1): the block shows, in order, (1) what the
+        venue books (intents and calendars), (2) "A pitch here needs: …" (the
+        required items), (3) a collapsible "A good pitch for {venue}" with the
+        venue's first example (else the platform's), with "How to write a
+        pitch" linking the V5 article, (4) the request buttons. The block keeps
+        today's outer gate (VERIFIED + accepting requests, entity-pages.ts
+        :228-234). Round 2 corrections: the buttons keep today's labels "Play
+        here" and "Rent or use a space" (BookingInfoBlock.tsx:72; en.ts
+        :1436-1437); the block keeps what it shows today (contact email/phone,
+        notes, external booking link, :153-278) below the new rows; it renders
+        only when the venue added one (V12). The data comes from
+        places.getBookingOptions, which already returns calendars, intent flags
+        and per-intent standards/examples (get-place-booking-options.ts:96-140);
+        no new endpoint. When a calendar has its own list that differs from the
+        place default, "A pitch here needs" names it per calendar ("Weeknight
+        shows: a music link"), so the line is never wrong for the calendar a
+        requester picks. The hero already carries a "Play here" button
+        (PlaceHero.tsx:211); the block's buttons stay, as the block is where the
+        standards are read.
+    - id: FR-009
+      description: >
+        Composer "+" menu and asks (V3, V9–V11; board C1). REWRITTEN in round 2.
+        (a) Upload path — a MISSING PREREQUISITE today: request attachments are
+        read-only (BookingThread.tsx:86-92), no use case mints a storageKey, and
+        files cannot be opened. New use cases, following
+        places/request-verification-doc-upload.ts and
+        get-verification-document-url.ts: requestBookingAttachmentUpload
+        (thread participant on VENUE or PERFORMER side; private bucket; key
+        booking-requests/{requestId}/{uuid}.{ext}; pdf, jpeg, png, webp; 25 MB;
+        15 min) → attachments.add (existing, attachments.ts:93-114) gains an
+        optional askId; getBookingAttachmentUrl (signed GET, participants only).
+        (b) New model BookingRequestAsk: id, bookingRequestId, kind (IMAGE |
+        FILE | LINK | TEXT | SET_LENGTH), label (≤ 80), note (≤ 240),
+        standardField? (the standard it came from), useAsEventImage (IMAGE
+        only), status (OPEN | ANSWERED | WITHDRAWN), askedByHumanId, askedAt,
+        answer (attachmentId | url | text ≤ 2000 | minutes), answeredByHumanId,
+        answeredAt. Use cases askOnBookingRequest (VENUE side),
+        answerBookingRequestAsk (PERFORMER side), withdrawBookingRequestAsk
+        (any VENUE-side participant, not only the person who asked: staff hand
+        threads over; only an OPEN ask can be withdrawn — as built 2026-10-02).
+        The signed GET is for thread participants on either side, not every
+        org member. Ledger kinds booking_request.ask_opened / ask_answered /
+        ask_withdrawn, visible to VENUE and PERFORMER. Notify: ask → sender
+        (booking.ask-received, in-app + email, transactional); answer → venue
+        (booking.ask-answered, in-app).
+        (c) UI: "Ask for…" lists, first, the suggested standards and custom
+        lines the pitch left empty (effective standards for the request's
+        calendar + intent via FR-003; each pre-typed — LINK_VIDEO → LINK,
+        SET_LENGTH → SET_LENGTH, TECH_NEEDS → TEXT, custom → FILE), then "Something
+        else…" (pick a kind, name it, optional note). Asks render as cards
+        in the thread message list; the sender answers on the card; answered
+        cards show the answer (file opens via the signed GET). "Attach a file"
+        uses (a) without an ask.
+        (d) Mapping (V10): at mint (booking-the-night FR-001/FR-004) and on
+        answer after mint, an IMAGE answer with useAsEventImage copies the
+        object into the event image pipeline (new server-side copy into
+        events/{eventId}/images/, an Image row, moderation kind EVENT_HERO) and
+        sets Event.heroImageId only if it is empty. SET_LENGTH sets
+        proposedEndDate = proposedDate + minutes while the agreement is DRAFT.
+        Other answers are listed under "From the booking" in AgreementEditor and
+        EventProvenanceNote. Web only.
+    - id: FR-010
+      description: >
+        Pitch outlines (V4; board T1). Platform outline text per intent lives
+        in the i18n catalog beside the platform examples (FR-002, en.ts:1988+),
+        one per intent, bracketed prompts on separate lines. "Start from an
+        outline" shows only while the Message field (the "The pitch" section,
+        10–2000 chars, pitch-schema.ts:74) is empty — so a sender whose saved
+        template prefilled it does not see it. A hint under the field: "Replace
+        each [bracket] with your own words." The server does not know outlines
+        exist; a pitch still containing "[" prompts is sent as written.
+    - id: FR-011
+      description: >
+        Help article "Writing a booking pitch" under apps/web/content/help/
+        (help-center-authoring skill): what a venue reads first, the generic
+        example annotated, how standards and examples work. Linked from the form
+        (under the message field) and the booking block.
+    - id: FR-012
+      description: >
+        The venue-side thread header shows nothing about standards (no
+        snapshot, V2). "Ask for…" is the only post-send surface. The
+        PERFORMER side shows "{venue}'s tech specs" linking the venue page's
+        tech_specs block when the venue has one (V11).
+
+  non_functional:
+    - id: NFR-001
+      description: All venue-authored text through the plain-text sanitizers; no markup, no links in hints.
+    - id: NFR-002
+      description: >
+        Zero regression for venues that set nothing: the platform defaults
+        are SUGGESTED-only (nothing newly blocks submit anywhere on day one).
+    - id: NFR-003
+      description: The panel meets the form's existing a11y bar — the live ticks are text state ("done"), not colour alone; errors reference the field by id.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: resolveBookingStandards (new, pure)
+        description: FR-003 resolution; shared by the options read, the create gate and the embed path.
+        input: calendar rows, place rows, intent
+        output: effective { standards[], examples[] }
+        idempotent: true
+        money: false
+      - name: setBookingStandards / setBookingPitchExamples (new)
+        description: replace-all writes per (owner, intent), validated, audited.
+        idempotent: true
+        money: false
+      - name: getPlaceBookingOptions (modified)
+        description: FR-004.
+        idempotent: true
+        money: false
+      - name: createBookingRequest / createBookingInquiry (modified)
+        description: FR-006 enforcement after the existing gate walk, before the write.
+        idempotent: false
+        money: false
+    ports:
+      new: [booking-standards repo (items + examples, by owner)]
+      existing: [calendars, places, booking-requests, authz]
+  adapters:
+    new: [prisma booking-standards]
+    existing: [prisma calendars (join for resolution)]
+  transport:
+    trpc_procedures:
+      - places.getBookingOptions — output gains standards[] / examples[]
+      - calendars.setBookingStandards / places.setBookingStandards (authed)
+      - calendars.setPitchExamples / places.setPitchExamples (authed)
+    webhooks: []
+  ui:
+    pages: []
+    components:
+      - RequestToPlayForm, SpaceRequestForm, SignedInBookingPanel, anonymous embed form: the standards panel + example disclosure + required errors
+      - CalendarsSection: standards + examples editor per intent
+      - Venue settings: place-default editor
+      - BookingInfoBlock: what the venue books, required items, good pitch (FR-008)
+      - "BookingThread: \"+\" menu, ask cards, attachment open links, tech-specs link (FR-009, FR-012)"
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - BookingStandardItem, BookingPitchExample (+ enums BookingStandardField, BookingStandardRequirement)
+    - BookingRequestAsk (+ enums BookingRequestAskKind, BookingRequestAskStatus) — v1.1 round 2, FR-009
+  modified_models:
+    - BookingRequestAttachment gains askId? (FR-009a)
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: A venue marks everything required and requests drop to zero.
+    severity: MEDIUM
+    mitigation: Cap of 12 items; the editor shows a live preview of the form with the count of required items; platform copy nudges "three required items is plenty".
+  - risk: Client and server disagree on what "satisfied" means for a field.
+    severity: MEDIUM
+    mitigation: One predicate table in core (field → satisfied(payload)) exported to the web helpers; the same table drives ticks, inline errors and STANDARDS_UNMET.
+  - risk: The embed's anonymous form has fewer fields than the platform form (no picker, no defaults) — a required `bill` or `linkEpk` could be unsatisfiable there.
+    severity: LOW
+    mitigation: The anonymous form renders every known field the standards can require; `bill` is satisfiable with free-text acts.
+
+open_questions:
+  - "(Owner, 2026-09-30, canvas note on T1.) Pitch questions/outlines templated by place and by the kind of person requesting (e.g. a solo act, a band, a promoter, a renter): venues authoring their own outlines per calendar and requester kind. Reverses V4's 'platform-written only'. Not built in v1.1; scope before building."
+  - "(Owner, 2026-09-30, canvas note on E2.) Groups of standards templates — e.g. one set for band nights, one for shows, one for one-offs — that a venue can apply to calendars. Likely the same 'requester/booking kind' axis as the outline note; scope together."
+# Closed 2026-09-25: D2a confirmed (V6); TO_PERFORMER not gated (V7).
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Scoring or ranking pitches against standards.
+  - Attachments as a REQUIRED standard at send (asks cover them after send, FR-009).
+  - New event fields for bio, links, set times or riders (V10).
+  - Asks from the sender to the venue (V11).
+  - A venue setup wizard (V12).
+  - Standards on TO_PERFORMER requests.
+  - A new block kind for standards on the public page (the summary rides `booking_info`).
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A venue with nothing configured: the dialog shows the platform SUGGESTED list and two platform examples; submit behaves exactly as today.
+  - A venue sets place defaults (required: music link, expected draw); calendar B overrides with its own list → the dialog on calendar A shows the place list, on B the calendar list; switching calendars swaps the panel live.
+  - Submitting on A without a music link → inline error under the link field reading the venue's label; server rejects the same payload with STANDARDS_UNMET listing that item.
+  - A custom item cannot be saved as REQUIRED (UI disables it; the API rejects it).
+  - The anonymous embed form for calendar A shows the same panel and the same block on submit.
+  - "`booking_info` on the public page lists the place-default required items in one line."
+  - Examples: the venue adds one on calendar B → the dialog shows it first, then the platform's.
+  # v1.1
+  - On a thread whose pitch left set length and a video link empty (both suggested on that calendar), the venue opens "+" → "Ask for…", picks both → two ask cards appear (SET_LENGTH, LINK); the sender gets one notice; answering 45 minutes sets the draft agreement's end to start + 45 min; the link is listed under "From the booking".
+  - The venue asks "Poster" (IMAGE, use as event image) → the sender uploads a jpeg on the card → the file opens for both sides via a signed link; when the terms are agreed the event's hero image is that poster (pending moderation); if the event already had a hero image it is left alone.
+  - '"Attach a file" on either side uploads through requestBookingAttachmentUpload and the file opens for both sides.'
+  - The ACT side of a thread shows no "+" menu; the PERFORMER side shows only "Attach a file" and a link to the venue's tech specs when the venue has that block.
+  - '"Start from an outline" shows only on an empty Message field and fills the bracketed prompts; a sender with a saved template sees their template prefilled and no outline button.'
+  - The place page's booking block (where the venue added one) shows what the venue books, its required items, a collapsed good pitch, then "Play here" / "Rent or use a space", then today's contact and notes; an unclaimed place shows no block.
+  - A request to an unclaimed place is refused before standards are read.

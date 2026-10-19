@@ -38,7 +38,7 @@
  *   never SSR-painted anyway.
  * - **Fixed-dark surfaces** — a photo scrim / LED band / camera feed that is dark in EVERY theme;
  *   a light-ink fallback on it is correct (`ON_STRUCTURE`-shaped).
- * - **Forced-light / scoped vars** — embeds and entity `--th-*` set these vars to their own scope's
+ * - **Scoped vars** — entity `--th-*` set these vars to their own scope's
  *   values; those are already excluded by scope, but a stray one lands here with a reason.
  */
 export const colorFallbackAllowlist = [
@@ -60,10 +60,26 @@ export const colorFallbackAllowlist = [
     reason: "DEBT: MapLibre paint/chrome literal — should track $accent (#E2481D). Deferred: HeroEventMap is under concurrent edit (handoff §6); revisit with its owner.",
   },
   {
-    file: "src/app/search/_components/EventResultsMap.tsx",
+    file: "src/app/search/_components/SearchResultsMap.tsx",
     token: "denylist",
     value: "#35589A",
-    reason: "PERMANENT: map loading-skeleton shimmer, dark-basemap-tinted. (File is the untracked sibling of the entangled UniversalSearchPage — handoff item 6.)",
+    reason: "PERMANENT: map loading-skeleton shimmer, dark-basemap-tinted. (SearchResultsMap.tsx replaced EventResultsMap.tsx on 2026-09-28 — same skeleton, same literal.)",
+  },
+  // Arrival areas (parking / drop-off / load-in on the place and event maps). The legend and list
+  // swatches mirror ARRIVAL_AREA_PAINT in `src/components/maps/arrival-areas.ts`, the MapLibre data
+  // palette (parking = palette.brandPrimary, map-sign blue), which MapLibre needs as a literal. On
+  // Ember the list swatch lifts to the theme's info blue so it holds contrast on navy.
+  {
+    file: "src/components/maps/arrival-areas.module.css",
+    token: "denylist",
+    value: "#35589A",
+    reason: "PERMANENT: parking swatch = the MapLibre paint literal ARRIVAL_AREA_PAINT.parking (data palette, not app chrome); must equal the map exactly.",
+  },
+  {
+    file: "src/components/maps/arrival-areas.module.css",
+    token: "info",
+    value: "#5E8AD4",
+    reason: "PERMANENT: inside `:global(.t_ember) .root` only, so it never paints on Stub SSR; the Ember info blue is the intended value there.",
   },
   // Decorative data palettes — colour arrays, not chrome (parity with eslint-hex-allowlist.mjs).
   {
@@ -77,20 +93,6 @@ export const colorFallbackAllowlist = [
     token: "denylist",
     value: "#35589A",
     reason: "PERMANENT: deterministic avatar-initials data palette (already a PERMANENT in eslint-hex-allowlist.mjs).",
-  },
-  // Embed forced-light block that lives in globals.css (so it's outside the src/app/embed/** scope
-  // exclusion). The embed renders in a third-party iframe with its own light palette.
-  {
-    file: "src/app/globals.css",
-    token: "denylist",
-    value: "#181818",
-    reason: "PERMANENT: forced-light embed `option` text (body.th-embed-body) — matches the embed palette, not Stub.",
-  },
-  {
-    file: "src/app/globals.css",
-    token: "denylist",
-    value: "#707070",
-    reason: "PERMANENT: forced-light embed input placeholder (body.th-embed-body) — matches embed TEXT_MUTED, not Stub.",
   },
   // MapLibre hero-map popup / overlay — deliberately navy in BOTH themes (fixed map chrome). The
   // "does a navy popup belong on a light basemap" question is open (handoff §10) but the value is
@@ -118,12 +120,12 @@ export const colorFallbackAllowlist = [
     value: "#2A3E66",
     reason: "DEBT: .th-skeleton-bar admin Ember-navy leftover (paired with the surfaceMuted above). Deferred — globals.css concurrent edit.",
   },
-  // Approved AA edits are staged in this file already but it is entangled with the untracked
-  // EventResultsMap.tsx from another session — land both together (handoff item 6).
+  // Approved AA edits are staged in this file already; it lands together with its map,
+  // SearchResultsMap.tsx (which replaced EventResultsMap.tsx) — handoff item 6.
   {
     file: "src/app/search/_components/UniversalSearchPage.tsx",
     token: "background",
     value: "#FDFAF3",
-    reason: "DEBT: `var(--background, #FDFAF3)` should be #F6F0E4. Deferred — this file is entangled with the untracked EventResultsMap.tsx; land via handoff item 6.",
+    reason: "DEBT: `var(--background, #FDFAF3)` should be #F6F0E4. Deferred — this file lands together with SearchResultsMap.tsx (formerly EventResultsMap.tsx); handoff item 6.",
   },
 ];

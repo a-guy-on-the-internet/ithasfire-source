@@ -1,0 +1,20 @@
+-- Bare `at` index backing the platform-wide /platform/audit-log viewer's
+-- default cross-entity feed (sorted by `at` descending, no `entity` filter
+-- applied). The existing [entity, at] composite index only helps once an
+-- `entity` filter narrows the scan first.
+--
+-- `AuditLog` is written to synchronously (inside the same DB transaction)
+-- from nearly every use case in the app, including hot money/scan paths
+-- (create-checkout, finalize-from-payment-intent, scan-ticket). A plain
+-- `CREATE INDEX` would take a SHARE lock and block writes for the duration
+-- of the build. We use `CONCURRENTLY` so production deploys don't stall
+-- checkout / ticket-scan writes. `CONCURRENTLY` cannot run inside a
+-- transaction; this file is intentionally kept to a single statement so
+-- Prisma migrate can execute it without an implicit BEGIN/COMMIT.
+--
+-- NOTE: this repo's dev DB is db-push-managed, not migrate-deploy-managed.
+-- This migration file was written but NOT applied — apply via
+-- `pnpm -F @th/db prisma db push` (dev) or the normal migrate-deploy path
+-- (prod) as a manual follow-up step.
+-- CreateIndex
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "AuditLog_at_idx" ON "AuditLog"("at");

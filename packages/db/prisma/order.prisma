@@ -1,0 +1,413 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Order — Orders and order items.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Order {
+  id                    String      @id @default(uuid())
+  shortId               String?     @unique
+  /// NULL for membership invoices, which have no event. Every read site that
+  /// assumed an event must narrow on `kind = TICKETING` instead.
+  eventId               String?
+  /// What this order IS (see OrderKind). Distinct from `source`, which is how
+  /// it was sold.
+  kind                  OrderKind   @default(TICKETING)
+  buyerHumanId          String
+  amountGrossCents      Int
+  feesPlatformCents     Int         @default(0)
+  /// Tax CHARGED TO THE BUYER, in cents.
+  ///
+  /// INVARIANT: for an order that has `taxLines`, this equals
+  /// Σ `OrderTaxLine.amountCents` over its `collector = PLATFORM` lines —
+  /// ORGANISER lines are disclosed, never charged, so they are not in it.
+  /// Both are written from the one `solveTaxLinesAndProcessorFee` result in the
+  /// order's create transaction (create-checkout, create-resale-checkout).
+  /// A zero-rate imposition writes no line, so an order with NO lines is one
+  /// of: nothing was taxed (then this column is 0), it predates the table
+  /// (2026-09-28), or it was taxed outside our solver (membership invoices —
+  /// Stripe computes that tax). Never read "no lines" as "zero tax" — read
+  /// this column. Refund attribution and the tax-nexus rollup read THIS
+  /// column, not the lines; both blend lines together, so they need a
+  /// per-line rule before the first PLATFORM local row lands.
+  taxAmountCents        Int         @default(0)
+  currency              String      @default("usd") @db.VarChar(3)
+  /// What Stripe ACTUALLY charged us to process this order, in cents — read
+  /// from the charge's balance transaction, never modelled from a rate card.
+  ///
+  /// Who bears it depends on `feeMode`, and that is the whole reason this is
+  /// worth storing. In PASS_THROUGH the buyer funds it through an exact
+  /// gross-up, so the platform nets ~0. In ABSORB there is no gross-up at all:
+  /// Stripe takes it from the PLATFORM balance, making it a real expense on
+  /// our side of the book. A single blended rate across the order book would
+  /// therefore be wrong in both directions.
+  ///
+  /// NOT written at finalize. The balance transaction is not reliably
+  /// available the instant a charge succeeds, and fetching it there would put
+  /// a Stripe HTTP call inside the finalize path. A sweep job stamps it after
+  /// the fact, which also lets it fill orders that predate this column.
+  ///
+  /// NULL means NOT YET READ — it does NOT mean zero, and the distinction is
+  /// load-bearing. `Order.taxAmountCents`'s sibling `refundedTaxCents` is
+  /// documented as "sums treat NULL as 0", which is safe there because tax is
+  /// a LIABILITY: under-netting a refund overstates what we owe, and
+  /// overstating a liability is the safe direction. This column is a COST.
+  /// Treating NULL as 0 would understate cost and therefore OVERSTATE what the
+  /// platform kept — the unsafe direction. Consumers must report COVERAGE
+  /// ("known for N of M orders") and refuse to compute a net below full
+  /// coverage, rather than summing what happens to be present.
+  processorFeeCents     Int?
+  /// RETRY BOOKKEEPING for the processor-fee sweep — NEVER money. How many
+  /// times `settlements.backfill-processor-fees` has tried and failed to read
+  /// this order's fee from Stripe, and when it last failed. The claim query
+  /// backs a failed row off (skips it until `processorFeeReadFailedAt` is
+  /// older than the retry window) and PARKS it once the count reaches the
+  /// sweep's cap, so a row Stripe can never resolve (deleted test data, an
+  /// intent on another account, an intent that produced no charge) cannot
+  /// occupy a page slot forever and starve newer orders. Both are left as-is
+  /// once `processorFeeCents` is stamped: they describe the road, not the
+  /// destination, and no read site consults them after a stamp.
+  processorFeeReadFailures Int @default(0)
+  processorFeeReadFailedAt DateTime?
+  status                OrderStatus @default(PENDING)
+  feePolicySnapshot     Json
+  occurredAt            DateTime    @default(now())
+  stripePaymentIntentId String?     @unique
+  /// Stripe Billing invoice that produced this order. MEMBERSHIP orders only.
+  /// Unique because it is the idempotency key for invoice.payment_succeeded:
+  /// a replayed webhook must collide here rather than mint a second order.
+  stripeInvoiceId       String?     @unique @db.VarChar(255)
+  parentOrderId         String?
+  source                OrderSource @default(PRIMARY)
+  nonRefundable         Boolean     @default(false)
+
+  // ── Comp provenance (source = COMP only) ─────────────────────────────────
+  // Both were previously written ONLY into the `comp_issued` audit-log
+  // payload, which left the comps ledger with no product read path — a UI
+  // table has no business querying the audit log. Promoted here so the ledger
+  // is a plain Order query.
+  //
+  // Nullable with no backfill: rows issued before this migration keep the
+  // audit log as their only record, and reward-granted comps legitimately have
+  // neither field (see below).
+  //
+  // NOTE two authors. `createCompOrder` is called by BOTH `issueCompTickets`
+  // (hand-issued, stamps these) and `grantVolunteerReward` (trigger-issued,
+  // leaves them null and is identifiable via
+  // VolunteerRewardGrant.compOrderId). Null therefore means "not hand-issued",
+  // never "unknown".
+  /// Free-text justification captured on the issue form. Cap matches the
+  /// use case's `plainTextMultilineOptional(500)`.
+  compReason            String?     @db.VarChar(500)
+  /// The human who issued it. Deliberately NOT a relation: this is a
+  /// provenance stamp that must survive the issuer leaving the org, so it
+  /// carries no FK and no cascade.
+  compIssuedByHumanId   String?
+
+  /// How this order was collected. WEB = standard online checkout,
+  /// POS = in-person Tap to Pay sale via the scanner app. Tags the
+  /// order without forking the order/ledger/refund pipelines.
+  paymentChannel        PaymentChannel @default(WEB)
+
+  /// Stripe payment method type used for this order (e.g. "card", "us_bank_account",
+  /// "cashapp", "amazon_pay"). Populated from the charge's payment_method_details.type
+  /// when the webhook fires. Null for free orders or legacy rows.
+  paymentMethodType     String?     @db.VarChar(32)
+
+  /// Stripe `charge.payment_method_details.card.checks` snapshot
+  /// (`address_line1_check`, `address_postal_code_check`, `cvc_check`), captured
+  /// best-effort at `payment_intent.succeeded` for chargeback evidence.
+  /// Going-forward only — null on every row that predates the capture and on
+  /// non-card methods. Shape: `PaymentCardChecks` in @th/types.
+  paymentCardChecks     Json?
+
+  /// Statement descriptor suffix submitted for online checkout PaymentIntents.
+  billingDescriptor     String?     @db.VarChar(22)
+
+  // Billing address (captured at checkout for tax purposes)
+  billingAddressLine1   String?
+  billingAddressLine2   String?
+  billingCity           String?
+  billingState          String?
+  billingPostalCode     String?
+  billingCountry        String?     @db.VarChar(2)
+
+  // Terms of Service acceptance (captured at checkout)
+  termsVersion          String?   // e.g. "2026-04" — slug of the ToS version accepted
+  termsAcceptedAt       DateTime? // timestamp of acceptance
+
+  // Refund policy acknowledgement snapshot (captured at checkout)
+  refundPolicyAckAt     DateTime?
+  refundPolicyAckIp     String?   @db.VarChar(128)
+  refundPolicyVersion   String?   @db.VarChar(64)
+  refundPolicyText      String?
+
+  // Stripe dispute intake mirror fields. Dispute rows are the source of truth.
+  disputedAt            DateTime?
+  disputeStatus         DisputeStatus?
+  checkoutIp            String?   @db.VarChar(128)
+
+  // Stripe Tax Calculation reference
+  stripeTaxCalculationId String?
+
+  // ── Point-in-time tax situs snapshot (spec 2026-07-01 §5.2) ──────────────
+  // Freezes the VENUE jurisdiction that determined this order's tax at
+  // create time, so historical threshold rollups stay correct even if the
+  // venue (Place / SavedLocation / inline address) is later edited. Distinct
+  // from the buyer's billing address above. Null on legacy rows (no backfill).
+  taxSitusCountry       String?   @db.VarChar(2) // "US" | "CA"
+  taxSitusState         String?   // state / province code (e.g. "AB", "FL", "TN")
+  taxSitusPostal        String?
+  taxRateSource         String?   // "ziptax" | "ca_gst_hst" | "none"
+
+  /// @deprecated Use OrderItem.paidOutAt instead. This field will be removed in a future migration.
+  /// Kept temporarily for backfill purposes.
+  // TODO: drop in its own PR once no code reads Order-level paidOutAt (audit `git grep -n paidOutAt`: optional on OrderRecord, so a missed read like `fresh.paidOutAt` in reconcile-stripe-full-refund.ts still compiles and reads undefined).
+  // Before dropping: `pnpm db:backfill:paidout[:remote] --dry-run`, then for real (:remote uses DATABASE_URL), then verify the counts. See docs/records/2026-01-28-order-paidOutAt-audit.md.
+  paidOutAt             DateTime?
+
+  event    Event?  @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  buyer    Human   @relation("BuyerOrders", fields: [buyerHumanId], references: [id], onDelete: Restrict)
+  parent   Order?  @relation("OrderParent", fields: [parentOrderId], references: [id])
+  children Order[] @relation("OrderParent")
+
+  items             OrderItem[]
+  tickets           Ticket[]
+  splits            OrderSplit[]
+  settlementLines   SettlementLine[]
+  disputes          Dispute[]
+  earlyFraudWarnings EarlyFraudWarning[]
+  transfers         TicketTransfer[]
+  promoRedemptions PromoRedemption[]
+  promoHolds       PromoHold[]
+  feedbackRequests  FeedbackRequest[]
+  claims                 Claim[]
+  resaleListingPurchase  ResaleListing? @relation("ResaleListingBuyerOrder")
+  waiverAcceptances      WaiverAcceptance[]
+  ticketAttributions     TicketAttribution[]
+  creditRedemptions      UserCreditRedemption[]
+  supportThreads         SupportThread[]        @relation("SupportThreadOrder")
+  volunteerRewardGrants  VolunteerRewardGrant[] @relation("VolunteerRewardGrantCompOrder")
+  /// Per-imposition tax breakdown — see `taxAmountCents` for the invariant.
+  taxLines               OrderTaxLine[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([eventId, occurredAt])
+  @@index([kind])
+  @@index([buyerHumanId])
+  // Recently changed orders platform-wide: the "an eligible order at this
+  // place changed since lastCalculatedAt" arm of
+  // PlaceStatsRepo.listStalePlaceIds (venue-track-record NFR-005). Same
+  // reasoning as Ticket(scannedAt).
+  @@index([updatedAt])
+}
+
+model OrderItem {
+  id             String  @id @default(uuid())
+  orderId        String
+
+  /// Discriminator for what this line represents. Validated in app
+  /// via the `OrderItemKind` Zod enum in `packages/core/src/lib/order-item-kind.ts`.
+  ///
+  /// Vocabulary:
+  ///   "ticket"          — admission ticket; ticketTypeId set
+  ///   "merch_freeform"  — POS-only ad-hoc merch sale; no SKU FK,
+  ///                       `label` carries the operator-typed string
+  ///                       (e.g. "Cassette", "Patch"), no admission
+  ///   "merch_sku"       — future: catalog merch item with inventory
+  ///                       (will add `merchItemId String?` alongside
+  ///                       `ticketTypeId` when introduced)
+  ///   "discount"        — promo / discount line, negative amount
+  ///   "surcharge"       — buyer-paid surcharge line, positive amount
+  ///   "fee"             — platform / payment-processor fee line
+  ///   "platform_credit" — platform-funded account credit applied to the
+  ///                       buyer charge, negative amount. Does NOT reduce
+  ///                       organiser settlement (see UserCredit / credit.prisma)
+  ///   "membership"      — one billing period of a membership tier;
+  ///                       `membershipId` set, `ticketTypeId` null, and the
+  ///                       parent Order carries kind = MEMBERSHIP
+  ///
+  /// Migration to a Postgres enum is deferred until the use-case
+  /// surface has stabilised across all kinds. Until then this stays
+  /// String + Zod-validated at every write site.
+  kind           String
+
+  /// Concrete FK for ticket lines. Null for non-ticket kinds.
+  ticketTypeId   String?
+
+  /// Concrete FK for "membership" lines. Null for every other kind.
+  membershipId   String?
+
+  /// Free-form display label for line items that don't have a
+  /// concrete catalog FK (currently "merch_freeform"). Operator
+  /// types this at the till. Null for ticket / discount / fee lines
+  /// — the FK or kind already names them. 64-char DB constraint plus
+  /// Zod input validation.
+  label          String? @db.VarChar(64)
+
+  qty            Int     @default(1)
+  unitPriceCents Int
+  amountCents    Int
+  meta           Json    @default("{}")
+  resaleListingId String?
+  resaleFaceValueCents Int?
+  resaleProcessingPassThroughCents Int @default(0)
+  resaleProcessingFeeConfigRef String?
+  resaleSaleCutoffAt DateTime?
+  resalePayoutReleaseAt DateTime?
+  resalePayoutStatus ResaleOrderItemPayoutStatus?
+  resalePayoutHeldAt DateTime?
+  resalePayoutHoldReason String?
+  resalePayoutNoticeSentAt DateTime?
+  resalePayoutReminderSentAt DateTime?
+  resalePayoutFinalNoticeSentAt DateTime?
+
+  // ── Resale share record (organiser-resale-share FR-003, FR-004) ──
+  // The resale clause in force when this ticket was first sold, copied from
+  // the event's RESALE PayoutTerms. A resale finalize copies the same record
+  // onto the buyer's item, so it travels down the chain; a later edit to the
+  // event's clause never reaches tickets already sold. Written once, at the
+  // sale, and never updated (append-only, like the rest of the purchase
+  // snapshot). The one exception is FR-004's one-time fill: a ticket sold
+  // before this shipped gets the event's clause at its first listing, by a
+  // conditional write WHERE "resaleClauseType" IS NULL, so it can land only
+  // once. All NULL on items sold before this shipped (until that fill), on
+  // non-ticket items, and on sales made while the event's clause was unset.
+  // A set clause always carries originalUnitPriceCents, and a terms id /
+  // version only appears with a set clause (SQL CHECK
+  // "OrderItem_resale_clause_complete_check"). Shape (SQL CHECK
+  // "OrderItem_resale_clause_shape_check") mirrors PayoutTerms':
+  //   type NULL  bps, cents and payer NULL
+  //   PERCENT    bps 0..1000, cents NULL, payer set, terms id + version set
+  //   FLAT       cents > 0, bps NULL, payer set, terms id + version set
+  //   always     terms id and version both set or both NULL;
+  //              originalUnitPriceCents NULL or >= 0
+  resaleClauseType          ResaleShareType?
+  resaleClauseBps           Int?
+  resaleClauseCents         Int?
+  resaleClausePayer         ResaleSharePayer?
+  /// The PayoutTerms row the clause was copied from. Deliberately NOT a
+  /// foreign key: this is a snapshot, the clause itself is copied into the
+  /// columns above, and it must outlive any edit or removal of the terms
+  /// (same as `ResaleListing.resalePayoutTermsId`).
+  resaleClauseTermsId       String?
+  /// `PayoutTerms.version` at the moment the clause was copied.
+  resaleClauseTermsVersion  Int?
+  /// "Original price": the organiser's unit price at the first sale (FR-007).
+  /// Copied unchanged down the resale chain, never the previous resale price.
+  originalUnitPriceCents    Int?
+  /// Resale order items only: the share this sale paid to the event side
+  /// (FR-005), and who paid it. Both set or both NULL (SQL CHECK
+  /// "OrderItem_event_share_shape_check").
+  eventShareCents           Int?
+  sharePayer                ResaleSharePayer?
+
+  /// When set, indicates this item's share of funds has been transferred to the organizer.
+  /// Used to branch refund behavior (pre-payout self-serve vs post-payout requires organizer action).
+  paidOutAt     DateTime?
+  /// When set, indicates this item was refunded.
+  refundedAt    DateTime?
+  /// The TAX PORTION of the refund actually issued for this item, in cents.
+  ///
+  /// Stamped at refund EXECUTION (never at quote time) by the same expression
+  /// that produced the money — see
+  /// `packages/core/src/lib/orders/refund-tax-share.ts`. It records what was
+  /// returned, not an idealised share, so `getTaxNexusRollup` can net refunded
+  /// tax out of "what do we owe" instead of counting the full original
+  /// `Order.taxAmountCents` on a PART_REFUNDED order.
+  ///
+  /// NULL means "not attributed": every refund issued before this column
+  /// existed, plus the paths that refund the WHOLE order (event cancellation,
+  /// Stripe-dashboard reconciliation) whose orders leave the rollup entirely
+  /// on status. NULL is deliberately NOT backfilled — a guessed share would
+  /// be indistinguishable from a measured one. Sums treat NULL as 0.
+  refundedTaxCents Int?
+  /// The PLATFORM-FEE PORTION of the refund actually issued for this item, in
+  /// cents. Sibling of `refundedTaxCents`, stamped at refund EXECUTION by the
+  /// same expression that produced the money.
+  ///
+  /// It exists because the platform fee IS refundable under the current policy
+  /// — a refund returns everything the buyer paid EXCEPT the processing fee
+  /// (`quote-full-refund.ts`) — yet nothing recorded how much went back.
+  /// `Order.feesPlatformCents` is never mutated by a refund, and the
+  /// payee-side REFUND_DEBIT is based on `gross - platformFee`, so by
+  /// construction it carries no fee component. Without this column, platform
+  /// revenue could only ever be stated as a CEILING.
+  ///
+  /// NULL means "not attributed", exactly as for `refundedTaxCents`: every
+  /// refund issued before this column existed, plus any path that does not run
+  /// the per-item expression. NULL is deliberately NOT backfilled — the
+  /// breakdown of a historical refund survives only in audit-log JSON, and a
+  /// reconstructed share would be indistinguishable from a measured one.
+  ///
+  /// UNLIKE `refundedTaxCents`, sums must NOT treat NULL as 0. This subtracts
+  /// from platform revenue, so a missing value that reads as zero OVERSTATES
+  /// what the platform kept. Consumers report coverage and withhold the net.
+  refundedPlatformFeeCents Int?
+  /// When set, indicates this item was transferred via resale or gift.
+  transferredAt DateTime?
+  /// "active" | "refunded" | "transferred" (validate in app)
+  status        String    @default("active")
+
+  order            Order                     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  ticketType       TicketType?               @relation(fields: [ticketTypeId], references: [id])
+  resaleListing    ResaleListing?            @relation("ResaleListingOrderItems", fields: [resaleListingId], references: [id], onDelete: Restrict)
+  settlementLinks  OrderItemSettlementLine[]
+  claim            Claim?
+  ticket           Ticket?
+
+  @@index([orderId])
+  @@index([ticketTypeId])
+  @@index([status])
+  @@index([resaleListingId])
+}
+
+/// One tax an order was charged (or, for ORGANISER lines, owes via the
+/// organiser), exactly as solved at checkout. Immutable: written once, in the
+/// order's create transaction, from `solveTaxLinesAndProcessorFee`. Read by
+/// receipts, per-imposition remittance and audit — the jurisdiction's rules
+/// are derived from the live situs at charge time and are NOT re-derivable
+/// later, so this row is the only record of what was applied.
+model OrderTaxLine {
+  id                 String            @id @default(uuid())
+  orderId            String
+  /// Stable machine code ("SALES", "CHI_AMUSEMENT", …). Never renamed.
+  code               String            @db.VarChar(64)
+  /// Human name at charge time ("Sales tax", "Chicago amusement tax").
+  label              String            @db.VarChar(128)
+  /// "US/TN", "US/IL/Chicago", … ("UNKNOWN" when the situs did not resolve).
+  jurisdiction       String            @db.VarChar(128)
+  rateBps            Int
+  base               OrderTaxBase
+  collector          OrderTaxCollector
+  /// What `rateBps` was applied to, in cents.
+  taxableAmountCents Int
+  /// round(taxableAmountCents × rateBps / 10⁴), rounded per line.
+  amountCents        Int
+  createdAt          DateTime          @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+}
+
+// These two enums live HERE, beside the one model that uses them, rather than
+// in enums.prisma: a path-scoped commit of this file then cannot split a model
+// from the type it references (the 785283f7 red-main failure).
+
+/// What a tax line's rate applies to — mirrors `TaxableBase` in
+/// `packages/core/src/lib/pricing/taxable-base.ts`.
+enum OrderTaxBase {
+  /// The post-discount ticket face only.
+  TICKET_FACE
+  /// Everything the buyer pays for admission: face + platform + processing fee.
+  BUYER_TOTAL
+}
+
+/// Who owes a tax line to the jurisdiction.
+enum OrderTaxCollector {
+  /// Collected from the buyer by the platform; in `Order.taxAmountCents`.
+  PLATFORM
+  /// Owed by the venue / promoter. Disclosed, NOT charged to the buyer.
+  ORGANISER
+}

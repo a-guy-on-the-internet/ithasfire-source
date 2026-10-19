@@ -1,0 +1,227 @@
+# Owner note 2026-10-08: "The wallet pass designer could be used for the event ticket builder as well."
+# volunteer-wallet-pass-designer.spec.yaml
+#
+# Apple / Google Wallet passes for volunteer QR tokens, plus an org-level
+# pass designer for per-event branding.
+
+version: "0.1"
+status: draft
+updated: "2026-04-24"
+related:
+  - docs/specs/2026-04-24/volunteer-scanner-check-in.spec.yaml
+  - docs/specs/2026-03-23/volunteering.spec.md
+
+scope_note: >
+  This spec covers only wallet-pass distribution for the volunteer QR
+  token already defined in `volunteer-scanner-check-in.spec.yaml`. It does
+  NOT modify the underlying `VolunteerScanTokenPort`, the token claim
+  shape, or scanner-side verification. It adds a new distribution surface
+  (wallet pass) and a new admin designer surface.
+
+dependencies:
+  hard:
+    - volunteer-scanner-check-in Phase 1 shipped (token mint mutation
+      `volunteer.signups.mintScanToken` + port wired in API)
+    - attendee ticket wallet-pass pipeline exists and can be reused or
+      mirrored (PKPass signer, Google Wallet JWT, asset hosting)
+  soft:
+    - org branding assets (logo, colors) already captured on the org
+      profile or event
+
+summary:
+  problem: >
+    Today volunteers can only receive their QR via email or in-app "Show
+    my QR". Event-day volunteers routinely lose or struggle to find these
+    links on arrival. Attendees already get wallet passes for tickets;
+    volunteers deserve parity so their QR lives in the same phone surface
+    the operator is already trained to look for.
+  solution: >
+    Issue Apple Wallet (.pkpass) and Google Wallet passes that embed the
+    same short-kind volunteer scan token as the email + in-app flows, and
+    give org admins a lightweight Pass Designer to customize visual
+    branding (title, accent color, logo, hero image, secondary fields) per
+    event or per org default.
+  users:
+    - Volunteers (pass recipient)
+    - Org admins / event staff leads (pass designer)
+    - Scanner operators (downstream, no behavior change)
+  surfaces:
+    - web-admin (Pass Designer)
+    - web (volunteer "Show my QR" -> Add to Wallet buttons)
+    - email (Add to Wallet buttons)
+    - mobile (volunteer-facing "Show my QR" screen)
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Volunteers with an APPROVED signup must see an "Add to Apple
+        Wallet" and "Add to Google Wallet" affordance anywhere the
+        in-app volunteer QR is currently shown, and in the volunteer
+        confirmation email.
+    - id: FR-002
+      description: >
+        Both wallet passes must embed the short-kind volunteer scan token
+        minted via the existing `volunteer.signups.mintScanToken`
+        mutation. Token TTL in the pass MUST match the mutation's returned
+        `expiresAt`; the pass must not outlive the token.
+    - id: FR-003
+      description: >
+        Passes must be refreshed (Apple push update / Google webhook) when
+        the underlying signup status changes to REJECTED, WITHDRAWN, or
+        when the event is cancelled. Passes for those states must display
+        a clearly voided front (grayed, "Cancelled" copy) and the embedded
+        QR must rotate to an unusable sentinel or be invalidated.
+    - id: FR-004
+      description: >
+        A Pass Designer surface under the org admin area must let org
+        admins (with `ORG_EDIT_ROLES`) configure per-org defaults and
+        per-event overrides for:
+          - Logo image
+          - Background / accent color
+          - Hero / strip image
+          - Pass title
+          - Up to 4 secondary field labels and values (e.g. "Role",
+            "Shift", "Arrive by", "Contact")
+          - Footer text
+      notes: >
+        Secondary field VALUES that bind to signup data (role label,
+        shift start, etc.) use a short token substitution syntax; see
+        design.field_bindings.
+    - id: FR-005
+      description: >
+        The designer must show a live preview that matches the rendered
+        .pkpass and Google Wallet class output for both light and dark
+        platform themes.
+    - id: FR-006
+      description: >
+        Design saves must be versioned per (orgId, eventId | null). When
+        a design changes, future passes use the new design immediately;
+        already-distributed passes use their embedded snapshot and are
+        only re-rendered if refreshed per FR-003.
+    - id: FR-007
+      description: >
+        If an org has no custom design, volunteers get a neutral default
+        pass (org name, event title, role, shift window, volunteer QR).
+        The default MUST be visually distinct from the attendee ticket
+        pass (different hero treatment + a "VOLUNTEER" watermark /
+        header) to match the "visually distinct" mandate in the scanner
+        check-in spec FR-001.
+    - id: FR-008
+      description: >
+        Print-kind volunteer tokens (the long-lived variant minted by
+        admins) are explicitly out of scope for wallet passes. Wallet
+        passes only carry short-kind tokens.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Pass generation (first Add-to-Wallet tap) must complete in <=
+        1.5s p95 under normal load.
+    - id: NFR-002
+      description: >
+        Pass refresh on status change must propagate within 60s p95 via
+        push (APNs / Google update webhook).
+    - id: NFR-003
+      description: >
+        PKPass bundles must be signed with the existing production Apple
+        Wallet certificate; no new CA material is provisioned by this
+        spec.
+
+design:
+  token_reuse: >
+    Wallet passes MUST call the same `mintScanToken` mutation at pass
+    issuance time and embed the returned short-kind token in the pass
+    barcode payload. No new token kind, issuer, or secret is introduced.
+  field_bindings:
+    syntax: "{{signup.roleLabel}}, {{signup.shiftStartAt|localDateTime}}"
+    allowed_sources:
+      - signup.roleLabel
+      - signup.shiftLabel
+      - signup.shiftStartAt
+      - signup.shiftEndAt
+      - event.title
+      - event.startsAt
+      - event.venueName
+      - human.displayName
+    formatters:
+      - localDateTime
+      - localDate
+      - localTime
+      - uppercase
+      - truncate(n)
+  refresh_triggers:
+    - signup.status -> REJECTED | WITHDRAWN
+    - event.status -> CANCELLED
+    - event.endsAt reached (pass becomes historical, no QR)
+    - manual re-issue from admin (rotates embedded token)
+
+acceptance_criteria:
+  - >
+    A volunteer with an APPROVED signup can tap "Add to Apple Wallet" and
+    receive a valid PKPass that scans successfully in the scanner app's
+    volunteer check-in mode.
+  - >
+    A volunteer with an APPROVED signup can tap "Add to Google Wallet"
+    and receive a valid Google Wallet pass that scans successfully in
+    the scanner app's volunteer check-in mode.
+  - >
+    An org admin can customize the pass design in a preview-driven
+    editor and save a per-org default or per-event override.
+  - >
+    Withdrawing a volunteer causes distributed passes to refresh to a
+    clearly voided state within 60s.
+  - >
+    Default (un-customized) volunteer pass is visually distinguishable
+    from the attendee ticket pass at a glance.
+
+out_of_scope:
+  - Changes to the volunteer scan token claim shape or issuer
+  - Printed badges / badge designer (separate spec: volunteer-badge-designer)
+  - Wallet pass support for attendee tickets (already exists)
+  - Offline pass distribution (AirDrop, SMS attachment)
+  - Multi-language pass content (inherits org default locale for now)
+  - Custom per-signup fields beyond the enumerated field_bindings
+
+open_questions:
+  - id: OQ-1
+    question: >
+      Do we let org admins upload raw PKPass / Google Wallet JSON as an
+      "advanced" escape hatch, or is the structured designer the only
+      authoring surface in v1?
+  - id: OQ-2
+    question: >
+      Should a pass cover a single (human, event) across ALL their
+      shifts (grouped), or issue one pass per signup row? Token is
+      already human+event scoped, so single-pass-per-event is more
+      natural.
+  - id: OQ-3
+    question: >
+      Where does the Pass Designer live in nav? Under org settings,
+      under event settings, or both (with per-event overriding the org
+      default)?
+
+risks:
+  - risk: >
+      Embedded tokens outlive the short TTL because the pass is cached on
+      device and not refreshed in time.
+    severity: MEDIUM
+    mitigation: >
+      Render embedded `expiresAt` into pass body, schedule APNs push at
+      expiry - 1h, and mint on-demand when the user opens the in-app
+      "Show my QR" after expiry.
+  - risk: >
+      Designer complexity creeps into "make every pixel configurable"
+      territory.
+    severity: MEDIUM
+    mitigation: >
+      Lock v1 to the explicit FR-004 field list. No custom layouts, no
+      arbitrary CSS.
+  - risk: >
+      Revoked / withdrawn volunteers keep scanning successfully because
+      the pass hasn't pushed yet.
+    severity: MEDIUM
+    mitigation: >
+      Scanner verification ALREADY re-checks signup status server-side
+      at scan time (per scanner check-in spec). Pass refresh is a UX
+      nicety, not the security boundary.

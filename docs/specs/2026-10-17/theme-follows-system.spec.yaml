@@ -1,0 +1,221 @@
+# theme-follows-system.spec.yaml
+#
+# Web light/dark follows the OS appearance setting unless the person has picked one.
+#
+# Draft, scoping. Q2 + Q3 answered; Q1 waiting on the design board pick.
+
+version: "1.0"
+updated: "2026-10-17"
+
+# ── Rulings (owner, 2026-10-17; memory feedback_theme_follows_system.md) ─────
+# R1  "I would hope our app theming would be based on the system." — the OS
+#     setting (prefers-color-scheme) is the default; an explicit light/dark
+#     choice still wins. Supersedes the layout.tsx comment "dark is only
+#     painted where the user has opted in".
+# R2  Q1 "Hit me with the design for it" — three-way control accepted in
+#     principle; the look waits on the design board pick.
+# R3  Q2 "Yeah that's fine." — web only; mobile and scanner get follow-up specs.
+# R4  Q3 "That's fine. Assuming we aren't needing to do GDPR bullshit." — keep
+#     account values, drop device cookies by renaming th-theme → th-theme-pref.
+#     GDPR [REASONED, not legal advice]: the cookie is set only when the person
+#     picks a theme, holds one word, and is never read for anything else, so it
+#     is the user-requested-functionality kind that ePrivacy exempts from
+#     consent. Reading prefers-color-scheme stores nothing. Logged in
+#     docs/legal-and-tax-questions.md for the lawyer.
+# Earlier rulings that still bind: /embed/* is always light (route lock,
+# lib/route-context.ts) because it sits on someone else's site.
+
+# ── Findings that shape the design ───────────────────────────────────────────
+# F1 [VERIFIED 10-17, prod, unique ?th_probe= cache key so no visitor saw it]
+#    Cloudflare caches public pages (/, /about, /events/*, /places/*, /orgs/*,
+#    /humans/*, /p/*: `public, s-maxage`) with no cookie in the cache key. A
+#    page rendered for a `th-theme=dark` request was then served as a HIT,
+#    `data-theme="ember"`, to two requests that sent no cookie. So today the
+#    server-side theme on cached pages belongs to whoever filled the cache.
+# F2 [REASONED, AppThemeProvider.tsx mount effect] the provider rewrites the
+#    `th-theme` cookie to the mode the HTML was painted in. A cookieless
+#    visitor who gets a cached dark page is therefore set to dark for a year,
+#    and a dark-cookie visitor who gets a cached light page loses their choice.
+#    `th-theme` values in the wild are not reliable choices.
+# F3 [REASONED, ThemeAccountSyncer.tsx] the account column `Human.themeMode` is
+#    written only when the person toggles (mount is skipped, and F2 changes the
+#    cookie, not the mode state). Stored account values are real clicks.
+# F4 [VERIFIED, node_modules/@tamagui/web types] Tamagui supports
+#    `settings.themeClassNameOnRoot`, so the theme class can live on <html>,
+#    where a script in <head> can set it before first paint.
+# Consequence: the server cannot pick the theme on a cached page, OS or no OS.
+# The theme has to be decided in the browser before paint, from the cookie and
+# matchMedia. That fixes F1/F2 and gives "system" for free.
+
+summary:
+  problem: >
+    Web paints light unless the person found the toggle, so someone whose
+    computer is set to dark gets a bright cream page at night. Separately, the
+    edge cache serves one visitor's theme to everyone (F1) and can overwrite a
+    person's saved choice (F2).
+  solution: >
+    Three preferences: system (default), light, dark. A small blocking script
+    in <head> resolves the preference to a mode before paint and sets the
+    theme class, data-theme and color-scheme on <html>. Both themes' CSS
+    variables ship in the stylesheet keyed on that class, so the HTML itself is
+    theme-neutral and safe to cache. While on system, the page follows OS
+    changes live.
+  users:
+    - every web visitor, signed in or not
+  surfaces:
+    - web
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Preference is one of system | light | dark. No stored choice means
+        system. Resolution: route lock (/embed/* = light) → account choice →
+        device cookie choice → system. system resolves to dark exactly when
+        matchMedia('(prefers-color-scheme: dark)') matches.
+    - id: FR-002
+      description: >
+        The first paint uses the resolved mode on every route, cached or not:
+        the <html> theme class, data-theme and color-scheme are set by an
+        inline <head> script before <body> is parsed. No light-then-dark flash
+        for an OS-dark visitor on first visit, in Chromium, Safari and Firefox.
+    - id: FR-003
+      description: >
+        Server HTML on cacheable routes does not depend on the theme cookie or
+        the account. Two requests that differ only in theme cookie get
+        byte-identical HTML.
+    - id: FR-004
+      description: >
+        While the preference is system, changing the OS appearance updates the
+        open page without a reload.
+    - id: FR-005
+      description: >
+        The person can choose System, Light or Dark from the navbar control
+        (every surface that has ThemeToggleButton today). The choice is written
+        to the cookie and, when signed in, to the account. Choosing System
+        clears both (account themeMode = null).
+    - id: FR-006
+      description: >
+        The browser theme-color follows the resolved mode: two
+        <meta name="theme-color"> tags with media queries for system, and the
+        script overrides them for an explicit choice.
+    - id: FR-007
+      description: >
+        The client never writes the cookie from the painted mode (removes the
+        F2 reconcile). It writes only on an explicit choice, or to copy the
+        account choice to the device after sign-in.
+  non_functional:
+    - id: NFR-001
+      description: >
+        The inline script is under 1 KB and has no imports. The page CSP sets
+        no script-src today [VERIFIED 10-17, curl -sI web-dev /about], so it
+        runs as is; if a script-src is ever added, this script needs a hash.
+    - id: NFR-002
+      description: >
+        Zero new hydration warnings or console errors on /, an event page, a
+        place page, /admin and /embed, in both OS modes.
+    - id: NFR-003
+      description: >
+        The root layout stops calling humans.getMyThemePreference on every
+        signed-in request; the account choice reaches the device cookie
+        client-side (one fewer internal API round trip per page).
+
+architecture:
+  core:
+    use_cases:
+      - name: set-theme-preference (modified)
+        description: >
+          Accepts mode light | dark | system; system stores null. Self-scoped
+          to actingUserId as today.
+        input: actingUserId, mode
+        output: mode
+        idempotent: true
+        money: false
+  ports:
+    new: []
+    existing: [repos.humans.setThemeMode (accepts null)]
+  adapters:
+    existing: [packages/adapters/src/db/prisma/humans.ts setThemeMode]
+  transport:
+    trpc_procedures:
+      - humans.setThemePreference (input widens to include system)
+      - humans.getMyThemePreference (unchanged shape; null now means system)
+  ui:
+    components:
+      - apps/web/src/lib/theme-mode.ts — ThemePreference type, resolver, the
+        inline script source, both themes' CSS var blocks
+      - apps/web/src/app/layout.tsx — script in <head>, html attrs no longer
+        from cookie/account, suppressHydrationWarning on <html>
+      - packages/ui tamagui config — settings.themeClassNameOnRoot
+      - AppThemeProvider — preference + resolved mode, matchMedia listener,
+        reads the mode the script set on <html>
+      - ThemeAccountSyncer — syncs preference (incl. system); copies the
+        account choice to the device cookie after sign-in
+      - ThemeToggleButton — System / Light / Dark control (design board first,
+        per feedback_show_design_before_building)
+      - cookie-policy page copy if the cookie name or values change
+      - locale keys en + es for the three labels
+
+data:
+  new_models: []
+  modified_models:
+    - Human.themeMode — values unchanged ("light" | "dark" | null); null now
+      means system instead of unset
+  migrations_needed: false
+
+risks:
+  - risk: >
+      React output that depends on the mode (toggle icon, useIsDarkTheme,
+      Sonner theme) renders light on the server and must not mismatch on
+      hydration.
+    severity: HIGH
+    mitigation: >
+      Mode-dependent React state starts from a server snapshot and switches in
+      an effect; colours come from CSS, so only icons/labels can change after
+      hydration, never the canvas.
+  - risk: >
+      themeClassNameOnRoot changes how nested <Theme> subtrees (embed, admin
+      shells, presets from ActiveThemeInjector) inherit.
+    severity: MEDIUM
+    mitigation: >
+      Spike first (step 1 of the plan) on a branch: render embed, admin and a
+      preset org page in both modes and diff screenshots before building.
+  - risk: >
+      F1 also applies to anything else the root layout reads from cookies on
+      cached pages (the locale cookie was probed and did NOT reproduce on prod,
+      which paints lang="en" with th-locale=es).
+    severity: LOW
+    mitigation: Out of scope here; noted for the Spanish SEO work (/es/ URLs).
+
+open_questions:
+  - Q1 Control. Recommend a three-way System / Light / Dark control in the
+    navbar slot (design board before building). The alternative, keeping the
+    one-tap toggle and treating "back to whatever the OS is" as System, leaves
+    no way to say "always dark" on a Mac set to Auto. Consent principle: the
+    OS setting is the person's standing choice, and a choice we made for them
+    should not stick.
+  - Q2 Scope. Recommend web only in this spec. Mobile is pinned light and has
+    no dark theme wired; the scanner has its own Dark theme switch in
+    settings. Each gets a follow-up spec.
+  - Q3 Existing choices. Recommend keeping account values (F3: real clicks)
+    and dropping device cookies by renaming th-theme → th-theme-pref, since F2
+    means cookie values may be choices nobody made. Effect: signed-out
+    visitors start on System once; signed-in people get their account choice
+    back on first load.
+
+out_of_scope:
+  - Mobile (apps/mobile) and scanner theming
+  - Per-org colour presets (ActiveThemeInjector), beyond keeping them working
+  - Edge-cache fixes for anything other than theme
+
+acceptance_criteria:
+  - OS dark, no cookie, first visit to a cached event page — first paint is
+    ember, in Chromium and WebKit (Playwright colorScheme "dark").
+  - Two curl requests to the same cacheable URL, one with the preference
+    cookie set to dark and one without, return identical HTML.
+  - Choosing Light on an OS-dark machine sticks across reloads and pages;
+    choosing System returns to dark and clears the account value.
+  - Flipping the emulated colour scheme on an open page while on System
+    repaints without a reload.
+  - /embed/* paints light regardless of OS and preference.
+  - No hydration warnings; 320px check of the new control.

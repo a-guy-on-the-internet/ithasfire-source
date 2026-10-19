@@ -1,0 +1,19 @@
+{
+  "extends": "../config/tsconfig/base.json",
+  "include": ["src", "test"],
+  "compilerOptions": {
+    "composite": true,
+    "incremental": true,
+    "outDir": "dist",
+    "baseUrl": ".",
+    "rootDirs": ["./src", "../types/src"],
+    "skipLibCheck": true,
+    "paths": {
+      "@th/types": ["../types/src/index.ts"],
+      "@th/types/*": ["../types/src/*"],
+      "@th/ports": ["./src/index.ts"],
+      "@th/ports/*": ["./src/*"]
+    }
+  },
+  "references": [{ "path": "../types" }]
+}

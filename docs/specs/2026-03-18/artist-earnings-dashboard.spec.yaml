@@ -1,0 +1,287 @@
+# Owner note 2026-10-08: "This... will need to exist at some point on the admin dashboard. That admin dashboard will become polymorphic depending on if they are an act/performer or venue/organizer"
+status: draft
+priority: p1
+depends_on:
+  - agreements-booking-requests-payout-consolidation.md
+  - payout-terms-claims-resale-controls.md
+
+task: >
+  Build an artist-facing financial dashboard that aggregates earnings, pending
+  payouts, and performance metrics across all events where the artist is a
+  payee -- regardless of which org or place hosted the show.
+
+goal: >
+  Give touring artists a single, trusted source of truth for their income on
+  Ithas Fire.  Without financial visibility, artists have no reason to prefer
+  the platform over collecting cash at the door.  This feature turns
+  Ithas Fire from "a ticketing tool the venue uses" into "my earnings
+  platform."
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Context: What Exists Today
+# ───────────────────────────────────────────────────────────────────────────────
+
+current_state:
+  settlement_model: >
+    Settlements are created per-payee per-event via OrderSplit -> SettlementLine
+    -> Settlement.  The batch runner (run-batch.ts) groups settlements into
+    PayoutItems.  All of this is payee-scoped already -- the data exists, it's
+    just not surfaced to the artist.
+
+  payee_identity: >
+    A Payee record links to a Stripe Connect account.  An artist (Human) is
+    associated with a Payee through PayoutTermsLine entries on events where
+    they perform.  The link chain is:
+      Human -> EventHuman (role=PERFORMER) -> Event -> PayoutTerms -> PayoutTermsLine (payeeId)
+    There is no direct Human.payeeId FK today.
+
+  existing_views: >
+    Org admins see per-event settlement breakdowns in the admin dashboard.
+    There is no human-scoped (artist-scoped) earnings view.
+
+  analytics_infra: >
+    EventDailyStats tracks sell-through, revenue, ticket counts per event.
+    AnalyticsRepo has getLatestDailyStats / getLatestDailyStatsBatch.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Data Model
+# ───────────────────────────────────────────────────────────────────────────────
+
+schema:
+  notes: >
+    No new tables required.  The dashboard is a read-only aggregation view
+    over existing Settlement, SettlementLine, PayoutItem, OrderSplit, Event,
+    and EventHuman data.  The key query pattern is "given a humanId, find all
+    Payees linked to that human, then aggregate their settlements."
+
+  new_index:
+    - table: PayoutTermsLine
+      columns: [payeeId]
+      reason: >
+        Enables efficient lookup of all PayoutTermsLine entries for a payee,
+        which is how we trace Human -> events they earned from.
+
+  potential_materialized_view: >
+    If query performance becomes a problem at scale, consider a
+    HumanEarningsSummary materialized view or a nightly job that snapshots
+    per-human monthly aggregates.  Premature for v1 -- start with live queries
+    against indexed Settlement/PayoutItem tables.
+
+  link_human_to_payee: >
+    Add an optional Human.payeeId FK (or a join table HumanPayee for humans
+    with multiple Stripe accounts).  Today the link is implicit through
+    EventHuman -> Event -> PayoutTerms -> PayoutTermsLine.  Making it explicit
+    simplifies the dashboard query from a 4-join chain to a direct lookup.
+    Decide in implementation whether to add the FK or keep the join chain.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Use Cases
+# ───────────────────────────────────────────────────────────────────────────────
+
+use_cases:
+  - name: getArtistEarningsSummary
+    location: packages/core/src/use-cases/earnings/get-artist-earnings-summary.ts
+    input: >
+      { actorHumanId: string; range?: { from: Date; to: Date };
+        currency?: string }
+    output: >
+      { totalEarnedCents: number; totalPendingCents: number;
+        totalPaidOutCents: number; eventCount: number;
+        ticketsSoldForArtist: number; currency: string;
+        byMonth: { month: string; earnedCents: number; paidOutCents: number }[];
+        byCity: { city: string; earnedCents: number; eventCount: number }[] }
+    flow:
+      - Resolve all Payee IDs linked to the actor's humanId
+      - Query Settlements grouped by status (pending vs transferred)
+      - Join to Events for city/region and date bucketing
+      - Return aggregated summary
+    authz: >
+      Actor can only see their own earnings.  No org role required -- this is
+      a personal view.
+
+  - name: listArtistSettlements
+    location: packages/core/src/use-cases/earnings/list-artist-settlements.ts
+    input: >
+      { actorHumanId: string; cursor?: string; limit?: number;
+        status?: "pending" | "transferred" | "failed" }
+    output: >
+      { settlements: { id: string; eventTitle: string; eventDate: Date;
+        placeName: string | null; city: string | null;
+        amountCents: number; currency: string; status: string;
+        scheduledPayoutDate: Date; transferredAt: Date | null }[];
+        nextCursor: string | null }
+    flow:
+      - Resolve Payee IDs for actor
+      - Paginated query over Settlement + Event join
+      - Return settlement list with event context
+
+  - name: getArtistSettlementDetail
+    location: packages/core/src/use-cases/earnings/get-artist-settlement-detail.ts
+    input: >
+      { actorHumanId: string; settlementId: string }
+    output: >
+      { settlement: { id: string; amountCents: number; status: string;
+        scheduledPayoutDate: Date; stripeTransferId: string | null };
+        event: { id: string; title: string; startsAt: Date; placeName: string | null };
+        breakdown: { grossRevenueCents: number; platformFeeCents: number;
+          transferFeeCents: number; splitPercent: number;
+          guaranteeFloorCents: number | null; netPayoutCents: number };
+        lines: { orderId: string; itemCount: number; amountCents: number }[] }
+    flow:
+      - Verify actor owns the payee linked to this settlement
+      - Fetch Settlement + SettlementLines + OrderSplits
+      - Compute breakdown from PayoutTermsLine + FeePolicy
+      - Return full transparency view
+    notes: >
+      This is the "show me the math" view.  It should make disputes nearly
+      impossible by showing exactly how the payout was computed.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Port Changes
+# ───────────────────────────────────────────────────────────────────────────────
+
+ports:
+  repos:
+    settlements:
+      new_methods:
+        - name: listByPayeeIds
+          signature: >
+            (payeeIds: string[], opts: { status?: string; cursor?: string;
+             limit?: number }) => Promise<{ items: SettlementRecord[];
+             nextCursor: string | null }>
+        - name: aggregateByPayeeIds
+          signature: >
+            (payeeIds: string[], opts: { from?: Date; to?: Date;
+             groupBy: "month" | "city" }) => Promise<AggregateRow[]>
+
+    payees:
+      new_methods:
+        - name: listByHumanId
+          signature: >
+            (humanId: string) => Promise<PayeeRecord[]>
+          notes: >
+            Resolves the Human -> Payee link.  If we add Human.payeeId this
+            becomes trivial.  If we keep the implicit chain, this method
+            does the EventHuman -> PayoutTermsLine join internally.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Transport
+# ───────────────────────────────────────────────────────────────────────────────
+
+transport:
+  trpc:
+    router: earnings
+    procedures:
+      - name: getEarningsSummary
+        type: query
+        auth: required
+        notes: Maps to getArtistEarningsSummary, injects actorHumanId from ctx
+
+      - name: listSettlements
+        type: query
+        auth: required
+        notes: Maps to listArtistSettlements, cursor-based pagination
+
+      - name: getSettlementDetail
+        type: query
+        auth: required
+        notes: Maps to getArtistSettlementDetail
+
+# ───────────────────────────────────────────────────────────────────────────────
+# UI
+# ───────────────────────────────────────────────────────────────────────────────
+
+ui:
+  web:
+    route: /dashboard/earnings
+    sections:
+      - name: Summary cards
+        description: >
+          Top row: Total Earned (lifetime), Pending, Paid Out, Events Played.
+          Currency selector if the artist has multi-currency earnings.
+
+      - name: Monthly chart
+        description: >
+          Bar or area chart showing earned vs paid-out by month.  12-month
+          rolling window by default, expandable.
+
+      - name: By-city breakdown
+        description: >
+          Table or horizontal bar chart: city, event count, total earned.
+          Helps the artist decide where to route their next tour.  Sorted by
+          earnings descending.
+
+      - name: Settlement list
+        description: >
+          Paginated table: event name, date, venue, amount, status (pending /
+          transferred / failed), payout date.  Click-through to detail view.
+
+      - name: Settlement detail
+        description: >
+          Full breakdown: gross revenue, platform fee, transfer fee, split %,
+          guarantee floor, net payout.  Line items showing which orders
+          contributed.  "How was this calculated?" expandable explainer.
+
+  mobile:
+    notes: >
+      Same data, simplified layout.  Summary cards + settlement list.
+      Detail view accessible via tap.  Chart can be deferred to v2.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Test Matrix
+# ───────────────────────────────────────────────────────────────────────────────
+
+tests:
+  - name: Artist with 3 events, mixed settlement statuses
+    validates: Summary aggregation (earned + pending + paid out)
+
+  - name: Artist with multi-currency earnings (USD + EUR)
+    validates: Currency filtering and correct per-currency totals
+
+  - name: Artist with guarantee floor that kicked in
+    validates: Detail breakdown shows guarantee applied correctly
+
+  - name: Settlement detail breakdown math
+    validates: >
+      gross - platformFee - transferFee = netPayout, and
+      netPayout >= guaranteeFloorCents when floor applies
+
+  - name: Artist can only see own settlements
+    validates: Requesting another artist's settlement returns forbidden
+
+  - name: Artist with no events returns empty state
+    validates: Graceful empty response, no errors
+
+  - name: Pagination over 50+ settlements
+    validates: Cursor-based pagination returns correct pages
+
+  - name: By-city grouping with events in 5 cities
+    validates: Correct aggregation per city, sorted by earnings
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Open Questions
+# ───────────────────────────────────────────────────────────────────────────────
+
+open_questions:
+  - question: Should we add a direct Human.payeeId FK?
+    context: >
+      Simplifies the earnings query chain significantly.  Downside: a human
+      could theoretically have multiple Stripe Connect accounts (e.g.,
+      personal + band LLC).  A join table (HumanPayee) handles that but adds
+      complexity.  Start with single payeeId, migrate to join table if needed.
+
+  - question: CSV/PDF export?
+    context: >
+      Artists need this for taxes.  A "Download 2025 earnings (CSV)" button
+      is low effort and high value.  Include it in v1 or defer?
+
+  - question: Real-time vs cached aggregates?
+    context: >
+      Live queries against Settlement are fine for < 1000 settlements per
+      artist.  If an artist has 10K+ settlements, consider a nightly
+      materialized summary.  Monitor query times post-launch.
+
+  - question: Should the detail view show the buyer's city?
+    context: >
+      Useful for "where are my fans buying from?" but adds PII concerns.
+      Could show city-level only (no names/emails) -- same as EventDailyStats.

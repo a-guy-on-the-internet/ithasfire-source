@@ -1,0 +1,27 @@
+/*
+ * The lineup renders each row twice, wide and compact, and CSS picks one.
+ * The breakpoint is MOBILE_BREAKPOINT (hooks/useIsMobile.ts, 600px): keep the
+ * two in step. A media query is right on the server's first paint, where the
+ * `useIsMobile` hook is always false; switching rows on that hook made every
+ * 320px visit paint the desktop row and then jump to the compact one.
+ *
+ * `display: none` also takes the hidden variant out of the accessibility tree,
+ * so each list item exposes exactly one link.
+ */
+.wide {
+  display: contents;
+}
+
+.narrow {
+  display: none;
+}
+
+@media (max-width: 599px) {
+  .wide {
+    display: none;
+  }
+
+  .narrow {
+    display: contents;
+  }
+}

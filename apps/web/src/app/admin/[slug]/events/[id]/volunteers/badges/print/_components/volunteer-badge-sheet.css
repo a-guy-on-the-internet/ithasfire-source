@@ -1,0 +1,535 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   THE VOLUNTEER BADGE SHEET — document-specific styles
+   ═══════════════════════════════════════════════════════════════════════════
+
+   Third document on the print layer, after the ticket sheet
+   (`my-tickets/[orderId]/print`) and the hours statement
+   (`my-volunteering/hours/print`). Layers on top of `src/app/_print/print.css`,
+   which owns the `--print-*` palette, the paper wrapper and the shared
+   primitives (`__rule`, `__label`, `__value`, `__keep`, `__sr`). Only rules
+   TRUE OF BADGES belong here; the three documents share the layer, never each
+   other's stylesheets.
+
+   EVERY RULE IN THIS FILE IS CLASS-SCOPED. Not style — correctness. Next does
+   not unload a route's stylesheet on client-side navigation (citation at the
+   top of `print.css`), so a bare-element or `@page` rule here would follow the
+   operator onto the next page they print. Document-lifetime rules live in
+   `PaperSheet`'s un-hoisted <style>; there are none in this file.
+
+   No colour literals: every value is a `--print-*` custom property, which is
+   what makes the sheet a FIXED LIGHT artefact whatever theme the operator's
+   ACCOUNT is on. A printed dark-mode QR is an unscannable QR.
+
+   ── WHY THE RUN IS BLOCK FLOW AND NOT A GRID ──────────────────────────────
+
+   Badges are laid out two-up, which reads like a job for
+   `grid-template-columns: 1fr 1fr`. It is not, because this sheet has to make
+   a PROMISE about pagination: six badges per page, on Letter and on A4 alike.
+   Forced page breaks (`break-before: page`) are only dependable on
+   BLOCK-LEVEL boxes; inside a grid or flex container browsers have long
+   ignored them, and "how many badges come off a sheet" is not something a box
+   office can be asked to discover per printer. So the rows are real elements
+   (`chunkIntoRows`, `badge-sheet-helpers.ts`) in ordinary block flow, and the
+   two-up arrangement happens INSIDE a row, where no fragmentation occurs.
+
+   That also disposes of the marooned-cut-mark bug the ticket sheet hit (a
+   scissors glyph stranded at a page foot with nothing beneath it to cut). Here
+   the cut line is the badge's own dashed FRAME — one box, four sides, cut
+   round it — so a mark cannot be separated from its badge by construction, and
+   `break-inside: avoid` on the row binds the pair anyway, belt and braces.
+
+   ── The six-per-page arithmetic, MEASURED and then re-measured ────────────
+     Letter content box  = 279.4 − 24 (the 12mm @page margins) = 255.4mm tall
+     A4 content box      = 297   − 24                          = 273.0mm tall
+     A4 is the NARROWER  = 210   − 24                          = 186.0mm wide
+   Width budget therefore comes off A4, height budget off Letter. Measured on
+   a real Letter proof, the masthead costs ~13mm and the footer ~13mm, leaving
+   about 229mm for badge rows.
+
+   The first draft budgeted a 62mm badge from arithmetic. A browser said 70mm
+   — the scan panel alone is ~35mm and `min-height` is only a floor — which
+   left 7mm of slack on Letter. That is not a failure, but it is too little:
+   one two-line name (~5mm) would have pushed the third row onto page 2 while
+   A4, with 14mm more, kept it. The count would then have depended on the
+   paper again, which is the exact thing this document refuses to do.
+
+   So the badge was tightened — 3mm padding, 1.5mm internal gaps, a 2mm quiet
+   zone, a 1.2mm foot rule gap, a 4mm gutter — and every millimetre that bought
+   went into the SCAN SYMBOL, which is the part of this artefact most likely to
+   fail in the field (28mm → 30mm → 36mm across three measured passes; see the
+   QR note below for why that is where the budget belongs).
+
+   The shipped figures are `getBoundingClientRect` in print media at the true
+   Letter content width (191.8mm), NOT arithmetic:
+
+     badge  = 93.9 × 71.2mm
+     sheet chrome (masthead + footer)  =  21.1mm
+     3 rows + 2 gaps × 4mm             = 221.5mm
+     4 rows + 3 gaps × 4mm             = 296.6mm  ✗ fits neither paper
+
+     Letter rows budget 234.3mm  ⇒  SLACK 12.8mm
+     A4     rows budget 251.9mm  ⇒  SLACK 30.4mm
+
+   Letter is the binding paper and keeps ~12.8mm: two badges on a page can wrap
+   their name to a second line (~5.2mm each) and the page still holds three
+   rows. Past that the browser moves a row on, which is the graceful direction
+   — it can only ever take badges OFF a page, never overflow one, because
+   `break-inside: avoid` on the row still applies.
+
+   If a future field pushes the badge past ~75mm, RE-MEASURE rather than
+   trusting this paragraph. An earlier revision of it was arithmetic, and it
+   was wrong by 8mm.
+
+   The rule below then PINS the count, because content pushes and a floor
+   cannot stop it. Like the ticket sheet's, the forced break can only ever
+   REDUCE the badges on a page, never overflow one: three unusually tall rows
+   still fragment between themselves normally.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Sheet header ──────────────────────────────────────────────────────────── */
+
+.th-badge-sheet__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 4mm;
+  padding-bottom: 3mm;
+  /* Never orphan the masthead at the foot of a page. */
+  break-after: avoid;
+  page-break-after: avoid;
+}
+
+/* Replaced content always prints, even with Chrome's "Background graphics"
+   default of off — the same reason the other two sheets use an <img>. */
+.th-badge-sheet__wordmark {
+  display: block;
+  width: 34mm;
+  height: auto;
+}
+
+/* Event · badge count · issue timestamp.
+   140mm, not 110: the header is `space-between` against a 34mm wordmark, so
+   about 153mm is actually available, and the tighter cap was breaking the
+   timestamp across two lines ("ISSUED AUG 12, / 2026, 9:53 PM") for an
+   ordinary event title. It still wraps for a genuinely long one, which is
+   correct — the event's name is the first thing this line has to carry. */
+.th-badge-sheet__meta {
+  margin: 0;
+  font-size: 7pt;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--print-muted);
+  text-align: right;
+  max-width: 140mm;
+  overflow-wrap: anywhere;
+}
+
+.th-badge-sheet__meta-sep {
+  padding-inline: 1.5mm;
+  color: var(--print-rule-soft);
+}
+
+/* ── The run ───────────────────────────────────────────────────────────────── */
+
+.th-badge-sheet__run {
+  margin-top: 3mm;
+}
+
+/*
+ * A row of (up to) two badges. BLOCK-level container, flex only INSIDE — see
+ * the header note. `break-inside: avoid` binds both badges and both dashed
+ * cut frames into one unbreakable box.
+ */
+.th-badge-row {
+  display: flex;
+  gap: 4mm;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.th-badge-row + .th-badge-row {
+  margin-top: 4mm;
+}
+
+/*
+ * AT MOST three rows — six badges — to a page. Enforced, not left to the paper
+ * size. A physical artefact whose structure depends on which paper the
+ * operator's printer happened to hold is a support ticket waiting to happen:
+ * "cut on the dashed lines, six badges per sheet" has to be true every time.
+ */
+@media print {
+  .th-badge-row:nth-child(3n + 1):not(:first-child) {
+    break-before: page;
+    page-break-before: always;
+  }
+}
+
+/* ── One badge ─────────────────────────────────────────────────────────────── */
+
+/*
+ * `flex: 0 0 calc(50% - 2mm)` rather than `flex: 1`: the last row of an odd
+ * run holds ONE badge, and a lone badge stretched to full width is a different
+ * artefact from the five above it — different cut size, wrong for the holder.
+ * Half the row minus half the 4mm gutter keeps every badge identical.
+ *
+ * The dashed border IS the cut line. Adjacent badges therefore show two dashed
+ * lines 4mm apart, which is correct for badge stock: you cut twice and discard
+ * the gutter, so a slightly wandering cut spoils one badge rather than two.
+ *
+ * `min-height`, never `height`: a long name, a second shift or a 20%-longer
+ * Spanish string must PUSH the badge, never clip inside it.
+ *
+ * Every dimension here is deliberately mean, and the savings all went to the
+ * scan panel — see the QR note below for why that was the right place to
+ * spend them.
+ */
+.th-badge {
+  flex: 0 0 calc(50% - 2mm);
+  min-width: 0;
+  min-height: 58mm;
+  box-sizing: border-box;
+  padding: 3mm;
+  border: 1px dashed var(--print-rule-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 1.5mm;
+}
+
+/* ── Designation + issuer ──────────────────────────────────────────────────── */
+
+.th-badge__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 3mm;
+}
+
+/*
+ * "VOLUNTEER" — the designation, and the reason this is credential stock
+ * rather than a name card. Accent-as-ink (`--print-accent`, the sanctioned
+ * accent-at-label-legibility rung), never the `accent` fill value: at 7.5pt on
+ * paper that lighter orange has no AA foreground contrast and photocopies to
+ * mush. Ornamental kicker type, per the design system's accent rule.
+ */
+.th-badge__designation {
+  margin: 0;
+  font-size: 7.5pt;
+  font-weight: 700;
+  letter-spacing: 2.4px;
+  text-transform: uppercase;
+  color: var(--print-accent);
+  white-space: nowrap;
+}
+
+/*
+ * The ISSUER — the organizer or venue this badge came from. Not decoration:
+ * it is what makes the badge venue-issued rather than self-printed, and it is
+ * the party a door escalates to. Wraps rather than truncating; an issuer whose
+ * name is cut in half is worse than one that costs a line.
+ */
+.th-badge__issuer {
+  margin: 0;
+  font-size: 6pt;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--print-muted);
+  text-align: right;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.th-badge__rule {
+  border: 0;
+  border-top: 1px solid var(--print-rule);
+  margin: 0;
+}
+
+/* ── Name ──────────────────────────────────────────────────────────────────── */
+
+/*
+ * The one thing door staff read first, so it gets the full 82mm inner width
+ * and the largest type on the badge. 14pt over a 90mm badge sets roughly 28
+ * uppercase characters on a line; longer names wrap onto a second, which is
+ * correct — the badge has no fixed height and nothing clips.
+ */
+.th-badge__name {
+  margin: 0;
+  font-size: 14pt;
+  font-weight: 700;
+  line-height: 1.05;
+  letter-spacing: -0.2px;
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+}
+
+/* ── Assignments (role + shift window) ─────────────────────────────────────── */
+
+.th-badge__assignments {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5mm;
+}
+
+.th-badge__role {
+  margin: 0;
+  font-size: 9.5pt;
+  font-weight: 700;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+
+.th-badge__shift {
+  margin: 0.4mm 0 0;
+  font-size: 8pt;
+  font-weight: 500;
+  line-height: 1.25;
+  color: var(--print-muted);
+  overflow-wrap: anywhere;
+}
+
+/* ── Footer zone: where + the scan block ───────────────────────────────────── */
+
+/*
+ * `margin-top: auto` pins this to the bottom of the badge so every badge in a
+ * row lands its QR on the same line, whatever the name above it did. The
+ * design system's card-internals rule, at paper scale.
+ *
+ * `align-items: flex-start`, not `flex-end`: the scan panel is ~35mm tall and
+ * the Event/Venue pair is about half that, so bottom-aligning the text opened
+ * a conspicuous empty band directly under the rule — visible in the first
+ * Letter proof. Top-aligning hangs both columns off the rule, which is what
+ * the rule is for, and moves the unavoidable slack to the bottom-left where it
+ * reads as margin rather than as a hole.
+ */
+.th-badge__foot {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 2.5mm;
+  margin-top: auto;
+  padding-top: 1.2mm;
+  border-top: 1px solid var(--print-rule-soft);
+}
+
+.th-badge__where {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5mm;
+}
+
+.th-badge__field {
+  min-width: 0;
+}
+
+/* <dd> carries a 40px UA indent. */
+.th-badge__field dd {
+  margin: 0.5mm 0 0;
+}
+
+.th-badge__field-value {
+  margin: 0;
+  font-size: 8pt;
+  font-weight: 600;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+/* ── Scan block ────────────────────────────────────────────────────────────── */
+
+/*
+ * The quiet zone, and the one element on this sheet whose meaning depends on a
+ * FILL. Chrome's print dialog ships with "Background graphics" OFF, which
+ * drops backgrounds — so without `print-color-adjust: exact` the white scan
+ * field disappears on tinted stock or under a forced-background setting, and a
+ * QR without a light quiet zone is a QR a scanner refuses.
+ *
+ * `--print-paper` is pure white (NOT the Stub paper cream), declared for
+ * exactly this reason in `PaperSheet`.
+ *
+ * 2mm of padding around a 36mm symbol is ~4.3 modules of margin — just past
+ * the 4 the spec asks for, which is the point at which trading quiet zone for
+ * symbol size stops being a win.
+ */
+.th-badge-qr {
+  flex: 0 0 auto;
+  padding: 2mm;
+  background-color: var(--print-paper);
+  border: 1px solid var(--print-rule);
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+  line-height: 0;
+}
+
+/*
+ * 36mm printed. THE most load-bearing number in this file — read the table
+ * before shrinking it.
+ *
+ * ── This badge is a far harder scan than the ticket stub ──────────────────
+ *
+ *   artefact      payload              modules  EC level  printed  mm/module
+ *   ticket stub   ticket CODE (~12ch)     29       H (30%)   32mm     1.10
+ *   THIS badge    signed JWT (382 B)      77       M (15%)   36mm     0.47
+ *
+ * Same job, same building — and the badge's modules are less than half the
+ * size with half the error correction. It is also the artefact that gets
+ * hand-cut, worn all night, pocketed and rained on. So do not reason from
+ * "the ticket sheet only needs 32mm"; that symbol is luxuriously oversized
+ * for a 29-module code, and this one has no such headroom.
+ *
+ * ── The two levers, and why only one of them is real ──────────────────────
+ *
+ * DENSITY is not ours: the payload is a signed HS256 JWT — MEASURED at 382
+ * characters off a real mint (`{alg,kid}` + `{humanId,eventId,kind,iss,iat,
+ * exp,jti}` + signature) — and base64url falls outside QR alphanumeric mode
+ * (which is uppercase-only), so it encodes in 8-bit byte mode however we hold
+ * it. 382 bytes at level M is exactly the version-15 / 77-module symbol the
+ * browser renders. RAISING the error level
+ * makes this WORSE, not better — Q or H would push the symbol past 85 modules
+ * and shrink the module below where it is now. Level L would drop to ~69
+ * modules (+11% module size) but only recovers 7%, which is the wrong trade
+ * for a credential that gets creased. M stays.
+ *
+ * PHYSICAL SIZE is ours, and it is where all the tightening in this file went:
+ * 3mm badge padding, 1.5mm internal gaps, a 2mm quiet zone, a 1.2mm foot rule
+ * gap and a 4mm gutter all exist to fund these 36mm. 28mm → 30mm → 36mm across
+ * three measured passes; 0.36 → 0.39 → 0.47mm per module.
+ *
+ * ── Why not bigger ────────────────────────────────────────────────────────
+ *
+ * Height, not width, is the binding constraint: every extra millimetre of
+ * symbol is a millimetre of badge, times three rows. Past ~37mm the sheet can
+ * no longer hold three rows on US Letter with enough slack for a wrapped name,
+ * and the badges-per-page count would start depending on the paper — the one
+ * thing this document refuses to do. Going materially larger means 4 badges
+ * per page instead of 6; that is a product call, not a CSS one.
+ *
+ * `QRCodeSVG` emits a viewBox and no intrinsic size, so CSS alone scales it.
+ */
+.th-badge-qr__svg {
+  display: block;
+  width: 36mm;
+  height: 36mm;
+}
+
+/* ── Footer ────────────────────────────────────────────────────────────────── */
+
+.th-badge-sheet__footer {
+  margin-top: 4mm;
+  padding-top: 2mm;
+  border-top: 1px solid var(--print-rule);
+  font-size: 7pt;
+  font-weight: 700;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+  color: var(--print-muted);
+  text-align: center;
+  /* One sentence stating what the paper is. Splitting it across a page break
+     leaves half a statement on each. */
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+/* Screen-only note pointing at the browser's own Save-as-PDF. */
+.th-badge-sheet__hint {
+  margin: 5mm 0 0;
+  font-size: 8pt;
+  line-height: 1.45;
+  color: var(--print-muted);
+  max-width: 80ch;
+}
+
+/* ── Screen-only states (loading / manifest / empty / error / partial) ─────── */
+
+.th-badge-sheet__notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 24px 0;
+}
+
+.th-badge-sheet__notice-title {
+  margin: 0;
+  font-size: 13pt;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+.th-badge-sheet__notice-body {
+  margin: 0;
+  font-size: 10pt;
+  line-height: 1.45;
+  color: var(--print-muted);
+  max-width: 62ch;
+}
+
+/*
+ * The partial-issue warning. Screen only (`data-print-hide` in the markup):
+ * the paper is credential stock and carries no operational error text, but the
+ * operator MUST see that the stack in their hand is short — a volunteer whose
+ * badge silently failed to mint only finds out at the door.
+ */
+.th-badge-sheet__warning {
+  margin: 4mm 0 0;
+  padding: 3mm;
+  border: 2px solid var(--print-rule);
+  font-size: 9pt;
+  line-height: 1.45;
+}
+
+.th-badge-sheet__warning-title {
+  margin: 0 0 1.5mm;
+  font-size: 7pt;
+  font-weight: 700;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+}
+
+.th-badge-sheet__warning-list {
+  margin: 1.5mm 0 0;
+  padding-left: 5mm;
+  color: var(--print-muted);
+}
+
+/* ── Narrow screens ────────────────────────────────────────────────────────────
+   Two-up badges are a PAPER layout and do not survive a phone. Below the same
+   threshold at which the paper preview itself gives up (`print.css`), a row
+   re-declares to a single column.
+
+   NOTHING IS HIDDEN — layouts collapse by re-declaring, never by dropping
+   content, and every field on the printed badge is still here.
+
+   `@media screen` only: print media is untouched, so paper always gets the
+   two-up run and its deterministic six-per-page pagination. */
+
+@media screen and (max-width: 820px) {
+  .th-badge-row {
+    flex-direction: column;
+    gap: 5mm;
+  }
+
+  .th-badge {
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  .th-badge-sheet__meta {
+    text-align: left;
+    max-width: none;
+  }
+
+  /* A 320px column has no room for a side-by-side scan block; the QR drops
+     below the venue block rather than squeezing both. */
+  .th-badge__foot {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}

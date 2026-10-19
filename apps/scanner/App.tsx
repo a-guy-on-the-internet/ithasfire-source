@@ -17,6 +17,7 @@ import { loadApiOverridesAsync } from "./src/config/api";
 import { initSentry } from "./src/lib/sentry";
 import { ScannerApp } from "./src/scanner-app";
 import { TrpcProvider } from "./src/trpc";
+import { AppErrorBoundary } from "./src/ui/app-error-boundary";
 import { FIXED, NativeThemeProvider, useNativeTheme } from "@th/ui-native";
 
 const SPLASH_ICON = require("./assets/splash-icon.png");
@@ -184,7 +185,13 @@ function ThemedRoot() {
         theme doesn't silently ship unreadable clock/battery glyphs.
       */}
       <StatusBar style="light" />
-      <ScannerApp />
+      {/*
+        Inside the theme providers so the crash screen is themed; around
+        everything else so no crash under here leaves a blank screen.
+      */}
+      <AppErrorBoundary>
+        <ScannerApp />
+      </AppErrorBoundary>
     </IthasFireProvider>
   );
 }

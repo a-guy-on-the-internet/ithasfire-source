@@ -1,0 +1,285 @@
+/* ── Arrival areas: legend + "Getting there" list (arrival-areas FR-006) ──────
+   Board option A (owner R4): the legend sits under the map, the list under the
+   address. Strict Swiss content: square swatches, 2px rules, uppercase 800
+   heading over the accent underline (the place logistics card's heading).
+
+   Kind colours are custom properties so the swatches stay legible on both
+   page surfaces. On Stub they equal the MapLibre paint in `arrival-areas.ts`
+   exactly (the detail map always draws the light basemap); on Ember the
+   parking blue lifts to the theme's info blue and the drop-off line to its
+   amber, the same hue families at a contrast that holds on navy. Each kind
+   also differs by PATTERN (NFR-003): solid lot, dotted drop-off, dashed
+   load-in, a bar for street parking. */
+
+.root {
+  /* ds-color-ok: data palette for map kinds; mirrors ARRIVAL_AREA_PAINT.parking (palette.brandPrimary), which MapLibre paint needs as a literal */
+  --aa-parking: #35589a;
+  --aa-drop-fill: var(--support, #f59e0b);
+  --aa-drop-line: var(--warningSoft, #92400e);
+  /* Text follows its container's ink, so the list reads right both on the
+     event page (app theme) and inside a place page's own palette. */
+  --aa-load: currentColor;
+  --aa-accent: var(--place-accent, var(--accent, #e2481d));
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+:global(.t_ember) .root {
+  --aa-parking: var(--info, #5e8ad4);
+}
+
+/* A place page paints its OWN surface (the owner's background, or Stub cream),
+   which does not follow the app theme. When that surface is known to be light
+   (`data-surface="light"`, set by the page root), the list keeps the Stub
+   paint even in Ember: the lifted Ember blue and amber are for navy, and on
+   cream the drop-off line all but vanished. Declared after the Ember rule so
+   it wins at equal specificity. */
+[data-surface="light"] .root {
+  /* ds-color-ok-start: the Stub values of the kind palette above, pinned for a light owner surface the app theme cannot see; same literals as ARRIVAL_AREA_PAINT */
+  --aa-parking: #35589a;
+  --aa-drop-fill: #f59e0b;
+  --aa-drop-line: #92400e;
+  /* ds-color-ok-end */
+}
+
+/* ── Legend ─────────────────────────────────────────────────────────────── */
+
+/* The legend explains the MAP, and the map draws the light basemap with the
+   literal paints in ARRIVAL_AREA_PAINT in every theme, so the legend's
+   swatches use those same literals (on Ember too) and sit on a basemap-paper
+   ring so the dark load-in ink still reads on navy. The list's swatches keep
+   following the page theme (above). */
+.legend {
+  /* ds-color-ok-start: legend swatches mirror the MapLibre paint literals (ARRIVAL_AREA_PAINT: palette.brandPrimary, palette.support, stubTheme.warningSoft, stubTheme.color) and the light basemap paper (stubTheme.surface); the map cannot take var() */
+  --aa-parking: #35589a;
+  --aa-drop-fill: #f59e0b;
+  --aa-drop-line: #92400e;
+  --aa-load: #211c16;
+  --aa-map-paper: #fdfaf3;
+  /* ds-color-ok-end */
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem 0.875rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-md, 11.5px);
+  letter-spacing: var(--tr-mono-md, 1.4px);
+  text-transform: uppercase;
+}
+
+.legend .swatch {
+  outline: 2px solid var(--aa-map-paper);
+}
+
+/* The same tints as the list swatches, mixed over the map's paper rather
+   than the page, as they render on the map. */
+.legend .swatch[data-kind="PARKING_LOT"] {
+  background: color-mix(in srgb, var(--aa-parking) 22%, var(--aa-map-paper));
+}
+
+.legend .swatch[data-kind="ACCESSIBLE_DROP_OFF"] {
+  background: color-mix(in srgb, var(--aa-drop-fill) 35%, var(--aa-map-paper));
+}
+
+.legend .swatch[data-kind="LOAD_IN"] {
+  background: color-mix(in srgb, var(--aa-load) 10%, var(--aa-map-paper));
+}
+
+.legendItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+/* ── Swatches (legend + list rows) ───────────────────────────────────────── */
+
+.swatch {
+  display: inline-block;
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  box-sizing: border-box;
+}
+
+.swatch[data-kind="PARKING_LOT"] {
+  color: var(--aa-parking);
+  background: color-mix(in srgb, var(--aa-parking) 22%, transparent);
+}
+
+.swatch[data-kind="STREET_PARKING"] {
+  color: var(--aa-parking);
+  width: 16px;
+  height: 4px;
+  border: none;
+  background: currentColor;
+}
+
+.swatch[data-kind="ACCESSIBLE_DROP_OFF"] {
+  color: var(--aa-drop-line);
+  border-style: dotted;
+  background: color-mix(in srgb, var(--aa-drop-fill) 35%, transparent);
+}
+
+.swatch[data-kind="LOAD_IN"] {
+  color: var(--aa-load);
+  border-style: dashed;
+  background: color-mix(in srgb, var(--aa-load) 10%, transparent);
+}
+
+/* ── The list ───────────────────────────────────────────────────────────── */
+
+.heading {
+  margin: 0;
+  padding-bottom: 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  border-bottom: 2px solid var(--aa-accent);
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.item {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid color-mix(in srgb, currentColor 24%, transparent);
+}
+
+.item:first-child {
+  border-top: none;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: start;
+  gap: 0.25rem 0.625rem;
+  width: 100%;
+  min-height: 44px;
+  margin: 0;
+  padding: 0.625rem 0.375rem;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 150ms ease-out;
+}
+
+.row:hover {
+  background: color-mix(in srgb, currentColor 5%, transparent);
+}
+
+.row:focus-visible {
+  outline: 3px solid var(--focus-color, #e2481d);
+  outline-offset: -3px;
+}
+
+.row[data-selected="true"] {
+  background: color-mix(in srgb, var(--aa-accent) 10%, transparent);
+  box-shadow: inset 3px 0 0 var(--aa-accent);
+}
+
+.row .swatch {
+  margin-top: 3px;
+}
+
+.rowMain {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  min-width: 0;
+}
+
+.rowLabel {
+  font-size: 0.875rem;
+  font-weight: 700;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.rowMeta {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-md, 11.5px);
+  letter-spacing: var(--tr-mono-md, 1.4px);
+  text-transform: uppercase;
+  line-height: 1.5;
+  color: color-mix(in srgb, currentColor 72%, transparent);
+  overflow-wrap: anywhere;
+}
+
+/* The card the selected row opens. */
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+  margin: 0 0 0.625rem;
+  padding: 0.625rem 0.75rem 0.75rem calc(0.375rem + 18px + 0.625rem);
+}
+
+/* `display: flex` above outranks the UA `[hidden]` rule; restate it. */
+.card[hidden] {
+  display: none;
+}
+
+.note {
+  margin: 0;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+}
+
+.reportButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-height: 44px;
+  padding: 0 0.25rem;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: color-mix(in srgb, currentColor 72%, transparent);
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.reportButton:hover {
+  color: inherit;
+}
+
+.reportButton:focus-visible {
+  outline: 3px solid var(--focus-color, #e2481d);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .row {
+    transition: none;
+  }
+}

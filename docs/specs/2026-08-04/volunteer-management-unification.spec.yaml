@@ -1,0 +1,627 @@
+# volunteer-management-unification.spec.yaml
+#
+# Unify the two volunteer-management surfaces — the per-event tabbed view and
+# the standing-ask single-scroll monolith — onto one shared component
+# foundation, and redesign the ask admin experience as a tabbed surface that
+# closes its parity gaps (role delete, template/pack application) and gives the
+# freshly-shipped shift occurrences (phase A, commit eff42e71) a first-class
+# Schedule home.
+
+version: "1.0"
+updated: "2026-08-04"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Two admin surfaces manage volunteering and they have diverged into
+    different products. The per-event surface (VolunteersView) is a tabbed
+    view (roles | signups | rewards) with roving-tabindex keyboard nav, a
+    full inline shift composer, and template/pack application. The
+    standing-ask surface (AskManageView) is ONE 1430-line file rendering one
+    long scrolling page — lifecycle, pending queue, roles, groups, general
+    pool, broadcasts — under a file-wide @ts-nocheck. They share only three
+    leaf components. The ask side cannot delete a role (the router exposes
+    askRoles.add/update only), cannot apply templates or packs, and has
+    nowhere to put the occurrence scheduling that shipped server-side in
+    eff42e71 ("UI ships in a separate pass" — this is that pass). Every
+    fix to one surface is invisible to the other.
+  solution: >
+    One shared foundation in apps/web/src/components/volunteering/, built
+    by extraction rather than rewrite. A shared tab shell (roving tabindex,
+    generalized from VolunteersView) and a shared pending-queue section
+    (extracted from AskManageView) land first as behaviour-preserving
+    refactors. The transport gaps close next: askRoles.delete (guarded, not
+    cascade) and askRoles.createFromTemplates. Then AskManageView is rebuilt
+    on the shell as five tabs — Overview | Roles & Schedule | Signups |
+    Groups | Broadcasts — decomposed into per-tab files, with the Schedule
+    UI (occurrence list/create/cancel + roster with assign/check-in) riding
+    the already-shipped volunteer.schedule.* endpoints. Finally the
+    per-event side adopts the ask side's best idea: the pending-queue-first
+    signups layout and a pending-count tab badge. The coordinator console
+    keeps working untouched.
+  users:
+    - Org / place / personal owners running standing asks
+    - Organizers running per-event volunteering
+    - Group coordinators (indirectly — their console must not regress)
+  surfaces:
+    - web
+    - api
+
+# ── Context (verified ground truth, file:line) ───────────────────────────────
+
+context:
+  per_event_surface:
+    - >
+      apps/web/src/app/admin/[slug]/events/[id]/volunteers/_components/
+      VolunteersView.tsx — 3 tabs roles|signups|rewards (Tab type :19),
+      rewards finance-gated (:59, :95), roving tabindex + arrow-key nav
+      (:88-106, helpers in volunteers-tab-nav.helpers.ts), ARIA
+      tablist/tab/tabpanel wiring (:126-242), file-wide @ts-nocheck (:1).
+    - >
+      Sibling components: RolesTab.tsx (604 ln), SignupsTab.tsx (1157 ln),
+      RewardsTab.tsx (310 ln), InlineShiftComposer.tsx (1042 ln),
+      FromTemplatesDialog.tsx (492 ln — templates AND packs), RoleDialog.tsx,
+      ShiftDialog.tsx, RejectSignupDialog.tsx.
+    - >
+      Transport: volunteer.roles.create/createFromTemplates/update/delete/
+      list (packages/transport/trpc/src/routers/volunteer.ts:611-668),
+      volunteer.shifts.createBatch (:681).
+  standing_ask_surface:
+    - >
+      apps/web/src/app/admin/[slug]/volunteers/asks/[askId]/_components/
+      AskManageView.tsx — ONE file, 1430 lines, @ts-nocheck (:1), single
+      scrolling page of SectionFrames: pending queue (:521), waiver (:609),
+      roles (:625), groups (:741), general pool (:792), broadcasts (:844);
+      inline dialog components AskRoleDialog (:1072) and CreateGroupDialog
+      (:1292); cursor-paginated roster via volunteer.roster.ask
+      useInfiniteQuery with ask/roles/groups metadata on page 1 (:180-269).
+    - >
+      Transport gap: askRolesRouter exposes ONLY add and update
+      (volunteer.ts:1328-1352). No delete, no list (roles ride roster
+      page-1 metadata), no createFromTemplates. No shift composer, no
+      template picker on this surface.
+    - >
+      Ask-role authz precedent: addVolunteerAskRole / updateVolunteerAskRole
+      gate via resolveAskOwnership inside the write tx
+      (packages/core/src/use-cases/volunteering/add-volunteer-role.ts:41,
+      :56, :123, :143); EVENT-ask roles uniformly 404 (:121).
+    - >
+      Event-role delete cascades shifts AND signups
+      (manage-event-volunteer-roles.ts:301-327) — acceptable for a role
+      scoped to one event, too destructive for a standing role holding
+      APPROVED memberships and future claims (see FR-004's guard).
+  occurrences_phase_a:
+    - >
+      Commit eff42e71 shipped VolunteerShiftOccurrence +
+      VolunteerOccurrenceClaim, use cases manage-shift-occurrences.ts
+      (standing asks only — EVENT asks 404, resolveStandingAsk :71-84;
+      cancel fan-out notifies claimants) and occurrence-claims.ts
+      (claim/withdraw/assign/check-in; claimable statuses APPROVED and
+      CHECKED_IN :60-63; FOR UPDATE capacity gates), with NO UI ("UI ships
+      in a separate pass" per the commit message).
+    - >
+      Transport already live: volunteer.schedule.createOccurrence (:1475),
+      updateOccurrence (:1493), cancelOccurrence (:1518), listOccurrences
+      (:1543 — occurrences with active-claim counts), claim (:1555),
+      withdrawClaim (:1566), assign (:1582), checkIn (:1600), roster
+      (:1612 — owner all claims, coordinator own group);
+      volunteer.publicAsks.schedule (:1661).
+  shared_and_adjacent:
+    - >
+      apps/web/src/components/volunteering/ shared leaves used by BOTH admin
+      surfaces or the coordinator console: SignupReviewRow, BroadcastComposer,
+      AskWaiverSection, VolunteerGroupCard (AskManageView +
+      CoordinatorConsole), ShiftAnchorFields (InlineShiftComposer).
+    - >
+      Third surface: apps/web/src/app/admin/[slug]/volunteers/_components/
+      VolunteersHome.tsx — hours | asks tabs; roving tabindex explicitly
+      deferred there ("Interim: both tabs stay in the Tab order until
+      roving-tabindex …", :92) → AsksList.
+    - >
+      Fourth surface: apps/web/src/app/admin/[slug]/places/[placeId]/
+      volunteers/_components/PlaceVolunteersView.tsx — thin wrapper.
+    - >
+      Coordinator console: apps/web/src/app/volunteers/coordinate/[askId]/
+      _components/CoordinatorConsole.tsx — email-linked, group-scoped;
+      MUST NOT regress (its schedule tab is phase-B scope, not this spec).
+
+# ── Decisions (the calls this spec makes) ────────────────────────────────────
+
+decisions:
+  ask_ia: >
+    Five tabs on the ask surface, mirroring the per-event tab affordance:
+    Overview | Roles & Schedule | Signups | Groups | Broadcasts.
+    Overview = lifecycle status + transitions, share link, edit-ask dialog,
+    waiver section, at-a-glance counts. Roles & Schedule = role CRUD +
+    template/pack application + per-role occurrence scheduling and rosters
+    (one tab, not two — an occurrence belongs to a role, and splitting them
+    forces a cross-tab hop for the commonest flow "add role, schedule its
+    dates"). Signups = pending queue FIRST, then the cursor-paginated
+    general pool. Groups = group cards + create + coordinator assignment.
+    Broadcasts = scope picker + composer + history. Tab selection is local
+    state, matching the per-event surface; deep-linkable ?tab= is out of
+    scope for both.
+  per_event_adoption: >
+    The per-event side adopts the ask side's pending-queue-first layout:
+    SignupsTab renders the shared PendingQueueSection (PENDING signups with
+    role filter and approve/reject) above the full signup list, and both
+    surfaces show a pending-count badge on the Signups tab. It does NOT
+    adopt groups, broadcasts, or lifecycle — those are ask-domain concepts.
+  ask_role_delete_semantics: >
+    Guarded delete, NOT event-parity cascade. Event-role delete cascades
+    signups (manage-event-volunteer-roles.ts:301) — fine for a role that
+    dies with its event, destructive for a standing role holding APPROVED
+    memberships and future claims. askRoles.delete rejects with ROLE_IN_USE
+    when the role has any non-terminal signup (status other than
+    WITHDRAWN/REJECTED) or any future SCHEDULED occurrence; the UI explains
+    what to clear first. Empty roles delete cleanly.
+  extraction_not_rewrite: >
+    Shared components are extracted from the surface that already renders
+    them correctly, landed as behaviour-preserving refactors with their
+    existing tests moved alongside, BEFORE the ask rebuild consumes them.
+    Each FR below is independently shippable in order.
+  shared_component_extraction_list:
+    # New files in apps/web/src/components/volunteering/ …
+    - target: VolunteerTabShell.tsx
+      source: >
+        Generalized from VolunteersView.tsx (TabButton styled component,
+        tablist/tab/tabpanel ARIA wiring, roving tabindex :88-106) so one
+        implementation serves VolunteersView, the rebuilt AskManageView,
+        and VolunteersHome. API: ordered [{ key, id, label, badge?,
+        hidden? }] + controlled value/onChange + panel render slots.
+    - target: tab-nav.helpers.ts
+      source: >
+        Moved from events/[id]/volunteers/_components/
+        volunteers-tab-nav.helpers.ts (nextTabForKey) — pure, already
+        tested.
+    - target: PendingQueueSection.tsx
+      source: >
+        Extracted from AskManageView.tsx:521-605 (pending queue frame,
+        role filter select, SignupReviewRow list, live-region count).
+        Consumed by the ask Signups tab and the per-event SignupsTab.
+    - target: FromTemplatesDialog.tsx
+      source: >
+        MOVED from events/[id]/volunteers/_components/ and given a
+        mode: "event" | "ask" — event mode unchanged (roles + shifts via
+        volunteer.roles.createFromTemplates); ask mode applies roles only
+        (no shifts — standing asks schedule via occurrences) through the
+        new volunteer.askRoles.createFromTemplates (FR-005).
+    - target: RoleEditorDialog.tsx
+      source: >
+        Unifies the per-event RoleDialog.tsx and AskManageView's inline
+        AskRoleDialog (:1072) — same name/description/capacity core with a
+        variant for the ask-only defaultHours field and the event-only
+        fields.
+    - target: OccurrenceComposer.tsx
+      source: >
+        New — create/edit one-off occurrence dialog (role, date, start/end,
+        capacity, notes) over volunteer.schedule.createOccurrence /
+        updateOccurrence. Shared home so the coordinator console's future
+        schedule tab (phase B) reuses it.
+    - target: OccurrenceScheduleList.tsx
+      source: >
+        New — per-role occurrence list (upcoming + recent past, status,
+        claim counts, cancel with claimant-notification confirm) over
+        volunteer.schedule.listOccurrences.
+    - target: OccurrenceRosterPanel.tsx
+      source: >
+        New — per-occurrence roster (identity-only rows per NFR-003 of the
+        occurrences spec), assign from APPROVED signups, check-in with
+        hours override, over volunteer.schedule.roster/assign/checkIn.
+  stays_surface_specific:
+    - "InlineShiftComposer, ShiftDialog, RewardsTab, EventVolunteeringSection header — event-only (event shifts ≠ occurrences)."
+    - "Lifecycle/Overview, GroupsTab (incl. OwnerGroupCard, CreateGroupDialog), BroadcastsTab section chrome — ask-only (BroadcastComposer leaf stays shared as today)."
+    - "VolunteerHoursView, AsksList — VolunteersHome-only."
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      title: Shared tab shell extraction
+      description: >
+        Extract VolunteerTabShell + tab-nav.helpers into
+        components/volunteering/ (see extraction list) and re-base
+        VolunteersView on it with ZERO behaviour change: same tab ids,
+        testids, ARIA attributes, roving tabindex, finance-gated rewards
+        tab. VolunteersHome is upgraded onto the shell in the same FR,
+        retiring its ":92 interim" note — hours|asks gains the same
+        keyboard nav.
+      acceptance:
+        - Per-event volunteers page renders byte-identical tab ARIA
+          (role/aria-selected/aria-controls/tabIndex) before vs after;
+          existing VolunteersView and tab-nav tests pass unmodified except
+          import paths.
+        - VolunteersHome hours|asks tablist has roving tabindex (one tab
+          in Tab order, arrows move selection + focus).
+        - Rewards tab still absent for non-finance actors, and absent from
+          the arrow-key order when hidden.
+    - id: FR-002
+      title: PendingQueueSection extraction
+      description: >
+        Extract AskManageView's pending queue (:521-605) into the shared
+        PendingQueueSection with a props seam (items, roles for the filter,
+        selected roleId, decision handlers, testid passthrough). AskManageView
+        consumes it in place — still the single-scroll page at this step —
+        with no visual or behavioural change.
+      acceptance:
+        - data-testid="volunteer-pending-queue", the role-filter aria-label,
+          and the role="status" count line survive unchanged.
+        - Approve/reject from the queue still invalidates roster, broadcasts,
+          and signups queries (AskManageView.tsx:205-213 semantics).
+    - id: FR-003
+      title: Transport — volunteer.askRoles.delete
+      description: >
+        New use case deleteVolunteerAskRole (in add-volunteer-role.ts beside
+        its siblings) + volunteer.askRoles.delete procedure. Authz:
+        resolveAskOwnership inside the same tx as the write; EVENT-ask and
+        foreign roles uniformly 404 as ROLE_NOT_FOUND (add-volunteer-role.ts
+        :121 parity — no existence oracle). Guarded, not cascade (see
+        decisions.ask_role_delete_semantics): reject ROLE_IN_USE when the
+        role has any signup in a non-terminal status (anything other than
+        WITHDRAWN/REJECTED) or any future SCHEDULED occurrence; otherwise
+        delete, cascading only terminal-status signups and past/cancelled
+        occurrences, and write an AuditLog row (entity
+        "volunteer_ask_role", action "deleted") matching the event-role
+        precedent (manage-event-volunteer-roles.ts:319-325).
+      acceptance:
+        - Delete by a non-owner, on an EVENT-ask role, or on a missing id
+          returns the same ROLE_NOT_FOUND with no distinguishing signal.
+        - Role with one PENDING or APPROVED signup, or one future SCHEDULED
+          occurrence → ROLE_IN_USE; after withdrawing/rejecting the signups
+          and cancelling the occurrences, the same call succeeds.
+        - AuditLog row written on success; regression tests follow the
+          packages/core/src/use-cases/volunteering/ sibling patterns,
+          including a reportError test if any swallow branch exists
+          (CLAUDE.md convention).
+    - id: FR-004
+      title: Transport — volunteer.askRoles.createFromTemplates
+      description: >
+        New use case createAskRolesFromTemplates + procedure. Applies
+        selected VolunteerRoleTemplate rows (org-owned, or LIVE platform
+        rows per the role-packs spec's FR-010 rule — platform or own-org
+        only, foreign org → TEMPLATE_NOT_FOUND) to a standing ask as ask
+        roles: name/description/capacity copied; template SHIFTS are
+        deliberately ignored (standing asks schedule via occurrences, and
+        anchor resolution needs an event start that does not exist here).
+        Duplicate handling mirrors the event-side createFromTemplates
+        (manage-event-volunteer-roles.ts:173): a template whose name
+        already exists on the ask (case-insensitive) is skipped and
+        reported in the result, not an error.
+      acceptance:
+        - Applying a platform template and an own-org template to an ask
+          creates ask roles visible on the roster metadata; applying a
+          foreign org's template id → TEMPLATE_NOT_FOUND.
+        - Re-applying the same selection is a no-op that reports the skips.
+        - No VolunteerShiftOccurrence rows are created by this path.
+    - id: FR-005
+      title: Ask surface rebuilt as tabs, decomposed
+      description: >
+        Rebuild AskManageView on VolunteerTabShell with the five-tab IA
+        (decisions.ask_ia), decomposing the 1430-line file into
+        _components/ per-tab files — OverviewTab.tsx, RolesScheduleTab.tsx,
+        AskSignupsTab.tsx, GroupsTab.tsx, BroadcastsTab.tsx — plus the
+        extracted dialogs (RoleEditorDialog shared; CreateGroupDialog
+        stays local). AskManageView.tsx shrinks to shell + data
+        orchestration (the roster infinite query stays hoisted at the top
+        so page-1 metadata keeps feeding roles/groups to every tab —
+        AskManageView.tsx:180-269 pattern preserved, no per-tab refetch of
+        the roster). Role delete (FR-003) and the From-templates action
+        (FR-004 via the shared FromTemplatesDialog in ask mode) appear on
+        the Roles & Schedule tab. The Signups tab shows the pending-count
+        badge; the file-wide @ts-nocheck must not survive into files that
+        do not need the Tamagui web-prop escape hatch.
+      acceptance:
+        - All six existing sections are reachable under the new tabs;
+          existing AskManageView test intents pass re-homed per tab
+          (pending queue, role edit, group create, pool pagination,
+          broadcast send, status transitions, waiver).
+        - Tablist has the same roving-tabindex behaviour as the per-event
+          surface (arrows, Home/End if the helper supports them, one
+          tabbable tab).
+        - No file in the new decomposition exceeds ~500 lines;
+          AskManageView.tsx itself is orchestration only.
+        - Deleting an empty role from the Roles & Schedule tab removes it;
+          deleting an in-use role surfaces the ROLE_IN_USE guidance.
+    - id: FR-006
+      title: Schedule UI — occurrences on the Roles & Schedule tab
+      description: >
+        Each role card on the Roles & Schedule tab gains its schedule:
+        OccurrenceScheduleList (upcoming SCHEDULED + recent past/cancelled,
+        active-claim counts from volunteer.schedule.listOccurrences),
+        OccurrenceComposer for create/edit (24h max window and typed-error
+        surfacing per manage-shift-occurrences constraints), and cancel
+        with a confirm that states claimants will be notified
+        (cancelOccurrence fan-out). EVENT-style shift UI is NOT rendered
+        here; occurrence UI is NOT rendered on the per-event surface.
+      acceptance:
+        - Creating a one-off occurrence on an ask role shows it in the list
+          with 0/N claims; editing time/capacity/notes round-trips;
+          cancelling flips status and the confirm mentioned notification.
+        - Server validation errors (window too long, past start, EVENT ask)
+          surface as field/toast errors, not silent failures.
+        - The per-event volunteers page renders no occurrence UI.
+    - id: FR-007
+      title: Schedule UI — roster, assign, check-in
+      description: >
+        Expanding an occurrence opens OccurrenceRosterPanel: claim rows
+        (identity only), assign action opening a picker over the ask's
+        APPROVED/CHECKED_IN signups (occurrence-claims.ts:60-63) filtered
+        to the occurrence's role, and per-claim check-in stamping
+        duration-derived hours with an override field (999.99 cap
+        surfaced). Withdraw/claim self-serve stays on the public /v page —
+        not this surface.
+      acceptance:
+        - Assigning an APPROVED same-role signup adds a claim row and the
+          claim count increments; assigning is not offered for PENDING
+          signups.
+        - Check-in with no override stamps the duration-derived hours;
+          with an override, the override; >999.99 is rejected with the
+          typed error surfaced.
+        - Roster rows never render contact details beyond what
+          volunteer.schedule.roster returns (identity only).
+    - id: FR-008
+      title: Per-event surface adopts pending-queue-first + badges
+      description: >
+        Per-event SignupsTab renders the shared PendingQueueSection above
+        its existing list (PENDING rows with role filter, approve/reject
+        wired to the existing event signup mutations), and both surfaces'
+        Signups tab labels gain a pending-count badge via the
+        VolunteerTabShell badge slot. Counts come from queries both pages
+        already run — no new endpoint.
+      acceptance:
+        - With 2 PENDING signups, the event Signups tab shows the queue on
+          top and a "2" badge; approving from the queue updates both the
+          queue and the list below without a manual refresh.
+        - With zero pending, the queue section collapses (no empty frame)
+          and no badge renders.
+        - Ask surface shows the equivalent badge from its existing
+          pendingQueueQuery total (AskManageView.tsx:257).
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        A11y parity: every volunteer admin tablist (per-event, ask,
+        VolunteersHome) implements the same ARIA tabs pattern — roving
+        tabindex, aria-selected/aria-controls, focus follows selection,
+        hidden tabs absent from the arrow order. One shared implementation,
+        one shared test suite.
+    - id: NFR-002
+      description: >
+        320px: no horizontal overflow on any tab of either surface; the
+        five-tab ask tablist wraps or scrolls within its own container
+        (measure computed style — do not reason from arithmetic; see the
+        392px-card and Tamagui media-order precedents in project memory).
+    - id: NFR-003
+      description: >
+        i18n dual-catalog: every new user-facing string lands in BOTH the
+        package base catalog and the app en/es overrides (a missing key
+        renders the raw key). Tab labels, badge aria-labels, ROLE_IN_USE
+        guidance, occurrence composer/roster strings, cancel-confirm copy.
+    - id: NFR-004
+      description: >
+        No coordinator-console regression: CoordinatorConsole's imports of
+        shared leaves (SignupReviewRow, BroadcastComposer,
+        VolunteerGroupCard) keep compiling with unchanged props or get
+        compat props defaulted; its test suite passes untouched.
+    - id: NFR-005
+      description: >
+        Query discipline: the roster infinite-query pattern
+        (AskManageView.tsx:180-269) is preserved — tab decomposition must
+        not multiply roster fetches per tab, and occurrence lists fetch
+        per-role lazily (on expand) rather than eagerly for every role.
+    - id: NFR-006
+      description: >
+        Type honesty: @ts-nocheck confined to files that genuinely need
+        Tamagui web-prop escapes (tab shell), never blanket-applied to the
+        new tab files.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: delete-volunteer-ask-role (NEW, in add-volunteer-role.ts)
+        description: >
+          Guarded delete per FR-003: resolveAskOwnership in-tx, EVENT/foreign
+          → ROLE_NOT_FOUND, in-use → ROLE_IN_USE, AuditLog on success.
+        input: roleId, actorHumanId
+        output: void
+        idempotent: false
+        money: false
+        authz: ask owner via resolveAskOwnership
+      - name: create-ask-roles-from-templates (NEW)
+        description: >
+          Applies org-owned or LIVE platform templates to a standing ask as
+          roles (no shifts, no occurrences); case-insensitive name skips
+          reported, not thrown (FR-004).
+        input: askId, templateIds[], actorHumanId
+        output: "{ created[], skipped[] }"
+        idempotent: true
+        money: false
+        authz: ask owner via resolveAskOwnership; template visibility per
+          role-packs FR-010 (platform or own-org only)
+    notes: >
+      Everything else this spec touches is UI over transport that already
+      exists (volunteer.schedule.*, volunteer.publicAsks.schedule,
+      volunteer.roster.ask, volunteer.signups.listByAsk).
+
+  ports:
+    new: []
+    existing:
+      - VolunteeringRepo — likely needs a cheap "role in-use" read
+        (non-terminal signup count + future SCHEDULED occurrence count for
+        a roleId) and deleteAskRole; follow the eff42e71 repo extension
+        style (packages/ports/src/repos/volunteering.ts).
+      - ReporterPort — any new catch-and-fallback branch (CLAUDE.md
+        convention; reviewers flag misses as [BLOCKING]).
+
+  adapters:
+    new: []
+    existing:
+      - packages/adapters/src/db/prisma/volunteering.ts — deleteAskRole +
+        in-use counts; integration coverage in
+        packages/adapters/test/integration/ mirroring
+        volunteer-occurrences.test.ts setup.
+
+  transport:
+    trpc_procedures:
+      - volunteer.askRoles.delete (authed, ask owner)
+      - volunteer.askRoles.createFromTemplates (authed, ask owner)
+    webhooks: []
+
+  ui:
+    pages:
+      - /admin/[slug]/volunteers/asks/[askId] — rebuilt tabbed AskManageView
+      - /admin/[slug]/events/[id]/volunteers — re-based on the shared shell,
+        adopts pending-queue-first
+      - /admin/[slug]/volunteers — VolunteersHome onto the shared shell
+    components:
+      - See decisions.shared_component_extraction_list (authoritative) —
+        VolunteerTabShell, tab-nav.helpers, PendingQueueSection,
+        FromTemplatesDialog (moved + ask mode), RoleEditorDialog,
+        OccurrenceComposer, OccurrenceScheduleList, OccurrenceRosterPanel.
+      - "New ask _components: OverviewTab, RolesScheduleTab, AskSignupsTab,
+        GroupsTab, BroadcastsTab."
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+  notes: >
+    Deliberately zero schema change. The only backend additions are the two
+    ask-role use cases + procedures (FR-003/FR-004); occurrences shipped in
+    eff42e71 and phase B (patterns, materializer, reminders, coordinator
+    schedule tab) stays with the 2026-07-07 spec.
+
+# ── Build Order ──────────────────────────────────────────────────────────────
+
+build_order:
+  - step: 1
+    frs: [FR-001]
+    note: Shell extraction + VolunteersView/VolunteersHome re-base. Pure
+      refactor; ships alone.
+  - step: 2
+    frs: [FR-002]
+    note: PendingQueueSection extraction; AskManageView still single-scroll.
+      Ships alone.
+  - step: 3
+    frs: [FR-003, FR-004]
+    note: Backend parity gaps (use cases → adapters → transport, tests at
+      each layer). No UI consumer yet — dead-code-safe because the
+      procedures are additive.
+  - step: 4
+    frs: [FR-005]
+    note: The rebuild — consumes steps 1-3. Largest step; land tab-by-tab
+      behind the new shell if needed, but one review loop per the
+      one-feature-per-loop rule.
+  - step: 5
+    frs: [FR-006, FR-007]
+    note: Schedule UI on the rebuilt Roles & Schedule tab. FR-006 then
+      FR-007 (roster builds on the list).
+  - step: 6
+    frs: [FR-008]
+    note: Per-event adoption of the queue + badges. Last so the shared
+      section is already battle-tested on the ask side.
+  - validation: >
+      Every step: pnpm typecheck (NOT root tsc — it is a no-op), unit
+      tests, and for steps 4-6 drive the real app (both surfaces at
+      desktop AND 320px, zero new console errors) before calling it done —
+      green tests alone have shipped broken volunteer UI before.
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      The rebuild silently drops one of AskManageView's many behaviours
+      (six sections, three queries, cross-query invalidation, pagination
+      dedupe) — 1430 lines is a lot of undocumented intent.
+    severity: HIGH
+    mitigation: >
+      Extraction-first order (steps 1-2 shrink the file before step 4
+      touches IA); existing test intents re-homed per tab and required to
+      pass; the roster query stays hoisted (NFR-005) so data flow is
+      unchanged even as presentation moves.
+  - risk: >
+      Shared-shell generalization regresses the per-event surface's a11y
+      (the roving tabindex was hand-tuned, and rewards is conditionally
+      hidden).
+    severity: MEDIUM
+    mitigation: >
+      FR-001 acceptance pins the exact ARIA output; hidden-tab arrow-order
+      behaviour is an explicit shared test.
+  - risk: >
+      askRoles.delete guard misses a dependent record class (claims hang
+      off signups, occurrences off roles) and orphans rows.
+    severity: MEDIUM
+    mitigation: >
+      Guard checks BOTH non-terminal signups and future SCHEDULED
+      occurrences; adapter integration test creates the full
+      role→signup→occurrence→claim chain and proves ROLE_IN_USE, then
+      clears it and proves clean delete.
+  - risk: >
+      Template application to asks confuses users when template shifts
+      vanish (they exist on the event path).
+    severity: LOW
+    mitigation: >
+      Ask-mode FromTemplatesDialog states that shifts are not applied and
+      points at the role's Schedule; skip-report shows what was created vs
+      skipped.
+
+open_questions:
+  - >
+      Should the Overview tab surface upcoming-occurrence counts per role
+      (a mini schedule digest)? Cheap via listOccurrences but adds an eager
+      fetch; lean no for v1 (NFR-005), revisit with phase B.
+  - >
+      Does VolunteersHome's asks tab deserve pending-count badges per ask
+      row? Out of scope here (needs a count endpoint — same deferral as the
+      admin-nav badges), but the shell's badge slot makes it cheap later.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Data-model changes of any kind (the only backend work is FR-003/FR-004
+    use cases + procedures).
+  - Coordinator console redesign or its schedule tab — phase B of the
+    2026-07-07 occurrences spec; this spec only guarantees non-regression
+    (NFR-004).
+  - Rewards changes (RewardsTab untouched beyond the shell re-base).
+  - Occurrence patterns, materializer job, reminders, ICS feed rows —
+    occurrences spec phase B.
+  - Public /v/[askId] schedule/claim UI (publicAsks.schedule consumer) —
+    separate public-surface pass.
+  - Deep-linkable ?tab= selection on either admin surface.
+  - Event-shift ↔ occurrence unification (explicitly deferred in the
+    occurrences spec's open questions).
+
+# ── Acceptance Criteria (spec-level) ─────────────────────────────────────────
+
+acceptance_criteria:
+  - The ask manage page is a five-tab surface (Overview | Roles & Schedule |
+    Signups | Groups | Broadcasts) whose tablist keyboard behaviour is
+    indistinguishable from the per-event surface's, and AskManageView.tsx
+    no longer exceeds orchestration size (~200 lines, no rendering of
+    section internals).
+  - >
+    An ask owner can, without leaving the Roles & Schedule tab: create a
+    role from a platform pack template, schedule three one-off occurrences
+    on it, assign an approved volunteer to one, check them in with derived
+    hours, cancel another (claimants notified), and delete a different,
+    empty role.
+  - volunteer.askRoles now exposes add/update/delete/createFromTemplates;
+    delete fails closed (ROLE_NOT_FOUND) for non-owners, EVENT-ask roles,
+    and unknown ids, and fails safe (ROLE_IN_USE) for roles with live
+    signups or future occurrences.
+  - The per-event Signups tab leads with the shared pending queue and both
+    surfaces badge their Signups tab with the live pending count.
+  - VolunteersHome, the per-event surface, and the ask surface all ride
+    VolunteerTabShell; the three previously-divergent tab implementations
+    are one.
+  - Zero new console errors driving both surfaces; both render without
+    horizontal overflow at 320px; every new string resolves in en AND es
+    (no raw keys).
+  - CoordinatorConsole compiles and its tests pass with no source changes.

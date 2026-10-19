@@ -1,0 +1,575 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Place — Venues, layouts, seating, verification, saved locations.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Place {
+  id           String                  @id @default(uuid())
+  name         String
+  /// DIRECTORY KEY, NOT A PUBLIC URL. Format `{country}/{region}/{name}--{shortId}`
+  /// (multi-segment — it contains literal `/`), minted by `generatePlaceSlug`.
+  /// Resolved by `PlacesRepo.getBySlug` / `getVenueCalendar` and by
+  /// `PlaceSlugHistory`. NOTHING routes on it.
+  /// The public venue page (`/places/[slug]`, `/p/[slug]`) resolves on the
+  /// place's `EntityPage.slug` — a SEPARATE, flat slug minted alongside this
+  /// one. Never build a link out of this column.
+  slug         String?                 @unique
+  address      String
+  addrLine1    String?
+  addrLine2    String?
+  city         String?
+  region       String?
+  postcode     String?
+  country      String?
+  addressHash  String? // for deduplication/search
+  capacity     Int?
+  lat          Float?
+  lng          Float?
+  phone        String?
+  website      String?
+  /// Provenance of `website`. Only TRUSTED_IMPORT (set by verified bulk-import
+  /// paths) unlocks the claim email-domain fast-track (FR-010). Stub/user-set
+  /// domains stay provisional + admin-reviewed. Existing rows default UNKNOWN.
+  websiteSource PlaceWebsiteSource     @default(UNKNOWN) @map("website_source")
+  status       PlaceStatus             @default(ACTIVE)
+  verification PlaceVerificationStatus @default(UNVERIFIED) @map("verificaion")
+
+  /// IANA timezone (e.g. "America/Chicago"), derived from the place's address
+  /// (lat/lng → tz lookup) by the use-case layer — same recompute-on-address-
+  /// change lifecycle as the admission-tax-rate cache below (venue-hierarchy
+  /// FR-004). Not directly user-edited. All Calendar wall-clock defaults
+  /// resolve through it.
+  timezone     String?
+
+  // ── Tax rate cache ──────────────────────────────────────────────────────────
+  // Looked up via external provider (e.g. Ziptax) and cached here so checkout
+  // can compute admission tax with zero API calls. Mirrors SavedLocation.
+  // Refreshed on place create / address change and as a publish-time safety net.
+  admissionTaxRateBps Int?      @map("admission_tax_rate_bps") // basis points, e.g. 975 = 9.75%
+  taxRateSource       String?   @map("tax_rate_source") // "ziptax" | "manual" | "seed"
+  taxRateFetchedAt    DateTime? @map("tax_rate_fetched_at")
+
+  // ── Address privacy (place-address-withholding) ─────────────────────────────
+  // The SAME three-state model events already carry, on the venue itself, so a
+  // DIY house can list as a venue without ever publishing where it is. Reuses
+  // `EventLocationMode` deliberately — a parallel enum would let the two axes
+  // drift, and the whole point is that an event INHERITS the place's state.
+  //
+  //   EXACT                        → full public address + coordinates.
+  //   OBSCURED + radius non-null   → public map is an obfuscated circle of that
+  //                                  radius (deterministic offset, so every
+  //                                  surface draws the SAME circle).
+  //   OBSCURED + radius NULL       → FULLY HIDDEN: no public map, no
+  //                                  coordinates, no street address anywhere.
+  //
+  // Read ONLY through `redactPlaceLocation`
+  // (packages/core/src/lib/location/redact-place-location.ts). Nothing public
+  // may project `address`/`addrLine1`/`postcode`/`lat`/`lng` off this row
+  // directly.
+  //
+  // DEFAULT IS `EXACT` SO THE MIGRATION CHANGES NOTHING for existing venues.
+  // New places created through the PUBLIC "add a venue" flow default to
+  // OBSCURED with a null radius instead — that choice lives in `upsertPlace`,
+  // not here, because a column default cannot tell a public submission from a
+  // staff import.
+  locationMode         EventLocationMode @default(EXACT) @map("location_mode")
+
+  /// Public pre-reveal precision for an OBSCURED place: non-null = obfuscated
+  /// circle of this radius in metres; NULL = FULLY HIDDEN (no public map or
+  /// coordinates at all — documented sentinel, exactly as on `Event`). Ignored
+  /// while `locationMode` is EXACT. NULL is the fail-closed default: a venue
+  /// flipped to OBSCURED without picking a radius is hidden, not approximated.
+  locationRadiusMeters Int?              @map("location_radius_meters")
+
+  /// Coarse, publishable area label for a withheld place (e.g. "East
+  /// Nashville") — the mirror of `Event.locationLabel`. When null the redactor
+  /// falls back to "city, region". This is the ONLY place string a withheld
+  /// venue publishes.
+  locationLabel        String?           @map("location_label")
+
+  /// Whether this place appears in the public venue directory / autocomplete.
+  /// Verified imports (PRO lists, Google Places) set true on import.
+  /// User-submitted stubs stay false until platform admin approves.
+  listedInDirectory Boolean @default(false) @map("listed_in_directory")
+
+  /// Whether this verified venue accepts inbound booking requests from performers.
+  /// Public booking surfaces are additionally gated on verification == VERIFIED.
+  acceptsBookingRequests Boolean @default(false) @map("accepts_booking_requests")
+
+  /// The venue owner's standing consent to OWNERLESS community listings at this
+  /// place (community-listings-at-claimed-venues FR-001). A COMMUNITY event has
+  /// no owner by DB constraint, so the "event owner is a place owner" arm of
+  /// venue confirmation can never hold for one; this flag is the venue's side of
+  /// that relationship, given ONCE for the venue rather than per event.
+  ///
+  /// Read ONLY through `isVenueConfirmed` (packages/core/src/lib/venue-
+  /// confirmation.ts) — nothing is stamped, so flipping this retroactively
+  /// confirms every community listing already attached here and flipping it back
+  /// retracts them. A per-event `venueConfirmationWithdrawnAt` still negates one
+  /// bad listing without switching the venue-wide flag off.
+  ///
+  /// ACCEPTED LISTINGS BLOCK THEIR SLOT: confirmation drives availability and
+  /// conflict detection too, so an accepted weekly open mic makes that night
+  /// unavailable for booking requests. Deliberate — the room genuinely is busy.
+  ///
+  /// Default false (consent is explicit) and reset to false when place ownership
+  /// is revoked or transferred — unowned consent is the state this model exists
+  /// to prevent.
+  acceptsCommunityListings Boolean @default(false) @map("accepts_community_listings")
+
+  /// Owner opt-in that publishes the ATTENDEE/customer review aggregate on the
+  /// public venue page (venue-rating-block-and-owner-optin FR-004). Default
+  /// false = the attendee aggregate is PRIVATE owner feedback. Governs ONLY the
+  /// customer/attendee aggregate — never performer (PlaceReview) data.
+  attendeeReviewsPublic Boolean @default(false) @map("attendee_reviews_public")
+
+  communityReviewsEnabled Boolean @default(true) @map("community_reviews_enabled")
+
+  // ── Default payout terms ──────────────────────────────────────────
+  // Direct FKs to the place-level default PayoutTerms.
+  // When an event is created at this place, these override the org-level
+  // defaults (org -> place -> agreement cascade).
+  defaultPrimaryPayoutTermsId String? @map("default_primary_payout_terms_id")
+  defaultResalePayoutTermsId  String? @map("default_resale_payout_terms_id")
+
+  defaultPrimaryPayoutTerms PayoutTerms? @relation("PlaceDefaultPrimaryPayoutTerms", fields: [defaultPrimaryPayoutTermsId], references: [id], onDelete: SetNull)
+  defaultResalePayoutTerms  PayoutTerms? @relation("PlaceDefaultResalePayoutTerms", fields: [defaultResalePayoutTermsId], references: [id], onDelete: SetNull)
+
+  events               Event[]
+  savedLocations       SavedLocation[]
+  ownerships           PlaceOwnership[]
+  placeLayouts         PlaceLayout[]
+  slugHistory          PlaceSlugHistory[]
+  verificationRequests PlaceVerificationRequest[]
+  claimEmailChallenges PlaceClaimEmailChallenge[]
+  agreements           Agreement[]                @relation("AgreementPlace")
+  bookingRequests      BookingRequest[]           @relation("BookingRequestPlace")
+  waivers              PlaceWaiver[]              @relation("PlaceWaiverPlace")
+  reviews              PlaceReview[]
+  reviewSessions       PlaceReviewSession[]
+  stats                PlaceStats?
+  posReaders           PosReader[]
+  spaces               Space[]                    @relation("SpacePlace")
+  calendars            Calendar[]                 @relation("CalendarPlace")
+  calendarAvailability CalendarAvailability[]     @relation("CalendarAvailabilityPlace")
+  bookingGrants        PlaceBookingGrant[]        @relation("PlaceBookingGrantPlace")
+  arrivalAreas         ArrivalArea[]              @relation("ArrivalAreaPlace")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([slug])
+}
+
+/// Standalone per-place trust grant for a human the venue works with
+/// regularly (venue-confirmation-and-booking-intents spec, docs/specs/
+/// 2026-08-27 "Trust for regulars"). NOT an org role — works for human- and
+/// org-owned venues alike, scopes to the whole place (`calendarId` null) or
+/// one calendar, is revocable, and never touches org membership. No `BOOKER`
+/// org role exists (roles are load-bearing; the role-action sweep is open).
+///
+/// THIS SPEC SHIPS THE MODEL + THE AUTHZ HOOK ONLY: confirmation and hold
+/// authorization check `place owner OR org-EDITOR OR active grant`. Grants
+/// are checked, never granted, here — the granting/revoking UI ships with
+/// instant-book, which is what a grant is the prerequisite for. Rows are
+/// created only by fixtures/tests until then.
+///
+/// Active = revokedAt IS NULL AND (expiresAt IS NULL OR expiresAt > now).
+///
+/// holds-without-a-request (spec 2026-09-30, FR-002) makes the grant real:
+/// the grantee is an org OR a person (granteeOrgId / granteeHumanId, exactly
+/// one), and the grantee accepts or declines it. Active then becomes
+/// accepted AND not revoked AND not expired.
+model PlaceBookingGrant {
+  id               String    @id @default(uuid())
+  placeId          String
+  /// NULL = whole place; set = this calendar only.
+  calendarId       String?
+  /// DEPRECATED (holds-without-a-request FR-002): replaced by granteeHumanId.
+  /// Kept, nullable, only because the running revision still reads it during
+  /// rollout; the contract migration (plan step 18) drops it. Person grants
+  /// are dual-written here and in granteeHumanId until then. Plain id, no FK
+  /// (house style).
+  humanId          String?
+  /// DEPRECATED (FR-002): grants carry no capability flags. Dropped by the
+  /// contract migration (plan step 18); nothing new reads it.
+  canPlaceHolds    Boolean   @default(true)
+  /// DEPRECATED (FR-002): dropped by the contract migration (plan step 18);
+  /// nothing new reads it.
+  canCreateEvents  Boolean   @default(true)
+  /// The grantee: exactly one of granteeOrgId / granteeHumanId (SQL-only
+  /// CHECK "PlaceBookingGrant_grantee_xor", see the NOTE below).
+  /// granteeOrgId is an FK (Cascade, like every org-owned row; the app
+  /// archives orgs, never row-deletes them). granteeHumanId is a plain id,
+  /// no FK (house style, as humanId was).
+  granteeOrgId     String?
+  granteeHumanId   String?
+  /// Staff human who granted. Plain id, no FK (house style).
+  grantedByHumanId String
+  expiresAt        DateTime?
+  revokedAt        DateTime?
+  /// The grantee accepted (FR-003). At most one of acceptedAt / declinedAt
+  /// (SQL-only CHECK "PlaceBookingGrant_accept_decline_check").
+  acceptedAt       DateTime?
+  declinedAt       DateTime?
+  /// When the 7-days-before-expiry warning went out; the job sends it once
+  /// (FR-004).
+  expiryWarnedAt   DateTime?
+
+  place      Place         @relation("PlaceBookingGrantPlace", fields: [placeId], references: [id], onDelete: Cascade)
+  calendar   Calendar?     @relation("PlaceBookingGrantCalendar", fields: [calendarId], references: [id], onDelete: Cascade)
+  granteeOrg Organization? @relation("PlaceBookingGrantGranteeOrg", fields: [granteeOrgId], references: [id], onDelete: Cascade)
+  /// BOOKER holds riding this grant (BookingHold.grantId, onDelete NoAction).
+  holds      BookingHold[] @relation("BookingHoldGrant")
+
+  createdAt DateTime @default(now())
+
+  // `findActiveForHuman` lookup: (placeId, humanId) then revokedAt IS NULL.
+  // DEPRECATED with humanId; Postgres drops it with the column (step 18).
+  @@index([placeId, humanId, revokedAt])
+  // listForPlace (staff's grants tab, FR-003).
+  @@index([placeId, revokedAt])
+  // listForGrantee, org and person (booker's places, FR-014) + the actor
+  // lookup that resolves a grantee; granteeOrgId also serves FK maintenance.
+  @@index([granteeOrgId, revokedAt])
+  @@index([granteeHumanId, revokedAt])
+  // FK maintenance on calendar deletion (Cascade scans by calendarId).
+  @@index([calendarId])
+  // NOTE: two SQL-only CHECKs live in migration
+  // 20261015140000_holds_without_a_request (Prisma can't express CHECKs):
+  //  - "PlaceBookingGrant_grantee_xor": num_nonnulls(granteeOrgId,
+  //    granteeHumanId) = 1 (FR-002).
+  //  - "PlaceBookingGrant_accept_decline_check": acceptedAt and declinedAt
+  //    are never both set (FR-003).
+}
+
+model PlaceSlugHistory {
+  id         String   @id @default(uuid())
+  placeId    String
+  slug       String   @unique
+  recordedAt DateTime @default(now())
+
+  place Place @relation(fields: [placeId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([placeId, recordedAt])
+}
+
+model PlaceLayout {
+  id               String   @id @default(uuid())
+  placeId          String   @map("place_id")
+  name             String   @default("Default")
+  checksum         String
+  glyphSnapshotKey String   @map("glyph_snapshot_key")
+  metadata         Json     @default("{}")
+  seatIndex        Json     @default("{}") @map("seat_index")
+  stage            Json     @default("{}")
+  issues           Json     @default("[]")
+  /// Nullable: creator reference is detached (SetNull) on account deletion.
+  createdByHumanId String?  @map("created_by_human_id")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+  notes            String?
+
+  place          Place         @relation(fields: [placeId], references: [id], onDelete: Cascade)
+  createdByHuman Human?        @relation("PlaceLayoutCreatedBy", fields: [createdByHumanId], references: [id], onDelete: SetNull)
+  events         Event[]       @relation("EventPlaceLayout")
+  seatSections   SeatSection[] @relation("PlaceLayoutSeatSections")
+
+  @@unique([placeId, name])
+  @@index([placeId])
+  @@index([createdByHumanId])
+  @@map("place_layouts")
+}
+
+// Saved locations are user-saved reusable locations (not legal Place records).
+model SavedLocation {
+  id          String         @id @default(uuid())
+  name        String
+  address     String?
+  countryCode String?
+  region      String?
+  locality    String?
+  postalCode  String?
+  lat         Float?
+  lng         Float?
+  /// IANA timezone (e.g. "America/Chicago"), derived from the saved location's
+  /// coordinates (lat/lng → tz lookup) by the use-case layer when the address
+  /// is first normalized into this row — the same derive-and-cache lifecycle as
+  /// the admission-tax-rate cache below, and the exact mirror of
+  /// `Place.timezone` (venue-hierarchy FR-004). Not directly user-edited. This
+  /// is what a freeform-address event inherits when it has no zone of its own;
+  /// null (no coordinates, or the lookup failed) falls through to the platform
+  /// default.
+  timezone    String?
+  // usageCount to avoid littering the DB; indicates how many events used this saved location
+  usageCount  Int            @default(0)
+  // owner of this saved location (either a Human or an Organization)
+  ownerType   PlaceOwnerType
+  ownerId     String
+  // coarse spatial indexes for bucketing/search
+  geohash6    String? // length 6 ~ ~1km x 0.6km
+  geohash8    String? // length 8 ~ ~150m x 150m
+
+  // optional link back to a Place if this SavedLocation was promoted/managed by a Place
+  placeId String?
+  place   Place?  @relation(fields: [placeId], references: [id], onDelete: SetNull)
+
+  // ── Tax rate cache ──────────────────────────────────────────────────────────
+  // Looked up via external provider (e.g. Ziptax) and cached here so checkout
+  // can compute tax with zero API calls.
+  admissionTaxRateBps Int?      @map("admission_tax_rate_bps") // basis points, e.g. 975 = 9.75%
+  taxRateFetchedAt    DateTime? @map("tax_rate_fetched_at")
+  taxRateSource       String?   @map("tax_rate_source") // "ziptax" | "manual"
+
+  // Normalized lowercase address for dedup (prevents creating duplicate saved
+  // locations for the same address under the same owner).
+  addressHash String? @map("address_hash")
+
+  events Event[] @relation("SavedLocationEvents")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([ownerType, ownerId, addressHash], name: "saved_location_owner_address")
+  @@index([geohash6])
+  @@index([geohash8])
+  @@index([ownerType, ownerId])
+}
+
+model PlaceOwnership {
+  id              String         @id @default(uuid())
+  placeId         String
+  ownerType       PlaceOwnerType
+  ownerId         String
+  verified        Boolean        @default(false)
+  reviewerHumanId String?
+  reviewedAt      DateTime?
+  proof           Json?
+  /// Set when a provisional ownership claim is REJECTED — soft-revoke rather
+  /// than delete so the audit trail and the (placeId, ownerType, ownerId)
+  /// uniqueness survive. A revoked row confers NO access and does NOT block a
+  /// fresh claim (access + claimable checks filter on revokedAt IS NULL).
+  revokedAt       DateTime?      @map("revoked_at")
+
+  place    Place  @relation(fields: [placeId], references: [id], onDelete: Cascade)
+  reviewer Human? @relation(fields: [reviewerHumanId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([placeId, ownerType, ownerId])
+  @@index([placeId])
+  // Owner-keyed lookup backing `places.listOwnedBySubject` on the public,
+  // actor-free embed read path — it filters on (ownerType, ownerId, verified,
+  // revokedAt) with no placeId, so neither the [placeId]-leading @@unique nor
+  // @@index([placeId]) can serve it. Mirrors SavedLocation's identical index.
+  @@index([ownerType, ownerId])
+}
+
+model PlaceVerificationRequest {
+  id              String                         @id @default(uuid())
+  placeId         String
+  /// Null for HUMAN ownership claims (a person, not an org, is claiming).
+  /// Always set for ORG_SUBMISSION and org-side OWNERSHIP_CLAIM/DISPUTE.
+  orgId           String?
+  /// Nullable: submitter reference is detached (SetNull) on account deletion.
+  submittedById   String?
+  status          PlaceVerificationRequestStatus @default(PENDING)
+  /// What opened this request. ORG_SUBMISSION is the legacy verification path;
+  /// OWNERSHIP_CLAIM / OWNERSHIP_DISPUTE come from the claim-venue flow.
+  source          PlaceVerificationRequestSource @default(ORG_SUBMISSION)
+  /// Claim provenance (source != ORG_SUBMISSION). The human who initiated the
+  /// claim, the resolved owner identity, and the provisional PlaceOwnership row.
+  claimantHumanId String?                        @map("claimant_human_id")
+  claimOwnerType  PlaceOwnerType?                @map("claim_owner_type")
+  claimOwnerId    String?                        @map("claim_owner_id")
+  ownershipId     String?                        @map("ownership_id")
+  reviewerNotes   String?
+  reviewerHumanId String?
+  reviewedAt      DateTime?
+  /// When a platform admin claimed the request and started review.
+  /// Null until the request transitions PENDING → IN_REVIEW.
+  acknowledgedAt  DateTime?
+  /// Human.id of the platform admin currently reviewing the request.
+  acknowledgedBy  String?
+  documents       PlaceVerificationDocument[]
+
+  place        Place         @relation(fields: [placeId], references: [id], onDelete: Cascade)
+  org          Organization? @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  submittedBy  Human?        @relation("submittedVerifications", fields: [submittedById], references: [id], onDelete: SetNull)
+  reviewer     Human?        @relation("reviewedVerifications", fields: [reviewerHumanId], references: [id])
+  acknowledger Human?        @relation("acknowledgedVerifications", fields: [acknowledgedBy], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([placeId])
+  @@index([status])
+  @@index([status, createdAt])
+  @@index([source, status])
+}
+
+/// Short-lived email-mailbox challenge for claim proof kind (b): the claimant
+/// proves control of a mailbox at the venue's registrable domain by entering a
+/// 6-digit code. Consumed once by submit-place-claim. See claim-venue-flow.spec.
+model PlaceClaimEmailChallenge {
+  id         String    @id @default(uuid())
+  placeId    String    @map("place_id")
+  humanId    String    @map("human_id")
+  email      String
+  /// SHA-256 hash of the 6-digit code (never store the plaintext).
+  codeHash   String    @map("code_hash")
+  expiresAt  DateTime  @map("expires_at")
+  verifiedAt DateTime? @map("verified_at")
+  attempts   Int       @default(0)
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  place Place @relation(fields: [placeId], references: [id], onDelete: Cascade)
+
+  @@index([placeId, humanId])
+  @@map("place_claim_email_challenges")
+}
+
+model PlaceVerificationDocument {
+  id          String    @id @default(uuid())
+  requestId   String
+  storageKey  String
+  fileName    String
+  contentType String
+  sizeBytes   Int
+  deletedAt   DateTime?
+
+  request PlaceVerificationRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([requestId])
+}
+
+// Seat sections and seats support both GA and reserved seating.
+// When an event selects a PlaceLayout, SeatSection rows are materialised from
+// the layout's metadata.sections[]. The `layoutSectionId` column stores the
+// layout-internal section key (e.g. "ga-floor") so checkout can join layout
+// geometry to ticket-type pricing without fragile name matching.
+model SeatSection {
+  id              String          @id @default(uuid())
+  eventId         String // which event this section belongs to
+  name            String // e.g. "General Admission", "Front Row" — copied from layout section label
+  type            SeatSectionType @default(GA)
+  capacity        Int?
+  geometry        Json?
+  stageAnchor     Json?           @map("stage_anchor")
+  /// The layout-internal section key (e.g. "ga-floor") from PlaceLayout.metadata.sections[].sectionId.
+  /// Null for manually-created sections that didn't originate from a layout.
+  layoutSectionId String?         @map("layout_section_id")
+  /// Which PlaceLayout this section was materialised from. Null for manually-created sections.
+  placeLayoutId   String?         @map("place_layout_id")
+
+  event       Event        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  placeLayout PlaceLayout? @relation("PlaceLayoutSeatSections", fields: [placeLayoutId], references: [id], onDelete: SetNull)
+  ticketTypes TicketType[]
+  seats       Seat[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([eventId, name])
+  @@unique([eventId, placeLayoutId, layoutSectionId], name: "seat_section_event_layout_section")
+  @@index([eventId])
+  @@index([placeLayoutId])
+}
+
+model Seat {
+  id            String     @id @default(uuid())
+  seatSectionId String
+  label         String // e.g. "A1", "GA-1"
+  row           String?
+  number        Int?
+  status        SeatStatus // optional seat status
+  geometry      Json?
+  /// Optional per-seat price override, JSON { priceCents, reason? } (e.g.
+  /// { priceCents: 12500, reason: "premium view" }). On a FIXED tier the
+  /// override REPLACES the ticket type's resolved price for this seat and is
+  /// what checkout charges and snapshots into OrderItem.unitPriceCents;
+  /// priceCents 0 is a free seat. It ignores the tier's scheduled price
+  /// change, and ADJUSTABLE (pay-what-you-want) tiers ignore it. Checkout
+  /// re-reads it under the seat lock and refuses the order on a change
+  /// (seat_price_changed). Overridden seats are never auto-assigned, online or
+  /// at the door (the door prices at the tier price, so it never picks one);
+  /// they sell only by explicit pick online. SQL NULL and JSON null both mean
+  /// no override. Any other stored value that is not { priceCents: number },
+  /// or whose priceCents is negative or fractional, refuses checkout for that
+  /// seat (INTERNAL seat_price_override_invalid); auto-assign skips it like
+  /// any override. Mint, the ticket email and resale never read the amount
+  /// and are unaffected by a bad value.
+  /// See docs/specs/2026-08-12/seat-price-overrides.spec.yaml.
+  priceOverride Json?      @map("price_override")
+
+  seatSection SeatSection @relation(fields: [seatSectionId], references: [id], onDelete: Cascade)
+  ticket      Ticket?
+  // ticket relation is established on Ticket via seatId to avoid FK on PK here
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([seatSectionId, label])
+  @@index([seatSectionId])
+}
+
+/// A parking, accessible drop-off or load-in shape drawn on a place's or an
+/// event's map (arrival-areas spec, 2026-10-16). Exactly one of placeId /
+/// eventId is set (DB CHECK "ArrivalArea_parent_xor"). A place area
+/// shows on every event at the place unless the event hides it
+/// (EventArrivalAreaHide); an event area belongs to that event only.
+/// Hard delete with the audit row kept; CASCADE with its parent.
+model ArrivalArea {
+  id               String          @id @default(uuid())
+  placeId          String?
+  eventId          String?
+  kind             ArrivalAreaKind
+  /// GeoJSON Polygon or LineString, validated in core (FR-005). No PostGIS:
+  /// areas are only drawn beside their parent, never searched by location.
+  geometry         Json
+  /// Up to 80 characters, enforced in core.
+  label            String
+  cost             ArrivalAreaCost @default(UNKNOWN)
+  /// Up to 40 characters, enforced in core.
+  priceText        String?
+  /// Up to 280 characters, enforced in core.
+  note             String?
+  accessibleSpots  Boolean         @default(false)
+  sortOrder        Int             @default(0)
+  /// Set when the event changed place or address and this event area has not
+  /// been repositioned yet (FR-014). A disabled area is not shown.
+  disabledAt       DateTime?
+  createdByHumanId String?
+
+  place          Place?                 @relation("ArrivalAreaPlace", fields: [placeId], references: [id], onDelete: Cascade)
+  event          Event?                 @relation("ArrivalAreaEvent", fields: [eventId], references: [id], onDelete: Cascade)
+  createdByHuman Human?                 @relation("ArrivalAreaCreatedBy", fields: [createdByHumanId], references: [id], onDelete: SetNull)
+  eventHides     EventArrivalAreaHide[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([placeId])
+  @@index([eventId])
+  @@index([createdByHumanId])
+}
+
+/// An event hiding one of its place's arrival areas for this event only
+/// (arrival-areas FR-004). No fields to update: unhide deletes the row.
+model EventArrivalAreaHide {
+  id            String @id @default(uuid())
+  eventId       String
+  arrivalAreaId String
+
+  event       Event       @relation("EventArrivalAreaHides", fields: [eventId], references: [id], onDelete: Cascade)
+  arrivalArea ArrivalArea @relation(fields: [arrivalAreaId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([eventId, arrivalAreaId])
+  @@index([arrivalAreaId])
+}

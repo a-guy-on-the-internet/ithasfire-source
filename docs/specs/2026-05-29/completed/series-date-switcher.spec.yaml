@@ -1,0 +1,160 @@
+# series-date-switcher.spec.yaml
+# Public buyer experience for event series: let buyers jump between the
+# published dates of a series from any single occurrence's public event page.
+
+version: "1.0"
+updated: "2026-05-29"
+
+summary:
+  problem: >
+    Event series already generate one standalone Event per occurrence (each with
+    its own slug, public page, ticket types, and checkout), but there is no
+    public-facing way for a buyer to discover or switch between the other dates
+    in the same series. A buyer who lands on one date has no idea the same series
+    runs on other dates, and the only series-aware UI is organizer-only (the
+    admin calendar). The buyer experience is effectively "one isolated event per
+    URL."
+  solution: >
+    Add a read-only, public path that, given a single event, returns the other
+    PUBLISHED + PUBLIC sibling occurrences of its series (each with its event
+    slug, title, start/end, and timezone). Surface this on the public event page
+    as a "More dates" date switcher that highlights the current date and links to
+    each sibling occurrence's own event page. Checkout stays per-event and
+    unchanged: one date per checkout. No multi-date cart.
+  users:
+    - buyer browsing a single date of a recurring series
+    - organizer who published several dates of a series and wants buyers to find them all
+  surfaces:
+    - api
+    - web
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Provide a core use case that, given an eventId, resolves whether that
+        event belongs to a series and returns the series' sibling occurrences
+        whose linked event is PUBLISHED and PUBLIC. Each returned date includes
+        occurrenceId, eventId, slug, title, startsAt, endsAt, timezone, and an
+        isCurrent flag for the input event.
+    - id: FR-002
+      description: >
+        If the event is not part of a series, or the series has no other
+        published/public dates, the use case returns an empty date list (and a
+        null seriesId). It must never throw for "no series" — absence is normal.
+    - id: FR-003
+      description: >
+        Dates are returned sorted ascending by startsAt. The current event's date
+        is always included in the list (flagged isCurrent) so the switcher can
+        render it as the active selection.
+    - id: FR-004
+      description: >
+        Expose the use case over a PUBLIC (unauthenticated) tRPC procedure. It
+        must not require an actor and must only ever return published, public
+        occurrences — never DRAFT, private, or planned occurrences.
+    - id: FR-005
+      description: >
+        The public event page fetches the series dates only when an event is part
+        of a series, and renders a date switcher above the ticketing section.
+        Selecting a non-current date navigates to that occurrence's
+        /events/[slug] page. The current date is rendered as a non-link active
+        state.
+  non_functional:
+    - id: NFR-001
+      description: >
+        The series-dates fetch is non-blocking and degrades gracefully: if it
+        fails, the event page renders exactly as it does today (no switcher), and
+        the error is traced, not surfaced to the buyer.
+    - id: NFR-002
+      description: >
+        The query is bounded. Cap the number of returned dates (e.g. 60) and rely
+        on existing (seriesId, startsAt) indexing; no N+1 over occurrences.
+    - id: NFR-003
+      description: >
+        UI follows Ithas Fire Swiss International content rules: borderRadius 0,
+        visible borders, no hardcoded hex (theme tokens only), >=44px tap
+        targets, Inter typography, color-inversion active/hover states.
+
+design:
+  data:
+    existing:
+      - EventSeries
+      - EventSeriesOccurrence  # seriesId, ordinal, startsAt, endsAt, status, eventId
+      - Event                  # slug, title, status, visibility, timezone
+    changes: none  # no schema migration; read-only join over existing tables
+  use_cases:
+    new:
+      - name: list-public-series-dates
+        path: packages/core/src/use-cases/series/list-public-series-dates.ts
+        description: >
+          Resolve the series for an event and return its published+public sibling
+          dates. Read-only (no repos.tx); accesses repos.seriesOccurrences
+          directly. No owner gate — public.
+        input: "eventId"
+        output: "seriesId | null, seriesName | null, dates[]"
+        idempotent: true
+        money: false
+  ports:
+    existing:
+      - EventSeriesOccurrencesRepo
+    new_methods:
+      - repo: EventSeriesOccurrencesRepo
+        name: findSeriesIdByEventId
+        description: "Return the seriesId for an event that is linked to an occurrence, else null."
+      - repo: EventSeriesOccurrencesRepo
+        name: listPublishedDatesBySeriesId
+        description: >
+          Return sibling occurrences for a series whose linked event is PUBLISHED
+          and PUBLIC, joined with the event's slug/title/startsAt/endsAt/timezone,
+          ordered by startsAt asc and capped.
+  transport:
+    router: series
+    new_procedure:
+      name: publicSeriesDates
+      kind: publicProcedure
+      input: "{ eventId: string }"
+      output: "{ seriesId, seriesName, dates: [{ occurrenceId, eventId, slug, title, startsAt, endsAt, timezone, isCurrent }] }"
+      notes: "Unauthenticated. Maps core errors via toTrpcError. Never returns non-public dates."
+  web:
+    loader:
+      path: apps/web/src/server/events.ts
+      name: loadEventSeriesDates
+      description: >
+        Calls series.publicSeriesDates for a given eventId, returns [] on error
+        (traced). Invoked from the event page only when relevant.
+    page:
+      path: apps/web/src/app/events/[...slug]/page.tsx
+      description: >
+        Fetch series dates alongside the other non-blocking loaders and pass them
+        into EventDetail.
+  ui:
+    component:
+      name: SeriesDateSwitcher
+      description: >
+        Renders the list of series dates. Current date = active (non-link) state;
+        others link to /events/[slug]. Swiss content styling. Hidden when there
+        are fewer than 2 dates.
+    integration:
+      - EventDetail forwards seriesDates into EventContent
+      - EventContent renders SeriesDateSwitcher above the ticketing CTA
+
+testing:
+  unit:
+    - list-public-series-dates: returns empty for non-series event
+    - list-public-series-dates: returns only PUBLISHED+PUBLIC siblings, sorted, with isCurrent set
+  e2e:
+    - load a series event page, see the date switcher, click another date, land on that occurrence's page, buy a ticket
+  manual:
+    - Chrome DevTools MCP walk-through of the switcher and a single-date checkout
+
+out_of_scope:
+  - multi-date cart / buying multiple dates in one checkout
+  - a dedicated /series/[slug] landing page
+  - per-date inventory/sold-out badges in the switcher (future enhancement)
+  - changing how ticket types are defined per occurrence
+
+acceptance:
+  - A buyer on one series date sees the other published dates and can switch between them.
+  - Non-series events render unchanged (no switcher, no extra blocking fetch).
+  - Only PUBLISHED + PUBLIC occurrences ever appear; drafts/planned/private never leak.
+  - Typecheck and core unit tests pass; an e2e proves the switch-and-buy path.

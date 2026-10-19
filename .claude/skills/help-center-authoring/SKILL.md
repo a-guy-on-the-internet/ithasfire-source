@@ -20,6 +20,7 @@ The help center lives at `apps/web/content/help/{category}/{slug}.md`. Articles 
 3. **Describe observable behaviour, not exact UI plumbing.** Prefer "open your Security settings and click **Change password**" over "navigate to /account/settings#section-05 and press the button at row 3". Behaviour rots more slowly than UI layouts.
 4. **One article per user-facing job.** If two articles would duplicate more than half their content, collapse them — either merge, or redirect one to the other with a link.
 5. **No feature flags or internal codes** in user text. Describe what a buyer sees, not what's in the enum (`DRAFT`, `PUBLISHED` status codes are acceptable when they appear in the UI verbatim; internal flags are not).
+6. **English only.** The help center has no translated copies. Cite button labels as the UI shows them: `apps/web/src/i18n/messages/en.ts` first (its keys win), then `packages/locale/messages/en.json`. The package JSON files are read-only for you (the owner keeps a rolling WIP in them).
 
 ## Frontmatter template
 
@@ -124,7 +125,7 @@ Follow the structure template. Keep paragraphs tight. Each section should answer
 
 ### 5. Verify render
 
-After writing, reload `/help/<category>/<slug>` in dev and confirm:
+After writing, open `http://localhost:3000/help/<category>/<slug>` on the running dev stack (the orchestrator delegates this to `browser-driver`; use `localhost`, not `127.0.0.1`) at desktop width and at 320px, and confirm:
 
 - All links resolve (no 404s)
 - Callouts render correctly (tip / warning / action variants)

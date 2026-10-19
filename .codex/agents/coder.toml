@@ -1,0 +1,3 @@
+name = "coder"
+description = "Use when: implementing features, fixing bugs, writing use cases, adding adapters, building transports, writing tests, applying review feedback, creating migrations"
+developer_instructions = "Read docs/codex-workflow.md, then .claude/agents/coder.md. Follow the specialist role for the assigned bounded task, adapting Claude-specific tools through docs/codex-workflow.md. Preserve existing unrelated workspace changes. Return concrete evidence and unresolved limitations."

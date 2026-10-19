@@ -1,0 +1,60 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Trust & safety — "a ban that sticks" (2026-09-29).
+//
+// NO RAW IP ADDRESSES OR EMAILS ARE STORED HERE. Every value is an
+// HMAC-SHA256 under a purpose-bound key derived (HKDF) from the server secret
+// — see packages/core/src/lib/security/network-identity.ts. Without the
+// secret the hashes cannot be reversed or recomputed from a guessed address.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One sign-up or sign-in, reduced to keyed hashes of the network it came
+/// from. Retention: 30 days (`security.purge-network-sightings`). Written
+/// best-effort from the Better Auth hooks; a failed write never blocks auth.
+model NetworkSighting {
+  id              String              @id @default(uuid())
+  authUserId      String              @map("auth_user_id")
+  /// Null when the AuthUser was not linked to a Human yet at write time.
+  humanId         String?             @map("human_id")
+  kind            NetworkSightingKind
+  /// HMAC of the full, normalised client IP.
+  ipHash          String              @map("ip_hash")
+  /// HMAC of the IP's network prefix: /24 for IPv4, /48 for IPv6.
+  networkHash     String              @map("network_hash")
+  /// ISO country from Cloudflare's `cf-ipcountry`, when present.
+  country         String?
+  /// Coarse browser + OS family only (e.g. "Chrome on macOS"), never the UA.
+  userAgentFamily String?             @map("user_agent_family")
+  createdAt       DateTime            @default(now()) @map("created_at")
+
+  authUser AuthUser @relation(fields: [authUserId], references: [id], onDelete: Cascade)
+  human    Human?   @relation(fields: [humanId], references: [id], onDelete: Cascade)
+
+  @@index([networkHash, createdAt])
+  @@index([humanId, createdAt])
+  @@index([authUserId, createdAt])
+  @@index([createdAt])
+  @@map("network_sighting")
+}
+
+/// An identity a BANNED or SUSPENDED human may not come back with. Rows exist
+/// while their source human is BANNED or SUSPENDED; only reactivation (ACTIVE)
+/// removes them (adminSetHumanStatus writes and removes them in the same tx as
+/// the status change). EMAIL rows block sign-up, email changes and sessions on
+/// that mailbox; NETWORK rows only FLAG new sign-ups for staff and expire.
+model BannedIdentity {
+  id            String             @id @default(uuid())
+  kind          BannedIdentityKind
+  valueHash     String             @map("value_hash")
+  /// SetNull, not Cascade: deleting the banned account must not lift the ban.
+  sourceHumanId String?            @map("source_human_id")
+  createdAt     DateTime           @default(now()) @map("created_at")
+  /// Null = no expiry (EMAIL). NETWORK rows expire 30 days after the ban.
+  expiresAt     DateTime?          @map("expires_at")
+
+  sourceHuman Human? @relation("BannedIdentitySource", fields: [sourceHumanId], references: [id], onDelete: SetNull)
+
+  @@unique([sourceHumanId, kind, valueHash])
+  @@index([kind, valueHash])
+  @@index([expiresAt])
+  @@map("banned_identity")
+}

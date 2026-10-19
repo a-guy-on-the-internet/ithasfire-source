@@ -1,0 +1,83 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Support — chat widget threads + messages.
+//
+// See docs/specs/2026-06-23/completed/support-chat-widget.spec.yaml.
+// A signed-in attendee opens the bottom-right widget and sends messages that
+// persist here. Operators reply from /admin/support. The message author type
+// is typed (USER | HUMAN_AGENT | AI_CLERK | SYSTEM) so the future AI clerk can
+// post into the same threads and escalate to a human in-place — one inbox, one
+// data model. Enums live in enums.prisma.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model SupportThread {
+  id String @id @default(uuid())
+
+  // The signed-in attendee who owns this thread. Set on creation (the widget is
+  // sign-in only — no anonymous threads), but NULLABLE because the FK below is
+  // ON DELETE SET NULL: when a Human is hard-deleted for GDPR/CCPA right-to-
+  // erasure, their threads survive as owner-less / staff-only rows rather than
+  // blocking the deletion. This mirrors the event/order SetNull FKs just below
+  // (a deleted owner drops the link, not the support history).
+  humanId String? @map("human_id")
+
+  // Optional order-aware context: the event/order the user was looking at when
+  // they opened the widget. SetNull so deleting an event/order doesn't drop the
+  // support history.
+  eventId String? @map("event_id")
+  orderId String? @map("order_id")
+
+  status SupportThreadStatus @default(OPEN)
+  source SupportThreadSource @default(WIDGET)
+
+  // Drives admin-inbox ordering (most-recently-active first) without scanning
+  // the messages table. Bumped on every new message.
+  lastMessageAt DateTime  @default(now()) @map("last_message_at")
+  resolvedAt    DateTime? @map("resolved_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  human    Human?           @relation("SupportThreadHuman", fields: [humanId], references: [id], onDelete: SetNull)
+  event    Event?           @relation("SupportThreadEvent", fields: [eventId], references: [id], onDelete: SetNull)
+  order    Order?           @relation("SupportThreadOrder", fields: [orderId], references: [id], onDelete: SetNull)
+  messages SupportMessage[]
+
+  // Inbox ordering: awaiting-human / recency. Composite covers the common
+  // "ORDER BY lastMessageAt DESC WHERE status = ?" query.
+  @@index([status, lastMessageAt])
+  @@index([humanId])
+  // NOTE: a PARTIAL UNIQUE INDEX enforces "one active thread per human"
+  //   UNIQUE (human_id) WHERE status IN ('OPEN','AWAITING_HUMAN')
+  // Partial uniques aren't expressible in Prisma's schema, so it lives as raw
+  // SQL in migration 20260623130000_support_thread_one_active_per_human. The
+  // send-support-message use case catches the resulting P2002 and re-reads the
+  // winning thread (race-safe single-thread-per-human; RESOLVED threads are
+  // excluded so a human can open a fresh thread after closure).
+  @@map("support_thread")
+}
+
+model SupportMessage {
+  id       String @id @default(uuid())
+  threadId String @map("thread_id")
+
+  authorType SupportAuthorType @map("author_type")
+
+  // The human who authored the message, when applicable: the attendee (USER) or
+  // the operator (HUMAN_AGENT). Null for AI_CLERK / SYSTEM messages. No FK
+  // relation — kept as a plain id to avoid coupling system/AI messages to a
+  // Human row and to keep the AI clerk migration-free.
+  authorHumanId String? @map("author_human_id")
+
+  body String @db.Text
+
+  // Simple read receipt (the spec scopes out anything richer). Set when the
+  // counterparty has seen the message.
+  readAt DateTime? @map("read_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  thread SupportThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@index([threadId, createdAt])
+  @@map("support_message")
+}

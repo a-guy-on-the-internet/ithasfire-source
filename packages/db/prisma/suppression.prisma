@@ -1,0 +1,25 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Suppression — Fallback opt-out list for recipients without a linked Human.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Anonymous email suppression list, scoped per organization.
+///
+/// Used when an announcement recipient has no linked `Human` (e.g. an imported
+/// contact-list entry that hasn't been matched to an auth user). When such a
+/// recipient unsubscribes from an org's announcements we record the
+/// `(email, orgId)` pair here so future announcement dispatch can suppress it.
+///
+/// Recipients with a linked `Human` use `NotificationPreference` (ORG scope)
+/// instead.
+model AnonymousEmailSuppression {
+  id        String   @id @default(cuid())
+  /// Lowercased email address being suppressed.
+  email     String
+  orgId     String
+  /// "unsubscribe" | "bounce" | "complaint"
+  reason    String   @default("unsubscribe")
+  createdAt DateTime @default(now())
+
+  @@unique([email, orgId])
+  @@index([orgId])
+}

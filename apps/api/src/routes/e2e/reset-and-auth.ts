@@ -8,6 +8,8 @@
 import type { FastifyPluginAsync } from "fastify";
 import { hashPassword } from "better-auth/crypto";
 import { prisma } from "@th/db";
+import type { OrgRole } from "@th/ports/repos/authz";
+
 import { assertE2eAuthorized, formatError } from "./_helpers.js";
 
 const resetAndAuth: FastifyPluginAsync = async (app) => {
@@ -50,6 +52,9 @@ const resetAndAuth: FastifyPluginAsync = async (app) => {
       await prisma.promoHold.deleteMany({}).catch(() => undefined);
       await prisma.promo.deleteMany({}).catch(() => undefined);
 
+      // ── P4b (deal terms) ── settlement sheets name payees (Restrict): they
+      // go before the payees below. Deductions cascade with their terms.
+      await prisma.settlementSheet.deleteMany({}).catch(() => undefined);
       await prisma.payoutTermsLine.deleteMany({}).catch(() => undefined);
       await prisma.payoutTerms.deleteMany({}).catch(() => undefined);
       await prisma.feePolicy.deleteMany({}).catch(() => undefined);
@@ -59,9 +64,16 @@ const resetAndAuth: FastifyPluginAsync = async (app) => {
       await prisma.event.deleteMany({}).catch(() => undefined);
 
       await prisma.placeOwnership.deleteMany({}).catch(() => undefined);
-      await prisma.placeSlugHistory.deleteMany({}).catch(() => undefined);
       await prisma.placeLayout.deleteMany({}).catch(() => undefined);
       await prisma.place.deleteMany({}).catch(() => undefined);
+
+      // ── booking-the-night P2d-1 (saved reasons) ──
+      // Saved reasons have no FK to their owner (polymorphic owner pair), so
+      // no cascade removes them. All of them go — the preserved user's lists
+      // too, so every run starts from "first use". List rows first (lock
+      // order, as SavedSnippetsRepo.deleteByOwner).
+      await prisma.savedSnippetList.deleteMany({}).catch(() => undefined);
+      await prisma.savedSnippet.deleteMany({}).catch(() => undefined);
 
       await prisma.orgMember.deleteMany({}).catch(() => undefined);
       await prisma.organization.deleteMany({}).catch(() => undefined);
@@ -138,6 +150,15 @@ const resetAndAuth: FastifyPluginAsync = async (app) => {
       email?: string;
       password?: string;
       name?: string;
+      /**
+       * Seed the user as an ALREADY-ACCEPTED org member / delegate. The API
+       * has no consent-free way to add someone (orgs.addMember and
+       * delegates.addDelegate were removed — security review F3), and this
+       * seeded user has no password to sign in and accept, so specs that need
+       * a second member seed the accepted state here.
+       */
+      orgMembership?: { orgId: string; role: OrgRole };
+      delegateOf?: { principalId: string; role: OrgRole };
     };
 
     const email = body.email ?? `e2e-user-${Date.now()}@example.com`;
@@ -160,6 +181,25 @@ const resetAndAuth: FastifyPluginAsync = async (app) => {
           updatedAt: now,
         },
       });
+
+      if (body.orgMembership) {
+        await prisma.orgMember.create({
+          data: {
+            orgId: body.orgMembership.orgId,
+            humanId: human.id,
+            role: body.orgMembership.role,
+          },
+        });
+      }
+      if (body.delegateOf) {
+        await prisma.humanDelegate.create({
+          data: {
+            principalId: body.delegateOf.principalId,
+            delegateId: human.id,
+            role: body.delegateOf.role,
+          },
+        });
+      }
 
       return reply.send({
         ok: true,

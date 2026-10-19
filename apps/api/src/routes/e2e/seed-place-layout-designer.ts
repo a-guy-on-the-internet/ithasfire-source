@@ -47,11 +47,9 @@ const seedPlaceLayoutDesigner: FastifyPluginAsync = async (app) => {
       });
 
       // ── Place ──────────────────────────────────────────────────────
-      const placeSlug = `e2e-venue-${Date.now()}`;
       const place = await prisma.place.create({
         data: {
           name: "E2E Test Venue",
-          slug: placeSlug,
           address: "100 E2E Blvd",
           city: "Testville",
           region: "TX",
@@ -80,7 +78,6 @@ const seedPlaceLayoutDesigner: FastifyPluginAsync = async (app) => {
           orgId: org.id,
           orgSlug,
           placeId: place.id,
-          placeSlug,
         },
       });
     } catch (err) {

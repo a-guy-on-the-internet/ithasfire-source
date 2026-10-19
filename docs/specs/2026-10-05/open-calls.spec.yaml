@@ -1,0 +1,600 @@
+# open-calls.spec.yaml
+#
+# Open calls, v1: an event's application form for acts. The organizer side
+# posts a call, acts apply (account optional), and the organizer side picks
+# acts onto the event's lineup. Replaces the Google Form organizers use today.
+
+version: "1.0"
+updated: "2026-10-07"
+
+# ── Rulings (owner, 2026-10-04/05, grilling rounds 1–5) ──────────────────────
+# Full text: memory project_open_call_for_performers.md. The ones this spec
+# leans on:
+# Q1   Anyone making an event can post a call, for any kind of act.
+# Q2   The call lives off an event; the event's dates are the dates applicants
+#      choose from. Festivals (timetable of sets) are out of scope.
+# Q3   Account optional to apply; signed-in applicants get prefill.
+# Q5   Built on the existing EventApplicationForm system, not a new form.
+# Q7   Pay is a REQUIRED field on the call. Q20: a ticket-quota call is
+#      allowed only when declared there. Q24: "We never ask people to pay to
+#      apply."
+# Q8   Applicants see who else applied (name, photo, links), never decisions.
+#      On by default, with a "keep my application private" checkbox.
+# Q9   A call = EventApplicationForm with a purpose (attend | perform).
+# Q10  A pick puts the act straight on the lineup as confirmed; the act can
+#      drop out in one tap.
+# Q11  The call can be public while the event is a draft; it shows only what
+#      the poster fills in; address withholding applies.
+# Q12  Optional deadline + manual close, no auto-close. Past applicants stay
+#      visible to the poster.
+# Q15  No platform-imposed act type: "the call is literally just whatever is
+#      on the application form". Templates give skeletons.
+# Q17  Automatic, non-removable "which dates can you do?" question on
+#      multi-date events. Q30: store the answer as a structured date
+#      reference, never free text.
+# Q21  Applicant edits until the organizer side opens it; withdraws any time.
+# Q22  One thread per application, like booking requests. No applicant-to-
+#      applicant messages.
+# Q23  A pick creates no agreement: "otherwise it is upon the organizer to
+#      pay out."
+# Q27  Applicant cards show trust traces: shown, never ranked.
+# Q28  Anyone on the organizer side votes and leaves notes; pick / not this
+#      time needs event edit rights.
+# Q29  The call page shows "Booked so far".
+# Q32  Guests follow their application through an emailed link: status,
+#      thread, edit, withdraw, optional "make this a page".
+# Q33  Apply as a person or as an organisation (a band is an organisation).
+# Q34  A picked guest act goes on by name + link; the pick email invites them
+#      to claim a page.
+# Q35  Cancelled event or pulled call: every pending applicant is told; the
+#      call page stays up, marked closed.
+# Q36  Not-picked applicants hear back when the decision is made, plus a
+#      sweep at close for anyone undecided.
+# Q37  Picks go on the event's LINEUP ("bill" is the booking-request word).
+# Q38  Code keeps REJECTED; screens say "Not this time". Never pass/decline
+#      on screens.
+# Q39  (owner 10-05, "yes I agree") Backstop: nobody waits forever. An
+#      application still undecided when its last chosen date starts gets the
+#      "not this time" reply automatically, even if the poster never closes.
+# Q40  (owner 10-05) "A call will belong to a series or an event. It's
+#      basically an extension of an event." The form hangs off exactly one
+#      of an event or a series; a series call's dates are the series' dates.
+#      As an extension, the call has no life of its own: it is edited from
+#      its event or series, and cancelling or deleting that ends the call.
+# Q41  (owner 10-05) A call needs an explicit "Post call" moment. Saving
+#      makes a draft call; only a posted call (postedAt set) is listed on
+#      the poster's page, served at /call/<publicId>, and accepts
+#      applications. [Principle 4, Protect the weaker side: acts never spend
+#      effort on a half-written call.]
+# Q42  (owner 10-06) "Simpler and dumber." One open application per
+#      applicant ENTITY per call: a person as themselves once, and each group
+#      they can apply for once (3 groups = 3 applications). Overlapping
+#      members are the organizer's call. Two members can't each apply as the
+#      same group.
+# Q43  (owner 10-06, "Yea. I agree with your nuance") Reviewing applications
+#      (queue, opening a card, votes, notes, the organizer thread) is limited
+#      to people who can EDIT the event: org OWNER/ADMIN/EDITOR, or a
+#      personal event's human and their delegates with an edit role. SCANNER,
+#      VIEWER and non-edit delegates are out. Narrows Q28 and overrides
+#      FR-014's "any role". [Principle 4.]
+# Q44  (owner 10-07, "Derive token") The guest status token is
+#      HMAC(server secret, submissionId); the DB still stores only its
+#      SHA-256 hash, so any later email can rebuild the link. Rotating the
+#      secret breaks old links, and that is accepted. Every guest and org
+#      email carries the status link and the one-tap Drop out.
+# Q45  (owner 10-07, "Any edit member") For an organisation's application,
+#      any member with an edit role (ORG_EDIT_ROLES) may drop out, not only
+#      the member who submitted it.
+# Q46  (owner 10-07, "Store it now") The submission stores the locale
+#      captured at submit (new nullable column, new migration
+#      20261007120000_open_call_contact_locale; 20261005120000 stays
+#      frozen). Guest emails render in it.
+#
+# Pro-social (docs/pro-social.md) decides the close calls below; each one
+# names the principle that decided it.
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Organizers fill lineups by posting a Google Form, then copying answers
+    into the event by hand. Applicants rarely hear back, can't see who else
+    is in the running, and nothing they did lands anywhere they keep. The
+    attendee application form already does most of the form work, but it
+    only ever lets people IN to an event; it can't put anyone on the lineup.
+  solution: >
+    Give EventApplicationForm a purpose. A PERFORM form is an open call: a
+    public page with the pay terms, the event's dates and the poster's
+    questions; a review queue for the organizer side with votes, notes and a
+    thread per application; and a pick that writes the act onto the lineup.
+    Every applicant gets an answer, by decision or by the sweep at close.
+  users:
+    - Organizer side (anyone making an event; reviewers = its members)
+    - Acts applying, signed in or as guests, as a person or an organisation
+    - Visitors to the call page (sees the call and "Booked so far")
+  surfaces:
+    - web
+    - api
+    - jobs (close sweep, backstop sweep)
+    - email + in-app notifications
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    # Posting
+    - id: FR-001
+      description: >
+        Someone with edit rights on an event or a series can create ONE open
+        call for it (one PERFORM form per event or series; an event keeps its
+        ATTEND form alongside). The call is a tab of its event or series
+        builder, not a separate thing to manage (Q40). A dated event that
+        belongs to a series with an open call shows that call instead of
+        offering its own, so an act never applies twice for one night. It
+        starts from a blank form or a template (the seeded "Performer / artist
+        application" template becomes a PERFORM template). The call carries
+        intro text, the poster's questions, a REQUIRED pay field, and an
+        optional deadline.
+    - id: FR-002
+      description: >
+        The pay field is a kind plus details: FIXED, DOOR_SPLIT, TICKET_SHARE,
+        TICKET_QUOTA, UNPAID, DISCUSSED_AFTER. Details text is required for
+        FIXED, DOOR_SPLIT, TICKET_SHARE and TICKET_QUOTA (TICKET_QUOTA must
+        state the number of tickets). The call page shows pay above the form.
+        No field anywhere charges an applicant; there is no application fee.
+    - id: FR-003
+      description: >
+        The call has its own public link (`/call/<publicId>`, short random id,
+        not the event id or slug) that works while the event is a draft. The
+        page shows only what the call shows: event name, dates, the place
+        subject to address withholding, intro, pay, deadline, "Booked so far",
+        and the form. The poster's public page (human or org page) lists its
+        open calls.
+    - id: FR-004
+      description: >
+        The deadline stops new applications at that instant (existing
+        closesAt behaviour). It does not close the call: the organizer side
+        keeps picking until someone with edit rights presses Close. There is
+        no auto-close (Q12).
+    - id: FR-005
+      description: >
+        Closing the call runs the close sweep (FR-020) and marks the page
+        "Closed". Reopening is allowed while the event is upcoming; it accepts
+        new applications but does not reopen swept ones.
+
+    # Applying
+    - id: FR-006
+      description: >
+        Anyone can apply with or without an account. Signed-in applicants
+        choose to apply as themselves or as an organisation they belong to
+        (Q33), and their name, photo and links prefill. Guests give a name,
+        an email and optionally a link; guests always apply as a name, with no
+        organisation. Submissions go through the existing Turnstile check and
+        rate limit on events.submitApplication.
+    - id: FR-007
+      description: >
+        When the call has more than one date (a series call: the series'
+        upcoming occurrences; an event call on a community listing: its
+        event dates), the form opens with a
+        "Which dates can you do?" question the poster cannot remove or edit.
+        At least one date is required. Each chosen date is stored as a row
+        pointing at the occurrence / event / event date (data:
+        OpenCallDateChoice), never as text. A single-date event has no such
+        question.
+    - id: FR-008
+      description: >
+        A "Keep my application private" checkbox, unticked by default. While
+        the call is open, each applicant sees the other non-private, non-
+        withdrawn applicants on the call page: name, photo, links. Nobody but
+        the organizer side ever sees statuses, votes, notes or who was told
+        "not this time". The list is visible only to people who have applied
+        (signed in, or through their guest link), not to the public.
+        [Principle 2, Visible in context; principle 4 bounds it.]
+    - id: FR-009
+      description: >
+        After submitting, the applicant gets an email with their status link
+        (`/call/<publicId>/application/<token>`). Every later email to a
+        guest or organisation applicant carries the same link and a one-tap
+        Drop out (Q44). Signed-in applicants also
+        find it in their hub. The status page shows status, the thread, Edit
+        (until opened, FR-010), Withdraw, and for guests "Make this a page"
+        (sign up with the email prefilled; the submission then attaches to
+        the new human).
+    - id: FR-010
+      description: >
+        The applicant can edit answers and date choices until someone on the
+        organizer side first opens the application in the queue (openedAt).
+        After that, Edit is replaced by a line saying the organizers have seen
+        it; the thread still works. Withdraw works at any time before a pick.
+    - id: FR-011
+      description: >
+        One open application per applicant per call, enforced by the existing
+        partial unique indexes, re-keyed from eventId to formId so the same
+        person can hold an attendee application and a performer application
+        on one event. A withdrawn or not-picked applicant can apply again.
+
+    # Reviewing
+    - id: FR-012
+      description: >
+        The organizer side sees a review queue per call, sorted by time
+        applied (oldest first). There is no score-based sort and no ranking
+        by traces. Filters: status, date chosen, my vote (none / yes / maybe /
+        no). [Principle 6, Spread attention.]
+    - id: FR-013
+      description: >
+        Each applicant card shows: name, photo, links, applied-as (person or
+        organisation), answers, dates chosen, and trust traces: "Played N
+        nights here before", "Played N nights on Ithas Fire", "Ran N nights".
+        A night counts when the event was published, is in the past and was
+        not cancelled; "played" counts only lineups of events the act did not
+        organise. A guest or newcomer shows "New here", never a zero. Traces
+        are display only and never feed a sort. [Principle 5, Trust comes
+        from traces; principle 6 keeps them out of ranking.]
+    - id: FR-014
+      description: >
+        Anyone on the organizer side casts one vote per application (Yes /
+        Maybe / No, changeable) and adds notes. Votes and notes are visible
+        to the organizer side only. The card shows the vote tally.
+        "Organizer side" here means people who can EDIT the event (owner
+        ruling 10-06, see Q43; overrides "any role"): the event
+        organisation's OWNER, ADMIN or EDITOR members, or, for a personal
+        event, its human and their delegates who hold an edit role. SCANNER
+        and VIEWER members and delegates without edit rights do not see the
+        queue, cards, votes, notes or the organizer thread. [Principle 4,
+        Protect the weaker side: applicants' details reach only the people
+        deciding.] Until the sides model lands (memory
+        project_event_two_sides_model), this edit-rights check stands in for
+        the organizer side.
+    - id: FR-015
+      description: >
+        Each application has one thread between the applicant and the
+        organizer side, mirroring BookingRequestMessage (author side, body,
+        read markers). Guests read and reply through their status link. A new
+        message notifies the other side. There are no applicant-to-applicant
+        messages (Q22).
+
+    # Deciding
+    - id: FR-016
+      description: >
+        Pick (needs event edit rights) sets the submission APPROVED and writes
+        an EventHuman row, role PERFORMER, at the end of the lineup:
+        humanId for a person, orgId for an organisation, externalName +
+        externalUrl for a guest. On a series call, the picker chooses which of the
+        applicant's dates to pick them for, and each chosen occurrence gets
+        its own row (materialising the occurrence's event if needed). On a
+        community listing with event dates, the act goes on the one shared
+        lineup and the card keeps showing their dates. If the act is already
+        on that lineup, the pick records the decision and adds no row. A pick
+        creates no agreement and moves no money (Q23).
+    - id: FR-017
+      description: >
+        A picked act is told by email and in-app: which event, which dates,
+        the pay terms as posted, and a one-tap "Drop out". A guest act's email
+        also invites them to make a page (Q34). Dropping out removes their
+        lineup row(s), marks the submission WITHDRAWN with droppedOutAt, and
+        tells the organizer side. Signed-in person acts drop out through the
+        existing leaveEventLineup path; organisation and guest acts through
+        their status link (FR-009). For an organisation's application, any
+        member with an edit role (ORG_EDIT_ROLES) may drop out, not only the
+        submitter (Q45).
+    - id: FR-018
+      description: >
+        "Not this time" (needs event edit rights) sets REJECTED with an
+        optional personal note (decisionReason). The applicant is told at
+        once, with the note if there is one. Screens and emails say
+        "Not this time"; code says REJECTED (Q38). [Principle 3, Nobody gets
+        silence.]
+    - id: FR-019
+      description: >
+        Removing a picked act from the lineup afterwards uses the existing
+        lineup removal and its notice. The submission keeps its APPROVED
+        decision and records removedFromLineupAt, so the history stays true.
+
+    # Endings
+    - id: FR-020
+      description: >
+        The close sweep (FR-005) sets every PENDING application on the call
+        to REJECTED with the standard "not this time" reply. Applicants
+        already picked or told are not contacted again.
+    - id: FR-021
+      description: >
+        Backstop (Q39): an application still PENDING when the last date it
+        chose starts (single-date call: the event's start) is set to REJECTED
+        with the standard "not this time" reply, whether or not anyone pressed
+        Close. Working per application rather than per call covers series
+        that never end. When the call's last date has started, the call shows
+        "Closed". The deadline never triggers either. [Principle 3, Nobody
+        gets silence.]
+    - id: FR-022
+      description: >
+        When the event or series is cancelled or deleted, or the call is
+        deleted, every PENDING
+        applicant is told the call was pulled (not "not this time"), their
+        applications go to EXPIRED, and the call page stays up marked
+        "Closed" (Q35).
+    - id: FR-023
+      description: >
+        Past calls and every application on them stay visible to the
+        organizer side after close (Q12). Applicants keep their status page.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Guest status tokens are derived: HMAC(server secret, submissionId)
+        (Q44), stored only as a SHA-256 hash (unique index), and compared in
+        constant time. Any later email can rebuild the link from the
+        submission id; rotating the secret invalidates old links, which is
+        accepted. A token grants
+        that one application: view, edit, withdraw, message, drop out. It
+        stops working 30 days after the last date the application chose.
+    - id: NFR-002
+      description: >
+        Every applicant-facing read (peer list, call page, status page)
+        returns no status, vote, note, decision reason of another applicant,
+        or email address. Covered by a test that asserts the response shape.
+    - id: NFR-003
+      description: >
+        Notifications render in the reader's language, through the
+        notification-text i18n path now landing (memory
+        project_notification_text_spanish). Guests have no account, so the
+        submission stores the locale captured at submit and guest emails
+        render in it (Q46).
+    - id: NFR-004
+      description: >
+        Sweeps are idempotent per (submission, notice kind) and catch per
+        item; a failed notice reports through `reportError` (ReporterPort)
+        and the sweep continues (CLAUDE.md error-reporting convention).
+    - id: NFR-005
+      description: >
+        Address withholding applies to the call page exactly as it does to
+        the event page.
+    - id: NFR-006
+      description: >
+        The call page and status page work at 320px with no horizontal
+        scroll, and the date question is keyboard and screen-reader usable.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: upsert-event-application-form (extend)
+        description: >
+          Accepts purpose; for PERFORM requires pay kind (+ details per
+          FR-002) and mints publicId. Auth: event edit rights.
+        input: eventId, purpose, introText, payKind, payDetails, closesAt
+        output: form
+        idempotent: true
+        money: false
+      - name: close-open-call / reopen-open-call
+        description: >
+          Sets closedAt / clears it; close runs the sweep (FR-020). Auth:
+          event edit rights.
+        input: formId, actorHumanId
+        output: { swept: number }
+        idempotent: true
+        money: false
+      - name: get-public-open-call
+        description: >
+          Public call page data: event summary (withheld address), pay, dates,
+          booked so far (public lineup), form questions. No auth.
+        input: publicId
+        output: call view
+        idempotent: true
+        money: false
+      - name: submit-event-application (extend)
+        description: >
+          Takes formId; for PERFORM accepts applyingAsOrgId (actor must be a
+          member), guest name/link, isPrivate, date choices (validated against
+          the event's dates); mints the guest status token. Turnstile + rate
+          limit unchanged.
+        input: formId, answers, dateChoices, isPrivate, applyingAsOrgId?, guest?
+        output: submissionId, statusUrl
+        idempotent: false
+        money: false
+      - name: edit-open-call-application
+        description: "Edit answers / dates / privacy while openedAt is null. Auth: applicant (session or token)."
+        input: submissionId | token, patch
+        output: submission
+        idempotent: true
+        money: false
+      - name: get-open-call-application-status
+        description: "Status page for the applicant, plus the peer list (FR-008). Auth: applicant."
+        input: submissionId | token
+        output: status, thread, peers
+        idempotent: true
+        money: false
+      - name: list-open-call-applications (extend list-event-application-submissions)
+        description: >
+          Queue with traces, tallies, my vote; marks openedAt when a card is
+          opened. Auth: organizer side.
+        input: formId, filters
+        output: cards
+        idempotent: true
+        money: false
+      - name: cast-application-vote / add-application-note
+        description: "Auth: organizer side."
+        input: submissionId, vote | body
+        output: tally | note
+        idempotent: true
+        money: false
+      - name: pick-open-call-application
+        description: >
+          FR-016 in one transaction: APPROVED + EventHuman row(s); notice
+          after commit. Auth: event edit rights.
+        input: submissionId, occurrenceIds?
+        output: lineup rows
+        idempotent: true
+        money: false
+      - name: review-event-application-submission (extend for REJECTED on PERFORM)
+        description: "Not this time with optional note (FR-018). Auth: event edit rights."
+        input: submissionId, note?
+        output: submission
+        idempotent: true
+        money: false
+      - name: drop-out-of-open-call
+        description: "FR-017. Auth: the picked act (session, org membership, or token)."
+        input: submissionId | token
+        output: removed rows
+        idempotent: true
+        money: false
+      - name: post-application-message / list-application-messages
+        description: "Mirrors booking-requests/messages. Auth: applicant or organizer side."
+        input: submissionId | token, body
+        output: message
+        idempotent: false
+        money: false
+      - name: sweep-open-calls (job)
+        description: FR-021 backstop + FR-022 pulled-call notices.
+        input: none
+        output: counts
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - TurnstilePort
+      - ReporterPort
+      - notification / email ports used by notify-event-application-received
+
+  adapters:
+    new: []
+    existing:
+      - Prisma application repository (formId keys, new tables)
+      - Prisma event-human repository (attach rows on pick)
+
+  transport:
+    trpc_procedures:
+      - openCalls.getPublic (public)
+      - openCalls.status / edit / withdraw / dropOut / messages (public, token or session)
+      - openCalls.queue / vote / note / pick / notThisTime / close / reopen (authed)
+      - events.submitApplication (extended input)
+    webhooks: []
+
+  ui:
+    pages:
+      - /call/[publicId]            # public call page + form
+      - /call/[publicId]/application/[token]   # guest status page
+      - admin event → Open call tab (builder: pay, deadline, questions, close)
+      - admin event → Open call → Applications (queue + card + thread)
+    components:
+      - Pay field editor and pay summary
+      - Date choice question (series occurrences / event dates)
+      - Applicant card (traces, tally, vote, notes)
+      - Peer list on the call page
+      - Hub "My applications" entries for signed-in applicants
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - OpenCallDateChoice  # submissionId, eventId? | occurrenceId? | eventDateId?; CHECK exactly one
+    - ApplicationVote     # submissionId, humanId, vote YES|MAYBE|NO; unique(submissionId, humanId)
+    - ApplicationNote     # submissionId, authorHumanId, body
+    - ApplicationMessage  # submissionId, authorSide ORGANIZER|APPLICANT, authorHumanId?, body, read markers
+  modified_models:
+    - EventApplicationForm: >
+        + purpose ApplicationFormPurpose (ATTEND default) ; eventId loses
+        @unique and becomes nullable ; + seriesId (nullable, FK
+        EventSeries, cascade) ; CHECK exactly one of eventId / seriesId ;
+        CHECK seriesId forms are PERFORM ; @@unique([eventId, purpose]) and
+        @@unique([seriesId, purpose]) ; + publicId (unique) ;
+        + payKind OpenCallPayKind? + payDetails (required for PERFORM in core)
+        ; + closedAt, closedByHumanId
+    - EventApplicationSubmission: >
+        + formId (backfilled from eventId + ATTEND form) ; + applyingAsOrgId ;
+        + guestName, guestUrl ; + isPrivate (false) ; + openedAt ;
+        + statusTokenHash (unique) ; + droppedOutAt, removedFromLineupAt ;
+        + contactLocale? (Q46; migration 20261007120000_open_call_contact_locale) ;
+        eventId becomes nullable (null on series-call submissions; formId is
+        the key) ; partial unique dedupe indexes re-keyed eventId → formId
+    - ApplicationFormTemplate: + purpose (seeded performer template → PERFORM)
+    - Event.gateType APPLICATION keeps reading the ATTEND form only
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Every reader of EventApplicationForm assumes one form per event
+      (findUnique by eventId). Missing one makes the attendee gate read the
+      performer form.
+    severity: HIGH
+    mitigation: >
+      Step 1 of the build is the purpose column + re-keyed lookups alone,
+      with a grep-backed list of every findUnique({ eventId }) call site in
+      the plan, and a test that an event with both forms gates on ATTEND.
+  - risk: >
+      The peer list leaks something the applicant didn't agree to share
+      (email, status, a private applicant).
+    severity: HIGH
+    mitigation: NFR-002 shape test; private and withdrawn rows filtered in the query, not the UI.
+  - risk: >
+      Trust traces are cheap to fake with a second account (make an event,
+      add yourself, wait).
+    severity: MEDIUM
+    mitigation: >
+      v1 traces are display only and never rank or gate anything. A stricter
+      "scanned door" definition comes with the poster's record in v2.
+  - risk: >
+      Picking onto unmaterialised series occurrences touches series
+      generation (sync-series-drafts, reconcile-series-schedule).
+    severity: MEDIUM
+    mitigation: Reuse the existing materialise path; route that step to coder on opus.
+  - risk: >
+      The sides model (memory project_event_two_sides_model) is unbuilt, so
+      "organizer side" is approximated (FR-014).
+    severity: LOW
+    mitigation: One resolver function for "is on the organizer side", swapped when sides land.
+
+open_questions: []  # Q39 and Q40 answered 10-05, see Rulings
+
+# ── Out of Scope (v1) ────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Public board as an "Open calls" filter in event search (v2, Q25)
+  - Automatic board listing gate (verified email + one event made, Q24) (v2)
+  - Category question type tied to platform categories (v2, Q26)
+  - Talent pool of past applicants (v2, Q14b)
+  - Poster's record on the call page ("answered everyone", nights run) (v2, Q27)
+  - Report button on calls (comes with the board; EntityReportSubjectType has no event or call today)
+  - A view of how often an act hears "not this time" (Q38 calls it a signal for change; v1 stores the data, no screen)
+  - Agreements or payouts from a pick (Q23)
+  - Mobile app screens
+  - Google Forms CSV import (only if someone asks, Q5)
+
+# ── Later: separate handoffs the owner asked for (do not start here) ─────────
+
+later:
+  - >
+    Rewrite docs/mission.md with concepts from Eric Ries's book
+    "Incorruptible". Research the book first; the current file has its text
+    duplicated and garbled ("attendees.on:").
+  - >
+    Festivals, option (c): one event over a period with a timetable of sets
+    (act × space × time); separately ticketed parts are linked events; a
+    guest-curated stage = a side scoped to that stage. Use "set", never
+    "slot".
+  - >
+    Saved applicant profile for one-tap applying (Q14c).
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - An event can hold an ATTEND form and a PERFORM form at once; the attendee gate reads only ATTEND.
+  - A PERFORM form cannot be saved without a pay kind, nor with FIXED / DOOR_SPLIT / TICKET_SHARE / TICKET_QUOTA and empty details.
+  - A signed-out visitor opens /call/<publicId> for a draft event, sees pay, dates and the form, and submits after Turnstile; the address follows withholding rules.
+  - On a multi-date event the date question is present, cannot be removed in the builder, rejects zero dates, and stores one OpenCallDateChoice row per date.
+  - An applicant's peer list shows other non-private, non-withdrawn applicants with name, photo, links and nothing else; a private applicant appears in no one's list.
+  - Edit works before the first organizer-side open and is refused after it.
+  - A vote by an organizer-side member is visible to other organizer-side members and to no applicant.
+  - Pick needs event edit rights; it writes exactly one EventHuman per chosen date (none if already on that lineup) and sends one pick notice with a working Drop out.
+  - Drop out removes the act's lineup row(s), marks the submission WITHDRAWN with droppedOutAt, and notifies the organizer side.
+  - Not this time sends the applicant a notice containing the optional note; no screen or email shows "rejected", "pass" or "decline".
+  - Close sets every PENDING application to REJECTED and notifies each once; running it twice sends nothing new.
+  - An application still PENDING when its last chosen date starts gets "not this time" without anyone pressing Close; a series call with no end date never leaves an applicant waiting past their dates.
+  - A series call accepts applications for its upcoming occurrences, and a pick for two dates writes one lineup row on each of those two events.
+  - Cancelling the event notifies every PENDING applicant that the call was pulled and leaves the call page up marked Closed.
+  - A guest status token works for its own application only and stops working 30 days after the last date the application chose.
+  - The queue sort is time applied; no option sorts by traces or votes.

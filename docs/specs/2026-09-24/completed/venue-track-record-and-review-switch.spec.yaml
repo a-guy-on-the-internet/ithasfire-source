@@ -1,0 +1,630 @@
+# venue-track-record-and-review-switch.spec.yaml
+#
+# Give an artist a way to know what they are walking into: a track-record block
+# on the place page built from things that happened (shows hosted, people
+# checked in, who has played the room), labelled by provenance beside the two
+# review tiers — and let a venue turn performer reviews off, reversing FR-007 of
+# the 2026-07-23 venue-rating spec.
+
+version: "1.1"
+updated: "2026-09-24"
+supersedes:
+  - spec: docs/specs/2026-07-23/completed/venue-rating-block-and-owner-optin.spec.yaml
+    requirements: [FR-007]
+    reason: >
+      FR-007 kept performer reviews owner-uncontrollable to protect performers
+      from retaliation. Its protection is statistical (k-gating, count bands, a
+      14-day embargo) and does not hold at house scale — six shows a year sits
+      at or below every threshold, so the performer is not anonymous and the
+      resident cannot close an anonymous inbound channel pointed at their home.
+      The rule delivered the exposure without the benefit it traded for.
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The only artist-facing signal on a venue page is the performer survey
+    (`venue_stats`): anonymous, unverified, no attendance gate, and structurally
+    corrupted by scarcity — a performer with three rooms in town gains nothing
+    by making one look bad. Meanwhile the behavioural record the platform already
+    holds is never shown: `PlaceStats` counts events and tickets but never scans,
+    is only ever recomputed for places whose performer reviews changed (a place
+    with none has never been computed), and nothing lists who has played a room.
+    Address-withholding shipped 2026-09-17 for DIY houses; those places now have
+    a hidden address and a permanent, unswitchable, anonymously-writable review
+    channel.
+  solution: >
+    A pinned `track_record` block — shows hosted, first and last show, acts that
+    have played here — computed from events, the `TicketScan` admit log and
+    public lineups, which the venue cannot edit or remove. A checked-in attendance band
+    shown only inside the request-to-play surface. Three blocks on the page,
+    each labelled by where its data came from. And `Place.communityReviewsEnabled`
+    (column already applied): off refuses new performer reviews and hides the
+    public performer surfaces; what was already written stays visible to the
+    owner. Withheld-location places default off at creation.
+  users:
+    - Artist / band deciding whether to request a show at a place
+    - Venue owner or admin (OWNER/ADMIN org role, or direct human owner)
+    - DIY house resident who withheld their address
+  surfaces:
+    - web (place page `/p/[slug]`, page-settings drawer, request-to-play block)
+    - jobs (`recalculatePlaceStatsJob` staleness + computation)
+    - api (tRPC `places.*`, `placeReviews.*`)
+
+# ── Rulings (decided 2026-09-22/24, do not relitigate) ───────────────────────
+
+rulings:
+  - id: R1
+    ruling: >
+      OFF = refuse new performer submissions AND hide every public performer
+      surface. Existing rows stay readable by the owner (respond/hide/list are
+      unaffected). The harassment vector is delivery, not publication.
+  - id: R2
+    ruling: >
+      The performer survey (`venue_stats`) REMAINS a trust signal. It is not
+      demoted below the track record; the three blocks are peers distinguished
+      by provenance labels. Accepted risk: scarcity still shapes it (see risks).
+  - id: R3
+    ruling: >
+      A place created with `locationMode != EXACT` defaults `communityReviewsEnabled`
+      to false. Everyone else defaults true. Existing rows untouched.
+  - id: R4
+    ruling: >
+      "Attendance" means people CHECKED IN (admitted at the door — the
+      `TicketScan` log, see R11), never tickets sold. Shown as a band, and only inside the request-to-play surface — a
+      placement decision, not an access control (the underlying read is public).
+      An event with zero scans is EXCLUDED from the average, not counted as zero.
+  - id: R5
+    ruling: >
+      RSVP counts stay never-public (port contract on `EventRsvpsRepo` stands).
+      A free/RSVP-only show contributes to shows-hosted and recency, not attendance.
+  - id: R6
+    ruling: >
+      `track_record` is UNDELETABLE by the owner (new `pinned` block property).
+      Reorderable, not removable. Its value is that the owner has no hand on it.
+  - id: R7
+    ruling: >
+      Lineup history is in scope: a recent list AND the all-time set of acts that
+      have played the place, each linked to the act's page, from published events
+      whose lineups are already public. The pattern disclosure ("plays here every
+      Thursday") is accepted — it is the useful part.
+  - id: R8
+    ruling: >
+      Provenance labels are fixed by this spec, not left to the UI. The stamp
+      idiom a peer already shipped (`ReviewTierStamp`: a bare noun, first thing
+      in the block) wins: `track_record` → stamp "THE DOOR", heading
+      "What's happened here"; `audience_stats` → "ATTENDEES" (as shipped);
+      `venue_stats` → "PERFORMERS" (as shipped). The sentence lives in the heading.
+  - id: R10
+    ruling: >
+      RULED 2026-09-25 (Step 6 review): a show that HAPPENED is in the track
+      record regardless of whether it was later marked COMPLETED. Every
+      track-record read (stats recompute, page loader, lineup history, stale
+      arms) admits `status IN (PUBLISHED, COMPLETED)`. `listPublishedByPlace`
+      keeps its PUBLISHED-only default for existing callers and gains an
+      explicit `statuses` option. `totalEventCount` is unchanged.
+  - id: R11
+    ruling: >
+      RULED 2026-09-25 (re-ruled the same day, FU-005): "checked in" is
+      counted from `TicketScan` admits — DISTINCT tickets with an `ACCEPTED`
+      row in the append-only scan log; REPLAY and REJECTED are not admits. A
+      later refund does not erase attendance: every refund path nulls
+      `Ticket.scannedAt`, which is why the stamp is NOT the basis. A scan
+      undone by `revertTicketScan` does not count; since the revert writes no
+      log row, it is detected from ticket state (VALID/LISTED today with no
+      transfer since the scan) — see FU-008. Staleness arm (c) watches
+      `TicketScan.scannedAt` (admits only) via `TicketScan_scannedAt_idx`.
+  - id: R12
+    ruling: >
+      RULED 2026-09-25: staleness has ONE window constant `STALE_WINDOW_DAYS`
+      used for both the activity lookback on the ticket/order arms AND a sweep
+      arm (f) that recomputes any row with `lastCalculatedAt < now − window`,
+      oldest first. With one constant the union is exact (an activity after a
+      row's stamp is either inside the window or the row is old enough to
+      sweep); the only remaining assumption is drain capacity. 30/30 if the
+      30-day activity arms stay within budget, else 7/7. After an outage the
+      sweep rows drain first at ~batchSize × runs/day; fresh activity waits
+      behind them — documented on the port, not "self-heals in one sweep".
+  - id: R9
+    ruling: >
+      DESIGN, chosen 2026-09-24 from the "From the Door" artifact (v2):
+      **Ledger** on the venue page — three figures on a rule (shows hosted +
+      "N this year"; first show + "N years running"; last show date + relative)
+      — with **Pulse's cadence line** beneath ("weekly since Apr", derived), then
+      the recent-acts line with regulars marked ×N and an "All N acts →" link.
+      **Roster** is the acts page that link opens: Regulars (≥3 shows) then
+      Recently, each tile "×N · last <date>". Stacked arrangement, door first.
+      No timeline SVG on the venue page in this build.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    # — the switch —
+    - id: FR-001
+      description: >
+        `Place.communityReviewsEnabled Boolean @default(true)` governs the
+        PERFORMER tier (`PlaceReview`) only. It never reads or affects
+        `attendeeReviewsPublic`, `AttendeeReview`, or `audience_stats`.
+        The column and migration `20260917140000_place_community_reviews_toggle`
+        are already applied to dev; no new migration for this field.
+    - id: FR-002
+      description: >
+        `submitPlaceReview` throws `PLACE_COMMUNITY_REVIEWS_DISABLED`
+        (PRECONDITION_FAILED) when the target place has the switch off, before
+        any row or session write. `createReviewSession` refuses likewise so a
+        multi-step form cannot start against a closed place.
+    - id: FR-003
+      description: >
+        When off, these serve nothing for that place: `venue_stats` block
+        (loader skipped), `placeReviews.getPublicStats` (`snapshot: null`),
+        `RequestToPlayStatsLine` (renders nothing), `getTrustedVenuesNearPlace`
+        (SQL filter `community_reviews_enabled = true`). This is the explicit
+        reversal of 2026-07-23 FR-007.
+    - id: FR-004
+      description: >
+        `respondToPlaceReview`, `hidePlaceReview`, `unhidePlaceReview`,
+        `flagPlaceReview` and any owner/staff listing keep working for existing
+        rows regardless of the switch. Turning it off is not deletion.
+    - id: FR-005
+      description: >
+        New use case `setPlaceCommunityReviewsEnabled` + `places.setCommunityReviewsEnabled`
+        (authedProcedure). Guard is the inline `ORG_ADMIN_ROLES` check copied from
+        `set-place-attendee-reviews-public.ts:90-102` — direct `humanIdsWithAccess`
+        or OWNER/ADMIN on an org in `orgIdsWithAccess`. NOT `ensurePlaceOwnerAccess`
+        (that admits EDITOR). Exposed via `getPlaceForEdit`.
+    - id: FR-006
+      description: >
+        `upsertPlace` CREATE path: `communityReviewsEnabled = locationMode === "EXACT"`
+        unless the input sets it explicitly. UPDATE path never touches it unless
+        the input carries it. A test creates an OBSCURED place and asserts false;
+        another creates EXACT and asserts true; another updates an existing place
+        without the field and asserts unchanged.
+    - id: FR-007
+      description: >
+        Toggle rendered in the page-settings drawer beside `AttendeeReviewsPublicToggle`,
+        same component pattern, copy in BOTH `apps/web/src/i18n/messages/{en,es}.ts`.
+        Off-state copy says what stays: "Reviews already written stay visible to you."
+
+    # — the track record —
+    - id: FR-008
+      description: >
+        `listStalePlaceIds` becomes stale-on-anything: a place is stale when a
+        `PlaceReview` changed, OR a PUBLISHED event at the place ended, OR a ticket
+        at the place was scanned, OR an eligible order at the place changed, since
+        `lastCalculatedAt`; and always when no `PlaceStats` row exists. A place with
+        zero performer reviews and one past event MUST be computed. Cadence stays
+        `*/15 * * * *`; the query must stay bounded (index on the timestamps it reads).
+    - id: FR-009
+      description: >
+        `recalculatePlaceStats` computes and stores on `PlaceStats`:
+        `showsHosted` — PUBLISHED PUBLIC venue-confirmed events whose `endsAt`
+        is in the past (RSVP included). RULED 2026-09-24: the whole track record
+        is on an `endsAt` basis — a show that has started but not ended has not
+        "happened", and its scans are partial. This differs from the existing
+        `totalEventCount` (which uses `startsAt <= now`) only by in-progress
+        shows; `totalEventCount` is left alone. The `[placeId, endsAt]` index
+        exists for this. `firstShowAt`, `lastShowAt` (both `endsAt`-based),
+        `scannedEventCount` (events with ≥1 scanned ticket), `checkedInTotal`,
+        `checkedInAvg` (= checkedInTotal / scannedEventCount, null when
+        scannedEventCount = 0). Scans read DISTINCT admitted tickets from the
+        `TicketScan` log via its `[eventId, scannedAt]` index (R11). `avgAttendance` (tickets-sold basis) is left
+        as-is for existing readers but is NOT surfaced by this feature.
+        DERIVED AT READ TIME, not stored (R9): `showsThisYear` (calendar year in
+        the place's timezone), `yearsRunning` (from firstShowAt, shown to a half
+        year), and `cadence` — median gap between shows over the trailing 180
+        days, bucketed `weekly` (≤10d) | `fortnightly` (≤21d) | `monthly` (≤45d)
+        | `occasional` (>45d) | null (<3 shows in window) — plus `cadenceSince`,
+        the start of the current bucket run. All from `Event.startsAt` rows the
+        loader already reads; nothing new to keep honest.
+    - id: FR-010
+      description: >
+        Attendance BAND derived at read time from `checkedInAvg`:
+        `under_25 | 25_to_100 | 100_to_300 | over_300`, null when `checkedInAvg`
+        is null. The exact number never leaves core.
+    - id: FR-011
+      description: >
+        New block kind `track_record` on `PLACE_BLOCK_KINDS`, server-injected
+        (`dataSource: "track_record"`, stored data stripped to `heading` exactly
+        like `venue_stats`), added to `PLACE_VENUE` with `sinceRevision: 4`,
+        positioned directly after `photos` and before `venue_stats`. Loader
+        `loadTrackRecordData` in `get-public-page.ts` reads `PlaceStats` columns
+        directly (NOT `publicSnapshot`, which is performer-only and weekly).
+        Public fields: `showsHosted`, `showsThisYear`, `firstShowAt`,
+        `yearsRunning`, `lastShowAt`, `cadence`, `cadenceSince`, `recentActs`
+        (≤8, newest first, each `{ name, profileUrl, timesPlayed }`),
+        `allActsCount`. The attendance band is NOT in this block.
+    - id: FR-012
+      description: >
+        Block config gains `pinned: boolean`. A pinned block cannot be removed by
+        the editor (`DraggableBlockList` hides the remove control; the
+        `updateBlocks`/`deleteBlock` core path rejects removal of a pinned kind
+        with a typed error). `track_record` is pinned; nothing else changes.
+        Template seeding re-adds a pinned kind if it is ever absent.
+    - id: FR-013
+      description: >
+        Use case `listPlaceLineupHistory({ placeId, recentLimit: number | null })`
+        → `{ recent: Act[], all: Act[], allActsCount: number }` where Act =
+        `{ key, name, profileUrl | null, timesPlayed, lastPlayedAt }` (`key` is
+        an opaque per-response-unique identity for rendering: `h:` + 12 hex of
+        SHA-256(humanId) for a linked act, `n:` + the folded stage name
+        otherwise — never a raw id). One act per `humanId`, else per
+        `lower(trim(externalName))`; a linked and an unlinked act of the same
+        name stay two. From `EventHuman` rows joined to PUBLISHED-or-COMPLETED
+        (R10) PUBLIC venue-confirmed ENDED events at the place, role PERFORMER.
+        Adapter: `EventHumansRepo.listActsByPlace({ placeId, now,
+        venueConfirmedFor, limit: number | null }) → { acts: ActAtPlaceRow[],
+        totalActs }`, grouped, ordered (`lastPlayedAt DESC, name`) and limited
+        in SQL (FU-006) — with a `recentLimit`, `all` equals `recent`; with
+        null, `all` is every act (the Roster). Only events whose lineup
+        `listPublicEventHumans` would already return. Linked acts link only to
+        a PUBLIC human page, as `list-public-event-humans.ts` does.
+    - id: FR-014
+      description: >
+        `RequestToPlayStatsLine` (and the same line in `RequestToPlayForm`)
+        adds the attendance band when non-null, phrased as a range
+        ("Usually 25–100 people checked in"), served by a new field on
+        `placeReviews.getPublicStats` output — OR a sibling `places.getTrackRecord`
+        read; implementation picks whichever avoids widening the performer
+        snapshot schema. Gated by nothing beyond being inside that surface (R4).
+    - id: FR-015
+      description: >
+        Provenance labels per R8 rendered as the block eyebrow (`<Text variant="kicker">`)
+        on all three blocks, en+es, and included in the block's accessible name.
+    - id: FR-016
+      description: >
+        Acts page (R9 "Roster"): route `/p/[slug]/acts`, noindex, public, server
+        component. Reads `listPlaceLineupHistory({ placeId, recentLimit: null })`
+        extended to return every distinct act with `timesPlayed` and
+        `lastPlayedAt`. Renders two groups — REGULARS (timesPlayed ≥ 3, by
+        timesPlayed desc then lastPlayedAt desc) and RECENTLY (the rest, by
+        lastPlayedAt desc) — as bordered tiles: name, then a mono line
+        "×N · last <date>" (or just the date when N = 1). Linked acts use the
+        same `profileUrl` as the block. Empty state: "Nobody's played here yet."
+        The venue page's "All N acts →" links here. Not a template block; not
+        owner-editable; inherits the page's theme variables.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        SECURITY — `submitPlaceReview.source` is client-supplied on a
+        `publicProcedure` (`submit-place-review.ts:125`). Before ANY surface
+        renders or weights provenance, `source` must be server-derived
+        (`PLATFORM` iff `eventId` resolves to a published event at that place
+        and the actor is on its lineup; else `SURVEY`; `IMPORTED` only from the
+        import path). This spec does not display `source`, so the fix is a
+        prerequisite for the follow-on, not a blocker here — but it is recorded
+        so it is not forgotten.
+    - id: NFR-002
+      description: >
+        The FR-003 regression test asserts the PROPERTY, not a field name:
+        `venue_stats` is absent iff `communityReviewsEnabled === false`, and
+        present when it is true regardless of the value of `attendeeReviewsPublic`
+        or any other place boolean. (The 2026-07-23 test pinned `attendeeReviewsPublic`
+        by name and stayed green while the ruling was reversed via a second flag.)
+    - id: NFR-003
+      description: >
+        Every new catch-and-fallback branch (loaders in `get-public-page.ts`,
+        lineup history, stats line) declares `reportError?: ReporterPort` and
+        calls it in the swallow, per CLAUDE.md. Regression test per swallow.
+    - id: NFR-004
+      description: >
+        No k-threshold on the track record — it is the venue's own public event
+        history, not testimony. The attendance band IS the suppression; no exact
+        count is ever serialised past core.
+    - id: NFR-005
+      description: >
+        `listStalePlaceIds` and `listActsByPlace` must be index-backed;
+        add indexes in the same migration as the new `PlaceStats` columns. No
+        full-table scan on `Ticket` or `EventHuman`.
+    - id: NFR-006
+      description: >
+        Accessibility: the track-record block reads as a definition list
+        (term/value), dates carry `<time datetime>`, and the acts list is a
+        real `<ul>` of links. 320px: no horizontal overflow, measured with
+        `clientWidth` vs `scrollWidth`, not `docW > winW`.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: set-place-community-reviews-enabled
+        description: Owner/admin flips the performer-review switch. Mirrors set-place-attendee-reviews-public.
+        input: { placeId, enabled, actorHumanId }
+        output: { placeId, communityReviewsEnabled }
+        idempotent: true
+        money: false
+      - name: submit-place-review (modified)
+        description: Refuses when the place's switch is off (FR-002).
+        idempotent: false
+        money: false
+      - name: create-review-session (modified)
+        description: Refuses when the place's switch is off (FR-002).
+        idempotent: true
+        money: false
+      - name: get-place-public-stats (modified)
+        description: snapshot null when off (FR-003); optionally carries attendance band (FR-014).
+        idempotent: true
+        money: false
+      - name: get-trusted-venues-near-place (modified)
+        description: Excludes places with the switch off (FR-003).
+        idempotent: true
+        money: false
+      - name: recalculate-place-stats (modified)
+        description: Adds showsHosted/firstShowAt/lastShowAt/scannedEventCount/checkedInTotal/checkedInAvg (FR-009).
+        idempotent: true
+        money: false
+      - name: list-place-lineup-history (new)
+        description: Recent + all-time performers at a place from public lineups (FR-013).
+        input: { placeId, recentLimit }
+        output: { recent, allTimeCount }
+        idempotent: true
+        money: false
+      - name: get-public-page (modified)
+        description: loadTrackRecordData; venue_stats loader gated on the switch (FR-003, FR-011).
+        idempotent: true
+        money: false
+      - name: upsert-place (modified)
+        description: Create-time default per R3 (FR-006).
+        idempotent: true
+        money: false
+      - name: entity-pages block config / templates (modified)
+        description: track_record kind, pinned property, PLACE_VENUE revision 4 (FR-011, FR-012).
+
+  ports:
+    new:
+      - EventHumansRepo.listActsByPlace({ placeId, now, venueConfirmedFor, limit | null }) → { acts: ActAtPlaceRow[], totalActs }
+      - TicketsRepo.countScannedByEvent(eventIds[]) → Map<eventId, count>
+    existing:
+      - PlaceReviewsRepo.listStalePlaceIds (semantics broadened, FR-008)
+      - PlaceReviewsRepo.upsertStats (new columns)
+      - PlacesRepo (read/write communityReviewsEnabled — passthrough exists)
+      - EventsRepo.listPublishedByPlace (unchanged; reused for showsHosted)
+      - ReporterPort
+
+  adapters:
+    new: []
+    existing:
+      - packages/adapters/src/db/prisma/place-reviews.ts (stale SQL, stats upsert, trusted-venues filter)
+      - packages/adapters/src/db/prisma/event-humans.ts (listActsByPlace — `$queryRaw` GROUP BY, `Prisma.sql` params only)
+      - packages/adapters/src/db/prisma/tickets.ts (countScannedByEvent)
+      - packages/adapters/src/db/prisma/places.ts (communityReviewsEnabled passthrough — exists)
+
+  transport:
+    trpc_procedures:
+      - places.setCommunityReviewsEnabled (authedProcedure)
+      - places.getTrackRecord (publicProcedure) — only if FR-014 picks the sibling read
+    webhooks: []
+
+  ui:
+    pages:
+      - apps/web/src/app/p/[slug]/acts/page.tsx (new — R9 Roster; noindex)
+    components:
+      - apps/web/src/app/p/[slug]/_components/blocks/TrackRecordBlock.tsx (new — R9 Ledger + cadence line)
+      - apps/web/src/app/p/[slug]/_components/blocks/block-registry.ts (register track_record)
+      - apps/web/src/app/p/[slug]/_components/blocks/RequestToPlayStatsLine.tsx (attendance band; nothing when off)
+      - apps/web/src/app/p/[slug]/_components/blocks/VenueStatsBlock.tsx (R8 eyebrow)
+      - apps/web/src/app/p/[slug]/_components/blocks/AudienceStatsBlock.tsx (R8 eyebrow)
+      - page-settings drawer: CommunityReviewsToggle.tsx (new, beside AttendeeReviewsPublicToggle)
+      - editor DraggableBlockList (hide remove for pinned)
+      - apps/web/src/i18n/messages/{en,es}.ts (dual catalog — both or neither)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models:
+    - model: PlaceStats
+      change: >
+        +showsHosted Int, +firstShowAt DateTime?, +lastShowAt DateTime?,
+        +scannedEventCount Int, +checkedInTotal Int, +checkedInAvg Int?
+        (additive, defaults 0/null, no backfill — FR-008 recomputes on next run)
+    - model: Place.communityReviewsEnabled
+      change: >
+        ALREADY APPLIED (20260917140000). Its header comment describes the R3
+        create-time default; now accurate again. Never edit that migration.
+  migrations_needed: true   # one additive migration for PlaceStats columns + indexes (NFR-005)
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      R2 keeps a scarcity-shaped signal on the trust surface. The provenance
+      label tells a reader what it is; it does not make it honest.
+    severity: MEDIUM
+    mitigation: >
+      Accepted by ruling. Partial mitigations: track_record sits beside it with
+      equal weight; NFR-001 closes self-certified provenance before the
+      source-split display (separate work) lands.
+  - risk: >
+      A peer session is rebuilding the attendee-review questions ("direction C",
+      09-23) and touches aggregation-policy.ts / AudienceStatsBlock.tsx.
+    severity: HIGH
+    mitigation: >
+      This spec touches AudienceStatsBlock ONLY for the R8 eyebrow. Land the
+      backend and TrackRecordBlock first; apply the eyebrow last, after
+      re-reading the file. Coordinate via ListAgents before editing.
+  - risk: >
+      Venues that never scan render "no door counts yet" forever. Houses with
+      RSVP-only shows never get a band.
+    severity: LOW
+    mitigation: >
+      Honest by design (R4/R5). Copy says so plainly. Eventual path is RSVP→QR→scan
+      at free shows, not a weaker substitute number.
+  - risk: >
+      FR-008 broadens the stale query to four tables; a naive OR across joins
+      is a scan on every run.
+    severity: MEDIUM
+    mitigation: >
+      NFR-005 indexes; UNION of four narrow SELECT DISTINCT placeId queries,
+      each bounded by its own timestamp index; measure on the 508-place dev DB
+      and assert < 100ms in an adapter integration test.
+  - risk: >
+      Pinned blocks are a new editor concept; an owner who hides a bad record
+      by moving it to the bottom still "hides" it.
+    severity: LOW
+    mitigation: >
+      Accepted (R6 allows reorder). Not fighting placement.
+  - risk: >
+      Lineup history reveals residence patterns for acts at hidden-address
+      houses (R7 accepted).
+    severity: LOW
+    mitigation: >
+      Only from lineups already public per event; documented as an aggregation
+      disclosure in the help-center article.
+
+open_questions: []   # frontier emptied 2026-09-24; rulings R1–R8 above
+
+# ── Follow-ups surfaced during the build (not blockers) ──────────────────────
+
+follow_ups:
+  - id: FU-001
+    description: >
+      No PUBLIC read exposes `Place.timezone`, so the acts page and the
+      track-record block format dates in `DEFAULT_VENUE_TIMEZONE`
+      (America/Chicago) — right for the home market, a day off for a late
+      show elsewhere. Minimal fix: add `timezone` to `listPlaceLineupHistory`'s
+      output (or the PLACE entity summary) and pass it through.
+  - id: FU-002
+    description: >
+      `humanProfilesPublic` is a hardcoded `false` in `feature-gates.ts:31`, so
+      every act link would 404. The block and the acts page render names as
+      text while it is off. Flipping the gate is a product decision.
+  - id: FU-003
+    description: >
+      `listStalePlaceIds` arms (c)/(d) use a 7-day activity lookback for
+      performance (measured 5 ms vs 70–118 ms per-place); a jobs outage longer
+      than 7 days would strand scans/orders for places that already have a
+      stats row. Proposed arm (f): recompute any row older than 30 days,
+      oldest first — under review.
+  - id: FU-005
+    status: DONE
+    resolution: >
+      DONE 2026-09-25. `countScannedByEvent` reads `TicketScan` (ACCEPTED,
+      distinct ticketId, reverted admits excluded); stale arm (c) reads
+      `TicketScan.scannedAt` via the new `TicketScan_scannedAt_idx`
+      (migration 20260925130000). The two `Ticket` indexes built for the old
+      basis (`Ticket_eventId_scannedAt_idx`, `Ticket_scannedAt_idx`) had no
+      reader left and are dropped (20260925140000 / 20260925140001). The dev
+      track-record fixture and the POS cash / card seeds write the ACCEPTED
+      row each admit produces. R11 updated.
+    description: >
+      Count attendance from `TicketScan` (append-only, admit outcomes only,
+      distinct ticketId) instead of `Ticket.scannedAt`, so a post-door refund
+      does not erase the fact that a person walked in. Owner's call (R11).
+      Viability checked 2026-09-25: `TicketScan` carries `ticketId`,
+      `scannedAt`, `outcome: TicketScanOutcome` and is indexed
+      `[eventId, scannedAt]` — the swap is one adapter method and a filter on
+      admit outcomes; no schema change.
+  - id: FU-006
+    status: DONE
+    resolution: >
+      DONE 2026-09-25. `listPerformersByPlace` replaced by `listActsByPlace`:
+      GROUP BY `(humanId, lower(btrim(externalName)))`, COUNT(DISTINCT
+      eventId), LIMIT in SQL, total via `COUNT(*) OVER ()`; the venue page
+      reads 8 acts + the count, the Roster (`recentLimit: null`) reads all.
+      Integration-tested in `event-humans-acts-by-place.test.ts`.
+    description: >
+      `listPerformersByPlace` is unbounded on a public page read (needs the
+      full set for `allActsCount`). Fine at current history sizes; move to a
+      SQL GROUP BY on the act key or cache when it matters.
+  - id: FU-007
+    description: >
+      FR-015 accessible names: `BlockSection` gains an optional `aria-label`
+      and `track_record` sets it in this build. `venue_stats` and
+      `audience_stats` (a peer's in-flight files) still have no accessible
+      name — set them in one pass when that work lands.
+  - id: FU-008
+    description: >
+      `revertTicketScan` writes nothing to the `TicketScan` log, so the
+      attendance count infers a revert from ticket state (VALID/LISTED today,
+      no `TicketTransfer` after the admit). It over-counts a reverted admit
+      whose ticket is later refunded, invalidated or transferred without a
+      re-scan. Exact fix: the revert appends a log row with a new
+      `TicketScanOutcome` value (e.g. REVERTED) and the count excludes an
+      admit followed by one — touches the enum, the scanner's outcome
+      formatting, the web scan tally, and dispute evidence (which today shows
+      a reverted admit as an admit).
+  - id: FU-009
+    description: >
+      Public venue-page reads are not cached: the server tRPC link uses
+      `headers()` + `cache: "no-store"`, so `revalidate = 60` on `/p/[slug]`
+      and `/p/[slug]/acts` is inert and the track-record loader (place row,
+      stats row, up to 10 event pages, lineup) runs on every view. Fine at
+      current scale; cache the payload per place (stored columns change at
+      most every 15 minutes) when traffic warrants.
+  - id: FU-004
+    status: DONE
+    resolution: >
+      DONE 2026-09-25. Fixed on the read: `getPublicPage` synthesizes a
+      `track_record` (id `synthetic:track_record:<pageId>`, after `photos`,
+      else before `venue_stats`, else last) on any venue-category PLACE page
+      without a visible main one; a stored block always wins. Unclaimed
+      venues now show it without an editor load.
+    description: >
+      Fixture pages seeded before template revision 4 gain `track_record` only
+      on the owner's next editor load (the seeder runs in `getMyPage`). Public
+      pages created after rev 4 get it at creation.
+
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - >
+    Splitting PlaceReview by `source` in the public snapshot (the real remaining
+    "don't blend"); belongs with the attendee-review rebuild in flight.
+  - >
+    Displaying `source` anywhere (blocked on NFR-001).
+  - >
+    RSVP counts, public or banded (R5).
+  - >
+    Vouching / follow-graph ("bands you follow played here").
+  - >
+    Safety/harassment reasons in `entity-reports` (needs a moderation policy first).
+  - >
+    Host-side protection: seeing who is coming, barring a buyer.
+  - >
+    Free-text leak scanning of bios/house rules for street names.
+  - >
+    Any change to `attendeeReviewsPublic` semantics or default.
+  - >
+    `avgAttendance` (tickets-sold) removal — left for existing readers.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - >
+    A place with the switch off: `placeReviews.submit` → PLACE_COMMUNITY_REVIEWS_DISABLED; `createSession` likewise; no PlaceReview or session row written.
+  - >
+    Same place: `getPublicStats.snapshot === null`; `venue_stats` absent from `getPublicPage`; `RequestToPlayStatsLine` renders nothing; place absent from `getTrustedVenuesNearPlace`.
+  - >
+    Same place: owner can still `respond`, `hide`, `unhide` an existing review.
+  - >
+    Property test (NFR-002): `venue_stats` present iff switch on, across all four combinations with `attendeeReviewsPublic`.
+  - >
+    `audience_stats` and `AttendeeReview` submission are byte-identical in behaviour before and after, switch on or off.
+  - >
+    A SCANNER/EDITOR/VIEWER org member calling `setCommunityReviewsEnabled` → NOT_RESOURCE_OWNER; OWNER/ADMIN and direct human owner succeed.
+  - >
+    `upsertPlace` create with `locationMode: "OBSCURED"` → `communityReviewsEnabled: false`; with `EXACT` → true; update without the field → unchanged.
+  - >
+    A place with ZERO performer reviews and one past published event appears in `listStalePlaceIds` and gets a `PlaceStats` row with `showsHosted: 1`.
+  - >
+    Three past events, scans 20/30/0 → `scannedEventCount: 2`, `checkedInTotal: 50`, `checkedInAvg: 25`, band `25_to_100`. Zero scans anywhere → `checkedInAvg: null`, band null, block copy "No door counts yet".
+  - >
+    Public `getPublicPage` payload for `track_record` contains no field named like attendance/checkedIn/avg; the band appears only on the request-to-play read.
+  - >
+    Lineup history: an act on two public lineups at the place → `timesPlayed: 2`, one entry; an act on a DRAFT or PRIVATE event → absent; unlinked `externalName` acts appear with `profileUrl: null`.
+  - >
+    Editor: `track_record` shows no remove control; `deleteBlock` on it → typed error; reorder works; a page seeded at revision 3 gains `track_record` on next editor load without a migration.
+  - >
+    All three blocks render their R8 stamp in en and es; each block's accessible name includes it.
+  - >
+    Cadence: shows on 2026-09-01/08/15/22 (and none earlier in the 180-day window beyond ≥3) → `cadence: "weekly"`; gaps of ~30d → `monthly`; two shows in window → null. `showsThisYear` counts only the place-timezone calendar year. `yearsRunning` from 2024-03 at 2026-09 → 2.5.
+  - >
+    Acts page: an act with timesPlayed 3 lands in REGULARS; timesPlayed 2 lands in RECENTLY; ordering as FR-016; empty place renders the empty state; route is noindex; 320px no overflow.
+  - >
+    320px: no horizontal overflow on `/p/[slug]` with all three blocks populated; zero new console errors.
+  - >
+    `pnpm typecheck` + `apps/api`, `apps/jobs`, `apps/web` `tsc -p tsconfig.json --noEmit` clean; core/adapters/web suites green; `prisma validate --schema=packages/db/prisma/` valid.

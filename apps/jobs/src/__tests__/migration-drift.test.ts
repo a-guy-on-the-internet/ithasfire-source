@@ -90,12 +90,23 @@ function makeFakePrisma(
   };
 }
 
+/**
+ * A registry HANDLE (what `getJob` returns): eager metadata plus a `load()`
+ * that imports the handler module. `load` is spied separately from `handler`
+ * because the drift short-circuit must stop the run BEFORE the module is even
+ * imported — asserting only on `handler` would still pass if the service had
+ * paid to load it.
+ */
 function makeJob() {
+  const input = { parse: vi.fn((value: unknown) => value ?? {}) };
+  const handler = vi.fn(async () => ({ ok: true }));
+
   return {
     name: "demo.job",
     notify: true,
-    input: { parse: vi.fn((input: unknown) => input ?? {}) },
-    handler: vi.fn(async () => ({ ok: true })),
+    input,
+    handler,
+    load: vi.fn(async () => ({ name: "demo.job", input, handler })),
   };
 }
 
@@ -234,6 +245,9 @@ describe("jobs POST /jobs/:name short-circuit", () => {
 
     // The whole point: the handler never touches the stale schema.
     expect(job.handler).not.toHaveBeenCalled();
+    // Stronger than the handler check: a blocked run must not even pay
+    // to IMPORT the handler's module.
+    expect(job.load).not.toHaveBeenCalled();
     // A blocked run is not a run — no RunEntry, no DLQ entry, no lifecycle
     // alerts (the job is notify:true, so an alert would have fired).
     expect(tracker.record).not.toHaveBeenCalled();
@@ -261,6 +275,9 @@ describe("jobs POST /jobs/:name short-circuit", () => {
 
     expect(response.statusCode).toBe(503);
     expect(job.handler).not.toHaveBeenCalled();
+    // Stronger than the handler check: a blocked run must not even pay
+    // to IMPORT the handler's module.
+    expect(job.load).not.toHaveBeenCalled();
     await app.close();
   });
 
@@ -332,6 +349,9 @@ describe("jobs POST /jobs/:name short-circuit", () => {
       expect(body.error).toBe("migration_drift");
       expect(body.message).toContain("pnpm db:migrate:deploy");
       expect(job.handler).not.toHaveBeenCalled();
+      // Stronger than the handler check: a blocked run must not even pay
+      // to IMPORT the handler's module.
+      expect(job.load).not.toHaveBeenCalled();
     } finally {
       await app.close();
     }
@@ -422,6 +442,9 @@ describe("jobs recovers when migrations land after boot (prod deploy #583)", () 
       });
       expect(blocked.statusCode).toBe(503);
       expect(job.handler).not.toHaveBeenCalled();
+      // Stronger than the handler check: a blocked run must not even pay
+      // to IMPORT the handler's module.
+      expect(job.load).not.toHaveBeenCalled();
 
       // migrate_db completes.
       applied.push({ migration_name: "20260102120000_late" });

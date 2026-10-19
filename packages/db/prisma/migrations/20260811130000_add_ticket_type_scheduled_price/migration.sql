@@ -1,0 +1,32 @@
+-- Time-based ticket pricing, Phase 1a (docs/specs/2026-08-10/
+-- time-based-ticket-pricing.spec.yaml, FR-005): a two-step scheduled price
+-- change on a single TicketType row, sharing ONE capacity pool.
+--
+--   scheduledPriceCents — the post-flip price in cents. NULL = unscheduled.
+--                         0 is a LEGITIMATE value ("free after T") and is not
+--                         interchangeable with NULL.
+--   scheduledPriceAt    — the absolute UTC instant the flip takes effect.
+--                         NULL = unscheduled. Strictly before this instant the
+--                         effective online price is priceCents; at or after it,
+--                         scheduledPriceCents.
+--
+-- Both columns are set together or not at all. That invariant is enforced at
+-- the WRITE BOUNDARY in core (upsertTicketType / updateTicketType reject a
+-- half-configuration with TICKET_TYPE_SCHEDULE_INCOMPLETE) rather than by a
+-- CHECK constraint, matching how every other cross-column money invariant in
+-- this schema is enforced — a CHECK would surface as an opaque 23514 through
+-- Prisma with no error code the UI can translate. The resolver
+-- (packages/core/src/lib/orders/door-pricing.ts) is defensive regardless: it
+-- treats a half-configured row as unscheduled and charges priceCents.
+--
+-- scheduledPriceAt is TIMESTAMP(3) to match every other DateTime in this
+-- schema. The admin UI resolves the organizer's wall-clock choice against
+-- Event.timezone with luxon before it ever reaches this column; PAYOUT_TZ /
+-- REFUND_TZ (America/Chicago) must NOT be used for that resolution.
+--
+-- Additive only, no backfill: every existing row gets NULL / NULL, which is
+-- exactly today's behaviour by construction (NFR-001). Instant on this table
+-- (ADD COLUMN with a NULL default does not rewrite on PG 11+). Reversible by
+-- dropping both columns; no index or constraint is touched.
+ALTER TABLE "TicketType" ADD COLUMN "scheduledPriceCents" INTEGER,
+ADD COLUMN "scheduledPriceAt" TIMESTAMP(3);

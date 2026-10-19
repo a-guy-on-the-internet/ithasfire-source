@@ -1,0 +1,314 @@
+# community-listing-change-notifications.spec.yaml
+#
+# Wikipedia-watchlist-style change notifications for COMMUNITY event listings:
+# when a moderator-approved edit changes a MATERIAL field (date/time, venue,
+# cancellation), notify the users watching that listing (saved ∪ RSVP'd).
+#
+# DEPENDS ON (hard, build-order):
+#   1. docs/specs/2026-07-01/completed/community-managed-event-listings.spec.yaml
+#      — COMMUNITY listings, EventEditSuggestion review flow, FR-013 material
+#        tagging + material:true marker on the applied AuditLog row.
+#   2. docs/specs/2026-07-01/saved-events-watchlist.spec.yaml — the EventSave
+#      model + repos/event-saves port (incl. listHumanIdsForEvent). The
+#      audience here = savers ∪ RSVPers. If this ships before EventSave is
+#      BUILT, v1 audience degrades gracefully to RSVPers only.
+
+version: "1.0"
+updated: "2026-07-01"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Community listings are crowd-maintained: a moderator-approved edit can move
+    an event's date or venue, or cancel it, after people have saved or RSVP'd.
+    Today nothing tells them — they show up at the old venue. Wikipedia solves
+    this with watchlists: opt-in, audience-scoped notifications to self-selected
+    watchers only (never "prior contributors"), pull-based feed first, optional
+    email second. Mirror that philosophy.
+  solution: >
+    Consume the material:true marker that the community-listings review flow
+    (FR-013 there) already stamps when applying an approved suggestion — do NOT
+    re-derive materiality here. In the SAME transaction that applies a material
+    diff, write a ListingChangeNotice outbox row (mirrors the
+    pending_object_deletions outbox pattern). A scheduled jobs-service task
+    drains the outbox on a debounce window, coalesces bursts per event, resolves
+    the watcher set (EventSave ∪ EventRsvp), and fans out through the existing
+    notify() use-case: in-app Notification row (the pull-based watchlist state)
+    plus email per NotificationPreference. Dedup rides the existing
+    NotificationDigestLog (digestType+channel+payloadHash unique constraint).
+    Non-material edits (typo in description) produce no notice and notify no one.
+  users:
+    - Attendee who saved or RSVP'd a community listing (the watcher)
+    - Community moderator (indirect — approving an edit triggers the flow, no new UI)
+  surfaces:
+    - api
+    - jobs # scheduled outbox drain + fan-out
+    - web # in-app notification feed entries + email template (reuses existing feed UI)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Material field set (confirms the open question in community-listings
+        FR-013): startsAt, endsAt, addressText + geo (countryCode, region,
+        locality, postalCode, lat, lng), plus a status transition to CANCELLED
+        (future — community listings have no cancel flow yet; this spec defines
+        the notice kind so the hook exists). Non-material: title, body,
+        timezone, categoryId, heroImageId, ageLimit. Timezone stays non-material
+        because startsAt/endsAt are stored as UTC instants — a timezone edit
+        changes display only, not when the event happens.
+    - id: FR-002
+      description: >
+        Trigger: review-event-edit-suggestion APPROVE applies a diff containing
+        ≥1 material field (the same computed materiality that stamps
+        material:true on the community_edit.applied AuditLog row). In that SAME
+        repos.tx, insert one ListingChangeNotice row: eventId, kind
+        DETAILS_CHANGED, changedFields Json ({ field: { before, after } } for
+        the MATERIAL fields only), status PENDING. The notice denormalizes the
+        diff rather than FK-ing AuditLog (AuditRepo.log() returns void — no id
+        to reference; keep the port unchanged). Materiality is computed ONCE in
+        the review use-case and drives both the audit marker and the notice.
+    - id: FR-003
+      description: >
+        Non-material-only approvals write NO notice and notify no one. An
+        approval whose material fields were all conflict-skipped (community
+        FR-009) also writes no notice — only fields actually APPLIED count.
+    - id: FR-004
+      description: >
+        Audience = watchers who could see the listing: humanIds from EventSave
+        (watchlist spec) ∪ EventRsvp for the event, deduplicated. Both repos
+        gain a listHumanIdsForEvent(eventId) method. Fan-out is skipped entirely
+        if at dispatch time the event is not stewardship COMMUNITY or fails the
+        STATUS-based visibility definition the watchlist spec resolved
+        2026-07-01 (PUBLISHED/CANCELLED visible; PRIVATE = unlisted-by-link and
+        does NOT suppress — watchers by definition had the link; matches
+        get-public-event-body's status-only gate). OWNED/ticketed events never
+        reach this path.
+    - id: FR-005
+      description: >
+        Delivery is drained by a scheduled jobs-service task
+        (community.dispatch-change-notifications, cron */5) — plain HTTP-invoked
+        Cloud Scheduler job, no long-lived connections, scale-to-zero preserved.
+        Mirrors volunteers.reminders-* (defineScheduledTask + jobs.manifest.json).
+    - id: FR-006
+      description: >
+        Debounce + coalescing: the drain only picks up events whose newest
+        PENDING DETAILS_CHANGED notice is older than 15 minutes, then coalesces
+        ALL of that event's PENDING notices into ONE notification per watcher
+        (merged field set, latest after-values win). A burst of approved edits
+        = one message. CANCELLED notices skip the debounce (dispatched on the
+        next tick, ≤5 min).
+    - id: FR-007
+      description: >
+        In-app (v1 core): one Notification row per watcher via the existing
+        notify() use-case — title "A saved event changed", body summarizing the
+        changed fields (old → new date/venue, or "cancelled"), actionRoute to
+        the event detail page. This IS the pull-based watchlist state; no new
+        feed infrastructure.
+    - id: FR-008
+      description: >
+        Email (v1, preference-gated): sent through notify()'s email channel
+        under a NEW NotificationPreferenceCategory "savedEventUpdates" —
+        default ON, respecting channel deltas and EVENT-scoped mutes (a user
+        can mute one listing without leaving its watchlist). Suppressed for
+        AuthUser.emailDeliveryStatus BOUNCED/COMPLAINED. Mobile push is a
+        follow-on (out of scope), but the category name is channel-agnostic so
+        push can slot in later without a prefs migration.
+    - id: FR-009
+      description: >
+        Dedup/idempotency: per-recipient sends record a NotificationDigestLog
+        row (new digestType LISTING_CHANGE) with payloadHash =
+        sha256({ humanId, eventId, noticeIds }); the existing unique
+        (digestType, channel, payloadHash) constraint makes overlapping cron
+        ticks and job retries no-ops. Notices flip PENDING → DISPATCHED only
+        after fan-out completes; per-recipient failures are logged and skipped
+        (announcements.dispatch-notifications pattern), never failing the job.
+    - id: FR-010
+      description: >
+        Watchers are notified about the CHANGE, not the suggestion pipeline:
+        no notification on submit, reject, or conflict-skip. Submitters and
+        moderators get nothing (Wikipedia philosophy: watchers self-select;
+        contributors are not an audience).
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Scale-to-zero preserved: trigger is a transactional outbox write inside
+        an existing API request; delivery is a stateless cron-invoked HTTP job.
+        No queues consumed by long-lived workers, no websockets.
+    - id: NFR-002
+      description: >
+        Notice write must not widen the review transaction's failure surface:
+        a single INSERT in the existing repos.tx (community NFR-002). If the tx
+        rolls back, no notice exists — outbox and edit are atomic.
+    - id: NFR-003
+      description: >
+        Fan-out is bounded per tick (e.g. 500 recipients/event page-size,
+        remainder next tick) so one viral listing can't blow the Cloud Run
+        request timeout. Watcher counts for community listings are expected to
+        be small (tens–hundreds).
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: review-event-edit-suggestion (MODIFY — community-listings spec)
+        description: >
+          Extend the APPROVE path: after computing appliedFields and the
+          material flag (already required by FR-013 there), when material
+          fields applied, insert the ListingChangeNotice in the same tx.
+        input: (unchanged)
+        output: (unchanged)
+        idempotent: true # claim guard, unchanged
+        money: false
+      - name: dispatch-listing-change-notifications
+        description: >
+          Drain the outbox: select events with dispatchable PENDING notices
+          (debounce per FR-006), coalesce per event, guard visibility (FR-004),
+          resolve watcher set, per watcher call notify() (in-app + email per
+          prefs) and record the LISTING_CHANGE digest log, then mark notices
+          DISPATCHED. Returns counters { events, notices, recipients, sent,
+          skipped, failed }. Mirrors send-volunteer-shift-reminders +
+          send-attendee-feedback-digests.
+        input: windowNowIso? (clock override for tests)
+        output: counters
+        idempotent: true # digest-log unique constraint + notice status
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - repos/listing-change-notices (NEW METHODS on a NEW repo — create,
+        listDispatchable, markDispatched; grouped here because the model is new
+        but tiny)
+      - repos/event-saves (watchlist spec) — ADD listHumanIdsForEvent(eventId)
+      - repos/event-rsvps (community spec) — ADD listHumanIdsForEvent(eventId)
+      - repos/notification-digests — extend NotificationDigestType with LISTING_CHANGE
+      - repos/notifications — reuse (in-app rows via notify())
+      - repos/notification-preferences — add "savedEventUpdates" category to the union
+      - comms/mailer (MailerPort, Resend) — reuse
+      - ports/clock — reuse
+
+  adapters:
+    new:
+      - db/prisma/listing-change-notices.ts
+    existing:
+      - db/prisma/notification-digests.ts (enum value)
+      - db/prisma/event-rsvps.ts + event-saves adapter (new list method each)
+      - comms/mail (new email template in @th/ui-email — "saved event changed")
+
+  transport:
+    trpc_procedures: [] # feed + prefs procedures already exist; nothing new
+    webhooks: []
+
+  ui:
+    pages: []
+    components:
+      - Existing notification feed renders the new entries (actionRoute → event page)
+      - Notification-prefs UI gains the "Saved event updates" category toggle
+      - Email template: changed-fields summary (old → new), cancelled variant
+
+  jobs:
+    - name: community.dispatch-change-notifications
+      schedule: "*/5 * * * *" # UTC; add to apps/jobs/jobs.manifest.json + community.ts job file
+      handler: dispatch-listing-change-notifications
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - name: ListingChangeNotice
+      fields: >
+        id, eventId (FK Event), kind (DETAILS_CHANGED | CANCELLED),
+        changedFields Json ({ field: { before, after } }, material fields only),
+        status (PENDING | DISPATCHED, default PENDING), createdAt,
+        dispatchedAt DateTime?.
+        Indexes: [status, createdAt], [eventId, status].
+  modified_models:
+    - name: enums / type unions
+      change: >
+        + enum ListingChangeNoticeKind { DETAILS_CHANGED CANCELLED }
+        + enum ListingChangeNoticeStatus { PENDING DISPATCHED }
+        + NotificationDigestType gains LISTING_CHANGE
+        + NotificationPreferenceCategory union gains "savedEventUpdates"
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Hard dependency #2 (EventSave, saved-events-watchlist.spec.yaml) is
+      specced but not built. Implementing this first means an RSVP-only
+      audience and misleading "saved event changed" copy.
+    severity: MEDIUM
+    mitigation: >
+      Build order: EventSave before FR-004 here; the union is a two-line
+      change once it lands. If sequencing forces it, ship with RSVP-only
+      audience + "an event you're going to changed" copy behind the same
+      fan-out, and add savers later.
+  - risk: >
+      Re-deriving materiality here drifts from the FR-013 tagging in the
+      community spec (two lists of "material fields" that disagree).
+    severity: MEDIUM
+    mitigation: >
+      One shared constant (the FR-013 field→material map) lives with the
+      community-edit whitelist; the review use-case computes materiality once
+      and both stamps the audit marker and writes the notice from that single
+      computation. This spec consumes, never recomputes.
+  - risk: >
+      Debounce coalescing shows a merged before/after that never existed as a
+      single edit (edit A moved the date, edit B moved it back — net no-op).
+    severity: LOW
+    mitigation: >
+      Coalesce by comparing earliest-before vs latest-after per field; drop
+      fields whose net change is identity, and skip the notification entirely
+      if all fields net out.
+  - risk: >
+      Notification volume: a moderator bulk-fixing listings triggers many
+      events' worth of fan-out in one tick.
+    severity: LOW
+    mitigation: >
+      Per-tick recipient page-size (NFR-003); remainder handled next tick.
+      Digest log makes re-entry safe.
+
+open_questions:
+  # (resolved 2026-07-01: OWNED+RSVP has no v1 surface — community spec FR-003
+  # makes RSVP reachable only via COMMUNITY creation — so the stewardship guard
+  # in FR-004 excludes nothing that exists. Owned-event comms stay with
+  # organizer announcements regardless.)
+  - Email frequency tiers (INSTANT vs DAILY_DIGEST) exist in
+    NotificationEmailFrequency — v1 sends instant-on-drain only; honor digest
+    tiers later?
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Talk pages / discussion threads on listings.
+  - Edit-reversion ("undo") notifications or notifying submitters/moderators
+    about suggestion lifecycle (submit/reject/conflict).
+  - Notifications for OWNED / ticketed events — organizer announcements and
+    the location-reveal spec (2026-06-23) cover those; this path is guarded to
+    stewardship=COMMUNITY.
+  - Mobile push + SMS channels (follow-on; category is channel-agnostic).
+  - Non-material change digests ("this listing had 3 minor edits this week").
+  - Building the CANCELLED transition itself for community listings (only the
+    notice kind + dispatch handling are defined here).
+  - The EventSave / watchlist model itself — separate spec (dependency #2).
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - Approving a suggestion that changes ONLY non-material fields (e.g. body typo) writes no ListingChangeNotice and produces zero notifications.
+  - Approving a suggestion that changes startsAt writes exactly one PENDING notice in the same transaction as the applied edit and the material:true audit row; rolling back the tx leaves no notice.
+  - A material field that was conflict-skipped (stale base) does not appear in the notice; if all material fields were skipped, no notice is written.
+  - After the debounce window, every watcher (saver ∪ RSVPer, deduplicated) receives exactly one in-app Notification linking to the event, and one email iff their effective savedEventUpdates × email preference allows it.
+  - Three approvals against the same event within the debounce window produce ONE notification per watcher with the merged field set; a net-identity change (A→B→A) produces none.
+  - Running the drain job twice over the same notices sends nothing the second time (digest-log unique constraint) and reports skips, not failures.
+  - A watcher whose email previously BOUNCED gets the in-app notification but no email.
+  - An event that became non-PUBLISHED/non-PUBLIC between approval and drain dispatches nothing; OWNED events never produce notices.
+  - One recipient's send failure does not fail the job or block other recipients; counters report it.
+  - The jobs manifest gains community.dispatch-change-notifications on */5 cron; the job runs as a plain scheduler-invoked HTTP request (no long-lived worker).

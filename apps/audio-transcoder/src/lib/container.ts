@@ -16,6 +16,7 @@ import { createPinoLoggerAdapter } from "@th/adapters/infra/logger";
 import { createSystemClock } from "@th/adapters/infra/clock";
 import { PrismaIdempotencyAdapter } from "@th/adapters/idempotency/prisma-adapter";
 import { RedisIdempotency } from "@th/adapters/idempotency/redis-adapter";
+import { resolveRedisConnection } from "@th/adapters/redis/connection-config";
 import { S3FileStorageAdapter } from "@th/adapters/file-storage/s3";
 import { FfmpegTranscoder } from "@th/adapters/transcoder/ffmpeg";
 
@@ -74,6 +75,35 @@ export interface TranscoderContainer {
   close: () => Promise<void>;
 }
 
+/**
+ * Build the transcoder's Redis client through the SAME resolver as `apps/api`
+ * and `apps/jobs`, so it inherits the production loopback guard, the bounded
+ * retries, and — the reason this exists — the `REDIS_NAMESPACE` key prefix.
+ *
+ * This service currently lands on the Postgres/Noop idempotency branch in every
+ * deployed environment (`REDIS_URL` is not in `audio_transcoder_secrets`), so
+ * these constructors are inert today. They were raw `new Redis(env.REDIS_URL)`
+ * until 2026-09-14, which meant the day anyone DID wire `REDIS_URL` here, its
+ * `idem:audio-transcoder:*` keys would have landed outside `ithasfire:<env>` —
+ * dev and prod silently sharing a keyspace again, and skipping the loopback
+ * guard entirely. Routed through the resolver now so that day is uneventful.
+ */
+function createNamespacedRedis(url: string, logger: LoggerPort): Redis {
+  const connection = resolveRedisConnection({
+    url,
+    namespace: env.REDIS_NAMESPACE,
+    nodeEnv: process.env.NODE_ENV,
+  });
+  const client = new Redis(connection.url, {
+    ...(connection.keyPrefix ? { keyPrefix: connection.keyPrefix } : {}),
+    commandTimeout: connection.commandTimeout,
+    maxRetriesPerRequest: connection.maxRetriesPerRequest,
+  });
+  client.on("error", (err) => logger.error("redis_error", { err }));
+  return client;
+}
+
+
 export async function buildContainer(): Promise<TranscoderContainer> {
   // Database
   const pool = new pg.Pool({
@@ -117,12 +147,10 @@ export async function buildContainer(): Promise<TranscoderContainer> {
     if (!env.REDIS_URL) {
       throw new Error("REDIS_URL is required when IDEMPOTENCY_BACKEND=redis");
     }
-    redis = new Redis(env.REDIS_URL);
-    redis.on("error", (err) => logger.error("redis_error", { err }));
+    redis = createNamespacedRedis(env.REDIS_URL, logger);
     idempotency = new RedisIdempotency(redis, "audio-transcoder", logger);
   } else if (env.REDIS_URL) {
-    redis = new Redis(env.REDIS_URL);
-    redis.on("error", (err) => logger.error("redis_error", { err }));
+    redis = createNamespacedRedis(env.REDIS_URL, logger);
     idempotency = new RedisIdempotency(redis, "audio-transcoder", logger);
   } else {
     // Use noop - we rely on S3 path overwriting for idempotency

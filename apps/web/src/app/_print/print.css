@@ -1,0 +1,194 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   THE PRINT LAYER — shared stylesheet for every printable document
+   ═══════════════════════════════════════════════════════════════════════════
+
+   Ithas Fire has no server-side PDF generation, deliberately: no pdfkit, no
+   puppeteer, no font embedding, no Cloud Run memory bump. A printable document
+   is an ordinary route styled for `@media print`, and the browser's own
+   Print → Save as PDF produces the file.
+
+   ── EVERY RULE IN THIS FILE IS CLASS-SCOPED. That is not style, it is a
+      CORRECTNESS REQUIREMENT. ─────────────────────────────────────────────
+
+   Next.js does NOT unload a route's stylesheet on client-side navigation — its
+   own docs say so outright (`node_modules/next/dist/docs/01-app/
+   01-getting-started/11-css.md`: "since Next.js uses React's built-in support
+   for stylesheets to integrate with Suspense, this currently does not remove
+   stylesheets as you navigate between routes which can lead to conflicts").
+   And with the default `experimental.cssChunking` (merging enabled), a
+   stylesheet imported next to another one can be pulled in wherever that other
+   one is.
+
+   So anything here that targets `@page`, `html`, `body`, or a bare element
+   selector would follow the user off the print route — print the sheet, click
+   "Back to order", hit ⌘P, and the ORDER page would silently inherit
+   `@page { margin: 12mm }`. Those document-lifetime rules therefore live in
+   `PaperSheet` as an un-hoisted <style> element, which React removes on
+   unmount. `.th-paper*` rules can safely live here: they are inert on any page
+   that does not render the wrapper.
+
+   The ticket sheet (`/my-tickets/[orderId]/print`) is the first consumer;
+   the hours statement and the volunteer badge are meant to be the next two.
+
+   ── Two more things that are load-bearing ─────────────────────────────────
+
+   1. NO COLOUR LITERALS. Every value comes from `--print-*` custom properties
+      that `PaperSheet` writes onto `.th-paper` from the canonical Stub theme
+      snapshot (`getStubThemeSnapshot()`). That is what keeps the document a
+      FIXED LIGHT artefact — the app resolves its theme server-side and stamps
+      a full token snapshot as inline `<body>` vars, so a signed-in user on the
+      dark (Ember) account preference would otherwise inherit navy ink. A
+      printed dark-mode QR is an unscannable QR. Redeclaring the palette on a
+      wrapper element beats fighting inline body vars from page-level CSS, and
+      unlike a body CLASS it cannot be clobbered by Tamagui's className write.
+
+   2. `print-color-adjust: exact` on every FILLED element. Chrome's print
+      dialog ships with "Background graphics" OFF, which drops backgrounds
+      and box-shadows. Borders, text and <img> content always print; fills do
+      not. Anything whose meaning depends on a fill says `exact`.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── The paper ───────────────────────────────────────────────────────────────
+   `.th-paper` is the reusable wrapper. It carries the `--print-*` palette
+   (written inline by `PaperSheet`) and renders as a document, not an app page.
+
+   `color-scheme: light` here governs UA-rendered widgets inside this subtree
+   only — the page CANVAS derives from the ROOT, which the root layout stamps
+   `color-scheme: dark` on for a dark-mode user. The matching root override is
+   an `!important` print rule in `PaperSheet`'s <style>: author `!important`
+   beats an inline non-important declaration, so it needs no DOM mutation and
+   dies with the route. (The embed layer forces light by MUTATING
+   `documentElement.style.colorScheme` in a pre-paint script — correct for a
+   terminal iframe, wrong here, since a print route is reachable by client-side
+   navigation from the order page and back and the mutation would outlive it.) */
+.th-paper {
+  color-scheme: light;
+  color: var(--print-ink);
+  background-color: var(--print-paper);
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+  font-family: var(--font-body);
+  font-variant-numeric: tabular-nums;
+  /* Paper is a fixed-width artefact; it must not stretch to a 27" monitor. */
+  width: 100%;
+  max-width: 210mm;
+  margin: 0 auto;
+  padding: 12mm;
+  box-sizing: border-box;
+}
+
+@media screen {
+  /* On screen the sheet floats on the app canvas so it reads as a document
+     preview. A hairline rule (not a shadow — Swiss) marks its edge. */
+  .th-paper {
+    border: 1px solid var(--print-rule-soft);
+    margin-block: 24px;
+  }
+}
+
+@media screen and (max-width: 820px) {
+  /* A phone is not a sheet of paper. Below the width where the true-to-paper
+     preview stops being legible, spend the pixels on content instead of on
+     simulated margins — 12mm of padding at 320px leaves 230px of column. */
+  .th-paper {
+    padding: 16px;
+    margin-block: 12px;
+  }
+
+  .th-paper-toolbar {
+    padding-inline: 16px;
+  }
+}
+
+@media print {
+  .th-paper {
+    max-width: none;
+    width: auto;
+    margin: 0;
+    padding: 0;
+    border: 0;
+  }
+}
+
+/* ── Shared paper primitives ───────────────────────────────────────────────── */
+
+/* Structural rule. 2px is the app's Swiss divider; on paper that reads heavy at
+   print resolution, so paper rules are hairlines. */
+.th-paper__rule {
+  border: 0;
+  border-top: 1px solid var(--print-rule);
+  margin: 0;
+}
+
+.th-paper__rule--soft {
+  border-top-color: var(--print-rule-soft);
+}
+
+/* Uppercase letterspaced label — the Swiss field/kicker label, at paper scale. */
+.th-paper__label {
+  font-size: 6.5pt;
+  font-weight: 700;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+  color: var(--print-muted);
+  margin: 0;
+}
+
+.th-paper__value {
+  font-size: 9pt;
+  font-weight: 600;
+  line-height: 1.3;
+  margin: 0;
+  /* A long venue name must wrap, never clip or overflow the column. */
+  overflow-wrap: anywhere;
+}
+
+.th-paper__value--sub {
+  font-size: 7.5pt;
+  font-weight: 500;
+  color: var(--print-muted);
+}
+
+/* Genuine machine data (ticket codes, order references) — the system mono
+   stack, per the type rules. No mono webfont is loaded, and loading one for a
+   document the browser rasterises locally would be waste. */
+.th-paper__mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.5px;
+}
+
+/* The screen-only toolbar above the sheet (print button, back link). Chrome,
+   not content, so it stays in the app's live theme. */
+.th-paper-toolbar {
+  width: 100%;
+  max-width: 210mm;
+  margin: 0 auto;
+  padding-top: 24px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* A document block that must not be split across two sheets. */
+.th-paper__keep {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+/* Screen-reader-only. The global `.sr-only` utility lives in
+   `event-content.css`, which is not loaded on print routes, so the print layer
+   carries its own copy rather than pulling in an unrelated stylesheet. */
+.th-paper__sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}

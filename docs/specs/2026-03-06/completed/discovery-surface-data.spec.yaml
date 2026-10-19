@@ -1,0 +1,27 @@
+# Spec: Discovery Surface Data Contracts (Deferred)
+meta:
+  owner: events-platform
+  status: deferred
+  reviewers:
+    - search
+    - data
+    - growth
+  last_updated: 2025-11-26
+summary: |
+  This spec is intentionally deferred until the consumer discovery roadmap is staffed. Core navigation
+  work now focuses on admin/org shells; discovery payload contracts will be defined once search + growth
+  finalize taxonomy, ranking, and personalization requirements.
+reason_for_deferral:
+  - Discovery navigation shell is still in ideation; UI spec tracks entry points only.
+  - Taxonomy + personalization services require dedicated research and infra sizing.
+  - Admin/nav transports must ship first to unblock org experiences; discovery can follow after validation.
+references:
+  - docs/specs/ui/consumer/uncompleted/discovery-navigation.flow.yaml
+  - docs/specs/transport/event-search.transport.yaml
+  - docs/specs/platform/context-routing.spec.yaml
+resumption_checklist:
+  - [ ] Search + growth sign off on taxonomy ownership.
+  - [ ] Data platform capacity for personalization signals.
+  - [ ] Discovery shell component ready to consume payloads.
+notes:
+  - Keep this file as a placeholder so the README can indicate status; do not add schemas here until deferral lifts.

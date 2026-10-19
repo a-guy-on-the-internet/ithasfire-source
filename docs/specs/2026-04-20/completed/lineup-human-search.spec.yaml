@@ -1,0 +1,192 @@
+# lineup-human-search.spec.yaml
+#
+# Attach registered platform users to an event lineup via search autocomplete,
+# so lineup names link to real platform profiles instead of bare text.
+
+version: "1.0"
+updated: "2026-04-20"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The event lineup editor only accepts free-text names. There is no way to
+    attach a registered platform user (Human) to the lineup, so organizers
+    cannot cross-link performers/speakers who already have accounts. Names are
+    plain text with no profile link on the public event page.
+  solution: >
+    Add a human search autocomplete to the lineup add-form that queries the
+    existing Meilisearch human index. When a registered user is selected their
+    humanId is stored on EventHuman (already supported by the schema and
+    attach use case). On the public event page their name links to /p/<slug>.
+    Free-text entry remains available as a fallback.
+  users:
+    - event organiser (org admin/editor)
+    - public attendees viewing event detail pages
+  surfaces:
+    - web
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        The lineup add-form shows a combobox that queries
+        unifiedSearch with `types: ["human"]` as the user types (debounced,
+        min 2 chars). Results show displayName + username.
+    - id: FR-002
+      description: >
+        Selecting a search result populates the name field with the human's
+        displayName and sets an internal selectedHumanId. The URL field is
+        hidden when a registered human is selected (their profile IS the link).
+    - id: FR-003
+      description: >
+        Free-text mode: if the user types a name and presses Add without
+        selecting a search result the entry is created with externalName only
+        (existing behaviour unchanged). The input shows a clear affordance when
+        free-text vs. linked mode is active.
+    - id: FR-004
+      description: >
+        On submit, attachEventHuman is called with humanId set (when a
+        registered human was selected) or null (free-text). No new use-case
+        changes needed — the existing input already accepts humanId?.
+    - id: FR-005
+      description: >
+        In the lineup list, if humanId is set on a record the name renders as
+        a link to /p/<profileSlug> (or /p/<humanId> if no slug). Free-text
+        entries with externalUrl keep the existing external-link behaviour.
+        Free-text entries with no URL are plain text.
+    - id: FR-006
+      description: >
+        The list query (listEventHumans) must return profileSlug so the UI can
+        build the profile link without an extra query. This requires enriching
+        the list output.
+    - id: FR-007
+      description: >
+        Human autocomplete results must only include public/searchable human
+        profiles already eligible for the existing human search index. Private
+        or unsearchable humans must not appear in the picker.
+    - id: FR-008
+      description: >
+        The lineup add-form must allow the organiser to clear a selected human
+        before submission, returning the form to free-text mode so they can add
+        an external name and optional URL instead.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Autocomplete results must appear within 300ms on a local connection.
+        Debounce at 250ms.
+    - id: NFR-002
+      description: >
+        Searching humans is read-only and scoped to the existing
+        unifiedSearch.autocomplete tRPC procedure. No new backend endpoints needed.
+    - id: NFR-003
+      description: >
+        Existing event-human auth rules remain unchanged: only authorised event
+        editors can add lineup entries, while public event detail pages may read
+        linked lineup data without exposing any non-public human fields.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: attachEventHuman (reuse)
+        description: >
+          Existing write path reused unchanged, with humanId populated when the
+          organiser selected a registered human and null when using free-text mode.
+        input: "eventId, actorHumanId, role, humanId?, externalName?, externalUrl?"
+        output: "eventHumanId, persisted lineup row"
+        idempotent: false
+        money: false
+      - name: listEventHumans (modify)
+        description: >
+          Enrich each record: if humanId is set, join the Human table to
+          retrieve profileSlug and displayName so the UI can render a profile
+          link without a secondary query.
+        input: "eventId, actorHumanId (unchanged)"
+        output: "add profileSlug?: string | null, humanDisplayName?: string | null"
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - repos.eventHumans.listByEvent — needs to join Human for profileSlug
+      - MultiSearchQueryPort (already wired, used via existing unified-search procedure)
+
+  adapters:
+    new: []
+    existing:
+      - PrismaEventHumansAdapter.listByEvent — add include: { human: { select: { profileSlug, displayName } } }
+
+  transport:
+    trpc_procedures:
+      - eventHumans.list (output schema update: add profileSlug, humanDisplayName)
+      - unifiedSearch.autocomplete (reuse with `types: ["human"]`)
+    webhooks: []
+
+  ui:
+    pages: []
+    components:
+      - LineupEditor.tsx — replace name TextInput with HumanSearchCombobox;
+        show URL field only in free-text mode; show "linked" badge when humanId set
+      - HumanSearchCombobox (new) — debounced combobox backed by
+        trpc.unifiedSearch.autocomplete with types:["human"]; renders
+        name + @username in dropdown; exposes onSelect(humanId, displayName)
+        and onClear() callbacks
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models:
+    - EventHumanRecord (ports DTO): add profileSlug?: string | null, humanDisplayName?: string | null
+    - listEventHumansOutput (Zod schema): add same fields
+  migrations_needed: false
+
+# ── Risks & Open Questions ────────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      If a linked Human deletes their account or removes their profile, the
+      EventHuman row retains the humanId but the join returns null for
+      profileSlug. The UI must gracefully fall back to externalName with no link.
+    severity: LOW
+    mitigation: >
+      Render as plain text when profileSlug and displayName are null even if
+      humanId is set.
+  - risk: >
+      A organiser could attach a Human who has not consented to being listed.
+      Human profiles are already public-opt-in (isPublic flag on search doc).
+    severity: MEDIUM
+    mitigation: >
+      Filter the human search results to isPublic: true only. An org member
+      can still type a free-text name for a non-public user.
+
+open_questions:
+  - Should linked lineup entries eventually show richer profile context in the public UI,
+    such as avatar and primary genre, or should this spec remain name-link only?
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Human consent/approval flow for being added to a lineup
+  - Notification to linked Humans
+  - Mobile (scanner / Expo) surface
+  - Editing an existing persisted lineup entry beyond the current remove-and-readd flow
+
+# ── Acceptance Criteria ───────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - Typing 2+ chars in the name field shows a dropdown of matching platform users
+  - Selecting a user sets their name and stores humanId on the EventHuman record
+  - Clearing a selected user before submit returns the form to free-text mode and re-enables the URL field
+  - Free-text entry with no selection still works and creates an externalName-only record
+  - In the lineup list, linked names are clickable links to /p/<profileSlug>
+  - Non-public humans do not appear in autocomplete results
+  - External URL entries retain the existing ExternalLink icon behaviour
+  - pnpm -C packages/core vitest --run passes (listEventHumans output schema test)
+  - pnpm -F web build passes

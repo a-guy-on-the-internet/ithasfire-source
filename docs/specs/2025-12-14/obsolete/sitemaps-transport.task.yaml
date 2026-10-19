@@ -1,0 +1,34 @@
+# Copilot Task: Expose sitemap routes
+context:
+  references:
+    - ../platform/sitemaps-architecture.spec.yaml
+    - ../platform/sitemaps-observability.spec.yaml
+    - sitemaps-generator.task.yaml
+  packages:
+    - apps/api (Fastify)
+    - apps/web (Next.js app routes)
+    - packages/transport/trpc (if helpers needed)
+  dependencies:
+    - Access to object storage client via adapters
+    - Feature flag `feature.sitemaps`
+goal: |
+  Serve sitemap XML through Fastify (for crawlers hitting api subdomain) and Next.js (for
+  canonical web domain) with proper caching, error handling, and observability hooks.
+requirements:
+  - Fastify route `GET /sitemaps/:shard` streaming from GCS with caching headers.
+  - Fastify route `GET /sitemap.xml` returning index manifest.
+  - Next.js App Route `apps/web/src/app/sitemap.xml/route.ts` (or existing SEO module) that fetches same content.
+  - Shared helper for fetching shard/index to avoid duplicate storage logic.
+  - Return 404 for missing shards; log + emit metric.
+  - Add e2e smoke tests (or integration tests) verifying response headers and gzip availability.
+  - Update `robots.txt` to include sitemap index once feature flag enabled.
+implementation_notes:
+  - Use `@th/adapters` storage client or add wrapper if missing.
+  - Consider streaming via `Readable` to avoid buffering.
+  - Add caching layer (Redis or CDN hints) if needed—document decision.
+validation:
+  - pnpm -F api test smoke (ensure route accessible)
+  - pnpm -F web lint/typecheck after adding route.
+  - Manual curl to confirm gzip variant and header values.
+handoff:
+  - Update docs/app.md and `apps/docs` platform page with route availability.

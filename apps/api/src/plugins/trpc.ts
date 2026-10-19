@@ -8,6 +8,7 @@ import { ZodError, type ZodIssue } from "zod";
 import { logAndReport } from "@th/adapters/infra/discord-alerts";
 import { appRouter, createContextFactory, type TrpcDeps } from "@th/trpc";
 import { resolveWireAppCode } from "@th/trpc/utils";
+import { describeClientIp } from "@th/trpc/client-ip";
 import { Sentry } from "../instrument";
 import { env } from "../lib/env";
 
@@ -67,12 +68,36 @@ const plugin: FastifyPluginAsync<TrpcPluginOptions> = async (app, opts) => {
         path,
         error,
         type,
+        req,
+        ctx,
       }: {
         path: string | undefined;
         error: any;
         type: string;
+        // Absent when createContext itself failed.
+        ctx?: { clientIp?: string | null; clientIpSource?: string };
+        // The Fastify adapter forwards the FastifyRequest as `req`.
+        req?: {
+          headers?: Record<string, unknown>;
+          socket?: { remoteAddress?: unknown };
+        };
       }) => {
         const isServerError = error.code === "INTERNAL_SERVER_ERROR";
+
+        // Real client IP for the log line + Sentry (2026-09-29: the attacker
+        // could not be identified from edge IPs). See `describeClientIp` for
+        // the hop-trust caveat on `cf-connecting-ip`. `clientIp` is the value
+        // the limiters keyed on (`ctx.clientIp`, which includes a verified
+        // web → API visitor forward) whenever a context exists, so a 429 on
+        // the unlock route logs the guest, not the web server; the raw
+        // `cfConnectingIp` / `forwardedFor` fields still come from headers.
+        const ip = describeClientIp(
+          req?.headers,
+          req?.socket?.remoteAddress,
+          ctx ? (ctx.clientIp ?? null) : undefined,
+        );
+        // forwarded | edge | direct — which path `clientIp` was resolved on.
+        const clientIpSource = ctx?.clientIpSource ?? null;
 
         // Mirror the stable client-facing code into server logs (FR-008) so the
         // log line and the client response carry the same identifier — shared
@@ -139,6 +164,10 @@ const plugin: FastifyPluginAsync<TrpcPluginOptions> = async (app, opts) => {
               cause: causeMessage,
               causeCode,
               zodErrors,
+              clientIp: ip.clientIp,
+              clientIpSource,
+              cfConnectingIp: ip.cfConnectingIp,
+              forwardedFor: ip.forwardedFor,
             },
             report: {
               captureException: Sentry.captureException,
@@ -150,8 +179,13 @@ const plugin: FastifyPluginAsync<TrpcPluginOptions> = async (app, opts) => {
                   trpcType: type,
                   trpcCode: error.code,
                   isOutputValidation: isOutputValidation ? "true" : undefined,
+                  // instrument.ts `beforeSend` pins user.ip_address to this.
+                  client_ip: ip.clientIp ?? undefined,
                 },
                 extra: {
+                  clientIpSource,
+                  cfConnectingIp: ip.cfConnectingIp,
+                  forwardedFor: ip.forwardedFor,
                   ...(zodErrors ? { zodErrors } : {}),
                   ...(causeSnapshot ? { cause: causeSnapshot } : {}),
                   ...(causeCode ? { causeCode } : {}),
@@ -186,6 +220,10 @@ const plugin: FastifyPluginAsync<TrpcPluginOptions> = async (app, opts) => {
             errorCode: error.code,
             errorMessage: error.message,
             appCode,
+            clientIp: ip.clientIp,
+            clientIpSource,
+            cfConnectingIp: ip.cfConnectingIp,
+            forwardedFor: ip.forwardedFor,
           });
         }
       },

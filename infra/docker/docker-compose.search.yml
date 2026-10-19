@@ -1,0 +1,26 @@
+# Meilisearch for local development
+# Usage: docker compose -f docker-compose.search.yml up -d
+version: "3.9"
+
+services:
+  meilisearch:
+    image: getmeili/meilisearch:v1.11
+    restart: unless-stopped
+    ports:
+      - "${MEILISEARCH_PORT:-7700}:7700"
+    environment:
+      MEILI_ENV: development
+      MEILI_MASTER_KEY: ${MEILISEARCH_MASTER_KEY:-dev-master-key-change-in-prod}
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - meilisearch-data:/meili_data
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--spider", "http://localhost:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  meilisearch-data:
+    name: ithasfire-meilisearch-dev

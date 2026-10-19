@@ -1,6 +1,7 @@
 import { test as setup, expect } from "@playwright/test";
 
 import { ensureBetterAuthTestUserExists } from "./helpers/better-auth-test-user";
+import { submitSignInForm } from "./helpers/sign-in";
 
 const authFile = "playwright/.auth/user.json";
 
@@ -92,74 +93,38 @@ setup("authenticate as test user", async ({ page }) => {
   // Pre-set the cookie-consent cookie so the banner does not cover the form.
   await page
     .context()
+    .clearCookies();
+
+  // ORDER MATTERS: clear FIRST, then re-add consent.
+  //
+  // The PRE-SEED steps above are handed `page.request`, which shares this
+  // page's cookie jar, and Better Auth's `sign-up/email` returns a SESSION on
+  // success — so on any run where the account did not already exist, the
+  // pre-seed silently signed us in, `/sign-in` redirected straight to
+  // `/account`, and the UI step below waited 20s for a form that can never
+  // render. Every auth-dependent spec died with it.
+  //
+  // Clearing keeps the pre-seed's guarantee (the account exists and is
+  // verified) while making the sign-in below actually exercise the card, which
+  // is the point of minting `storageState` through the real form.
+  await page
+    .context()
     .addCookies([
       { name: "th-consent", value: "all", domain: "localhost", path: "/" },
     ]);
+
   await page.goto("/sign-in?redirect=/account");
 
-  // /sign-in is passkey-FIRST: the email+password form lives inside a
-  // collapsed "Use password instead" disclosure (LoginCard.tsx — a
-  // role="button" carrying aria-expanded, controlling #auth-sign-in-fallback,
-  // whose collapsed state is `inert` with gridTemplateRows: 0fr). Until it is
-  // expanded, `auth-sign-in-form` exists in the DOM but is not visible, so
-  // waiting on it times out and takes the ENTIRE authenticated `chromium`
-  // project down with it — every spec that depends on this setup.
+  // The two-step credential flow lives in ONE place now: `helpers/sign-in.ts`.
   //
-  // Expand it idempotently: only click when aria-expanded is not already true,
-  // so this stays correct if the disclosure ever defaults to open (e.g. for an
-  // account with no enrolled passkey — see the note at LoginCard.tsx:167).
-  const passwordDisclosure = page.getByRole("button", {
-    name: /use password instead/i,
-  });
-  // `waitFor`, NOT `isVisible()`. `isVisible()` is a point-in-time poll: on a
-  // freshly-navigated page it returns false because the card has not painted
-  // yet, which silently skips the expand and leaves the form inert — the fields
-  // then accept no input and the submit stays aria-disabled. Auto-wait instead,
-  // while still tolerating a page variant that has no disclosure at all (e.g.
-  // an account with no passkey, where the password fields render directly).
-  const hasDisclosure = await passwordDisclosure
-    .waitFor({ state: "visible", timeout: 10_000 })
-    .then(() => true)
-    .catch(() => false);
-  if (
-    hasDisclosure &&
-    (await passwordDisclosure.getAttribute("aria-expanded")) !== "true"
-  ) {
-    await passwordDisclosure.click();
-    await expect(passwordDisclosure).toHaveAttribute("aria-expanded", "true");
-  }
-
-  const form = page.getByTestId("auth-sign-in-form");
-  await expect(form).toBeVisible();
-
-  // Use the live accessible field labels on the dedicated sign-in page.
-  const emailInput = form.getByLabel(/email or username/i);
-  const passwordInput = form.getByLabel(/^password$/i);
-
-  // `pressSequentially`, not `fill`, and `toBeEditable` before each.
-  //
-  // The submit button is gated on REACT state
-  // (`canSubmit = Boolean(identifier.trim()) && password.length > 0`,
-  // LoginCard.tsx:255). The disclosure we just opened animates
-  // (gridTemplateRows 0fr→1fr) and is `inert` while collapsed, so a `fill()`
-  // fired the moment `auth-sign-in-form` turns visible can set the DOM value
-  // without React ever seeing the change — leaving `canSubmit` false and the
-  // submit button aria-disabled forever. Real key events avoid that, and
-  // `toBeEditable` waits out the inert window.
-  await expect(emailInput).toBeEditable();
-  await emailInput.pressSequentially(email, { delay: 10 });
-  await expect(emailInput).toHaveValue(email);
-
-  await expect(passwordInput).toBeEditable();
-  await passwordInput.pressSequentially(password, { delay: 10 });
-  await expect(passwordInput).toHaveValue(password);
-
-  // Assert the button actually left its disabled state before clicking, so a
-  // future regression in `canSubmit` fails HERE with a clear message instead of
-  // as an opaque 15s click timeout.
-  const submit = page.getByTestId("auth-sign-in-submit");
-  await expect(submit).not.toHaveAttribute("aria-disabled", "true");
-  await submit.click();
+  // What used to be here was a hand-rolled expansion of the old "Use password
+  // instead" disclosure, and it was load-bearing in the worst way: this setup
+  // mints the `storageState` the entire authenticated `chromium` project runs
+  // on, so when the disclosure moved, every auth-dependent spec went down with
+  // it. The helper is now the single point that has to track the card's shape,
+  // and it carries the hydration-race handling (fill → assert value → advance,
+  // retried as one unit) that this block used `pressSequentially` for.
+  await submitSignInForm(page, { email, password });
 
   // Better Auth may enforce verification gates in some environments.
   // If sign-in is blocked (commonly a 403 from `/api/auth/sign-in/email`),

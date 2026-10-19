@@ -1,0 +1,285 @@
+# entity-page-templates.spec.yaml
+#
+# Generalizes the ad-hoc, blank-page EntityPage block system into a real
+# per-owner-type-and-category starter-template model, so a new page seeds
+# sensible default blocks instead of starting empty. Infrastructure spec —
+# feeds the musician-EPK-content spec (docs/specs/2026-07-07/completed/musician-epk-content.spec.yaml).
+
+version: "1.0"
+updated: "2026-07-07"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Every EntityPage (Human/Organization/Place public profile) starts
+    completely blank; an owner adds every block one at a time from a
+    dropdown-style palette. Worse, five block kinds already defined in
+    block-config.ts (`shows`, `tracks`, `past_shows`, `past_events`,
+    `mission`) are marked `palette: false` — they exist in code but have
+    NO path for any user to ever add them, because nothing seeds default
+    blocks anywhere. PLACE pages get an implicit "standardized" feel today
+    only because `layoutKey: standard` is a fixed rendering shell — that
+    conflates visual layout with content composition and doesn't generalize
+    to other owner types/categories (e.g. a musician profile).
+  solution: >
+    Add an orthogonal `category` classifier to EntityPage (independent of
+    `layoutKey`, which stays a pure visual-shell/theme choice) and a
+    code-defined template registry (mirrors the existing block-config.ts
+    pattern — no new DB table) mapping (ownerType, category) to an ordered
+    list of default block kinds. Templates seed additively at two trigger
+    points — first page creation, and category transitions (e.g. a Human
+    enabling performer mode) — never overwriting or reordering blocks an
+    owner already has.
+  users:
+    - Human owners (especially performer-mode musicians)
+    - Organization owners
+    - Place (venue) owners
+    - Platform engineers building on top of EntityPage (Spec B depends on this)
+  surfaces:
+    - web
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Add `EntityPage.category: String?` (free-form, same convention as
+        `PageBlock.kind`/`PageTheme.layoutKey` — not a DB enum) and
+        `EntityPage.templateAppliedCategories: String[]` (default `{}`).
+        `category` records the page's current content classification;
+        `templateAppliedCategories` records every category that has ever
+        been seeded, so re-entering a category (e.g. disable/re-enable
+        performer mode) never reseeds.
+    - id: FR-002
+      description: >
+        Add a code-defined template registry
+        (`packages/core/src/use-cases/entity-pages/page-templates.ts`)
+        mapping (ownerType, category) to an ordered list of default block
+        kinds + optional per-kind default-data overrides. Initial entries:
+        HUMAN/"generic" (universal kinds only), HUMAN/"musician" (adds
+        `shows`, `music`, `tracks`, `video`, `press`, `stats`, `past_shows`,
+        `rider`, `genre_tags` in that order), PLACE/"venue" (adds
+        `location_map`, `capacity_info`, `house_rules`, `amenities`,
+        `booking_info`, `request_to_play`), ORGANIZATION/"generic" (adds
+        `team`, `mission`, `managed_places`, `past_events`).
+    - id: FR-003
+      description: >
+        New use case `seedPageTemplateBlocks(page, category)`: for each
+        block kind in the resolved template not already present on the
+        page (by `kind`), append it at the next `orderIndex` with the
+        template's default data. Never edits, reorders, or deletes an
+        existing block. No-ops entirely if `category` is already present
+        in `templateAppliedCategories`; otherwise appends `category` to
+        that array after seeding (in the same transaction).
+    - id: FR-004
+      description: >
+        SINGLE trigger point — lazy seeding on owner editor load. Pages
+        are created empty at entity-provisioning time across six scattered
+        call sites (better-auth.ts signup hook, provision-human-for-auth-user,
+        create-human, create-org, upsert-place, set-avatar/banner-from-upload)
+        — one of them outside core — so hooking creation (or
+        performers.setMode) is fragile and is deliberately NOT done.
+        Instead, `getMyPage` (the owner-facing editor load path) resolves
+        the owner's CURRENT category on every load (per FR-005) and calls
+        `seedPageTemplateBlocks` for any category not yet in
+        `templateAppliedCategories`. This is a side-effecting read,
+        accepted deliberately: it is idempotent (FR-003 guard), touches
+        only the owner's own page, and covers every past and future
+        page-creation path AND every category transition (e.g. enabling
+        performer mode, then opening the editor) with one code path.
+        Public page rendering (`get-public-page`) never seeds.
+    - id: FR-005
+      description: >
+        Category resolution (pure function alongside the registry):
+        HUMAN with enabled PerformerProfile → "musician"; HUMAN otherwise
+        → "generic"; PLACE → "venue"; ORGANIZATION → "generic". A HUMAN
+        who enables performer mode after their "generic" seed gets the
+        "musician" top-up on next editor load — additive per FR-003, with
+        universal kinds already present simply skipped. Disabling
+        performer mode changes nothing (seeded blocks remain; category
+        reverts for classification purposes only).
+    - id: FR-006
+      description: >
+        Migration backfills `templateAppliedCategories` on every existing
+        `EntityPage` row to `["generic"]` (HUMAN/ORGANIZATION) or
+        `["venue"]` (PLACE) as part of the same migration that adds the
+        columns, so no pre-existing page is retroactively bulk-seeded with
+        template blocks the owner never asked for. `category` itself
+        backfills to the same value for display/filtering purposes.
+    - id: FR-007
+      description: >
+        Reconcile every `palette: false` block kind in block-config.ts
+        (`shows`, `tracks`, `past_shows`, `past_events`, `mission`)
+        against the new templates — each must appear in at least one
+        (ownerType, category) template's default list. This closes the
+        existing gap where those kinds are defined but unreachable by any
+        user action.
+    - id: FR-008
+      description: >
+        `layoutKey` (`standard`/`stack`/`grid`) remains a pure
+        visual-shell/theme choice, decoupled from `category`. PLACE pages
+        keep defaulting to `layoutKey: standard`; this spec does not
+        change PLACE rendering behavior, only formalizes "venue" as an
+        explicit category rather than an implicit side-effect of the
+        layout default.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Seeding is additive-only and idempotent per category — running it
+        twice for the same (page, category) produces no duplicate blocks
+        and no data loss, verified by a regression test per trigger point.
+    - id: NFR-002
+      description: >
+        No behavior change for any existing EntityPage at migration time —
+        verified by a migration test asserting block counts/order are
+        unchanged for a sample of pre-existing HUMAN/ORGANIZATION/PLACE
+        pages after the backfill runs.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: seed-page-template-blocks
+        description: >
+          Resolves the (ownerType, category) template and appends any
+          missing default block kinds to an existing EntityPage; records
+          the category as applied. Called by the two trigger points below,
+          never exposed directly over tRPC.
+        input: "pageId, ownerType, category"
+        output: "list of newly-appended PageBlock records (may be empty)"
+        idempotent: true
+        money: false
+      - name: get-page-template (helper, not a use case per se)
+        description: >
+          Pure lookup — (ownerType, category) -> ordered block-kind list +
+          default-data overrides. Lives alongside block-config.ts.
+        input: "ownerType, category"
+        output: "ordered list of {kind, defaultDataOverride?}"
+        idempotent: true
+        money: false
+      - name: modify:get-my-page
+        description: >
+          On every owner editor load, resolves the owner's current
+          category (FR-005, checks PerformerProfile for HUMAN) and calls
+          seed-page-template-blocks for any not-yet-applied category
+          (FR-004 lazy seeding). Provisioning call sites and
+          performers.setMode are deliberately NOT modified.
+        input: "ownerType, ownerId"
+        output: "EntityPage with seeded blocks"
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - entityPages (repo) — extend with block-append-in-tx support if not
+        already expressible via existing methods
+      - performerProfiles (repo) — read-only, existing
+
+  adapters:
+    new: []
+    existing:
+      - packages/adapters/src/db/prisma/entity-pages.ts — persist
+        `category` / `templateAppliedCategories`, support the seed
+        use case's transactional append
+
+  transport:
+    trpc_procedures: []
+    webhooks: []
+
+  ui:
+    pages: []
+    components: []
+    # No new UI in this spec. Optional future affordance (manual "apply
+    # missing template blocks" button, palette highlighting of
+    # template-suggested-but-missing blocks) is an open question, not a
+    # committed FR — see open_questions.
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models:
+    - EntityPage: "+ category String?, + templateAppliedCategories String[] @default([])"
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Reseeding on repeated category transitions (e.g. disable/re-enable
+      performer mode) resurrects a block the owner deliberately deleted.
+    severity: MEDIUM
+    mitigation: >
+      `templateAppliedCategories` is set-once per category and never
+      cleared, so a category is only ever seeded a single time in a page's
+      lifetime (FR-003).
+  - risk: >
+      Seeding inside a read path (`getMyPage`) surprises a future
+      maintainer or fails mid-read.
+    severity: LOW
+    mitigation: >
+      Documented in-code as deliberate (FR-004 rationale); seed failure
+      must not fail the read (log + return the page as-is; next load
+      retries because `templateAppliedCategories` only updates on
+      successful seed).
+  - risk: >
+      Migration backfill runs against a large `EntityPage` table without
+      chunking.
+    severity: LOW
+    mitigation: >
+      Backfill is a single flat UPDATE (no per-row business logic), same
+      pattern as other additive-column migrations in this codebase.
+
+open_questions:
+  - Should there be a manual "add missing template blocks" affordance in
+    the editor UI (e.g. a button, or palette highlighting), or is
+    auto-seed-only sufficient for v1? Recommend deferring to the `ui`
+    skill when Spec B's editor work is scoped.
+  - Does performer mode ever need HUMAN sub-categories beyond "musician"
+    (e.g. "dj", "speaker") in the near term, or is a single "musician"
+    category sufficient until a second concrete use case appears?
+  - Should ORGANIZATION ever get a non-"generic" category (e.g. a
+    promoter/label org template)? No current signal for this — left
+    generic-only.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Musician-specific block CONTENT or renderer implementation (`music`,
+    `tracks`, `stats`, `past_shows` currently render "Content coming
+    soon.") — covered by musician-epk-content.spec.yaml.
+  - PDF/one-sheet export of an EntityPage.
+  - Audience-weighted "multiple pitch view" pages (festival vs. sync vs.
+    label vs. playlist-curator framing of the same profile).
+  - Any change to PLACE's visual rendering/theme behavior.
+  - New HUMAN sub-categories beyond "musician" (dj, speaker, etc.).
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - >
+    A Human who enables performer mode with an empty (never-edited) page
+    ends up with the "musician" template's blocks pre-seeded, in template
+    order, on first visit to their page editor. (Note — every Human gets
+    an empty page at signup via provisioning; "no page exists" is not a
+    state this spec needs to handle.)
+  - A Human who already has a manually-built page, then enables performer
+    mode, gets only the template's blocks they don't already have appended
+    at the end — none of their existing blocks are edited, reordered, or
+    removed.
+  - Disabling then re-enabling performer mode does not duplicate or
+    resurrect any template block.
+  - All pre-existing EntityPage rows show identical block lists
+    immediately after the migration runs (verified by migration test).
+  - >
+    Every currently palette-hidden block kind (`shows`, `tracks`,
+    `past_shows`, `past_events`, `mission` — `palette: false` in
+    block-config.ts) appears in at least one template and is therefore
+    reachable on a real page.
+  - PLACE page rendering (layout, theme) is unchanged before/after this
+    spec ships.

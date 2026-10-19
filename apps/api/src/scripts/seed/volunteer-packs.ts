@@ -1,6 +1,6 @@
 /**
  * volunteer-packs.ts — the launch volunteer-role catalogue (FR-018 of
- * docs/specs/2026-07-27/volunteer-role-packs.spec.yaml).
+ * docs/specs/2026-07-27/completed/volunteer-role-packs.spec.yaml).
  *
  * Five platform-curated packs, seeded through the normal seed path so dev,
  * staging and prod start from the same reviewed baseline. A catalogue row is

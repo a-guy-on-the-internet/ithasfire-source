@@ -1,0 +1,166 @@
+status: draft
+note: Implementation pending — no `packages/ports/src/seatmaps` module exists yet; this spec remains a planning artifact.
+task: Define seatmap-related ports for single-venue layouts, glyph storage, seat status hydration, and realtime fan-out.
+repo_root: packages/ports/src/seatmaps
+goal: Provide stable TypeScript interfaces + zod schemas enabling adapters to implement
+  single-seatmap persistence per venue, glyph snapshot storage, availability hydration, and
+  optional streaming updates without leaking adapter-specific details.
+
+files:
+  - path: packages/ports/src/seatmaps/seatmap.repo.port.ts
+  - path: packages/ports/src/seatmaps/seatmap-blob.repo.port.ts
+  - path: packages/ports/src/seatmaps/status.repo.port.ts
+  - path: packages/ports/src/seatmaps/streaming.port.ts
+  - path: packages/ports/src/seatmaps/parser.port.ts
+  - path: packages/ports/src/seatmaps/types.ts
+  - path: packages/ports/src/index.ts
+
+constraints:
+  - Ports expose only typed DTOs (no Prisma models or vendor SDK types).
+  - All read methods return `Result`-style discriminated unions or throw typed
+    errors with `{ code: <union>; message; details? }` matching standards.
+  - Use zod schemas alongside TypeScript interfaces for request/response validation.
+  - Include paginated/diff helpers to support admin UI comparisons.
+  - All write mutations accept `context: { actorId: string; requestId?: string }` for audit tracing.
+  - Streaming port must be optional but share payload schema with API transport.
+  - Parser port returns normalized geometry + validation issues, never throws on
+    recoverable errors.
+
+shared_types (types.ts):
+  SeatGlyph:
+    - seatId: string
+    - sectionId: string
+    - geometry:
+        x: number
+        y: number
+        radius?: number
+        width?: number
+        height?: number
+        rotation?: number
+        facingAngle?: number
+    - label: string
+    - tierId?: string
+    - attrs?: { accessible?: boolean; companionSeatIds?: string[]; notes?: string }
+  SectionTransform:
+    - sectionId: string
+    - name: string
+    - transform: { origin: { x: number; y: number }; rotation: number; scale: number }
+    - geometry?: { polygons: Array<Array<{ x: number; y: number }>> }
+    - bounds: { minX: number; minY: number; maxX: number; maxY: number }
+    - visibility: "PUBLIC" | "ORGANIZER_ONLY"
+    - stageAnchor?: { facingAngle?: number; point?: { x: number; y: number } }
+  StageLayout:
+    - center: { x: number; y: number }
+    - polygon?: Array<{ x: number; y: number }>
+    - lookAt?: { x: number; y: number }
+    - label?: string
+  SeatIndexNode:
+    - minX: number
+    - minY: number
+    - maxX: number
+    - maxY: number
+    - children?: SeatIndexNode[]
+    - seatIds?: string[]
+  VenueSeatmap:
+    - id: string
+    - venueId: string
+    - checksum: string
+    - glyphSnapshotKey: string
+    - metadata: {
+        defaultViewport: { center: { x: number; y: number }; zoom: number }
+        minZoom: number
+        maxZoom: number
+        sectionOverlays?: Array<{ sectionId: string; colorToken: string }>
+        notes?: string
+      }
+    - stage: StageLayout
+    - seatIndex: SeatIndexNode
+    - issues: ParserIssue[]
+    - createdAt: Date
+    - updatedAt: Date
+    - createdBy: string
+  LayoutDiff:
+    - added: number
+    - removed: number
+    - moved: number
+    - sectionsChanged?: string[]
+    - warnings?: string[]
+  SeatAvailability:
+    - seatId: string
+    - status: "AVAILABLE" | "HELD" | "SOLD" | "BLOCKED" | "UNKNOWN"
+    - holdExpiresAt?: Date
+    - orderId?: string
+  ParserIssue:
+    - code: string
+    - message: string
+    - severity: "warning" | "error"
+    - seatId?: string
+    - sectionId?: string
+
+error_codes:
+  - "invalid_input"
+  - "not_found"
+  - "forbidden"
+  - "conflict"
+  - "dependency_failed"
+  - "transient"
+
+SeatmapRepo (layout.repo.port.ts):
+  methods:
+    - getByVenue(venueId: string): Promise<Result<VenueSeatmap, SeatmapPortError>>
+    - getForEvent(eventId: string): Promise<Result<VenueSeatmap, SeatmapPortError>>
+    - replaceWithSnapshot(input: ReplaceSeatmapInput, context): Promise<Result<VenueSeatmap, SeatmapPortError>>
+    - previewDiff(input: ReplaceSeatmapInput): Promise<Result<LayoutDiff, SeatmapPortError>>
+    - deleteForVenue(venueId: string, context): Promise<Result<{ deleted: boolean }, SeatmapPortError>>
+  notes:
+    - `ReplaceSeatmapInput` contains normalized geometry snapshot ID, section metadata, and optional parser issues.
+    - Replace operation is destructive: delete existing sections/seats + seatmap row, then insert new snapshot in a single transaction.
+    - Persist `stage` and `seatIndex` so transport + UI can orient point-only seats without recomputing.
+    - `deleteForVenue` limited to venues without active events or during initial venue setup.
+
+SeatmapBlobRepo (layout-blob.repo.port.ts):
+  methods:
+    - getByVenue(venueId: string): Promise<Result<SeatGlyph[], SeatmapPortError>> | stream variant for large payloads
+    - putForVenue(venueId: string, glyphs: SeatGlyph[], context): Promise<Result<{ checksum: string }, SeatmapPortError>>
+    - deleteForVenue(venueId: string, context): Promise<Result<void, SeatmapPortError>>
+    - generateThumbnail(venueId: string): Promise<Result<{ url: string }, SeatmapPortError>>
+  notes:
+    - Implementations may store binary blobs; keep API JSON-friendly.
+    - Glyph blobs must persist center `{ x, y }` and any supplied optional size/orientation fields.
+    - Provide helper to stream glyphs when seat index data needs regeneration or cache warmup.
+
+SeatStatusRepo (status.repo.port.ts):
+  methods:
+    - getAvailability(eventId: string): Promise<Result<{ seats: SeatAvailability[]; checksum: string }, SeatmapPortError>>
+    - getOrganizerView(eventId: string): Promise<Result<{ seats: SeatAvailability[]; checksum: string }, SeatmapPortError>>
+    - upsertSeatStatuses(input: UpsertSeatStatusesInput, context): Promise<Result<void, SeatmapPortError>>
+    - releaseExpiredHolds(now: Date, limit?: number): Promise<Result<{ released: number }, SeatmapPortError>>
+  notes:
+    - Buyer view must redact `orderId`; organizer view retains.
+
+SeatmapStreamingPort (streaming.port.ts):
+  methods:
+    - publishSeatStatusChanged(eventId: string, payload: SeatAvailability, context): Promise<Result<void, SeatmapPortError>>
+    - publishSeatmapReplaced(venueId: string, checksum: string, context): Promise<Result<void, SeatmapPortError>>
+    - subscribe?(eventId: string, handler: (payload) => void): AsyncIterator<SeatAvailability> # optional, for adapters supporting inbound streams
+  notes:
+    - Stick to SSE-friendly payload size; include retry/backoff hints in context if needed.
+
+SeatGeometryParserPort (parser.port.ts):
+  methods:
+    - parse(input: { uploadRef: string; format: "cad" | "svg" | "csv"; venueId: string }): Promise<Result<{ glyphs: SeatGlyph[]; sections: SectionTransform[]; stage?: StageLayout; issues: ParserIssue[] }, SeatmapPortError>>
+  notes:
+    - Always return issues array even on success; callers decide whether to block publish.
+    - Parsers should infer `radius` fallback (`width`/`height` absent) and normalize `facingAngle` to degrees clockwise from positive X.
+    - Missing optional geometry fields must not throw; downstream renderers rely on point-only seats as MVP.
+    - Parser output should include bounding boxes to speed up R-tree creation during publish.
+
+index_exports:
+  - Re-export all ports + types from `packages/ports/src/index.ts` under `seatmaps` namespace.
+  - Provide helper factory `createSeatmapPorts()` for DI registration.
+
+tests (interface-level):
+  - Ensure zod schemas cover glyph + availability shapes; add contract tests with sample payloads (arena vs theater).
+  - Validate that optional geometry fields (`radius`, `width`, `height`, `facingAngle`) are all permitted and default correctly.
+  - Validate error code union shared across ports.
+  - Snapshot compile test verifying exported types align with spec (use dtslint or vitest type tests).

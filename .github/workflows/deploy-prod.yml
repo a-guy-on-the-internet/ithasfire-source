@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   # Shared group with terraform-apply so a deploy-prod and a manual
@@ -13,176 +14,267 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ── Promote api + jobs (re-tag dev → prod, no rebuild) ────────────────
-  promote_api:
-    name: Promote api:dev → api:prod
+  # ── Version-skew guard (promoted images match the dispatched commit) ──
+  # build_web and migrate_db work from github.sha, but the promote jobs take
+  # images deploy-dev already built. `:dev` is a moving tag that deploy-dev
+  # pushes at build time and only for the services a run's diff touched, so
+  # it can be older or newer than github.sha even when dev's last run is
+  # green. Shipping web at HEAD against an older api breaks every tRPC
+  # procedure the api does not have yet.
+  #
+  # The guard checks each service's `:dev` digest against github.sha (rule
+  # and edge cases in scripts/ci/check-prod-version-skew.sh), refuses a
+  # dispatch from any ref but main, and requires deploy-dev green at this
+  # commit or at a docs-only ancestor. It outputs the digests it verified and
+  # the promote jobs retag THOSE, not `:dev`, so a push to main during the
+  # run cannot swap in an unchecked image between the check and the retag.
+  #
+  # Like manifest_drift_guard, the promote_* and build_web jobs `need` it,
+  # so nothing moves a `:prod` tag until it passes. No dependency install:
+  # this job holds the GCP credential.
+  version_skew_guard:
+    name: Version-skew guard (promoted images match this commit)
     runs-on: ubuntu-latest
     environment: prod
+    permissions:
+      contents: read
+      id-token: write
+      # Reads deploy-dev.yml's run history.
+      actions: read
+    timeout-minutes: 10
+    outputs:
+      api_digest: ${{ steps.skew.outputs.api_digest }}
+      jobs_digest: ${{ steps.skew.outputs.jobs_digest }}
+      tileserver_digest: ${{ steps.skew.outputs.tileserver_digest }}
+      audio_transcoder_digest: ${{ steps.skew.outputs.audio_transcoder_digest }}
     steps:
-      - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+      # First, before checkout and the GCP credential: a branch dispatch
+      # never gets as far as holding prod auth. The script refuses it too.
+      - name: Refuse a dispatch from any ref but main
+        env:
+          REF_NAME: ${{ github.ref }}
+        run: |
+          if [[ "$REF_NAME" != "refs/heads/main" ]]; then
+            echo "::error::deploy-prod was dispatched from ${REF_NAME}. Dispatch it from main."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          # Full history: the dev-<sha7> tags must resolve to commits, and the
+          # check diffs each one against github.sha.
+          fetch-depth: 0
+          lfs: false
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        id: setup_gcloud
-        # Retried below — see the note at the first occurrence in deploy-dev.yml.
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
 
-      - name: Re-tag api:dev as api:prod
+      # yq, jq and python3 come with ubuntu-latest; nothing is installed here.
+      - name: Check promoted images against this commit
+        id: skew
         env:
           PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
           AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          REF_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash scripts/ci/check-prod-version-skew.sh
+
+  # ── Promote api + jobs (re-tag the verified dev digest → prod) ────────
+  promote_api:
+    name: Promote verified api digest → api:prod
+    needs: [manifest_drift_guard, version_skew_guard]
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      # By digest, not `api:dev`: the digest is the one version_skew_guard
+      # checked, and `:dev` may have moved since. An empty output would make
+      # the ref `api@`, so refuse it here rather than let gcloud guess.
+      - name: Re-tag the verified api digest as api:prod
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
+          AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          DIGEST: ${{ needs.version_skew_guard.outputs.api_digest }}
         run: |
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::version_skew_guard gave no api digest ('${DIGEST}')."; exit 1; }
           base="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}"
-          gcloud artifacts docker tags add "${base}/api:dev" "${base}/api:prod" --quiet
+          gcloud artifacts docker tags add "${base}/api@${DIGEST}" "${base}/api:prod" --quiet
 
   promote_jobs:
-    name: Promote jobs:dev → jobs:prod
+    name: Promote verified jobs digest → jobs:prod
+    needs: [manifest_drift_guard, version_skew_guard]
     runs-on: ubuntu-latest
     environment: prod
     steps:
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        id: setup_gcloud
-        # Retried below — see the note at the first occurrence in deploy-dev.yml.
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
 
-      - name: Re-tag jobs:dev as jobs:prod
+      # By digest, for the reason on promote_api's retag.
+      - name: Re-tag the verified jobs digest as jobs:prod
         env:
           PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
           AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          DIGEST: ${{ needs.version_skew_guard.outputs.jobs_digest }}
         run: |
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::version_skew_guard gave no jobs digest ('${DIGEST}')."; exit 1; }
           base="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}"
-          gcloud artifacts docker tags add "${base}/jobs:dev" "${base}/jobs:prod" --quiet
+          gcloud artifacts docker tags add "${base}/jobs@${DIGEST}" "${base}/jobs:prod" --quiet
 
   promote_tileserver:
-    name: Promote tileserver:dev → tileserver:prod
+    name: Promote verified tileserver digest → tileserver:prod
+    needs: [manifest_drift_guard, version_skew_guard]
     runs-on: ubuntu-latest
     environment: prod
     steps:
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        id: setup_gcloud
-        # Retried below — see the note at the first occurrence in deploy-dev.yml.
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
 
       # The tileserver image has no NEXT_PUBLIC_* / per-env build args, so the
       # dev-built digest is byte-identical to what prod should run. Promote by
-      # re-tagging dev → prod (same pattern as api/jobs) rather than rebuilding.
-      - name: Re-tag tileserver:dev as tileserver:prod
+      # re-tagging the verified dev digest → prod (same pattern as api/jobs)
+      # rather than rebuilding.
+      - name: Re-tag the verified tileserver digest as tileserver:prod
         env:
           PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
           AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          DIGEST: ${{ needs.version_skew_guard.outputs.tileserver_digest }}
         run: |
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::version_skew_guard gave no tileserver digest ('${DIGEST}')."; exit 1; }
           base="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}"
-          gcloud artifacts docker tags add "${base}/tileserver:dev" "${base}/tileserver:prod" --quiet
+          gcloud artifacts docker tags add "${base}/tileserver@${DIGEST}" "${base}/tileserver:prod" --quiet
 
   promote_audio_transcoder:
-    name: Promote audio-transcoder:dev → audio-transcoder:prod
+    name: Promote verified audio-transcoder digest → audio-transcoder:prod
+    needs: [manifest_drift_guard, version_skew_guard]
     runs-on: ubuntu-latest
     environment: prod
     steps:
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        id: setup_gcloud
-        # Retried below — see the note at the first occurrence in deploy-dev.yml.
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
 
       # The audio-transcoder image has no NEXT_PUBLIC_* / per-env build args, so
       # the dev-built digest is byte-identical to what prod should run. Promote
-      # by re-tagging dev → prod (same pattern as api/jobs/tileserver) rather
-      # than rebuilding.
-      - name: Re-tag audio-transcoder:dev as audio-transcoder:prod
+      # by re-tagging the verified dev digest → prod (same pattern as
+      # api/jobs/tileserver) rather than rebuilding.
+      - name: Re-tag the verified audio-transcoder digest as audio-transcoder:prod
         env:
           PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           REGION: ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}
           AR_REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+          DIGEST: ${{ needs.version_skew_guard.outputs.audio_transcoder_digest }}
         run: |
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::version_skew_guard gave no audio-transcoder digest ('${DIGEST}')."; exit 1; }
           base="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}"
-          gcloud artifacts docker tags add "${base}/audio-transcoder:dev" "${base}/audio-transcoder:prod" --quiet
+          gcloud artifacts docker tags add "${base}/audio-transcoder@${DIGEST}" "${base}/audio-transcoder:prod" --quiet
 
   # ── Build web (needs different NEXT_PUBLIC_* for prod) ────────────────
   build_web:
     name: Build + push web:prod
+    # version_skew_guard too, though web is built here from github.sha: a
+    # web:prod pushed beside a refused api would still be what the next
+    # redeploy-prod rolls.
+    needs: [manifest_drift_guard, version_skew_guard]
     runs-on: ubuntu-latest
     environment: prod
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
-          lfs: false
+          # MUST be true — same reason as deploy-dev.yml's build_web. This is
+          # the only prod job that builds from source (api/jobs/tileserver/
+          # audio are re-tag promotions), so it is the only place prod's OG
+          # fonts can come from. With lfs:false the prod image ships ~130-byte
+          # pointer stubs for public/fonts/og/*.ttf and every share card on
+          # ithasfire.com renders blank.
+          lfs: true
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        id: setup_gcloud
-        # Retried below — see the note at the first occurrence in deploy-dev.yml.
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v3
 
       - name: Configure docker auth for Artifact Registry
         run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
+
+      # Same step as deploy-dev.yml's build jobs: deploy-dev runs 38363414045
+      # and 38448102851 (2026-10-13) lost web:dev to "No space left on device"
+      # mid-build, and this job builds the same image.
+      - name: Reclaim runner disk
+        run: |
+          echo "--- before ---"; df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/share/swift || true
+          sudo docker image prune -af || true
+          echo "--- after ---"; df -h /
 
       - name: Build and push (web)
         env:
@@ -245,12 +337,9 @@ jobs:
           build_args+=(--build-arg "NEXT_PUBLIC_BUILD_SHA=${NEXT_PUBLIC_BUILD_SHA:0:7}")
           build_args+=(--build-arg "NEXT_PUBLIC_APP_VERSION=${NEXT_PUBLIC_APP_VERSION:-0.1.0}")
 
-          # Reads dev's buildcache too (second --cache-from). apps/web/Dockerfile
-          # declares the NEXT_PUBLIC_* ARGs AFTER the install stage on purpose, so
-          # pnpm install + prisma generate are byte-identical between dev and prod
-          # and prod can reuse dev's layers. The `next build` layer is NOT shared:
-          # different arg values give it a different cache key, so prod always
-          # rebuilds the bundle with prod values. Writes only to buildcache-prod.
+          # No layer cache: a prod build never trusts the GitHub Actions cache,
+          # which any workflow run on main can write, and with mode=min it saved
+          # almost nothing here (the bundle rebuilds with prod values every time).
           #
           # The prod-<sha> tag exists so a prod web image is traceable back to
           # a commit. api/jobs/tileserver/audio don't need one: they're PROMOTED
@@ -262,9 +351,6 @@ jobs:
             --platform linux/amd64 \
             --provenance=false \
             --push \
-            --cache-from=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-prod \
-            --cache-from=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-v2 \
-            --cache-to=type=registry,ref=${repo_host}/${PROJECT_ID}/${AR_REPO}/${SERVICE}:buildcache-prod,mode=max \
             "${build_args[@]}" \
             -f apps/web/Dockerfile \
             -t "${image_ref}" \
@@ -282,29 +368,26 @@ jobs:
     # from the (already-provisioned) hf-prod-database-url secret directly, so it
     # does not depend on terraform running first in steady state.
     # NOTE: on a brand-new env bootstrap (secret not yet created) this job will
-    # fail until the first terraform_apply provisions hf-prod-database-url; that
-    # is a one-time bootstrap concern, not a steady-state deploy.
-    needs: [promote_api, promote_jobs, promote_tileserver, promote_audio_transcoder, build_web]
+    # fail until terraform-apply.yml (environment: prod) has run once to
+    # provision hf-prod-database-url. terraform_apply below waits for this job,
+    # so a deploy-prod run cannot bootstrap itself. One-time concern only.
+    # version_skew_guard is already upstream of every image job; it is listed
+    # so the migration's gate does not depend on those jobs keeping it.
+    needs: [version_skew_guard, promote_api, promote_jobs, promote_tileserver, promote_audio_transcoder, build_web]
     runs-on: ubuntu-latest
     environment: prod
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        id: setup_gcloud
-        # Retried below — see the note at the first occurrence in deploy-dev.yml.
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
@@ -320,10 +403,10 @@ jobs:
           echo "DATABASE_URL=${url}" >> "$GITHUB_ENV"
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@v4
 
       - name: Setup Node
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v4
         with:
           node-version: 22
 
@@ -340,10 +423,10 @@ jobs:
       # only platform-default content; support-recovery is withheld. They
       # inherit DATABASE_URL exported to $GITHUB_ENV above.
       - name: Seed platform categories
-        run: pnpm -F api exec tsx src/scripts/seed-platform-categories.ts
+        run: pnpm -F api exec tsx src/scripts/reference-data/seed-platform-categories.ts
 
       - name: Seed platform tags
-        run: pnpm -F api exec tsx src/scripts/seed-platform-tags.ts
+        run: pnpm -F api exec tsx src/scripts/reference-data/seed-platform-tags.ts
 
       # GLOBAL fee policy. The platform fee is defined in CODE
       # (packages/core/src/lib/pricing/platform-fee-policy.ts) and this step
@@ -361,7 +444,7 @@ jobs:
       # would reproduce that. Fail loudly.
       - name: Seed platform fee policy
         id: seed_fee_policy
-        run: pnpm -F api exec tsx src/scripts/seed-platform-fee-policy.ts
+        run: pnpm -F api exec tsx src/scripts/reference-data/seed-platform-fee-policy.ts
 
       # The generic `notify` job at the bottom of this file already fires on a
       # red migrate_db, but it says only "Deploy PROD — failure". This names the
@@ -407,7 +490,7 @@ jobs:
       - name: Seed volunteer role packs
         id: seed_volunteer_packs
         continue-on-error: true
-        run: pnpm -F api exec tsx src/scripts/seed-volunteer-packs.ts
+        run: pnpm -F api exec tsx src/scripts/reference-data/seed-volunteer-packs.ts
 
       # Mirrors deploy-dev.yml's migration-failure alert. `failure()` would not
       # fire here — `continue-on-error` keeps the job green — so this keys off
@@ -435,7 +518,7 @@ jobs:
       - name: Seed ticket-type packs
         id: seed_ticket_packs
         continue-on-error: true
-        run: pnpm -F api exec tsx src/scripts/seed-ticket-packs.ts
+        run: pnpm -F api exec tsx src/scripts/reference-data/seed-ticket-packs.ts
 
       # Application-form starter catalogue (application-driven-events spec
       # Phase 4). Same contract as the two steps above: INSTALL-ONLY (no
@@ -445,7 +528,7 @@ jobs:
       - name: Seed application-form templates
         id: seed_application_form_templates
         continue-on-error: true
-        run: pnpm -F api exec tsx src/scripts/seed-application-form-templates.ts
+        run: pnpm -F api exec tsx src/scripts/reference-data/seed-application-form-templates.ts
 
       - name: Report ticket-pack seed failure to Discord
         if: steps.seed_ticket_packs.outcome == 'failure'
@@ -478,11 +561,14 @@ jobs:
 
       # FOLLOW-UP (not this diff): `migrate_db` runs AFTER promote_api /
       # promote_jobs / promote_tileserver / promote_audio_transcoder have
-      # already re-tagged `:prod`, and `terraform_apply` is gated only on the
-      # image jobs, not on `migrate_db`. A red migrate_db therefore leaves the
-      # DB migrated, the `:prod` tags moved and terraform possibly half-rolled
-      # while `deploy_prod` goes red. The categories/tags seeds share that
-      # coupling. Worth restructuring on its own.
+      # already re-tagged `:prod` and build_web has pushed `web:prod`. `terraform_apply` now waits for a green
+      # migrate_db, so a red migrate_db blocks both the apply and the roll,
+      # but the `:prod` tags have still moved. A later terraform apply that
+      # changes service config (e.g. a manual terraform-apply.yml) would then
+      # roll those images onto the unmigrated schema. The open fix is to move
+      # `:prod` only after a green migration. The seed steps here without
+      # continue-on-error (categories, tags, fee policy) can also turn
+      # migrate_db red after the tags moved. Worth restructuring on its own.
 
   # ── Terraform apply (sync env vars + infra before rolling services) ───
   # Ensures Cloud Run env vars, IAM bindings, Scheduler jobs, and DNS
@@ -495,27 +581,74 @@ jobs:
   #
   # If the secrets are not configured the step is skipped (services still
   # deploy with existing env vars, matching pre-Terraform behaviour).
-  terraform_apply:
-    name: Terraform apply (prod)
-    needs: [promote_api, build_web, promote_jobs, promote_tileserver, promote_audio_transcoder]
+  # Terraform override drift guard — section 5 of
+  # apps/jobs/src/scripts/validate-manifest.ts: every `jobs_scheduler_overrides`
+  # entry in infra/terraform/envs/prod/prod.tfvars must be declared on its
+  # manifest entry, because the staff console reports the MANIFEST schedule.
+  # Same job as deploy-dev.yml's; unconditional here because this workflow is
+  # dispatch-only and always applies. Kept out of terraform_apply itself so a
+  # dependency install never shares a job with the GCP OIDC credential.
+  #
+  # The promote_* and build_web jobs `need` this, so it runs FIRST rather than
+  # alongside them: otherwise a red guard would leave the :prod tags already
+  # moved with no apply, migrate or roll behind them. The trade is ~2 minutes
+  # of serial latency on every prod deploy, paid before any credential is used.
+  manifest_drift_guard:
+    name: Jobs manifest / Terraform override drift guard
     runs-on: ubuntu-latest
-    environment: prod
-    # Runs BEFORE migrate_db so the Secret Manager entries it creates
-    # (notably hf-prod-database-url) exist before the migration job tries
-    # to read them. On a fresh-bootstrap deploy that secret doesn't exist
-    # yet, and the old order — migrate_db before terraform_apply — failed
-    # every first apply.
+    permissions:
+      contents: read
+    timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install apps/jobs and its workspace dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts --filter jobs...
+
+      - name: Validate jobs manifest and Terraform override drift
+        run: pnpm -C apps/jobs validate:manifest
+
+  terraform_apply:
+    name: Terraform apply (prod)
+    needs: [promote_api, build_web, promote_jobs, promote_tileserver, promote_audio_transcoder, manifest_drift_guard, version_skew_guard, migrate_db]
+    # A failed drift or version-skew guard blocks the apply outright;
+    # deploy_prod already requires terraform_apply to be `success`, so it
+    # blocks the roll too. `success()` keeps the default
+    # all-needs-succeeded rule explicit.
+    if: success() && needs.manifest_drift_guard.result == 'success' && needs.version_skew_guard.result == 'success' && needs.migrate_db.result == 'success'
+    runs-on: ubuntu-latest
+    environment: prod
+    # Runs AFTER migrate_db. Terraform reasserts the moving `:prod` image tags,
+    # so any apply that changes service config creates a new Cloud Run
+    # revision on whatever `:prod` points at. Running first, it could serve
+    # new code against an unmigrated schema (e.g. a new auth_user column
+    # breaks sign-in). A red migration therefore blocks terraform and the
+    # roll. On a brand-new env bootstrap the hf-prod-database-url secret
+    # doesn't exist yet, so run terraform-apply.yml (environment: prod) once
+    # first (see the NOTE on migrate_db).
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v4
+        uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.6
 
@@ -586,9 +719,11 @@ jobs:
     # build fails, block the roll outright. Keeping these in the gate (rather
     # than relying on the transitive terraform_apply chain) means a future
     # change to terraform_apply's own gating can't silently re-open the
-    # build-doesn't-gate-roll footgun.
+    # build-doesn't-gate-roll footgun. version_skew_guard is listed for the
+    # same reason: the roll must never ship images from another commit.
     needs:
       [
+        version_skew_guard,
         promote_api,
         promote_jobs,
         promote_tileserver,
@@ -599,6 +734,7 @@ jobs:
       ]
     if: >-
       ${{ !cancelled() &&
+      needs.version_skew_guard.result == 'success' &&
       needs.promote_api.result == 'success' &&
       needs.promote_jobs.result == 'success' &&
       needs.promote_tileserver.result == 'success' &&
@@ -610,19 +746,13 @@ jobs:
     environment: prod
     steps:
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        id: setup_gcloud
-        # Retried below — see the note at the first occurrence in deploy-dev.yml.
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
@@ -642,6 +772,13 @@ jobs:
           # promoted + applied by Terraform, just not rolled here). Set it to
           # hf-prod-tileserver to roll the prod tileserver on every dispatch.
           SERVICE_TILESERVER_NAME: ${{ vars.CLOUD_RUN_PROD_TILESERVER_SERVICE }}
+          # Prod audio-transcoder Cloud Run service name (hf-prod-audio-transcoder).
+          # Same "set-it-to-enable" pattern as the tileserver. Without this roll
+          # the transcoder only picks up a new :prod image when Terraform happens
+          # to change its template (the module ignores image changes), so new
+          # transcoder code could sit unrolled while the API that depends on it
+          # (the upload-start warm message) goes live.
+          SERVICE_AUDIO_TRANSCODER_NAME: ${{ vars.CLOUD_RUN_PROD_AUDIO_TRANSCODER_SERVICE }}
         run: |
           repo_host="${REGION}-docker.pkg.dev"
 
@@ -659,6 +796,15 @@ jobs:
               --region "$REGION" --to-latest --quiet
           }
 
+          # Consumer before producer: the API publishes messages (the upload-start
+          # warm-up) that only a current transcoder acks; an old one answers 400,
+          # which Pub/Sub retries to the dead-letter topic.
+          if [[ -n "${SERVICE_AUDIO_TRANSCODER_NAME:-}" ]]; then
+            deploy_service "${SERVICE_AUDIO_TRANSCODER_NAME}" "${repo_host}/${PROJECT_ID}/${AR_REPO}/audio-transcoder:${TAG}"
+          else
+            echo "CLOUD_RUN_PROD_AUDIO_TRANSCODER_SERVICE unset: skipping the audio-transcoder roll (set it to hf-prod-audio-transcoder)."
+          fi
+
           deploy_service "${SERVICE_API_NAME}"  "${repo_host}/${PROJECT_ID}/${AR_REPO}/api:${TAG}"
           deploy_service "${SERVICE_WEB_NAME}"  "${repo_host}/${PROJECT_ID}/${AR_REPO}/web:${TAG}"
           deploy_service "${SERVICE_JOBS_NAME}" "${repo_host}/${PROJECT_ID}/${AR_REPO}/jobs:${TAG}"
@@ -675,19 +821,13 @@ jobs:
     environment: prod
     steps:
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        id: setup_gcloud
-        # Retried below — see the note at the first occurrence in deploy-dev.yml.
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Setup gcloud (retry)
-        if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify gcloud is on PATH
         run: gcloud version
@@ -699,6 +839,7 @@ jobs:
           SERVICE_API_NAME: ${{ vars.CLOUD_RUN_PROD_API_SERVICE }}
           SERVICE_WEB_NAME: ${{ vars.CLOUD_RUN_PROD_WEB_SERVICE }}
           SERVICE_JOBS_NAME: ${{ vars.CLOUD_RUN_PROD_JOBS_SERVICE }}
+          WIF_SA: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
         run: |
           set -euo pipefail
 
@@ -726,10 +867,27 @@ jobs:
             local auth="${3:-public}"  # "public" or "authed"
             echo "Probing ${label}: ${url}"
             if [[ "$auth" == "authed" ]]; then
-              local token
-              token="$(gcloud auth print-identity-token --audiences="$url")"
-              curl --fail --silent --show-error --location --max-time 30 \
-                -H "Authorization: Bearer ${token}" "$url" > /dev/null
+              # Private service (no allUsers invoker). Under Workload Identity
+              # Federation there is no SA key, so `gcloud auth print-identity-token
+              # --audiences` fails ("Invalid account type for --audiences") — an
+              # OIDC token must be minted via impersonation instead. Both that
+              # mint AND the run.invoker binding for the CI SA may be absent, so
+              # this HTTP probe is BEST-EFFORT: the authoritative readiness gate
+              # for a private service is the Cloud Run `Ready` condition already
+              # asserted by describe_service above (and by the roll's own
+              # `gcloud run deploy`, which only succeeds on a Ready revision).
+              local token=""
+              token="$(gcloud auth print-identity-token \
+                --impersonate-service-account="${WIF_SA}" \
+                --audiences="$url" --include-email 2>/dev/null)" || true
+              if [[ -n "$token" ]]; then
+                curl --fail --silent --show-error --location --max-time 30 \
+                  -H "Authorization: Bearer ${token}" "$url" > /dev/null \
+                  && echo "  ${label}: OK" \
+                  || echo "::warning::${label} HTTP probe failed (non-fatal; readiness gated via describe_service)"
+              else
+                echo "::warning::${label} HTTP probe skipped — could not mint an OIDC token under WIF (non-fatal; readiness gated via describe_service)"
+              fi
             else
               curl --fail --silent --show-error --location --max-time 30 "$url" > /dev/null
             fi
@@ -751,7 +909,27 @@ jobs:
           # triggers, no allUsers invoker binding) so it needs an OIDC token.
           probe_url "api /health" "${api_url%/}/health"
           probe_url "jobs /health" "${jobs_url%/}/health" authed
-          probe_url "web /" "${web_url%/}/"
+          # Probe through Cloudflare: the run.app origin lacks the
+          # x-origin-secret header and will 403 once enforce_origin_secret is on.
+          # The run-id query busts the edge cache so the NEW revision answers.
+          probe_url "web / (via Cloudflare)" "https://ithasfire.com/?deploy=${GITHUB_RUN_ID}"
+
+      # Search index format check (search.ensure-format). Fired once, AFTER
+      # the jobs service rolled, so the revision that compares
+      # SEARCH_INDEX_FORMAT_VERSION is the one that rebuilds. Non-destructive
+      # and idempotent (a claim absorbs redelivery); a current index is a
+      # one-row read. NON-FATAL: the nightly search.full-reindex records the
+      # version too, so a missed publish self-heals by the next night.
+      - name: Trigger search index format check
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          topic="projects/${PROJECT_ID}/topics/prod-hf-trigger-search-ensure-format"
+          if gcloud pubsub topics publish "$topic" --message='{}' --project "$PROJECT_ID"; then
+            echo "Published search.ensure-format trigger to ${topic}"
+          else
+            echo "::warning::Could not publish search.ensure-format (non-fatal; the nightly search.full-reindex records the format version)"
+          fi
 
   # ── Seed admin REMOVED — bootstrap is manual now ──────────────────────
   # Previously a `seed_admin` job upserted the prod platform admin from
@@ -775,7 +953,7 @@ jobs:
 
   notify:
     name: Notify deploy result
-    needs: [promote_api, promote_jobs, promote_audio_transcoder, build_web, migrate_db, terraform_apply, deploy_prod, post_deploy_verify]
+    needs: [manifest_drift_guard, version_skew_guard, promote_api, promote_jobs, promote_tileserver, promote_audio_transcoder, build_web, migrate_db, terraform_apply, deploy_prod, post_deploy_verify]
     if: >-
       always() && !cancelled() &&
       (

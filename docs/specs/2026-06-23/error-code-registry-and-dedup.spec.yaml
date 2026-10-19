@@ -1,0 +1,194 @@
+# Not built yet (2026-10-08 docs consolidation): P3 codemod of ~937 throw sites onto registry
+# error-code-registry-and-dedup.spec.yaml
+#
+# Build a complete, tiered, typed registry of ALL domain error codes, dedupe the
+# accumulated drift, and migrate the ~937 throw sites onto it. The deferred
+# "big piece" of the error-contract effort — explicitly IN SCOPE, not cut.
+
+version: "1.0"
+updated: "2026-06-23"
+
+# Parent: docs/specs/2026-06-23/completed/error-contract-and-logging.spec.yaml
+# This spec is the follow-on that finishes what the parent started: the parent
+# shipped the MECHANISM (shared @th/errors, structured data.appCode, one
+# resolver). This spec pays down the accumulated code DEBT the mechanism exposed.
+
+# ── Current state (so a fresh context can start cold) ──────────────────────────
+
+current_state:
+  shipped:
+    - "PR1 (committed 663b1115): @th/errors leaf package — SCREAMING_SNAKE
+      `AppErrorCode` union (~56 curated codes), `AppError`/`isAppError`,
+      `fail()`, `toKey(code)`→camelCase i18n key, `fromLegacyCode(snake)`→
+      AppErrorCode|null, `normalizeError(error,t?)`. tRPC boundary in
+      packages/transport/trpc/src/utils.ts: `errorCodeMap` (legacy {code,message}
+      path) + `appCodeToTrpc` (`satisfies Record<AppErrorCode,…>`, AppError path);
+      apps/api/src/plugins/trpc.ts errorFormatter attaches `data.appCode`."
+    - "PR2 (committed 22161712): web + scanner + mobile consume the shared
+      resolver; bespoke detectors retired."
+  in_flight:
+    - "Five follow-up prompts (A–E) dispatched by the user in parallel: A=
+      errorCodeMap 500-bug fix (utils.ts), B=curate AppErrorCode + en/es i18n
+      parity test, C=`fail()`/`AppError` go-forward helper + convention doc,
+      D=jobs adoption, E=webhook adoption. THIS spec extends B's curation into a
+      FULL tiered registry — let B land first, then supersede/extend it."
+  blockers:
+    - "Full `pnpm typecheck` is currently RED from UNRELATED user WIP (a comms
+      `./inapp` port deletion + volunteering). The codemod phase CANNOT be
+      verified until that clears. Harvest/analysis (Phase 1) is unblocked."
+
+# ── Summary ────────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    There are ~504 DISTINCT domain error codes across ~937 throw sites in
+    packages/core/src/use-cases (+ some in packages/ports), grown per-feature
+    with no central registry. They are untyped strings (typos compile and become
+    phantom codes / silent 500s), undeduplicated (the "you're not allowed"
+    concept alone is spelled ≥6 ways: insufficient_role / insufficient_permissions
+    / insufficient_org_role / staff_only / not_owner / actor_must_be_owner /
+    cannot_*), and not tiered (internal infra codes like db_error/redis_down mixed
+    with user-facing domain codes). The convention itself is violated: the domain
+    code is meant to live in `message` but frequently sits in the `code` field —
+    which is exactly how a class of business/auth errors (listing_not_found,
+    cannot_buy_own_listing, unauthenticated, resale_price_exceeds_cap…) ended up
+    returning HTTP 500 instead of 4xx (symptom; partially fixed by follow-up A).
+  solution: >
+    Build the complete typed registry as the single source of truth: harvest all
+    codes, DEDUPE the drift into a canonical set, TIER them (user-facing → needs
+    en/es i18n + parity gate; internal → typed but i18n-exempt and never shown),
+    give every canonical code a deliberate HTTP status, then CODEMOD the throw
+    sites onto it (batched per-domain). Goal is not to shrink the number for its
+    own sake — a platform this size legitimately has hundreds of failure states —
+    but to make them VISIBLE, ENFORCED, and DEDUPLICATED so drift and silent 500s
+    can't recur.
+  users:
+    - developers (typed/enumerable/typo-proof error surface — primary)
+    - all clients downstream (correct HTTP status + stable codes)
+  surfaces:
+    - api
+    - web
+    - scanner
+    - mobile
+    - jobs
+
+# ── Findings / data (from the 2026-06-23 audit) ────────────────────────────────
+
+findings:
+  distinct_codes: ~504
+  throw_sites: ~937
+  occurrence_concentration: >
+    Much of the 937 is a small core repeated, NOT 937 unique decisions —
+    e.g. ~133 idempotency_* occurrences are really ~2 codes fired at every money
+    mutation; ~299 `event*` occurrences are a smaller set reused across use-cases.
+  composition_estimate: >
+    Roughly: ~250-300 genuinely-distinct user-meaningful states (real domain
+    breadth across events/series/ticketing/seating/checkout/Stripe Connect/
+    payouts/resale/claims/promos/venue-verification/booking/volunteering/scanning);
+    ~100-150 entity×violation multiplication (X_not_found / X_not_editable per
+    entity — some legit, some collapsible to category + `{ entity }` meta);
+    ~50-100 near-duplicate drift (esp. the authz cluster); ~50 internal/infra
+    codes that belong in their own tier.
+  root_cause: >
+    No registry + "the code is a free string written in local context." Every
+    use-case author coined a fresh snake_case string that read right in place,
+    with no canonical list to dedupe against. Multiply by ~15 bounded contexts ×
+    years of feature-first growth.
+
+# ── Approach: a 3-phase PIPELINE (sequential, not parallel) ────────────────────
+# Each phase consumes the previous phase's output. Fan-out happens INSIDE phase 3
+# (per-domain codemods are independent).
+
+phases:
+  - id: P1
+    title: Harvest & triage (analysis only — no throw-site mutation)
+    output:
+      - "docs/specs/2026-06-23/error-code-registry.md — human-review table grouped
+        by domain: each code with occurrence count, source files, proposed
+        `canonical` (SCREAMING_SNAKE), `tier` (user-facing|internal),
+        `httpCategory`, and `disposition` (KEEP | COLLAPSE→<canonical> | INTERNAL |
+        NEEDS_DECISION)."
+      - "A machine-readable map (TS or YAML) `oldCode → { canonical, tier,
+        httpCategory }` consumed by P2/P3."
+    rules:
+      - Flag every COLLAPSE where merged codes currently map to DIFFERENT http
+        statuses or DIFFERENT user copy (risky merges).
+      - NEEDS_DECISION = collapsing would erase a distinction a client may rely on
+        (e.g. series_not_found vs event_not_found). Propose, do NOT decide
+        unilaterally — these need user sign-off before P2.
+      - No edits to throw sites or the union in this phase.
+  - id: P2
+    title: Build the typed registry in @th/errors (after P1 sign-off)
+    work:
+      - Expand `AppErrorCode` (packages/errors/src/codes.ts) to the full canonical
+        set; export `USER_FACING_CODES` vs `INTERNAL_CODES` subsets; keep the
+        two-way drift guard.
+      - Parity test requires en+es `errors.*` keys for USER_FACING_CODES only, and
+        asserts INTERNAL_CODES are absent from the catalog (can't leak user copy).
+      - Make `appCodeToTrpc` (utils.ts) exhaustive for the expanded union; reconcile
+        with `errorCodeMap` so legacy and AppError paths return the SAME status for
+        the same logical code.
+      - Extend `fromLegacyCode` with the P1 alias→canonical table so boundary and
+        codemod agree.
+  - id: P3
+    title: Codemod throw sites onto the registry (after P2 + GREEN typecheck)
+    work:
+      - Rewrite `throw { code, message }` / `fail(...)` / domain-error-factory sites
+        to `throw fail("CANONICAL_CODE", { meta })` using the P1 map. Preserve
+        `cause` and any meta; for collapses, preserve lost specificity in meta
+        (e.g. `{ entity: "series" }`).
+      - PER DOMAIN, one reviewable PR each (resale/claims/volunteering/series/event/
+        order/place/agreement/payments/…). NOT one mega-diff.
+      - Per batch: `pnpm typecheck` green + that domain's tests pass; update tests
+        that asserted the old `{code,message}` shape to assert the canonical code
+        (tighten, don't loosen).
+    precondition: >
+      MUST NOT start until `pnpm typecheck` is green (comms WIP resolved). A large
+      codemod is unverifiable while typecheck is red — stop and report if so.
+
+# ── Risks ──────────────────────────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      A collapse erases a distinction a client legitimately needs (e.g. different
+      404 copy/handling for series vs event).
+    severity: MEDIUM
+    mitigation: >
+      P1 marks these NEEDS_DECISION for user sign-off; P3 preserves the specific
+      identity in `meta` rather than dropping it.
+  - risk: A 937-site codemod is unreviewable as one diff and risks regressions.
+    severity: MEDIUM
+    mitigation: Per-domain PRs; tighten (not loosen) tests per batch; codemod is
+      mechanical given the P1 map.
+  - risk: Validation blocked by unrelated comms WIP (red typecheck).
+    severity: LOW
+    mitigation: P1 is unblocked; P2 scoped to packages/errors + transport; P3 gated
+      on green typecheck.
+  - risk: Overlap with in-flight follow-up B (curate union) causes churn.
+    severity: LOW
+    mitigation: Let B land first; P1/P2 extend B's curated set into the full tier.
+
+# ── Out of scope ────────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Changing business logic / control flow / which condition throws (representation
+    only).
+  - The in-flight A–E follow-ups (separate prompts already dispatched).
+  - Shrinking the code count as a goal in itself — dedup only removes genuine
+    duplicates; legitimate distinct states stay.
+
+# ── Acceptance criteria ──────────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - "A canonical registry exists: every domain code in core/ports maps to a typed
+    AppErrorCode; `fromLegacyCode` resolves every legacy alias to its canonical."
+  - "Codes are tiered: USER_FACING_CODES have en+es i18n keys (parity-gated);
+    INTERNAL_CODES are typed but absent from the i18n catalog."
+  - "appCodeToTrpc and errorCodeMap agree on HTTP status for the same logical
+    code; no business/auth code resolves to a 500."
+  - "The authz drift cluster is collapsed to a small deliberate set; collapsed
+    entity-specific codes preserve identity via meta."
+  - "All ~937 throw sites migrated per-domain with green typecheck + passing,
+    tightened tests; the registry doc tracks per-domain completion."
+  - "A new ad-hoc `throw { code: 'typo' }` is a compile error (or lint warning) —
+    drift cannot silently recur."

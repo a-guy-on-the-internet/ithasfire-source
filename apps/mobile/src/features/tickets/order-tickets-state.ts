@@ -26,6 +26,11 @@ export type OrderTicketsQueryState = {
   isQueryLoading: boolean;
   isQueryError: boolean;
   queryErrorMessage: string | null;
+  /**
+   * The server refused with `email_verification_required` (B2). Optional so
+   * existing callers and fixtures read as "not gated".
+   */
+  isVerificationRequired?: boolean;
 };
 
 export type ResolvedOrderTickets = {
@@ -34,6 +39,8 @@ export type ResolvedOrderTickets = {
   cachedAt: string | null;
   isLoading: boolean;
   errorMessage: string | null;
+  /** Show the verify prompt; no tickets, live or cached, are returned. */
+  verificationRequired: boolean;
 };
 
 const GENERIC_ERROR = "Couldn't load your tickets.";
@@ -78,6 +85,27 @@ export const toCacheableTickets = (
   }));
 
 /**
+ * What a settled cache read puts into state. A read that started before the
+ * verify-your-email gate answered must not restore the entry the gate just
+ * deleted (B2).
+ */
+export const applyCacheRead = <T>(entry: T | null, gated: boolean): T | null =>
+  gated ? null : entry;
+
+/**
+ * Whether to write live tickets through to the cache. Never behind the gate
+ * (the server has said this account may not hold them), and not again for a
+ * payload already written.
+ */
+export const shouldWriteCache = (input: {
+  hasLiveTickets: boolean;
+  gated: boolean;
+  fingerprint: string;
+  lastWritten: string | null;
+}): boolean =>
+  input.hasLiveTickets && !input.gated && input.lastWritten !== input.fingerprint;
+
+/**
  * Key for "have we already written exactly this?".
  *
  * Includes the order id because two orders can legitimately hold an identical
@@ -97,6 +125,11 @@ export const buildCacheFingerprint = (
  *
  * Order of precedence, and why:
  *
+ *   0. **The verify-your-email gate beats everything** (B2). The server
+ *      answered, so this is not the offline case, and its answer is that this
+ *      account may not see these tickets. A cached copy (written before the
+ *      gate, possibly by a squatter on someone else's address) is not shown;
+ *      the hook also deletes it.
  *   1. **Live data wins**, even alongside an error — a background refetch can
  *      fail while `data` is still populated, and yanking the buyer's tickets
  *      away to show an error card would be strictly worse than stale data.
@@ -111,6 +144,17 @@ export const buildCacheFingerprint = (
 export const resolveOrderTicketsState = (
   state: OrderTicketsQueryState,
 ): ResolvedOrderTickets => {
+  if (state.isVerificationRequired) {
+    return {
+      tickets: [],
+      source: "none",
+      cachedAt: null,
+      isLoading: false,
+      errorMessage: null,
+      verificationRequired: true,
+    };
+  }
+
   if (state.liveTickets) {
     return {
       tickets: state.liveTickets,
@@ -118,6 +162,7 @@ export const resolveOrderTicketsState = (
       cachedAt: null,
       isLoading: false,
       errorMessage: null,
+      verificationRequired: false,
     };
   }
 
@@ -128,6 +173,7 @@ export const resolveOrderTicketsState = (
       cachedAt: state.cached.cachedAt,
       isLoading: false,
       errorMessage: null,
+      verificationRequired: false,
     };
   }
 
@@ -138,6 +184,7 @@ export const resolveOrderTicketsState = (
       cachedAt: null,
       isLoading: false,
       errorMessage: state.queryErrorMessage || GENERIC_ERROR,
+      verificationRequired: false,
     };
   }
 
@@ -147,5 +194,6 @@ export const resolveOrderTicketsState = (
     cachedAt: null,
     isLoading: state.isQueryLoading || !state.cacheChecked,
     errorMessage: null,
+    verificationRequired: false,
   };
 };

@@ -1,0 +1,350 @@
+/* ── Track record ("The door") ─────────────────────────────────────────────
+   venue-track-record-and-review-switch R8/R9: the third provenance block on
+   a venue page, beside the PERFORMERS and ATTENDEES tiers. Its stamp lives in
+   `review-tier.module.css` so the three read as one system; what is here is
+   the Ledger itself — three figures on a rule, a cadence line, the acts.
+
+   THEME: this block renders inside an owner-themed page, so every colour
+   resolves from the per-page custom properties (`--th-color-*`) with a
+   currentColor-derived fallback. No literal light/dark value may appear here
+   — a hardcoded ink is invisible on a dark venue theme and vice versa.
+
+   MONO LADDER: size and tracking always travel together, so every mono pair
+   below comes off the SAME step in globals.css (`--fs-mono-*` / `--tr-mono-*`).
+   A size with another step's tracking is not "close to the idiom". */
+
+.section {
+	background-color: rgba(128, 128, 128, 0.04);
+}
+
+.empty {
+	margin: 0;
+	font-size: 0.9375rem;
+	line-height: 1.5;
+	color: var(--th-color-text, inherit);
+	opacity: 0.7;
+}
+
+/* ── The ledger: three cells on a 2px rule ────────────────────────────────
+   GRID, not flex: the three columns must align as columns (the dt row and
+   the figure row line up across cells). `minmax(0, 1fr)` so a long figure
+   can never widen its column past a third — the cell wraps instead. */
+.ledger {
+	display: grid;
+	grid-template-columns: repeat(3, minmax(0, 1fr));
+	margin: 0;
+	border-top: 2px solid
+		var(--th-color-border, color-mix(in srgb, currentColor 28%, transparent));
+	border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent);
+}
+
+.cell {
+	min-width: 0;
+	padding: 0.85rem 0.75rem 0.85rem 0;
+	border-right: 1px solid color-mix(in srgb, currentColor 15%, transparent);
+}
+
+.cell + .cell {
+	padding-left: 0.75rem;
+}
+
+.cell:last-child {
+	padding-right: 0;
+	border-right: 0;
+}
+
+.term {
+	margin: 0 0 0.3rem;
+	font-family: var(
+		--font-mono,
+		ui-monospace,
+		SFMono-Regular,
+		Menlo,
+		Consolas,
+		monospace
+	);
+	/* sm — the label step. */
+	font-size: var(--fs-mono-sm, 11px);
+	font-weight: 600;
+	line-height: 1.3;
+	letter-spacing: var(--tr-mono-sm, 2px);
+	text-transform: uppercase;
+	color: var(--th-color-text, inherit);
+	opacity: 0.62;
+	/* Not `nowrap`: a tracked uppercase term wider than its cell would
+	   overprint the neighbour without ever changing the cell's scrollWidth
+	   (measured: es "SHOWS REALIZADOS" is 138px, a cell at 481px is 119px).
+	   Above the collapse every term fits on one line; below it the term owns
+	   an `auto` column and never wraps. A longer locale degrades to a wrap. */
+	white-space: normal;
+}
+
+.figure {
+	margin: 0;
+	font-size: 1.85rem;
+	font-weight: 700;
+	line-height: 1.05;
+	letter-spacing: -0.02em;
+	font-variant-numeric: tabular-nums;
+	color: var(--th-color-text, inherit);
+	/* A figure is short by construction; this is the safety net that keeps a
+	   wide locale string inside its third rather than pushing the block into
+	   a horizontal scroll. */
+	overflow-wrap: anywhere;
+}
+
+.figureDate {
+	font-size: 1.5rem;
+}
+
+.figure time {
+	font-variant-numeric: tabular-nums;
+}
+
+/* The second line under each figure: "14 this year" / "2½ years running" /
+   "9 days ago". Mono lg — the large-meta step. */
+.sub {
+	display: block;
+	margin-top: 0.35rem;
+	font-family: var(
+		--font-mono,
+		ui-monospace,
+		SFMono-Regular,
+		Menlo,
+		Consolas,
+		monospace
+	);
+	font-size: var(--fs-mono-lg, 13px);
+	font-weight: 500;
+	line-height: 1.35;
+	letter-spacing: var(--tr-mono-lg, 0.4px);
+	color: var(--th-color-text, inherit);
+	opacity: 0.7;
+	white-space: normal;
+}
+
+/* ── Cadence: one derived sentence under the numbers ─────────────────────── */
+.cadence {
+	margin: 0.9rem 0 0;
+	font-family: var(
+		--font-mono,
+		ui-monospace,
+		SFMono-Regular,
+		Menlo,
+		Consolas,
+		monospace
+	);
+	font-size: var(--fs-mono-lg, 13px);
+	font-weight: 600;
+	line-height: 1.4;
+	letter-spacing: var(--tr-mono-lg, 0.4px);
+	font-variant-numeric: tabular-nums;
+	color: var(--th-color-text, inherit);
+}
+
+/* ── Who has played here ──────────────────────────────────────────────────── */
+.acts {
+	margin: 1rem 0 0;
+}
+
+/* Label row: the overline on the left, the "All N acts" link on the right.
+   Flex — nothing here needs to align with a row above. It wraps at narrow
+   widths rather than truncating either half. */
+.actsLabel {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: space-between;
+	align-items: baseline;
+	gap: 0.25rem 1rem;
+	margin: 0 0 0.4rem;
+	font-family: var(
+		--font-mono,
+		ui-monospace,
+		SFMono-Regular,
+		Menlo,
+		Consolas,
+		monospace
+	);
+	font-size: var(--fs-mono-sm, 11px);
+	font-weight: 600;
+	line-height: 1.3;
+	letter-spacing: var(--tr-mono-sm, 2px);
+	text-transform: uppercase;
+	color: var(--th-color-text, inherit);
+	opacity: 0.82;
+}
+
+/* The one place the page's primary colour appears in this block: the way to
+   the Roster. Underlined so it survives a theme where primary ≈ text. */
+.actsAll {
+	color: var(--th-color-primary, inherit);
+	text-decoration: none;
+	white-space: nowrap;
+}
+
+a.actsAll {
+	text-decoration: underline;
+	text-underline-offset: 3px;
+	text-decoration-thickness: 1px;
+}
+
+a.actsAll:hover,
+a.actsAll:focus-visible {
+	text-decoration-thickness: 2px;
+}
+
+/* Inline FLOW, not flex: a flex container blockifies its items, so at narrow
+   widths every act lands on its own line with a stray "·" at each line end.
+   As inline text the names wrap like a sentence and the separators stay
+   between words. */
+.actsList {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	font-size: 0.9375rem;
+	line-height: 1.7;
+	color: var(--th-color-text, inherit);
+}
+
+.actsItem {
+	display: inline;
+	/* An act name is the one unbounded string in this block. */
+	overflow-wrap: anywhere;
+}
+
+/* Interpunct separators as generated content with EMPTY alternative text
+   (`content: "·" / ""`), so assistive tech reads the list, not the dots. The
+   plain declaration first: engines without the alt-text syntax (older
+   Safari/Firefox) drop the whole declaration otherwise, and the inline
+   items run together. */
+.actsItem::after {
+	content: "·";
+	content: "·" / "";
+	margin: 0 0.5rem;
+	opacity: 0.5;
+}
+
+.actsItem:last-child::after {
+	content: none;
+}
+
+.actLink {
+	color: inherit;
+	text-decoration: underline;
+	text-underline-offset: 3px;
+	text-decoration-thickness: 1px;
+}
+
+.actLink:hover,
+.actLink:focus-visible {
+	text-decoration-thickness: 2px;
+}
+
+/* "×5" — the regulars marker. Mono md, the meta-line step. */
+.times {
+	margin-left: 0.2rem;
+	font-family: var(
+		--font-mono,
+		ui-monospace,
+		SFMono-Regular,
+		Menlo,
+		Consolas,
+		monospace
+	);
+	font-size: var(--fs-mono-md, 11.5px);
+	letter-spacing: var(--tr-mono-md, 1.4px);
+	font-variant-numeric: tabular-nums;
+	opacity: 0.7;
+}
+
+.srOnly {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	margin: -1px;
+	padding: 0;
+	overflow: hidden;
+	clip: rect(0 0 0 0);
+	white-space: nowrap;
+	border: 0;
+}
+
+/* The provenance line. 0.7 is the opacity floor that keeps 13px ink on Stub
+   paper at AA (the review-tier note measured 5.9:1 there). */
+.foot {
+	margin: 0.9rem 0 0;
+	font-size: 0.8125rem;
+	line-height: 1.5;
+	color: var(--th-color-text, inherit);
+	opacity: 0.7;
+}
+
+/* Narrow widths: three columns would be ~65px each at 320 (the page's own
+   padding takes the rest), which breaks "running" mid-word and stacks
+   "Mar 2024"; and below 600px the widest term (es "SHOWS REALIZADOS",
+   138px) wraps inside its third and pushes its figure below the others'.
+   The grid collapses by re-declaring its columns — one per row, each row a
+   hairline-divided term-over-figure stack — never by hiding a cell. Stacked,
+   not side by side: a term column wide enough for the es label leaves the
+   figure's second line ("9 este año") three words on three lines. */
+@container entity-page (max-width: 568px) {
+	.ledger {
+		grid-template-columns: minmax(0, 1fr);
+	}
+
+	.cell,
+	.cell + .cell {
+		padding: 0.7rem 0;
+		border-right: 0;
+		border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent);
+	}
+
+	.cell:last-child {
+		border-bottom: 0;
+	}
+
+	.figure {
+		font-size: 1.6rem;
+	}
+
+	.figureDate {
+		font-size: 1.35rem;
+	}
+
+	.sub {
+		margin-top: 0.2rem;
+	}
+}
+
+/* Fallback for browsers without container queries (iOS 15 Safari and
+   older): the viewport rule this replaced. Keep in sync with the block above. */
+@supports not (container-type: inline-size) {
+	@media (max-width: 600px) {
+		.ledger {
+			grid-template-columns: minmax(0, 1fr);
+		}
+
+		.cell,
+		.cell + .cell {
+			padding: 0.7rem 0;
+			border-right: 0;
+			border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent);
+		}
+
+		.cell:last-child {
+			border-bottom: 0;
+		}
+
+		.figure {
+			font-size: 1.6rem;
+		}
+
+		.figureDate {
+			font-size: 1.35rem;
+		}
+
+		.sub {
+			margin-top: 0.2rem;
+		}
+	}
+}

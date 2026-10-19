@@ -1,0 +1,211 @@
+/* ============================================================
+   Block gutter: the "+" insert button, the block grip, their menus
+   ============================================================
+   The controls sit in the editor's 28px left padding (ProseEditor's
+   EditorContentWrapper), so they never cover or push the text. They are chrome: round, muted, inked only on hover or focus. The menus
+   they open are content: square, a 2px border from Popover, no shadow,
+   and an ink inversion on the active entry. */
+
+/* Fills the editor's padding box; only the controls take pointer events,
+   so a click in the empty gutter still reaches the wrapper (which puts the
+   caret at the end). */
+.th-pe-gutter {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.th-pe-caret-anchor {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 0;
+  pointer-events: none;
+}
+
+.th-pe-gutter-btn {
+  position: absolute;
+  top: 0; /* set to the block's first-line centre by BlockGutter */
+  left: 2px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin: 0;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--colorMuted, #5C544A);
+  cursor: pointer;
+  pointer-events: auto;
+  transform: translateY(-50%);
+  transition:
+    background-color 150ms ease-out,
+    border-color 150ms ease-out,
+    color 150ms ease-out;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.th-pe-grip {
+  cursor: grab;
+  touch-action: manipulation;
+}
+
+.th-pe-grip:active {
+  cursor: grabbing;
+}
+
+.th-pe-gutter-btn:hover,
+.th-pe-gutter-btn[aria-expanded="true"] {
+  border-color: color-mix(in srgb, var(--color, #211C16) 24%, transparent);
+  background-color: var(--backgroundHover, #EFE7D6);
+  color: var(--color, #211C16);
+}
+
+.th-pe-gutter-btn:focus-visible {
+  outline: var(--focus-width) solid var(--focus-color);
+  outline-offset: var(--focus-offset);
+  color: var(--color, #211C16);
+}
+
+/* Touch: a 44px square hit box around the 24px visual, the gutter staying
+   28px so the text column keeps its width (a 44px gutter left 148px to
+   write in at 320). The box grows up, down and 16px LEFT over the editor's
+   border into the page margin beside it, never right into the text, where
+   it would steal the taps that place the caret at a line start. Leftward
+   overflow adds no horizontal scroll. Nothing between here and the page
+   clips it: the editor box, the builder's section and columns and the admin
+   shell are all overflow: visible, and in the announcement dialog the
+   scrolling Modal body has 24px of padding, more than the 16px used. */
+@media (pointer: coarse) {
+  .th-pe-gutter-btn::after {
+    content: "";
+    position: absolute;
+    top: -10px;
+    bottom: -10px;
+    left: -18px;
+    right: -2px;
+  }
+}
+
+/* A grip drag lands between top-level blocks only, so ProseMirror's drop
+   cursor (which marks the deepest spot, inside a list item) is hidden and
+   this line marks the gap instead. It spans the text column. */
+.th-pe-grip-dragging .prosemirror-dropcursor-block,
+.th-pe-grip-dragging .prosemirror-dropcursor-inline {
+  display: none;
+}
+
+.th-pe-drop-line {
+  position: absolute;
+  left: 24px;
+  right: 8px;
+  height: 2px;
+  background-color: var(--accent, #E2481D);
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+/* ─── Menus (inside @th/ui Popover, portalled to <body>) ──────────────── */
+
+.th-pe-menu {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 192px;
+  max-width: calc(100vw - 16px);
+  max-height: min(296px, 50vh);
+  overflow-y: auto;
+  padding: 4px 0;
+  outline: none;
+}
+
+.th-pe-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 36px;
+  margin: 0;
+  padding: 6px 12px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--color, #211C16);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.3;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background-color 150ms ease-out,
+    color 150ms ease-out;
+}
+
+.th-pe-menu-item svg {
+  flex-shrink: 0;
+}
+
+/* The active option (arrows or pointer) and a hovered or focused entry:
+   ink fill, paper text. */
+.th-pe-menu-item[aria-selected="true"],
+.th-pe-menu[role="menu"] .th-pe-menu-item:hover,
+.th-pe-menu-item:focus-visible {
+  background-color: var(--structure, #211C16);
+  color: var(--onStructure, #FDFAF3);
+}
+
+.th-pe-menu-item:focus-visible {
+  outline: var(--focus-width) solid var(--focus-color);
+  outline-offset: calc(-1 * var(--focus-width));
+}
+
+.th-pe-menu-item--danger {
+  color: var(--danger, #B91C1C);
+}
+
+.th-pe-menu[role="menu"] .th-pe-menu-item--danger:hover,
+.th-pe-menu-item--danger:focus-visible {
+  background-color: var(--danger, #B91C1C);
+  color: var(--colorInverted, #FDFAF3);
+}
+
+.th-pe-menu-item[aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.th-pe-menu[role="menu"] .th-pe-menu-item[aria-disabled="true"]:hover {
+  background-color: transparent;
+  color: var(--color, #211C16);
+}
+
+@media (pointer: coarse) {
+  .th-pe-menu-item {
+    min-height: 44px;
+  }
+}
+
+.th-pe-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .th-pe-gutter-btn,
+  .th-pe-menu-item {
+    transition: none;
+  }
+}

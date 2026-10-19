@@ -1,0 +1,87 @@
+title: use-case | seatmaps.delete-seatmap
+owner: core
+file: packages/core/src/use-cases/seatmaps/delete-seatmap.ts
+goal: >
+  Remove a venue's canonical seatmap during initial setup or teardown when no
+  events depend on it, ensuring downstream caches and availability tables stay
+  consistent.
+
+ports:
+  - SeatmapRepo
+  - SeatmapBlobRepo
+  - SeatStatusRepo
+  - AuthzRepo
+  - FeatureFlagPort
+  - SeatmapStreamingPort
+  - Repos
+  - Clock
+  - Logger
+  - Metrics
+
+invariants:
+  - Seatmap deletion only allowed for venues without future or active events.
+  - Actor must hold organizer-level access for the venue's org.
+  - Feature flag `feature.seatmap` must be enabled; otherwise return `forbidden`.
+  - Use a single `repos.tx()` to remove seats, sections, seatmap metadata, and
+    availability rows to prevent dangling references.
+  - Downstream caches (CachePort, SeatmapStreamingPort subscribers) must be
+    invalidated to avoid serving stale seatmaps.
+
+input_schema:
+  venueId: uuid # required
+  actor:
+    humanId: uuid
+    orgContext: { orgId: uuid; roles: string[] }
+
+preconditions:
+  - Validate venueId and actor details via zod; missing data => `invalid_input`.
+  - Authorize actor via AuthzRepo for organizer role on venue's org.
+  - Confirm seatmap feature flag enabled.
+  - Query SeatmapRepo.getByVenue. If absent, respond `not_found` (idempotent delete).
+  - Verify no events for venue are in status DRAFT, PUBLISHED, or COMPLETED with
+    future dates; otherwise return `conflict` with event ids.
+
+execution:
+  1. Load current seatmap + dependent seats/sections counts for metrics.
+  2. Within repos.tx():
+     a. Delete SeatStatusRepo availability rows for venue's events (set to empty).
+     b. Delete seats and seat sections referencing the venue.
+     c. Remove glyph snapshot via SeatmapBlobRepo.deleteForVenue.
+     d. Call SeatmapRepo.deleteForVenue.
+  3. Emit SeatmapStreamingPort.publishSeatmapReplaced with checksum=`null` to
+     notify subscribers of removal.
+  4. Clear cache entries keyed by `seatmap:${checksum}:*`.
+  5. Record metrics (deleted seats, sections, duration) and structured log with actor + venue.
+
+output_schema:
+  removed: boolean
+  removedSeatCount: number
+  removedSectionCount: number
+  deletedChecksum?: string # checksum of prior seatmap for audit
+
+side_effects:
+  - Deletes seat + section records.
+  - Removes seatmap metadata row and glyph blob.
+  - Clears seat availability rows to prevent orphaned seatIds.
+  - Broadcasts removal event to streaming consumers.
+  - Clears cache and writes audit/metrics entries.
+
+errors:
+  - invalid_input(422): malformed uuid or missing actor context.
+  - forbidden(403): actor lacks permissions or feature flag disabled.
+  - not_found(404): seatmap already absent (treated as idempotent success, but
+    returned when actor expects existing state).
+  - conflict(409): venue has active/future events or holds referencing seats.
+  - dependency_failed(424): blob deletion or repo tx failure.
+  - transient(503): upstream timeout (repos, blob store).
+
+notes:
+  - Consider soft-delete metadata for audit; current design performs hard delete.
+  - Deletion should be rare; surface confirmation prompts in admin UI.
+  - Ensure analytics pipelines tolerate missing seatmaps after deletion.
+
+tests:
+  - happy path deletion with no events returns removed=true and counts.
+  - deletion blocked when active event found returns conflict with event ids.
+  - idempotent second call returns not_found but does not throw.
+  - dependency failure during blob delete triggers transaction rollback.

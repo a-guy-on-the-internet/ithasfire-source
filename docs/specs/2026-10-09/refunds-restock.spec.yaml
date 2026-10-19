@@ -1,0 +1,186 @@
+# Draft, scoping. Derived from the owner's ruling below; no further product decision open.
+# refunds-restock.spec.yaml
+#
+# A refunded or revoked ticket stops counting against its ticket type's
+# capacity, so the place goes back on sale online, in the embed and at the door.
+
+version: "1.0"
+updated: "2026-10-09"
+
+# ── Rulings (owner, 2026-10-09; full text in memory project_refunds_restock_ruling.md) ──
+# R1  "Yes, refunds restock." — a refunded or voided ticket frees its capacity,
+#     platform-wide: online refunds, door cash refunds, comp voids.
+# R2  The owner picked "Yes, refunds restock" over "Only before doors": a ticket
+#     refunded AFTER it was scanned restocks too (see risks: room capacity).
+# Earlier rulings that still bind: pro-social tiebreaker (feedback_prosocial_tiebreaker.md):
+# a refunded place should go to the next person, not sit empty.
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Every Ticket row counts toward its ticket type's capacity whatever its
+    status, so a refunded ticket keeps its place forever. After a 2-ticket cash
+    refund on 2026-10-08, GA still showed "248 left". Seats already free on
+    refund (`releaseSeatsForVoidedTickets`), so a seated tier shows a free seat
+    that the tier count still refuses.
+  solution: >
+    Count only tickets that still hold a place (VALID, SCANNED, LISTED — the
+    same set as `SEAT_OWNING_TICKET_STATUSES`) in every count that means
+    "capacity in use". Counts that mean "a ticket ever existed" (sales history,
+    delete guards, mint idempotency) keep counting every row.
+  users:
+    - buyer (sees the freed place and can buy it)
+    - organizer and door staff (Sell tab shows the freed place)
+  surfaces:
+    - web (event page, ticket tiers on cards)
+    - embed
+    - scanner (POS Sell tab)
+    - api (checkout, POS, free claim, mint backstop)
+
+# ── Facts the scope rests on (all [REASONED] from code, 2026-10-09) ──────────
+#
+# - TicketStatus = VALID | SCANNED | INVALID | REFUNDED | LISTED.
+# - REFUNDED is written by every refund path: refundFullOrder, refundOrderItems,
+#   reconcileStripeFullRefund (full and item-named partial), refundCashOrderCore
+#   (door cash, comps on cash orders), cancelEvent. INVALID is written only by
+#   revokeVolunteerReward (comp clawback). Every one already releases the seat.
+# - Transfer and resale update the SAME Ticket row (no new row, no INVALID), so
+#   excluding REFUNDED/INVALID cannot double-free.
+# - No path moves a REFUNDED/INVALID ticket back to VALID, and no path deletes
+#   Ticket rows. Exception to check: `reassignForResale` / `restoreAfterResale`
+#   update by id with no status predicate (see risks).
+# - A money-only partial refund (no ticket chosen) changes no Ticket status, so
+#   it frees nothing. Correct: the person still holds the ticket.
+# - "Sold" reports (getPopularityStats, EventDailyStats, digests) count
+#   OrderItems on orders, not Ticket rows; this change does not move them.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        One shared status list, `CAPACITY_CONSUMING_TICKET_STATUSES` in
+        `@th/types` beside `SEAT_OWNING_TICKET_STATUSES` (same members:
+        VALID, SCANNED, LISTED), is the only definition of "holds a place" for
+        capacity. Adapter SQL and any in-memory filter both read it.
+    - id: FR-002
+      description: >
+        `lockAndCountCapacityForTicketType` (pre-charge gate, under the
+        advisory lock) and `countCapacityUsageForTicketTypes` (lock-free badge
+        read) count `issued` as tickets of the type whose status is in
+        FR-001's list. Both change together and stay identical in definition.
+        `held` is unchanged.
+    - id: FR-003
+      description: >
+        The mint backstop (`mintTickets`) and the comp advisory check
+        (`issueCompTickets`) use the same capacity definition, through a new
+        port method `countCapacityConsumingForTicketType`. Otherwise a freed
+        place passes the pre-charge gate and is then refused at mint after the
+        card was charged.
+    - id: FR-004
+      description: >
+        Counts that mean "a ticket ever existed" keep counting every row:
+        `countIssuedForTicketType` (delete-ticket-type guard),
+        `countIssuedForEvent` (publish guard), `countForOrderTicketType` (mint
+        idempotency: a replayed mint after a refund must not re-mint).
+    - id: FR-005
+      description: >
+        Port and adapter doc blocks stop calling `issued` "Tickets that exist.
+        Irreversible." and say what it now counts. The `@@index([ticketTypeId])`
+        comment in ticket.prisma names the methods it serves.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        No new lock and no change to lock ordering. A refund only lowers the
+        count, so it cannot oversell — PROVIDED REFUNDED and INVALID are
+        terminal. Every write that moves an existing ticket into VALID, SCANNED
+        or LISTED is guarded on its starting status, so a terminal ticket can
+        never consume capacity again without passing the capacity lock.
+    - id: NFR-002
+      description: >
+        Integration test (testcontainers) seeds Ticket rows in all five
+        statuses and asserts both capacity methods return the same `issued`,
+        counting only VALID, SCANNED and LISTED. Today the suite never inserts
+        a Ticket.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: mint-tickets (modified)
+        description: backstop reads countCapacityConsumingForTicketType
+        idempotent: true
+        money: true
+      - name: issue-comp-tickets (modified)
+        description: advisory warning reads countCapacityConsumingForTicketType
+        idempotent: false
+        money: false
+  ports:
+    new:
+      - TicketsRepo.countCapacityConsumingForTicketType(ticketTypeId) → number
+    existing:
+      - TicketsRepo.lockAndCountCapacityForTicketType (doc + semantics)
+      - TicketsRepo.countCapacityUsageForTicketTypes (doc + semantics)
+  adapters:
+    existing:
+      - packages/adapters/src/db/prisma/tickets.ts (three counts filter by status)
+  transport: {}
+  ui: {}
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+
+# ── Risks ────────────────────────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Room over capacity. Under R2 a ticket refunded after it was scanned
+      restocks, so the door can sell that place while the refunded person is
+      still inside. Organizers can refund scanned tickets (the self-serve path
+      refuses them).
+    severity: MEDIUM
+    mitigation: >
+      Ruled by the owner; report the hazard, do not re-ask. TicketType capacity
+      is the organizer's number, not a fire-code count.
+  - risk: >
+      A terminal ticket written back to VALID consumes capacity without the
+      lock. Found in review (2026-10-09): a LISTED volunteer comp revoked to
+      INVALID kept its ACTIVE listing, and `cancelResaleListing` then set it
+      VALID by id — after the freed place had been resold (oversell by one).
+      `reassignForResale` / `restoreAfterResale` also update by id with no
+      status predicate.
+    severity: HIGH
+    mitigation: >
+      Revoke closes the comp's open listing; `cancelResaleListing`,
+      `reassignForResale` and `restoreAfterResale` write only from a
+      place-holding status and fail loudly otherwise. Ships WITH the count
+      change, never after it.
+  - risk: >
+      `delete-ticket-type` switched to the capacity count would let a tier with
+      only refunded tickets be deleted, nulling `ticketTypeId` on history rows.
+    severity: HIGH
+    mitigation: FR-004 keeps it on the all-rows count; a unit test pins it.
+
+open_questions: []
+
+out_of_scope:
+  - migrate-event-orders capacity check (countIssuedForEvent counts refunded
+    rows on both sides; already imprecise; follow-up)
+  - PROCESSING orders reserving capacity (existing known gap on the port)
+  - A composite (ticketTypeId, status) index; revisit if the count shows in spans
+  - Venue/fire-code room capacity
+
+acceptance_criteria:
+  - Refunding 2 GA tickets raises "N left" by 2 on the event page and in the
+    scanner Sell tab, on the dev stack.
+  - Both capacity methods agree, ticket type by ticket type, with Ticket rows
+    in all five statuses (integration test).
+  - A sold-out tier with one refunded ticket sells exactly one more, through
+    checkout and through mint, and the next buyer gets SOLD_OUT.
+  - A ticket type whose only tickets are refunded still cannot be deleted.

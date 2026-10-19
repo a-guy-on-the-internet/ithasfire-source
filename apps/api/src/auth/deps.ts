@@ -16,6 +16,7 @@ import type { MailerPort } from "@th/ports/comms/mailer";
 import type { SMSPort } from "@th/ports/comms/sms";
 
 import { env } from "../lib/env";
+import { smsCredentials } from "../lib/sms-capability";
 
 export type AuthDeps = {
   logger: LoggerPort;
@@ -55,21 +56,24 @@ export function createAuthDeps(): AuthDeps {
   });
 
   // SMS (optional)
+  // `smsCredentials` is also what `features.getFeatureGates` reports as `sms`,
+  // so the web hides SMS options exactly when this adapter is missing.
   let sms: SMSPort | null = null;
-  if (env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY) {
+  const credentials = smsCredentials(env);
+  if (credentials) {
     const snsClient = new SNSClient({
       region: env.AWS_REGION,
-      credentials: {
-        accessKeyId: env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
-      },
+      credentials,
     });
 
     sms = new SnsSmsAdapter({
       client: snsClient,
       logger,
       defaultSmsType: "Transactional",
-      defaultSenderId: env.AWS_SNS_SENDER_ID,
+      originationNumbers: {
+        otp: env.AWS_SMS_ORIGINATION_OTP,
+        notification: env.AWS_SMS_ORIGINATION_NOTIFICATIONS,
+      },
     });
   }
 

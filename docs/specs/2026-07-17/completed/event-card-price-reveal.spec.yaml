@@ -1,0 +1,312 @@
+# event-card-price-reveal.spec.yaml
+#
+# The event card's price badge shows the exact lowest price the buyer will
+# actually pay (fees + admission tax included), with no "+" suffix. On pointer
+# hover / keyboard focus, a panel slides up over the card art listing the
+# event's ticket tiers with their buyer totals; sold-out tiers render struck
+# through.
+
+version: "1.0"
+updated: "2026-07-17"
+status: shipped  # 2026-10-08 docs consolidation; was: draft
+
+# BUILD TRIGGER: none needed — explicitly requested by the founder 2026-07-16,
+# with the two product decisions (fee-inclusive pricing; sold-out struck
+# through) taken deliberately in that conversation rather than inferred.
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The card badge renders `priceLabel` — face value, with a "+" appended when
+    more than one paid tier exists ("$45+"). Two problems. (1) The "+" hides
+    the thing the buyer wants: what's actually on offer. To learn it they must
+    open the event page. (2) Face value is not what they pay. Under a
+    PASS_THROUGH fee policy the charge is grossed up, and admission tax is
+    added on top, so a card promising "$45" can settle at ~$48.50 — the classic
+    bait-and-switch complaint, and the risk grows the moment we show tiers with
+    exact figures rather than a vague "from" price.
+  solution: >
+    Two changes to the same surface. (1) The badge shows the exact lowest
+    BUYER TOTAL (gross + platform fee + processor fee + admission tax) and
+    drops the "+" — the reveal makes it redundant. (2) On hover-intent or
+    keyboard focus, a panel slides up from the bottom edge of the card's art
+    panel listing each ticket tier: name, buyer total, and a struck-through
+    treatment for sold-out tiers. Both surfaces derive from the SAME core
+    function (`estimateBuyerTicketPricingForEvent`), so the badge and the panel
+    cannot disagree on arithmetic — only on freshness.
+  users:
+    - Attendees browsing discovery grids (home, category, search, saved)
+    - Organizers, indirectly — accurate prices reduce refund/complaint load
+  surfaces:
+    - EventCard (packages/ui/.../event-grid/EventCard.tsx) — badge + new panel
+    - Every EventGrid consumer inherits it (home, category pages, search, saved)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  badge:
+    - >
+      Shows the exact lowest buyer total, formatted by the existing
+      `formatDollarsFromCents` (already exact: "$45", "$45.50" — it does not
+      round). No "+" suffix in any case.
+    - >
+      "Free" semantics are preserved. A free tier is free — fees/tax do not
+      apply to a $0 tier. Existing `hasFreeTier` / `paidTierCount` logic in
+      `formatPriceLabel` still decides Free / Free+ / See details; only the
+      paid figure changes basis, and "Free+" keeps its "+" (it means "free AND
+      paid tiers exist", a different claim from the price "+" being removed).
+    - >
+      Falls back to today's face-value label if `lowestBuyerTotalCents` is null
+      (event not yet indexed with a buyer total, or tax/fee context missing).
+      NEVER show a fee-inclusive price we are not confident in — degrade to the
+      current behaviour rather than display a wrong number.
+
+  reveal_panel:
+    - Opens on pointer hover-intent (~120ms delay) and on keyboard focus.
+    - >
+      Lists ticket tiers: name (mono, uppercase, truncating) + buyer total
+      (mono, bold). Sold-out tiers render struck through and dimmed.
+    - >
+      Caps at 4 tiers, then a "+N MORE" line. A 12-tier event must not blow out
+      the panel or overflow the card.
+    - >
+      Renders only when there is something to reveal — i.e. more than one tier,
+      or one tier whose state (sold out) is worth surfacing. A single available
+      tier that exactly equals the badge adds nothing; do not open a panel to
+      restate the badge.
+    - >
+      WCAG 1.4.13 (Content on Hover or Focus) — the panel must be hoverable
+      (pointer can move into it without dismissing), dismissible (Escape), and
+      persistent (stays until blur/Escape/pointer-leave). Non-negotiable.
+    - >
+      The card is already a link. The panel must not swallow the card's primary
+      click target, and tier rows are NOT separately clickable in v1 (nested
+      interactive content inside a link is an a11y trap).
+
+  mobile:
+    - >
+      There is no hover on touch. The panel is a POINTER-ONLY progressive
+      enhancement (`@media (hover: hover) and (pointer: fine)`). Touch keeps
+      the badge and taps through to the event page, which already carries the
+      full tier list. Deliberate: a tap-to-expand would fight the card's
+      primary tap target, and the event page is one tap away.
+
+  design:
+    - >
+      Per design-system-v2.md: radius 0, 2px border, `$surface` panel,
+      `--t-base` (160ms ease-out) transform, mono for all figures, UPPERCASE
+      labels. Honour `prefers-reduced-motion` (fade or instant, no slide).
+    - >
+      Accent budget ≤5% of viewport (§4). The badge is already an accent fill;
+      the panel must be ink-on-paper, NOT a second accent block. A grid of 19
+      cards each with an accent panel would blow the budget instantly.
+    - >
+      Contrast: every price/label pairing clears 4.5:1 against its ACTUAL fill,
+      in all three themes. Add the pairs to `contrast-pairs.test.ts` — the
+      struck-through sold-out treatment must still clear 4.5:1 (dimming to
+      illegibility is not "struck through", it is hidden).
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  # The single most important finding from scoping: almost all of this exists.
+  already_built:
+    - >
+      `estimateBuyerTicketPricingForEvent`
+      (packages/core/src/use-cases/events/_shared/estimate-buyer-ticket-pricing.ts)
+      already resolves the effective fee mode from the org's agreement /
+      fee policy, reads `event.admissionTaxRateBps`, and returns
+      `minBuyerUnitTotalCents` plus per-ticket estimates. It is the single
+      source of buyer-facing arithmetic. REUSE IT — do not reimplement money
+      math in the transport or UI layer.
+    - >
+      `Event.admissionTaxRateBps` is stamped at publish time from
+      SavedLocation/Place (packages/db/prisma/event.prisma:407) explicitly so
+      "checkout can compute admission tax with zero API calls". No ZipTax call
+      per card.
+    - >
+      `build-search-index.ts:275-280,405-412,586` ALREADY calls the estimator
+      and ALREADY stores `lowestBuyerTotalCents` on the search document.
+      `packages/ports/src/search/multi-index.types.ts:48,142` and the
+      Meilisearch adapter (multi-index-meilisearch-adapter.ts:85,195,205)
+      already carry it as a stored attribute.
+
+  the_gap: >
+    `lowestBuyerTotalCents` is computed, indexed, and then dropped on the floor.
+    `PricingSummary` (event-summary-mapper.ts:53-58) and `DiscoveredEventShape`
+    (84-96) carry only `hasFreeTier` / `paidTierCount` / `minPaidPriceCents`, so
+    the card physically cannot see the fee-inclusive number sitting in the
+    index. The badge is a last-mile plumbing job, not a new computation.
+
+  badge_path:
+    - Add `lowestBuyerTotalCents` to `DiscoveredEventShape` and `PricingSummary`.
+    - Thread it from the search hit through `discoveredEventToDto`.
+    - >
+      `formatPriceLabel` prefers `lowestBuyerTotalCents` when present; falls
+      back to `minPaidPriceCents` (today's behaviour) when null. Drop the "+"
+      from the paid-price branch.
+
+  reveal_path:
+    - >
+      **`events.getCheckoutFeeRates({ eventId })` already exists** and already
+      returns the money half: `{ feeMode, admissionTaxRateBps,
+      platformFeeLabel, processorFeeLabel, perTicketEstimates }`, where each
+      estimate is `{ ticketTypeId, unitPriceCents, platformFeeCents,
+      processorFeeCents, taxEstimateCents, buyerUnitTotalCents }`. The event
+      detail page already consumes it (`apps/web/src/server/events.ts:684`
+      `loadEventFeeRates` → `EventDetail.tsx:327` `feeEstimateMap`).
+    - >
+      What it does NOT carry: the tier NAME and SOLD-OUT state. The event page
+      gets names from its own event payload and keys the fee map by
+      `ticketTypeId`; the card has no such payload. So the card needs a small
+      composing query (e.g. `events.ticketTiersForCard({ eventId })`) that
+      joins the existing estimator output with ticket-type names + live
+      inventory, returning `{ name, buyerUnitTotalCents, soldOut }`.
+    - >
+      PREFER composing over extending. Do not widen `getCheckoutFeeRates` — it
+      is on the checkout path, and growing a checkout-facing contract to serve a
+      discovery card is the wrong direction of dependency.
+    - >
+      LAZY — fired on hover-intent only, never on grid render. ~17 of 19 cards
+      in a viewport are never hovered; eager fetching would be a query storm for
+      nothing. react-query cache + `staleTime` dedupes repeat hovers.
+    - >
+      DELIBERATELY NOT INDEXED. Sold-out state changes on every purchase, so it
+      can never be correct in a search document. Freshness is the whole point of
+      this path.
+
+  why_split_sources: >
+    The badge must render without hover, so it must come from the index. The
+    tiers need live inventory, so they must come from Postgres. Both compute
+    through the same estimator, so they agree on arithmetic by construction —
+    the only divergence possible is index staleness, addressed below.
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  no_migrations_expected: >
+    `Event.admissionTaxRateBps`, the payout-terms/fee-policy tables, and the
+    search document's `lowestBuyerTotalCents` all already exist. This is
+    plumbing + one new read query. If a migration turns out to be needed, that
+    is a signal the approach drifted — stop and re-scope.
+  reindex_triggers_required:
+    - >
+      **`upsert-org-fee-policy` does NOT call `reindexAfterMutation` today.**
+      Verified. Nothing reindexes an org's events when its fee policy changes.
+      This is currently invisible because `lowestBuyerTotalCents` is indexed but
+      unused — the moment we surface it, a fee-policy change silently makes
+      every one of that org's cards show the WRONG PRICE. Adding the trigger is
+      NOT optional and is part of this work, not a follow-up.
+    - >
+      Audit the same question for: payout-terms activation/change, ticket-type
+      price edits after publish (publish-event.ts reindexes; later edits are
+      unverified), and admission-tax-rate refresh on the Place/SavedLocation.
+
+# ── Risks ────────────────────────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Stale indexed buyer totals display wrong money. Wrong money is the worst
+      class of stale — it is a trust and potentially a consumer-protection
+      problem, not a cosmetic one.
+    mitigation: >
+      Add the reindex triggers above. Consider a freshness guard: if the
+      indexed buyer total is implausible relative to `minPaidPriceCents`
+      (e.g. lower than face, or >2x face), fall back to the face-value label
+      rather than render a suspect figure.
+  - risk: >
+      Badge (indexed) and panel (live) disagree visibly — badge says $48.50,
+      panel's cheapest row says $49.20. The user sees the contradiction in one
+      glance, which is worse than either number alone being slightly off.
+    mitigation: >
+      Same estimator on both paths means arithmetic agreement; only staleness
+      can diverge them. Once the panel's fresh data is in hand, the badge may
+      reconcile to it. Decide deliberately — do NOT let them silently differ.
+  - risk: >
+      Events whose `admissionTaxRateBps` is null (published before the rate was
+      stamped, or a non-US/unsupported jurisdiction) compute tax as 0, so the
+      "what you pay" promise understates the real charge.
+    mitigation: >
+      Audit how many published events have a null rate. If material, the null
+      case must fall back to the face-value label rather than a
+      confidently-wrong "inclusive" price.
+  - risk: >
+      Hover-fetch storm on a dense grid — a user sweeping the mouse across 19
+      cards fires 19 queries.
+    mitigation: >
+      Hover-intent delay (~120ms) + react-query cache + cancel on early leave.
+  - risk: >
+      Sold-out strikethrough contradicts the established convention that ticket
+      types are "there or not" (no DRAFT/ACTIVE status surfaced in UI).
+    mitigation: >
+      Deliberate, founder-approved exception, and the distinction is principled:
+      DRAFT/ACTIVE is AUTHORING state (internal, meaningless to a buyer),
+      whereas sold-out is DEMAND state — decision-relevant scarcity a buyer
+      acts on ("the cheap tier is gone"). Document it so the convention is not
+      read as broken.
+
+# ── Open questions ───────────────────────────────────────────────────────────
+
+open_questions:
+  # RESOLVED 2026-07-17 during scoping — kept for the record because it was the
+  # question that could have sunk the approach.
+  #
+  # "Does the event detail page show face value or the buyer total?"
+  # ANSWER: it ALREADY shows buyer totals. `EventDetail.tsx:325-338` builds a
+  # `feeEstimateMap` from `feeRates.perTicketEstimates` carrying
+  # `platformFeeCents` / `processorFeeCents` / `taxEstimateCents` /
+  # `buyerUnitTotalCents` per ticket type, and passes it to `EventContent`;
+  # `feeMode` rides along at line 552. The embed does the same
+  # (`EmbedEventDetail.tsx:277`).
+  #
+  # CONSEQUENCE — this strengthens the case rather than complicating it: the
+  # CARD IS ALREADY THE ODD ONE OUT. Event page and checkout speak buyer
+  # totals; only the discovery card still speaks face value. This feature
+  # REMOVES an existing inconsistency instead of introducing one, and it means
+  # card / event page / checkout all end up deriving from one estimator.
+  - >
+    Does an organizer editing a ticket price after publish trigger a reindex?
+    If not, the badge is stale for the most common mutation of all.
+  - >
+    Do we surface a "incl. fees & tax" affordance? Showing a bigger number than
+    competitors without saying why can read as more expensive rather than more
+    honest. A mono "INCL. FEES" line in the panel is cheap; on the badge it is
+    probably clutter.
+  - >
+    Resale listings (ResaleListingsSection exists) — are resale tiers in scope
+    for the panel, or strictly primary inventory? v1 assumption: primary only.
+
+# ── Out of scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Changing checkout, refund, or payout math in any way
+  - Tap-to-expand on touch devices (pointer-only enhancement in v1)
+  - Making tier rows individually clickable / add-to-cart from the card
+  - Resale listings in the reveal panel
+  - Indexing per-tier data into Meilisearch (sold-out state cannot be indexed)
+  - Any change to the ticket-type authoring UI
+
+# ── Acceptance criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - >
+    A card for a PASS_THROUGH org shows a badge figure that MATCHES the amount
+    checkout actually charges for that tier (modulo promos/credits). Verified
+    end-to-end against a real checkout, not a unit test.
+  - The badge never renders a "+" for a paid price.
+  - >
+    An org fee-policy change causes affected cards to show the new buyer total
+    without a manual reindex.
+  - >
+    An event with a null `admissionTaxRateBps` falls back to the face-value
+    label rather than an understated "inclusive" price.
+  - >
+    Hovering a card with multiple tiers reveals them within ~160ms; the panel is
+    hoverable, Escape-dismissible, and persists until blur.
+  - Keyboard focus opens the panel; Escape closes it; focus order is sane.
+  - A 12-tier event shows 4 tiers + "+8 MORE" and does not overflow the card.
+  - Sold-out tiers are struck through and still clear 4.5:1.
+  - Touch devices never open the panel and still reach the event page in one tap.
+  - `prefers-reduced-motion` suppresses the slide.
+  - No measurable increase in queries on grid render (lazy fetch verified).

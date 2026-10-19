@@ -1,0 +1,34 @@
+-- Comp provenance on the order.
+--
+-- "reason" and "issuedByHumanId" for a comp were written only into the
+-- `comp_issued` audit-log payload. That left the comps ledger with no product
+-- read path — rendering an organizer-facing table by querying the audit log is
+-- the wrong direction of dependency, and the audit log is not shaped for
+-- filtered, paginated reads.
+--
+-- Both columns are nullable and NOT backfilled. Two reasons:
+--
+--   1. Comps issued before this migration have no recoverable value here; the
+--      audit log remains their record. A backfill would mean parsing historical
+--      JSON payloads to populate a display field — not worth the migration
+--      risk.
+--   2. NULL is a legitimate steady state, not just a legacy artifact.
+--      `createCompOrder` has two callers: `issueCompTickets` (hand-issued —
+--      stamps both columns) and `grantVolunteerReward` (issued by a reward
+--      trigger — no human issuer and no typed reason). A reward-granted comp is
+--      identified by VolunteerRewardGrant.compOrderId pointing at it, so the
+--      ledger can label it without a discriminator column here.
+--
+-- No index. The ledger reads eventId + source = 'COMP' ordered by
+-- "occurredAt", which is served by the existing Order_eventId_occurredAt_idx;
+-- "source" is filtered in-heap, which is the right trade at tens of comps per
+-- event. These two columns are display fields and are never filter predicates.
+--
+-- "compIssuedByHumanId" intentionally has no foreign key to "Human": it is a
+-- point-in-time provenance stamp and must survive the issuer being removed
+-- from the org or deleted. A FK with ON DELETE SET NULL would erase exactly the
+-- record we are trying to keep.
+
+-- AlterTable
+ALTER TABLE "Order" ADD COLUMN     "compReason" VARCHAR(500),
+ADD COLUMN     "compIssuedByHumanId" TEXT;

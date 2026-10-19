@@ -1,0 +1,400 @@
+# Not built yet (2026-10-08 docs consolidation): items 5-13 pending/partial (barrels, seat-map split, platform pages 906 LOC, formatDate stragglers)
+status: in-progress
+updated: "2026-04-26"
+task: >
+  Consolidate duplicated code across the web app: shared styled components,
+  duplicate utility functions, repeated lookup maps, oversized page files,
+  and missing barrel exports. Behavior-preserving refactors only.
+
+goal: >
+  Reduce ~1,500–2,000 lines of duplicated or inlined code across platform
+  pages, admin pages, and component directories. Improve import ergonomics
+  with barrel files. Make the codebase easier to maintain without changing
+  any observable behavior.
+
+# Phase 1 (items 1–6) was the original 2026-04-11 scope. Several items have
+# landed; remaining work is tracked inline. Phase 2 (items 7–13) was added
+# 2026-04-26 after auditing the live tree against new file-size growth and
+# new duplication patterns surfaced during the unified-scan-resolver,
+# scanner-foundation, and places-admin work.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Work Items
+# ─────────────────────────────────────────────────────────────────────────────
+
+items:
+
+  # ── 1. Shared platform page layout components ─────────────────────────────
+  - id: platform-layout-components
+    status: done   # 2026-04-26
+    priority: high
+    title: Extract shared platform page styled components
+    description: >
+      Container, FilterChip, and FilterBar are copy-pasted with near-identical
+      styling across 12+ platform pages. Extract into a shared module.
+    output_file: apps/web/src/app/platform/_components/PlatformPageParts.tsx
+    duplicated_in:
+      - apps/web/src/app/platform/places/page.tsx
+      - apps/web/src/app/platform/reviews/page.tsx
+      - apps/web/src/app/platform/orders/page.tsx
+      - apps/web/src/app/platform/humans/page.tsx
+      - apps/web/src/app/platform/tickets/page.tsx
+      - apps/web/src/app/platform/quotas/page.tsx
+      - apps/web/src/app/platform/claims/page.tsx
+      - apps/web/src/app/platform/jobs/page.tsx
+      - apps/web/src/app/platform/overview/page.tsx
+    exports:
+      - PlatformContainer     # YStack with padding/gap/maxWidth
+      - PlatformFilterBar     # XStack filter row
+      - PlatformFilterChip    # Button-style filter chip
+    done_when:
+      - Shared file exists with exports
+      - All duplicated_in files import from shared file
+      - Inline definitions removed from each page
+      - No visual or behavioral change (manual spot-check)
+
+  # ── 2. Consolidate duplicate utility functions ─────────────────────────────
+  - id: deduplicate-utils
+    status: partial   # 2026-04-26 — buildFreshClientKey and verification-icon-map done; formatDate stragglers remain
+    priority: high
+    title: Consolidate duplicate utility functions
+    remaining:
+      - apps/web/src/app/lucky/_components/LuckyDraw.tsx (local `formatDateTime`)
+      - apps/web/src/components/events/EventContent.tsx (local `formatDateForDisplay`)
+    description: >
+      Several helper functions are independently implemented in multiple files.
+      Centralize each into one canonical location and update all consumers.
+    items:
+      - name: buildFreshClientKey
+        canonical_location: apps/web/src/lib/crypto-utils.ts
+        duplicated_in:
+          - apps/web/src/app/admin/[slug]/places/_components/PlacesTable.tsx
+          - apps/web/src/app/platform/places/page.tsx
+
+      - name: formatDate / formatDateTime (local reimplementations)
+        canonical_location: apps/web/src/lib/format.ts  # already exists
+        duplicated_in:
+          - apps/web/src/app/platform/reviews/page.tsx
+          - apps/web/src/app/p/[slug]/_components/blocks/AnnouncementsBlock.tsx
+          - apps/web/src/app/lucky/_components/LuckyDraw.tsx
+          - apps/web/src/components/events/EventContent.tsx
+
+      - name: buildLocationString
+        canonical_location: apps/web/src/lib/location-utils.ts
+        duplicated_in:
+          - apps/web/src/app/platform/places/page.tsx
+
+    done_when:
+      - Each function exists in exactly one canonical location
+      - All consumers import from the canonical location
+      - Local definitions deleted
+      - TypeScript compiles clean
+
+  # ── 3. VERIFICATION_ICON_MAP deduplication ─────────────────────────────────
+  - id: verification-icon-map
+    status: done   # 2026-04-26 — canonical at apps/web/src/lib/verification-config.ts, 6 consumers
+    priority: medium
+    title: Centralize VERIFICATION_ICON_MAP
+    description: >
+      The same verification status → icon/color/label map is defined in 4 files.
+      Centralize into one shared config.
+    canonical_location: apps/web/src/app/admin/[slug]/places/_lib/verification-config.ts
+    duplicated_in:
+      - apps/web/src/app/admin/[slug]/places/_components/PlacesTable.tsx
+      - apps/web/src/app/platform/places/page.tsx
+      - apps/web/src/app/admin/[slug]/places/[placeId]/edit/page.tsx
+      - apps/web/src/app/admin/[slug]/places/[placeId]/edit/_components/VerificationSection.tsx
+    done_when:
+      - Single source of truth exists
+      - All 4 files import from it
+      - Inline maps deleted
+
+  # ── 4. Split oversized page files ──────────────────────────────────────────
+  - id: split-large-pages
+    status: partial   # 2026-04-26 — PlaceDetailPanel extracted; platform/places page still 906 LOC; orders/reviews unchanged
+    priority: high
+    title: Extract detail panels from oversized platform pages
+    description: >
+      Several platform pages exceed 500 lines because they inline detail panels,
+      styled components, and config maps. Extract into _components/ subdirs.
+    files:
+      - file: apps/web/src/app/platform/orders/page.tsx
+        est_lines: ~800
+        extract:
+          - PlatformOrderDetail → _components/PlatformOrderDetail.tsx
+          - Inline styled components → use shared PlatformPageParts (item 1)
+
+      - file: apps/web/src/app/platform/reviews/page.tsx
+        est_lines: ~578
+        extract:
+          - Review detail panel → _components/PlatformReviewDetail.tsx
+
+      - file: apps/web/src/app/platform/places/page.tsx
+        est_lines: ~546
+        extract:
+          - Verification review panel → _components/PlatformPlaceDetail.tsx
+    done_when:
+      - Each page file is under ~300 lines
+      - Extracted components live in _components/ subdirs
+      - No behavioral change
+
+  # ── 5. Promote AdminTableParts for platform reuse ──────────────────────────
+  - id: share-table-parts
+    status: partial   # 2026-04-26 — moved to apps/web/src/components/AdminTableParts.tsx; platform pages NOT yet migrated to FilterChips/SearchBar
+    priority: medium
+    title: Move AdminTableParts to a shared location
+    description: >
+      AdminTableParts (SearchBar, FilterChips, Pagination, NoResults,
+      ColumnSelector) is admin-scoped but platform pages reimplement the
+      same patterns. Promote to a shared location or create a parallel
+      PlatformTableParts that reuses the same primitives.
+    current_location: apps/web/src/app/admin/[slug]/_components/AdminTableParts.tsx
+    candidate_location: apps/web/src/components/table-parts/
+    done_when:
+      - Shared table primitives accessible outside admin routes
+      - At least 2 platform pages migrated to use them
+      - AdminTableParts either re-exports from shared or remains for admin-specific variants
+
+  # ── 6. Barrel exports for major directories ────────────────────────────────
+  - id: barrel-exports
+    status: partial   # 2026-04-26 — components/events/index.ts exists; auth/navigation/hooks still missing
+    priority: medium
+    title: Add barrel export files to component directories
+    directories:
+      - path: apps/web/src/components/auth/
+        component_count: ~18
+        status: pending
+      - path: apps/web/src/components/events/
+        component_count: ~8
+        status: done
+      - path: apps/web/src/components/navigation/
+        component_count: ~5
+        status: pending
+      - path: apps/web/src/hooks/
+        component_count: ~15
+        status: pending
+    pattern: >
+      Follow the existing barrel pattern in
+      apps/web/src/app/_components/home/index.ts
+    done_when:
+      - Each directory has an index.ts barrel file
+      - Existing deep imports updated to use barrel where practical
+      - No circular dependency introduced
+
+  # ─── PHASE 2 — added 2026-04-26 ─────────────────────────────────────────
+  # Surfaced by the file-size audit and by patterns observed during the
+  # unified-scan-resolver, places-admin-v2, and scanner-foundation work.
+
+  # ── 7. Inventory & retire oversized component files ───────────────────────
+  - id: oversized-component-files
+    status: pending
+    priority: high
+    title: Break apart >1000-LOC component files
+    description: >
+      File-size audit on 2026-04-26 found 14 component files over 1000 LOC.
+      These resist review, fight tree-shaking, and conceal duplicate styled
+      components. Each entry below is a separate sub-task with a target
+      ceiling of ~400 LOC per output file. Behavior-preserving extractions
+      only — no refactoring of business logic.
+    files:
+      - file: apps/web/src/app/events/checkout/[...slug]/_components/SeatMapPicker.tsx
+        lines: 2477
+        suggested_extracts:
+          - SeatMapCanvas / pan-zoom logic → ./seat-map/SeatMapCanvas.tsx
+          - Legend + status chips → ./seat-map/SeatMapLegend.tsx
+          - Hold/selection state hook → ./seat-map/use-seat-selection.ts
+      - file: apps/web/src/app/admin/[slug]/places/[placeId]/layout/_components/designer/DesignerToolbar.tsx
+        lines: 1993
+        suggested_extracts:
+          - Tool group buttons → ./designer-toolbar/ToolGroups.tsx
+          - Property panels → ./designer-toolbar/PropertyPanels.tsx
+      - file: apps/web/src/app/admin/[slug]/events/new/_components/EventBuilder.tsx
+        lines: 1822
+        suggested_extracts:
+          - Step components into ./event-builder/steps/
+          - Stepper chrome into ./event-builder/EventBuilderStepper.tsx
+      - file: apps/web/src/app/search/_components/UniversalSearchPage.tsx
+        lines: 1543
+        suggested_extracts:
+          - Result row components per kind → ./search-rows/
+          - Filter pills → ./SearchFilterBar.tsx
+      - file: apps/web/src/app/admin/[slug]/scan/_components/UnifiedScanView.tsx
+        lines: 1253
+        note: Just shipped; defer until a second iteration. The consumer-side rewrite (deferred admin scan rebuild) will likely subsume it.
+      - file: apps/web/src/app/admin/[slug]/events/new/_components/prose-editor/ProseEditor.tsx
+        lines: 1220
+      - file: apps/web/src/components/search/SpotlightSearch.tsx
+        lines: 1200
+      - file: apps/web/src/app/admin/[slug]/events/_components/EventsManager.tsx
+        lines: 1176
+      - file: apps/web/src/app/events/[...slug]/_components/VolunteerSection.tsx
+        lines: 1089
+      - file: apps/web/src/app/events/checkout/[...slug]/_components/Checkout.tsx
+        lines: 1084
+      - file: apps/web/src/app/_components/home/place-review/PlaceReviewFormOrchestrator.tsx
+        lines: 1040
+      - file: apps/web/src/app/admin/[slug]/events/new/_components/TicketTypeEditor.tsx
+        lines: 1023
+      - file: apps/web/src/app/admin/[slug]/team/_components/TeamView.tsx
+        lines: 1007
+      - file: apps/web/src/app/my-tickets/[orderId]/_components/OrderDetail.tsx
+        lines: 1001
+    done_when:
+      - Each listed file is broken into a directory with no single child > ~500 LOC
+      - All extracted modules co-located with the parent (sibling dir, not global)
+      - No new circular imports
+      - Visual + interaction parity verified by smoke test
+
+  # ── 8. Migrate platform pages to shared FilterChips/SearchBar ─────────────
+  - id: platform-table-parts-migration
+    status: done   # 2026-04-26 — all 6 pages migrated to <FilterChips>; PlatformFilterChip + inline FilterChip removed
+    priority: medium
+    title: Migrate platform pages to shared FilterChips / SearchBar
+    description: >
+      Item 5 promoted AdminTableParts to apps/web/src/components/, but
+      platform pages still wrap PlatformFilterChip manually instead of using
+      the typed FilterChips primitive. Three pages still inline a FilterChip
+      styled component (e.g. apps/web/src/app/admin/[slug]/events/[id]/applications/page.tsx).
+    consumers_to_migrate:
+      - apps/web/src/app/platform/places/page.tsx
+      - apps/web/src/app/platform/reviews/page.tsx
+      - apps/web/src/app/platform/orders/page.tsx
+      - apps/web/src/app/platform/humans/page.tsx
+      - apps/web/src/app/platform/quotas/page.tsx
+      - apps/web/src/app/admin/[slug]/events/[id]/applications/page.tsx
+    done_when:
+      - All listed pages use <FilterChips options={...}> instead of mapping PlatformFilterChip manually
+      - Inline FilterChip styled components removed
+      - Type safety preserved (FilterChipOption<T>)
+
+  # ── 9. Centralize money formatting ────────────────────────────────────────
+  - id: money-formatting-helper
+    status: done   # 2026-04-26 — formatMoneyCents added at apps/web/src/lib/format-money.ts; remaining (cents/100).toFixed(2) hits are form input bindings or percent-from-bps, not money display
+    priority: medium
+    title: One canonical money formatter
+    description: >
+      `(cents / 100).toFixed(2)` and ad-hoc `$${dollars}` patterns appear
+      across 15+ checkout, order, embed, resale, and admin files. We ship
+      money in integer cents (engineering-standards) but format it inline.
+      Centralize a single `formatMoneyCents(cents, { currency })` helper so
+      currency, locale, and rounding stay consistent (and so future locale
+      work has one chokepoint).
+    canonical_location: apps/web/src/lib/format-money.ts
+    candidate_consumers:
+      - apps/web/src/app/embed/[embedId]/_components/EmbedTicketTypeList.tsx
+      - apps/web/src/app/my-tickets/[orderId]/resell/_components/ResellForm.tsx
+      - apps/web/src/app/platform/reviews/_components/ReviewDetailPanel.tsx
+      - apps/web/src/app/admin/[slug]/events/new/_components/TicketTypeEditor.tsx
+      - apps/web/src/app/events/checkout/[...slug]/_components/TicketTypeGrid.tsx
+      - apps/web/src/app/events/checkout/[...slug]/_components/OrderSummary.tsx
+      - (audit `grep -rn '/ 100).toFixed' apps/web/src` for the rest)
+    done_when:
+      - Helper exists with single-source rounding & currency rules
+      - All consumers in apps/web migrated
+      - No raw `(cents / 100).toFixed(2)` left in apps/web/src/**
+      - Sibling exists in @th/locale if it cleanly belongs there (check first)
+
+  # ── 10. Retire @ts-nocheck on shipped scanner-setup ──────────────────────
+  - id: scanner-setup-typecheck
+    status: pending
+    priority: medium
+    title: Remove @ts-nocheck from apps/web/src/app/admin/[slug]/scanner-setup/
+    description: >
+      The scanner-setup admin page (operator-rollout FR-002) shipped behind
+      `// @ts-nocheck — WIP scanner setup feature` headers. It is in active
+      use; the type holes are debt, not WIP. Restore real typing.
+    files:
+      - apps/web/src/app/admin/[slug]/scanner-setup/page.tsx
+      - apps/web/src/app/admin/[slug]/scanner-setup/_components/PersonalScannerCard.tsx
+      - apps/web/src/app/admin/[slug]/scanner-setup/_components/InstallPathsCard.tsx
+      - apps/web/src/app/admin/[slug]/scanner-setup/_components/RecoveryHelpCard.tsx
+      - apps/web/src/app/admin/[slug]/scanner-setup/_components/scanner-setup-shared.ts
+    done_when:
+      - All `@ts-nocheck` removed from these files
+      - tsc -p tsconfig.base.json --noEmit clean across them
+      - No `any` introduced beyond what was strictly necessary
+
+  # ── 11. Scanner @th/ui primitives migration ───────────────────────────────
+  - id: scanner-button-migration
+    status: pending
+    priority: low
+    title: Migrate scanner SquarePrimaryButton/SquareSecondaryButton to <Button>
+    description: >
+      The unified-scan-resolver round 1 design pass refactored most scanner
+      buttons to `@th/ui` Button. SquarePrimaryButton/SquareSecondaryButton
+      lookalikes still exist in apps/scanner/src/ui/ as carryover. Now that
+      the `<Button locked>` variant exists in @th/ui, migrate every callsite
+      and delete the local Square* primitives.
+    done_when:
+      - apps/scanner/src/ui/ no longer exports SquarePrimaryButton or SquareSecondaryButton
+      - All callsites use `<Button>` (with `locked` where appropriate)
+      - Visual parity confirmed in scanner Storybook / on-device smoke
+
+  # ── 12. Sweep `@ts-nocheck` and `// eslint-disable` debt across web ──────
+  - id: typecheck-debt-sweep
+    status: pending
+    priority: low
+    title: Inventory and retire @ts-nocheck / blanket eslint-disable
+    description: >
+      Beyond scanner-setup, several files carry blanket `@ts-nocheck` or
+      whole-file eslint-disable headers. Produce an inventory, retire what's
+      retire-able, file specs for the rest.
+    deliverables:
+      - docs/dev/typecheck-debt-2026-04-26.md (inventory)
+      - PRs that remove low-effort entries
+    done_when:
+      - Inventory committed
+      - At least 50% of @ts-nocheck files cleared
+
+  # ── 13. PlacesTable / VerificationSection size reduction ──────────────────
+  - id: places-component-trim
+    status: pending
+    priority: medium
+    title: Trim PlacesTable, VerificationSection, OrderDetail, OrderDetailPanel
+    description: >
+      All four are 800–940 LOC. The places-admin-v2 spec already proposes
+      detail-panel work for places; coordinate so that those extractions
+      reduce these files rather than create new oversized siblings.
+    files:
+      - apps/web/src/app/admin/[slug]/places/_components/PlacesTable.tsx (935)
+      - apps/web/src/app/admin/[slug]/places/[placeId]/edit/_components/VerificationSection.tsx (815)
+      - apps/web/src/app/admin/[slug]/orders/_components/OrderDetailPanel.tsx (911)
+      - apps/web/src/app/my-tickets/[orderId]/_components/OrderDetail.tsx (1001)
+    cross_refs:
+      - docs/specs/2026-04-26/places-admin-v2.spec.md
+    done_when:
+      - Each file under ~500 LOC OR cited as a "will be replaced by spec X"
+      - Coordinated with places-admin-v2 implementation
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Execution Order
+# ─────────────────────────────────────────────────────────────────────────────
+
+execution_order:
+  # Phase 1 (mostly done — pick up partials)
+  - deduplicate-utils            # finish formatDate stragglers
+  - split-large-pages            # finish platform/places, orders, reviews splits
+  - share-table-parts            # depends on item 8 below
+  - barrel-exports               # finish auth, navigation, hooks
+  # Phase 2
+  - platform-table-parts-migration   # quick wins, builds on item 5
+  - money-formatting-helper          # independent
+  - scanner-setup-typecheck          # bounded scope, unblocks contributor confidence
+  - oversized-component-files        # largest single bucket; slice by file
+  - places-component-trim            # coordinate with places-admin-v2
+  - scanner-button-migration         # low priority, follows scanner Storybook smoke
+  - typecheck-debt-sweep             # inventory first, then sweep
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+validation:
+  after_each_item:
+    - pnpm -w tsc -p tsconfig.base.json    # Type-check
+    - pnpm -F web build                    # Build check
+    - pnpm lint                            # Lint
+  after_all:
+    - Manual visual spot-check of platform pages
+    - Verify no new circular imports (tsc --noEmit passes)
+    - LOC delta report (`find apps/web/src -name '*.tsx' | xargs wc -l | sort -rn | head -25` before/after)

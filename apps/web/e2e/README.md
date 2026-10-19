@@ -2,6 +2,21 @@
 
 This directory contains Playwright end-to-end tests for the Ithas Fire web app.
 
+## Read this first: the default run WIPES your dev database
+
+Without `E2E_USE_LIVE_STACK=1`, Playwright boots its own API and runs `prisma migrate reset --force` against the database that API points at. Many specs also call `resetE2eState()` in `beforeEach`, which deletes every order, event, org and auth user in that database.
+
+To run against the stack you already have up (web on :3000, API on :3001) and keep your seed data:
+
+```bash
+cd apps/web && E2E_USE_LIVE_STACK=1 pnpm exec playwright test e2e/<spec>.spec.ts --project=chromium --reporter=list
+```
+
+- Under `E2E_USE_LIVE_STACK=1` the specs that call `resetE2eState()` (about 54) fail fast instead of wiping. Set `E2E_ALLOW_LIVE_RESET=1` as well only when you want the live stack wiped (`e2e/helpers/e2e-reset.ts`).
+- Your database is not pristine in this mode, so fixture-dependent specs can fail, and any spec you run must clean up what it creates. Use the default (wiping) path for money, settlement and journey suites, against a throwaway database.
+- `fullyParallel: true` is on. Specs that mutate the same account collide and the failure looks like a product bug. Pass `--workers=1` when running more than one spec that touches shared account state (the two passkey specs, for example).
+- Never set `PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION`. If a reset seems necessary, stop and ask.
+
 ## Prerequisites
 
 Before running E2E tests, ensure you have the following services running:
@@ -47,7 +62,7 @@ SMTP_DEFAULT_FROM_EMAIL=no-reply@ithasfire.local
 ### `apps/web/.env.local`
 
 ```bash
-NEXT_PUBLIC_API_BASE_URL=http://localhost:3001
+WEB_API_BASE_URL=http://localhost:3001
 
 # Stripe (for E2E tests that need direct Stripe API access)
 STRIPE_SECRET_KEY=sk_test_xxx...
@@ -55,28 +70,32 @@ STRIPE_SECRET_KEY=sk_test_xxx...
 
 ## Running Tests
 
+Run these from `apps/web` and put flags straight after the script name. Do not add a `--` separator: Playwright then treats everything after it as a file filter, so `--project=guest` or `--workers=1` is silently ignored.
+
+Every command below takes the default path and wipes the dev database. That is deliberate: the full suite and the guest project include the specs that call `resetE2eState()`, `my-tickets-refund.spec.ts` among them, and under `E2E_USE_LIVE_STACK=1` those fail fast instead of running. For a spec that does not reset, use the live-stack command at the top of this file.
+
 ### Run all E2E tests
 
 ```bash
-pnpm -F web test:e2e
+cd apps/web && pnpm test:e2e  # WIPES the dev DB
 ```
 
 ### Run specific test file
 
 ```bash
-pnpm -F web test:e2e -- apps/web/e2e/my-tickets-refund.spec.ts
+cd apps/web && pnpm test:e2e e2e/my-tickets-refund.spec.ts  # WIPES the dev DB
 ```
 
 ### Run guest-only tests (no auth setup)
 
 ```bash
-pnpm -F web test:e2e -- --project=guest apps/web/e2e/my-tickets-refund.spec.ts
+cd apps/web && pnpm test:e2e --project=guest e2e/my-tickets-refund.spec.ts  # WIPES the dev DB
 ```
 
 ### Run with single worker (serial execution)
 
 ```bash
-pnpm -F web test:e2e -- --workers=1
+cd apps/web && pnpm test:e2e --workers=1  # WIPES the dev DB
 ```
 
 ## Stripe Testing
@@ -99,7 +118,7 @@ STRIPE_BASE_URL=http://127.0.0.1:12111
 For full webhook testing, run Stripe CLI:
 
 ```bash
-stripe listen --forward-to localhost:3001/stripe/webhook
+stripe listen --forward-to localhost:3001/webhooks/stripe
 ```
 
 This outputs a webhook secret (`whsec_...`) - add it to your `.env.local`.
@@ -140,7 +159,7 @@ Ensure you have `STRIPE_SECRET_KEY` in your environment. The test reads from:
 You can set it inline:
 
 ```bash
-STRIPE_SECRET_KEY=sk_test_xxx pnpm -F web test:e2e -- apps/web/e2e/my-tickets-refund.spec.ts --project=guest
+cd apps/web && STRIPE_SECRET_KEY=sk_test_xxx pnpm test:e2e e2e/my-tickets-refund.spec.ts --project=guest  # WIPES the dev DB
 ```
 
 ### "Can't reach database server"
@@ -156,7 +175,7 @@ cd infra/docker && docker compose up -d
 Start Stripe CLI:
 
 ```bash
-stripe listen --forward-to localhost:3001/stripe/webhook
+stripe listen --forward-to localhost:3001/webhooks/stripe
 ```
 
 ### Tests timeout on auth
@@ -164,5 +183,5 @@ stripe listen --forward-to localhost:3001/stripe/webhook
 The auth setup test creates a dev user. If Better Auth is flaky, try running guest-only tests:
 
 ```bash
-pnpm -F web test:e2e -- --project=guest
+cd apps/web && pnpm test:e2e --project=guest  # WIPES the dev DB
 ```

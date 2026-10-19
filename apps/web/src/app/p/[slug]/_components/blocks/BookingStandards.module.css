@@ -1,0 +1,501 @@
+/* ── "What {place} expects" + the per-field markers ──────────────────────────
+   venue-booking-standards FR-005 / FR-010, boards S1 + S2 (combined) and T1.
+   Lives inside the request-to-play form, so it follows that form's theme
+   contract: the entity-page --th-color-* vars, falling back to the app theme
+   (Stub values as the SSR fallback). Strict Swiss: radius 0, ruled, the Plex
+   Mono label idiom for counts and markers, accentText (never accent) for
+   small accent-coloured text. */
+
+/* The query container. A wrapper, because a container cannot query itself
+   and the grid below lives on the form. */
+.container {
+	container-type: inline-size;
+	min-inline-size: 0;
+}
+
+/* The form, once it has a rail: narrow = one column, rail between the
+   header (sender / calendar) and the fields. */
+.withRail {
+	display: flex;
+	flex-direction: column;
+	gap: 1rem;
+}
+
+.part {
+	display: flex;
+	flex-direction: column;
+	gap: 1rem;
+	min-inline-size: 0;
+}
+
+.part:empty {
+	display: none;
+}
+
+/* Without a rail the two parts dissolve, so the form's DOM rhythm is the
+   pre-standards one exactly. */
+.partFlat {
+	display: contents;
+}
+
+/* ── Rail ───────────────────────────────────────────────────────────────── */
+
+.rail {
+	display: flex;
+	flex-direction: column;
+	gap: 0.75rem;
+	min-inline-size: 0;
+	color: var(--th-color-text, var(--color, #211C16));
+}
+
+/* Wide-only heading (narrow shows the title inside the fold button). Still
+   the region's label at every width: aria-labelledby reads hidden nodes. */
+.railHead {
+	display: none;
+	flex-direction: column;
+	gap: 0.125rem;
+}
+
+.railTitle {
+	margin: 0;
+	font-size: 0.9375rem;
+	font-weight: 900;
+	line-height: 1.25;
+	text-transform: uppercase;
+	overflow-wrap: break-word;
+}
+
+.railKicker {
+	margin: 0;
+	font-family: var(--font-mono, ui-monospace, monospace);
+	font-size: var(--fs-mono-xs, 10px);
+	letter-spacing: var(--tr-mono-xs, 2.5px);
+	font-weight: 600;
+	text-transform: uppercase;
+	color: color-mix(in srgb, var(--th-color-text, var(--color, #211C16)) 72%, transparent);
+	overflow-wrap: anywhere;
+}
+
+/* Narrow: the disclosure. A real button, 2px ruled (it is a control). */
+.foldButton {
+	display: flex;
+	align-items: center;
+	gap: 0.625rem;
+	width: 100%;
+	min-height: 52px;
+	padding: 0.5rem 0.75rem;
+	border: 2px solid var(--th-color-text, var(--color, #211C16));
+	border-radius: 0;
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+
+.foldButton:hover {
+	background-color: color-mix(in srgb, var(--th-color-text, var(--color, #211C16)) 6%, transparent);
+}
+
+.foldButton:focus-visible,
+.railButton:focus-visible,
+.examplesHeading:focus-visible {
+	outline: 2px solid var(--th-color-primary, currentColor);
+	outline-offset: 1px;
+}
+
+.foldText {
+	display: flex;
+	flex-direction: column;
+	gap: 0.125rem;
+	flex: 1;
+	min-width: 0;
+}
+
+.foldTitle {
+	font-size: 0.8125rem;
+	font-weight: 900;
+	text-transform: uppercase;
+	overflow-wrap: break-word;
+}
+
+.foldSummary {
+	font-size: 0.75rem;
+	line-height: 1.4;
+	color: color-mix(in srgb, var(--th-color-text, var(--color, #211C16)) 72%, transparent);
+	overflow-wrap: break-word;
+}
+
+.chevron,
+.chevronOpen {
+	flex-shrink: 0;
+	transition: transform 0.15s;
+}
+
+.chevronOpen {
+	transform: rotate(180deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.chevron,
+	.chevronOpen {
+		transition: none;
+	}
+}
+
+.railBody {
+	display: flex;
+	flex-direction: column;
+	gap: 0.75rem;
+	min-inline-size: 0;
+}
+
+.railBodyFolded {
+	display: none;
+}
+
+.railKickerNarrow {
+	display: block;
+}
+
+/* ── Progress ───────────────────────────────────────────────────────────── */
+
+.progress {
+	display: flex;
+	flex-direction: column;
+	gap: 0.375rem;
+}
+
+.progressCount {
+	margin: 0;
+	font-family: var(--font-mono, ui-monospace, monospace);
+	font-size: var(--fs-mono-md, 11.5px);
+	letter-spacing: var(--tr-mono-md, 1.4px);
+	font-weight: 600;
+	text-transform: uppercase;
+	font-variant-numeric: tabular-nums;
+}
+
+.progressBar {
+	display: flex;
+	gap: 3px;
+}
+
+.progressSegment,
+.progressSegmentDone {
+	flex: 1;
+	height: 6px;
+}
+
+.progressSegment {
+	background-color: color-mix(in srgb, var(--th-color-text, var(--color, #211C16)) 15%, transparent);
+}
+
+.progressSegmentDone {
+	background-color: var(--th-color-text, var(--color, #211C16));
+}
+
+/* ── Items ──────────────────────────────────────────────────────────────── */
+
+.items,
+.customList {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+}
+
+.item {
+	display: flex;
+	gap: 0.625rem;
+	align-items: flex-start;
+	padding: 0.5rem 0;
+	border-top: 1px solid color-mix(in srgb, var(--th-color-text, var(--color, #211C16)) 18%, transparent);
+}
+
+.tick,
+.tickDone {
+	box-sizing: border-box;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 20px;
+	height: 20px;
+	flex-shrink: 0;
+}
+
+.tick {
+	border: 2px solid var(--th-color-text, var(--color, #211C16));
+}
+
+.tickDone {
+	background-color: var(--th-color-text, var(--color, #211C16));
+	color: var(--th-color-bg, var(--background, #F6F0E4));
+}
+
+.itemText {
+	display: flex;
+	flex-direction: column;
+	gap: 0.125rem;
+	min-width: 0;
+}
+
+.itemLabel,
+.itemLabelDone {
+	font-size: 0.8125rem;
+	font-weight: 700;
+	line-height: 1.35;
+	overflow-wrap: break-word;
+}
+
+.itemLabelDone {
+	text-decoration: line-through;
+	text-decoration-thickness: 1px;
+	color: color-mix(in srgb, var(--th-color-text, var(--color, #211C16)) 72%, transparent);
+}
+
+.itemHint {
+	font-size: 0.75rem;
+	line-height: 1.4;
+	color: color-mix(in srgb, var(--th-color-text, var(--color, #211C16)) 72%, transparent);
+	overflow-wrap: break-word;
+}
+
+/* ── Markers (rail items and field labels share the idiom) ──────────────── */
+
+.marker {
+	font-family: var(--font-mono, ui-monospace, monospace);
+	font-size: var(--fs-mono-2xs, 9.5px);
+	letter-spacing: var(--tr-mono-2xs, 2.5px);
+	font-weight: 600;
+	text-transform: uppercase;
+	line-height: 1.4;
+	white-space: nowrap;
+}
+
+/* accentText, not accent: accent fails AA as small text on Stub. */
+.markerRequired {
+	color: var(--accentText, #A8300F);
+}
+
+.markerSuggested,
+.markerDone {
+	color: color-mix(in srgb, var(--th-color-text, var(--color, #211C16)) 72%, transparent);
+}
+
+/* The same fixed accessible red as the form's .errorText: the entity-page
+   theme exposes no danger var (see RequestToPlayBlock.module.css). */
+.markerError {
+	color: #dc2626; /* ds-color-ok: matches .errorText, no themed danger var in scope */
+}
+
+/* ── Custom lines (V6: guidance, never counted) ─────────────────────────── */
+
+.custom {
+	display: flex;
+	flex-direction: column;
+	gap: 0.375rem;
+	padding: 0.5rem 0.625rem;
+	background-color: color-mix(in srgb, var(--th-color-text, var(--color, #211C16)) 6%, transparent);
+}
+
+.customKicker,
+.exampleSource {
+	margin: 0;
+	font-family: var(--font-mono, ui-monospace, monospace);
+	font-size: var(--fs-mono-2xs, 9.5px);
+	letter-spacing: var(--tr-mono-2xs, 2.5px);
+	font-weight: 600;
+	text-transform: uppercase;
+	color: color-mix(in srgb, var(--th-color-text, var(--color, #211C16)) 72%, transparent);
+}
+
+.customLine {
+	display: flex;
+	flex-direction: column;
+	gap: 0.125rem;
+}
+
+.customLine + .customLine {
+	padding-top: 0.375rem;
+}
+
+.customLabel {
+	font-size: 0.8125rem;
+	font-weight: 500;
+	line-height: 1.4;
+	overflow-wrap: break-word;
+}
+
+/* ── Examples ───────────────────────────────────────────────────────────── */
+
+/* Secondary, outlined: the form's Send stays the one primary. */
+.railButton {
+	width: 100%;
+	min-height: 44px;
+	padding: 0 1rem;
+	border: 2px solid var(--th-color-text, var(--color, #211C16));
+	border-radius: 0;
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	font-size: 0.75rem;
+	font-weight: 700;
+	letter-spacing: 0.1em;
+	text-transform: uppercase;
+	cursor: pointer;
+	transition:
+		background-color 0.15s,
+		color 0.15s;
+}
+
+.railButton:hover {
+	background-color: var(--th-color-text, var(--color, #211C16));
+	color: var(--th-color-bg, var(--background, #F6F0E4));
+}
+
+.examples {
+	display: flex;
+	flex-direction: column;
+	gap: 0.75rem;
+}
+
+/* An author `display` beats the UA's [hidden] rule; restore it. */
+.examples[hidden] {
+	display: none;
+}
+
+.examplesHeading {
+	margin: 0;
+	font-size: 0.8125rem;
+	font-weight: 900;
+	text-transform: uppercase;
+}
+
+.example {
+	display: flex;
+	flex-direction: column;
+	gap: 0.25rem;
+	padding-top: 0.5rem;
+	border-top: 1px solid color-mix(in srgb, var(--th-color-text, var(--color, #211C16)) 18%, transparent);
+}
+
+.exampleTitle {
+	margin: 0;
+	font-size: 0.8125rem;
+	font-weight: 700;
+	overflow-wrap: break-word;
+}
+
+.exampleBody {
+	margin: 0;
+	font-size: 0.8125rem;
+	line-height: 1.5;
+	white-space: pre-wrap;
+	overflow-wrap: break-word;
+}
+
+/* ── Field side (board S2) ──────────────────────────────────────────────── */
+
+/* Label + marker on one line; the marker wraps under a long label. */
+.labelRow {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	justify-content: space-between;
+	column-gap: 0.5rem;
+	row-gap: 0.125rem;
+}
+
+.fieldLine {
+	overflow-wrap: break-word;
+}
+
+/* Text-weight action beside the Message label ("Start from an outline") —
+   link-styled so Send stays the only primary. */
+.textAction {
+	min-height: 44px;
+	padding: 0;
+	border: 0;
+	background: none;
+	font: inherit;
+	font-size: 0.8125rem;
+	font-weight: 700;
+	color: var(--accentText, #A8300F);
+	text-decoration: underline;
+	text-underline-offset: 2px;
+	cursor: pointer;
+}
+
+.textAction:focus-visible {
+	outline: 2px solid var(--th-color-primary, currentColor);
+	outline-offset: 1px;
+}
+
+/* Under the Message field: the outline hint and the live bracket count. */
+.pitchFooter {
+	display: flex;
+	flex-direction: column;
+	gap: 0.25rem;
+}
+
+.bracketCount {
+	font-family: var(--font-mono, ui-monospace, monospace);
+	font-size: var(--fs-mono-xs, 10px);
+	letter-spacing: var(--tr-mono-xs, 2.5px);
+	font-weight: 600;
+	text-transform: uppercase;
+	color: var(--accentText, #A8300F);
+}
+
+/* ── Wide: the rail beside the fields ───────────────────────────────────── */
+
+@container (min-width: 45rem) {
+	.withRail {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) 17.5rem;
+		grid-template-rows: auto 1fr;
+		grid-template-areas:
+			"head rail"
+			"body rail";
+		column-gap: 1.5rem;
+		row-gap: 1rem;
+		align-items: start;
+	}
+
+	.withRail:has(> .head:empty) {
+		grid-template-rows: 1fr;
+		grid-template-areas: "body rail";
+	}
+
+	.head {
+		grid-area: head;
+	}
+
+	.body {
+		grid-area: body;
+	}
+
+	.rail {
+		grid-area: rail;
+		/* A ruled column, not a card inside the form's box. Sticks inside the
+		   dialog's scrolling body (the dialog sets the offset); `auto` on the
+		   page leaves it static. */
+		padding-left: 1.25rem;
+		border-left: 2px solid var(--th-color-text, var(--color, #211C16));
+		position: sticky;
+		top: var(--th-booking-rail-sticky-top, auto);
+	}
+
+	.railHead {
+		display: flex;
+	}
+
+	.foldButton,
+	.railKickerNarrow {
+		display: none;
+	}
+
+	.railBodyFolded {
+		display: flex;
+	}
+}

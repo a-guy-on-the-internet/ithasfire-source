@@ -29,11 +29,15 @@ import {
 import { formatOrderCode } from "@th/types";
 
 import { trpc } from "@/lib/trpc";
-import { useOrderTickets } from "@/features/tickets/use-order-tickets";
+import { EmailVerificationPrompt } from "@/features/auth/EmailVerificationPrompt";
+import { EmailVerificationScroll } from "@/features/auth/EmailVerificationScroll";
 import {
-  computeOrderCharges,
-  shouldShowChargeRow,
-} from "@/features/tickets/order-format";
+  isEmailVerificationRequired,
+  retryUnlessVerificationRequired,
+} from "@/features/auth/email-verification-required";
+import { useEmailVerificationLatch } from "@/features/auth/use-email-verification-latch";
+import { useOrderTickets } from "@/features/tickets/use-order-tickets";
+import { buyerChargeLines } from "@/features/tickets/order-format";
 import {
   formatTicketCode,
   formatTicketCount,
@@ -93,9 +97,13 @@ export const OrderDetailScreen = ({ route, navigation }: Props) => {
 
   const orderQuery = trpc.orders.getMyOrder.useQuery(
     { orderId },
-    { staleTime: 30_000, retry: 1 },
+    { staleTime: 30_000, retry: retryUnlessVerificationRequired(1) },
   );
   const order = orderQuery.data;
+  const orderGated = useEmailVerificationLatch({
+    gated: isEmailVerificationRequired(orderQuery.error),
+    answered: orderQuery.isSuccess || orderQuery.isError,
+  });
 
   // This screen is the only one that knows the event date, so it is the only
   // one that can make the cached entry evictable once the show is over. The
@@ -106,6 +114,8 @@ export const OrderDetailScreen = ({ route, navigation }: Props) => {
     cachedAt,
     isLoading: ticketsLoading,
     errorMessage: ticketsError,
+    verificationRequired: ticketsGated,
+    isFetching: ticketsFetching,
     refetch: refetchTickets,
   } = useOrderTickets(orderId, order?.eventStartsAt ?? null);
 
@@ -134,6 +144,25 @@ export const OrderDetailScreen = ({ route, navigation }: Props) => {
   );
 
   const isLoading = orderQuery.isLoading && ticketsLoading;
+
+  // Before the loading branch: the latch holds through a refetch, which is
+  // when both queries read as loading again.
+  if (orderGated || ticketsGated) {
+    return (
+      <ScreenSurface testID="order-detail-screen">
+        <SafeAreaView style={styles.safe} edges={["bottom"]}>
+          <EmailVerificationScroll
+            contentContainerStyle={styles.verifyContent}
+            refreshing={orderQuery.isFetching || ticketsFetching}
+            onRefresh={handleRefresh}
+            testID="order-detail-verify"
+          >
+            <EmailVerificationPrompt context="order" />
+          </EmailVerificationScroll>
+        </SafeAreaView>
+      </ScreenSurface>
+    );
+  }
 
   if (isLoading) {
     return (
@@ -192,7 +221,9 @@ export const OrderDetailScreen = ({ route, navigation }: Props) => {
     );
   }
 
-  const charges = order ? computeOrderCharges(order) : null;
+  // Split server-side; the lines always add to the total, and an ABSORB
+  // buyer gets no platform or processing line.
+  const charges = order?.charges ?? null;
   const status = order ? getTicketOrderStatusDisplay(order.status) : null;
 
   return (
@@ -322,40 +353,16 @@ export const OrderDetailScreen = ({ route, navigation }: Props) => {
             <View style={styles.section}>
               <Text style={styles.sectionTitle}>Payment</Text>
               <View style={styles.chargeGroup}>
-                <ChargeRow
-                  label="Subtotal"
-                  value={formatTicketOrderCurrency(
-                    charges.subtotalCents,
-                    order.currency,
-                  )}
-                />
-                {shouldShowChargeRow(charges.platformFeeCents) ? (
+                {buyerChargeLines(charges).map((line) => (
                   <ChargeRow
-                    label="Platform fee"
+                    key={line.id}
+                    label={line.label}
                     value={formatTicketOrderCurrency(
-                      charges.platformFeeCents,
+                      line.cents,
                       order.currency,
                     )}
                   />
-                ) : null}
-                {shouldShowChargeRow(charges.taxCents) ? (
-                  <ChargeRow
-                    label="Tax"
-                    value={formatTicketOrderCurrency(
-                      charges.taxCents,
-                      order.currency,
-                    )}
-                  />
-                ) : null}
-                {shouldShowChargeRow(charges.processingFeeCents) ? (
-                  <ChargeRow
-                    label="Processing fee"
-                    value={formatTicketOrderCurrency(
-                      charges.processingFeeCents,
-                      order.currency,
-                    )}
-                  />
-                ) : null}
+                ))}
                 <ChargeRow
                   label="Total paid"
                   value={formatTicketOrderCurrency(
@@ -403,6 +410,14 @@ const makeSheet = (c: NativePalette) =>
       justifyContent: "center",
       paddingHorizontal: 20,
       gap: 12,
+    },
+    // `centered`, as scroll content, so the keyboard can push the code field
+    // into view.
+    verifyContent: {
+      flexGrow: 1,
+      justifyContent: "center",
+      paddingHorizontal: 20,
+      paddingVertical: 24,
     },
     section: { gap: 12 },
     headerRow: {

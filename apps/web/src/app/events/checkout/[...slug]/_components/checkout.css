@@ -1,0 +1,297 @@
+/* Responsive overrides for checkout layout. Pulled out of Checkout.tsx so
+   the parent file doesn't carry ~95 lines of CSS-in-JSX, and so Turbopack
+   doesn't have to re-run Tamagui's babel pipeline over CSS strings on every
+   parent edit. */
+
+/* One mobile breakpoint for the whole checkout: 959px, the width below which
+   `useIsCompactViewport` (COMPACT_VIEWPORT_BREAKPOINT = 960) treats the app as
+   compact and `MobileCTABar` docks. It used to be 900 here and 900 in the bar's
+   own injected stylesheet, which left 901–959 as a seam where the layout was
+   still two-column. Both are 959 now, so the layout stacks exactly when the bar
+   appears and there is never a second primary on screen. */
+@media (max-width: 959px) {
+  .checkout-main-grid {
+    grid-template-columns: 1fr !important;
+    display: flex !important;
+    flex-direction: column !important;
+  }
+  /* Promo input + discount line + total live in the sidebar, so it cannot be
+     hidden outright on mobile — a buyer would have no way to apply a promo or
+     see that one applied. It follows the step content in DOM order and stays
+     there: nothing above the fold that the buyer cannot act on, and the
+     picker is the first thing on screen. */
+  .checkout-sidebar {
+    position: static !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    border-left: none !important;
+    border-top: 1px solid var(--borderColor, #211C16);
+  }
+  /* Before a ticket is chosen there is nothing to summarise, and an "order
+     summary" reading "Select tickets to see your order total" is a heading and
+     a prompt occupying a screen the buyer needs for the picker. Driven by a
+     data attribute rather than a viewport hook so SSR and first paint agree. */
+  .checkout-sidebar[data-summary="empty"] {
+    display: none !important;
+  }
+  .checkout-sidebar > div {
+    position: static !important;
+    max-height: none !important;
+    overflow: visible !important;
+  }
+}
+
+@media (max-width: 720px) {
+  /* Info bar: the countdown chip ("14:34 remaining") is flex-shrink:0 and
+     was crushing the title block to ~30px at phone widths. Force the left
+     (back link + identity) block to a full row so the countdown wraps to its
+     own row below. */
+  .checkout-info-bar-left { flex-basis: 100% !important; }
+  /* ...and stack the exit above the identity inside it. Side by side, the
+     back link takes ~180 of 320px and the event name ellipsised to
+     "Brooklyn W…" — measured. The identity line is the one thing on this page
+     that says what is being bought, so it gets the full width and the exit
+     sits above it. */
+  .checkout-info-bar-left {
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    gap: 6px !important;
+  }
+  .checkout-info-bar-divider { display: none !important; }
+  .checkout-billing-payment-grid { grid-template-columns: 1fr !important; }
+  .checkout-payment-col {
+    padding-left: 0 !important;
+    border-left: none !important;
+    padding-top: 24px;
+    border-top: 1px solid var(--borderColor, #211C16);
+    margin-top: 8px;
+  }
+}
+
+/* Bottom clearance for the fixed `MobileCTABar`, MEASURED rather than assumed:
+   the bar publishes its own height to `--checkout-cta-bar-height` on <html>
+   while it is docked (its padding resolves through `env(safe-area-inset-bottom)`,
+   which differs between a browser tab and an installed PWA on the same device).
+   The 0px fallback is the desktop truth — no bar, no reserve. A hard-coded
+   number here is the same class of bug as the shell reserving a flat 96px for
+   an 85px bar. */
+.checkout-wrapper {
+  padding-bottom: calc(var(--checkout-cta-bar-height, 0px) + 24px);
+}
+
+/* Mobile: reduce shell padding so checkout fills the screen */
+@media (max-width: 640px) {
+  .checkout-wrapper { padding-left: 4px; padding-right: 4px; }
+  .checkout-card-wrapper { border-radius: 0 !important; }
+  .checkout-section-padding { padding: 16px 12px !important; }
+  .seat-map-visual-container { border-radius: 0 !important; padding: 4px !important; }
+  .checkout-name-email-row { grid-template-columns: 1fr !important; }
+  .checkout-info-bar-row { padding: 10px 12px !important; }
+  /* Compact section #1 header — keep heading on one line and shrink the
+     change-tickets button so layout doesn't wrap awkwardly. */
+  .checkout-ticket-summary-padding { padding: 12px 12px !important; }
+  /* Force Tamagui Checkbox text column to take the remaining row width and
+     let the label wrap, instead of growing past the container. Tamagui's
+     atomic extraction caches default flex:0 0 auto for the YStack, so we
+     override it from CSS rather than fighting the cache. */
+  .is_IthasFireCheckboxContainer { width: 100% !important; min-width: 0 !important; }
+  .is_IthasFireCheckboxTextContent { flex: 1 1 0% !important; min-width: 0 !important; }
+  .is_IthasFireCheckboxLabel { white-space: normal !important; overflow-wrap: anywhere; }
+  .checkout-card-wrapper input,
+  .checkout-card-wrapper select,
+  .checkout-card-wrapper textarea {
+    font-size: 16px !important;
+  }
+}
+
+/* Keyframes for the ToS checkbox attention pulse — fires when the buyer
+   hits "Continue" without ticking the box. 3 quick outline pulses then
+   back to neutral. We deliberately animate `outline` only (no box-shadow)
+   so the pulse doesn't fight Tamagui's own focus shadow on the Checkbox
+   frame. Total run is 1.6s; the className stays on for TERMS_PULSE_MS
+   (1800ms) so removal happens after the animation. */
+@keyframes th-terms-pulse {
+  0%, 100% { outline: 2px solid transparent; outline-offset: 0; }
+  15%, 45%, 75% { outline: 2px solid rgba(226,72,29,0.95); outline-offset: 4px; }
+  30%, 60%, 90% { outline: 2px solid rgba(226,72,29,0.45); outline-offset: 2px; }
+}
+.th-terms-pulse { animation: th-terms-pulse 1.6s ease-in-out 1; }
+
+/* Hold-release warning dialog enter animations. */
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes slideUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+
+/* Details-step inline "Continue to payment" and the fixed MobileCTABar both
+   render below 960px, under distinct accessible names ("Continue to payment"
+   inline, "Continue" in the bar). The bar is the step's primary — same
+   position on every step — and the inline control is the in-flow one a
+   keyboard user tabs into. */
+
+/* Step 1's sidebar "Hold tickets" is the DESKTOP primary only. `MobileCTABar`
+   re-enables itself at <=959px and carries the same action with the running
+   total on it, so below that width this one is a second, unnamed-apart copy —
+   measured at 390px the fixed bar overlapped it by ~15px. One primary per
+   viewport: the bar owns mobile, this owns desktop. */
+@media (max-width: 959px) {
+  .checkout-sidebar-hold { display: none; }
+}
+
+/* The one primary-CTA focus ring — step 1 "Hold tickets" (sidebar) and step 2
+   "Continue to payment". Both are inline-styled buttons, and an inline style
+   cannot express a pseudo-class, so the keyboard indicator lives here rather
+   than in a JS onFocus handler (which would also fire on mouse press). Ink at
+   3px, held 2px clear of the deep #B93312 fill so it reads against the cream
+   page/sidebar behind it (>12:1); a ring drawn ON that fill would not. */
+.checkout-primary-action:focus-visible {
+  outline: 3px solid var(--structure, #211C16);
+  outline-offset: 2px;
+}
+
+/* Placeholders must read as PROMPTS, not filled values. The app-wide
+   ::placeholder is full `--colorMuted`, which lands at 6.56:1 on the cream
+   input wells — indistinguishable from real input at a glance. 85% of the
+   same token composites to ≈4.6:1 on `--background` (≈4.9:1 on `--surface`):
+   still WCAG AA, but clearly lighter than the 12+:1 ink of typed values.
+   Token-derived (no new hex) so it tracks theme changes. Scoped to checkout;
+   the embed keeps full `--colorMuted` (globals.css `body[data-th-embed]`,
+   which adds the host fontColor layer). */
+.checkout-card-wrapper input::placeholder,
+.checkout-card-wrapper textarea::placeholder {
+  color: color-mix(in srgb, var(--colorMuted, #5C544A) 85%, transparent);
+}
+
+/* ─── Skeleton placeholders (SkeletonLine, StripePaymentCardSkeleton) ───────
+   The shimmer used to be an inline <style> emitted once per <SkeletonLine>,
+   which the payment-card skeleton would have repeated a dozen times in one
+   subtree. Fill is ink at 8%, so it tracks the theme rather than pinning a
+   grey. `radius: 0` — a skeleton stands in for content, and content is strict
+   Swiss. */
+@keyframes checkout-skeleton-shimmer {
+  0% { opacity: 0.4; }
+  50% { opacity: 0.8; }
+  100% { opacity: 0.4; }
+}
+
+.checkout-skeleton-line {
+  border-radius: 0;
+  background: color-mix(in srgb, var(--color, #211C16) 8%, transparent);
+  animation: checkout-skeleton-shimmer 1.5s ease-in-out infinite;
+}
+
+/* An infinite pulse is exactly what a reduced-motion reader asked not to see.
+   Hold it at the midpoint so the placeholder is still legible as one. */
+@media (prefers-reduced-motion: reduce) {
+  .checkout-skeleton-line {
+    animation: none;
+    opacity: 0.6;
+  }
+}
+
+/* ─── Payment card slot ─────────────────────────────────────────────────────
+   Height reserved for Stripe's card WHILE IT LOADS, so the checkout box does
+   not collapse out from under the buyer between steps.
+
+   It has to outlast TWO waits, which is why it sits on the slot and not on the
+   skeleton: `next/dynamic` drops the skeleton the moment the chunk resolves,
+   but PaymentElement is an IFRAME and renders as a zero-height div for another
+   second or more after that. Without the slot the card collapses twice.
+
+   It is NOT released once the card reports ready. That was tried and measured:
+   PaymentElement's `onReady` fires when the element MOUNTS, not when it has
+   laid out, so dropping the floor there put the card back at 544px and let it
+   climb through 27 discrete height steps as the express row and Link panel
+   resolved — the original defect, moved later.
+
+   ── SLOT WIDTH IS THE DRIVER. VIEWPORT IS NOT. ──────────────────────────────
+
+   Do not re-cut these against the viewport. Stripe reflows on the width IT is
+   given, and this slot's width does not track the viewport monotonically: the
+   checkout grid is `1fr 380px` above 959px and stacked below it, so the slot
+   JUMPS WIDER as the window gets NARROWER across that line. Measured: viewport
+   960 -> slot 474, viewport 940 -> slot 834. A viewport ladder therefore gets
+   it exactly backwards — the previous one reserved 756px at viewport 960 for a
+   869px card (113px short, the original defect alive) while reserving 872px at
+   viewport 900 for a 758px card (114px of dead cream).
+
+   Card height against SLOT width, measured in Chrome against this account's
+   enabled payment methods. Probe: sample `.checkout-payment-slot > *` once
+   nine Stripe iframes have landed, resizing between samples.
+
+     slot  card | slot  card | slot  card | slot  card
+      854   758 |  694   775 |  546   869 |  406   946
+      834   758 |  614   775 |  534   869 |  386   946
+      794   758 |  594   775 |  526   869 |  366   964
+      774   758 |  584   869 |  486   869 |  346   964
+      754   758 |  574   869 |  474   869 |  326   948
+      734   758 |  564   869 |  466   869 |  306   966
+      714   775 |  554   869 |  446   869 |  286   982
+
+   A step function whose thresholds Stripe owns, each bracketed by measurement
+   and each rung placed inside its gap:
+
+     720  (slot 714 -> 775, 734 -> 758)
+     590  (slot 584 -> 869, 594 -> 775 — expiry/CVC leave the card-number row)
+     436  (slot 426 -> 946, 446 -> 869)
+     300  (slot 286 -> 982, 306 -> 966)
+
+   Each rung is its band's WORST case. Worst error across every sample above:
+   20px over, 0px under.
+   Under-reserving a little is free; over-reserving is permanent dead cream
+   under the pay button, so the rungs never round up past their band.
+
+   RE-MEASURE WHEN: a payment method is enabled or disabled in the Stripe
+   dashboard, or the Link opt-in panel changes shape. Nothing else will catch
+   that drift — the numbers are Stripe's, not ours, and they vary by ~20px
+   between sessions on the same account depending on what it decides to render.
+
+   `.checkout-payment-measure` exists ONLY to carry `container-type`, and it
+   carries no padding, so its inline size IS the slot's inline size and the
+   thresholds above are real slot widths rather than slot-plus-padding (the
+   section's padding changes at 959px, which would put a seam right back in).
+   An element cannot match a container query it establishes itself, so this
+   cannot live on the slot. Named, so a container introduced higher up later
+   cannot quietly capture these rules.
+
+   `container-type` implies `contain: layout`, which makes the element a
+   containing block for `position: fixed` descendants. Checked before adopting
+   it: zero fixed-position descendants inside the slot at all 13 measured
+   widths. Stripe's own overlays live in its iframes or on `document.body`.
+
+   `display: flex` on the slot so the skeleton can grow into the reservation
+   (`flex: 1 0 auto`). The mounted card takes its natural height — no grow — so
+   the reservation never stretches real content. */
+.checkout-payment-measure {
+  container-type: inline-size;
+  container-name: checkout-payment;
+}
+
+.checkout-payment-slot {
+  display: flex;
+  flex-direction: column;
+  min-height: 982px;
+}
+
+@container checkout-payment (min-width: 300px) {
+  .checkout-payment-slot {
+    min-height: 966px;
+  }
+}
+
+@container checkout-payment (min-width: 436px) {
+  .checkout-payment-slot {
+    min-height: 869px;
+  }
+}
+
+@container checkout-payment (min-width: 590px) {
+  .checkout-payment-slot {
+    min-height: 775px;
+  }
+}
+
+@container checkout-payment (min-width: 720px) {
+  .checkout-payment-slot {
+    min-height: 758px;
+  }
+}

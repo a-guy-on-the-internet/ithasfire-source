@@ -1,0 +1,73 @@
+# Spec: Ticket Component Localization
+meta:
+  owner: design-system
+  status: draft
+  reviewers:
+    - platform
+    - web
+    - mobile
+    - qa
+  last_updated: 2025-11-14
+component: ticketing-ui
+summary: |
+  Update `@th/ui` ticketing primitives (TicketBadge, PriceBreakdown, TicketList,
+  HoldCountdown, etc.) to consume shared translation dictionaries provided by
+  `@th/locale`. Ensure Storybook, Vitest stories, and downstream apps can render
+  localized copy while preserving existing API shapes and theming tokens.
+objectives:
+  - Introduce a translation context inside `@th/ui` that mirrors the hooks provided by `next-intl` (`useTranslations`, `useFormatter`).
+  - Replace literal strings and `toLocaleString` calls inside ticket components with dictionary lookups and shared formatting helpers.
+  - Maintain tree-shakeable bundles by dynamically loading only required language chunks during Storybook/test scenarios.
+  - Provide design review controls (Storybook toolbar) to toggle locales and verify RTL readiness.
+  - Guarantee TypeScript type safety for translation keys consumed by components.
+scope:
+  in_scope:
+    - Components: `TicketBadge`, `TicketStatusChip`, `PriceBreakdown`, `TicketList`, `SeatSummary`, `OrderMeta`, `HoldCountdown`, `TransferBanner`.
+    - Supporting hooks/utilities in `packages/ui/src/ui/tickets/**`.
+    - Storybook stories for the above components.
+    - Unit tests (Vitest) touching ticket UI.
+  out_of_scope:
+    - Non-ticket UI primitives (handled separately when needed).
+    - Runtime locale persistence (handled by host app providers).
+    - Legacy React Native wrappers (covered by Expo spec).
+usage_contract:
+  - Components accept either localized strings (for backward compat) or translation keys via new props (e.g., `statusLabelId`).
+  - Preferred pattern: host passes `t` function via context provider; components call `t("tickets.status.held")` internally.
+  - Formatters exposed through context: `formatCurrency`, `formatDate`, `formatNumber` delegating to `@th/locale` helpers.
+architecture:
+  provider:
+    - New `TranslationProvider` exported from `@th/ui` that accepts `{ locale, messages, formatterOptions }`.
+    - Defaults to `DEFAULT_LOCALE` + `en` messages when provider absent (development fallback).
+    - Exposes hooks `useTranslations`, `useFormatters`, `useLocale` for internal components.
+  message_loading:
+    - `@th/ui` does not ship dictionaries itself; host app injects them from `@th/locale`.
+    - Storybook stories import dictionaries directly and wrap stories with provider.
+  typing:
+    - `@th/locale` publishes `TicketMessages` TypeScript type; components type props accordingly.
+    - Lint rule ensures only defined keys used via custom ESLint plugin (`no-unknown-ticket-translation`).
+  formatting:
+    - Monetary formatting pipes through `formatMoney` from `packages/core/src/lib/pricing` before localized string conversion to avoid float drift.
+    - Date/time formatting uses `Intl.DateTimeFormat` via shared helper, ensuring consistent timezone (defaults to event timezone when provided).
+storyboard:
+  - Add Storybook global toolbar knob `Locale` (values from `SUPPORTED_LOCALES`).
+  - Configure preview decorator to load dictionaries asynchronously and wrap stories in `TranslationProvider`.
+  - Capture Chromatic snapshots (if configured) for each locale to detect layout regressions.
+testing:
+  - Vitest: update component tests to mount with `TranslationProvider` and assert localized output.
+  - CI: add `pnpm -F @th/ui test:locale` running tests in two locales to ensure formatting parity.
+risks:
+  - Component API churn if we require translation keys for all props; mitigate by maintaining string props but marking them deprecated.
+  - Bundle size increase if dictionaries accidentally bundled in `@th/ui`; ensure peer dependency contract documented.
+  - Theme tokens might not adapt for RTL (spacing/margin). Track separately but note risk.
+open_questions:
+  - Should we auto-detect locale from host app context (React context bridging) instead of requiring provider prop wiring?
+  - Do we need fallback fonts for locales requiring non-Latin glyphs within components?
+  - How will screenshot diffs be managed if Chromatic multiplies by locale count?
+dependencies:
+  - Completion of `@th/locale` package (message schemas, loaders).
+  - ESLint rule update to allow `t` usage within `@th/ui`.
+  - Storybook config adjustments for async decorators.
+references:
+  - ../../../platform/localization-platform.spec.yaml
+  - ../../design/component-library.md
+  - ../../design/playbook.md

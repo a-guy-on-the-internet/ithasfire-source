@@ -16,6 +16,7 @@ import type { AppRouter } from "@th/trpc";
 
 import { getTrpcHttpUrl } from "@/config/api";
 import { authClient } from "@/features/auth/better-auth-client";
+import { shouldLogTrpcOperation } from "@/features/auth/email-verification-required";
 import {
   getAuthToken,
   loadSessionToken,
@@ -58,7 +59,8 @@ const createTrpcClient = (resolveAuthToken: AuthTokenResolver) =>
         // credentials that admit whoever holds them. In a release build those
         // lines become Sentry console breadcrumbs and ride along on the next
         // captured error. Do not re-enable this for production traffic.
-        enabled: () => __DEV__,
+        // Not for the B2 gate refusal: see shouldLogTrpcOperation.
+        enabled: (op) => __DEV__ && shouldLogTrpcOperation(op),
         colorMode: "none",
       }),
       httpBatchLink({
@@ -105,9 +107,20 @@ export const TrpcProvider = ({ children }: { children?: ReactNode }) => {
   const queryClient = useMemo(() => createQueryClient(), [authScope]);
   const [client] = useState(() => createTrpcClient(resolveAuthToken));
 
-  return createElement(
-    trpc.Provider,
-    { client, queryClient },
-    createElement(QueryClientProvider, { client: queryClient }, children),
-  );
+  // `children` goes IN the props object, not as createElement's third
+  // argument: TRPCProviderProps declares it as a required prop, so
+  // `{ client, queryClient }` alone fails the props type (TS2769). React
+  // treats the two forms identically at runtime.
+  //
+  // `react/no-children-prop` (on via `expo lint`) wants the third-argument
+  // form — the one the type rejects. Under createElement the two gates cannot
+  // both pass, so the lint rule gives way on this line only. apps/scanner's
+  // TrpcProvider does the same thing; its eslint config just doesn't enable
+  // the rule.
+  // eslint-disable-next-line react/no-children-prop -- TRPCProviderProps requires `children` as a prop; see above.
+  return createElement(trpc.Provider, {
+    client,
+    queryClient,
+    children: createElement(QueryClientProvider, { client: queryClient }, children),
+  });
 };

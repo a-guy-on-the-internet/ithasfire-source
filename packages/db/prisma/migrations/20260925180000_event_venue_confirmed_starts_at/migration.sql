@@ -1,0 +1,20 @@
+-- Place address withholding, N1 (final threat-model pass, 2026-09-25): the
+-- date the venue vouched for.
+--
+-- A venue that withholds its address releases it to a THIRD PARTY's ticket
+-- holders only when it confirmed that event by stamp, and then no earlier
+-- than a day before the show. That floor was measured from the LIVE
+-- `startsAt`, which the third party can edit: confirm a show three months
+-- out, move it to tomorrow, collect the reveal, move it back.
+--
+-- `venueConfirmedStartsAt` records `startsAt` AT STAMP TIME. The stamp write
+-- (`EventsRepo.setVenueConfirmation`) copies it from the row in the same
+-- transaction; withdrawal clears it. Core's floor becomes
+-- `max(startsAt, venueConfirmedStartsAt) − 24h`: moving the show EARLIER no
+-- longer pulls the reveal forward, moving it later still defers it.
+--
+-- Additive, nullable, no default: a metadata-only ALTER (no table rewrite, no
+-- long lock). Single statement. The backfill for rows stamped before this
+-- column existed is the next migration
+-- (20260925180001_event_venue_confirmed_starts_at_backfill).
+ALTER TABLE "Event" ADD COLUMN IF NOT EXISTS "venueConfirmedStartsAt" TIMESTAMP(3);

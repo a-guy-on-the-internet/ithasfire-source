@@ -1,0 +1,196 @@
+# Generic FormBuilder Extraction
+
+> Superseded by docs/specs/2026-08-10/application-driven-events.spec.md, which absorbs it in its Phase 4; only the FormBuilder extraction was built (2026-10-08 docs consolidation)
+
+> **Status**: Superseded (2026-10-08 docs consolidation; was: Draft)
+> **Created**: 2026-06-26
+> **Authors**: Engineering Team
+> **Blocks**: `events/volunteering.spec.md` (volunteer signup form reuses this)
+
+## Overview
+
+Extract the existing `ApplicationFormBuilder` component into a generic, reusable `FormBuilder` that can power both the event application form and the new volunteer signup form (and any future form-driven feature). This also renames the shared `ApplicationQuestionType` enum to `FormQuestionType` to reflect its broader usage.
+
+## What already exists
+
+### `ApplicationFormBuilder`
+
+Located at `apps/web/src/app/admin/[slug]/events/new/_components/ApplicationFormBuilder.tsx` (~700 lines).
+
+Capabilities:
+- Question CRUD (add, edit, delete, reorder via drag)
+- Question type picker: `SHORT_TEXT`, `LONG_TEXT`, `SINGLE_CHOICE`, `MULTI_CHOICE`
+- Per-question options management (for choice types)
+- Required toggle per question
+- Intro text editor
+- Saves via tRPC mutations: `upsertApplicationForm`, `upsertApplicationQuestion`, `deleteApplicationQuestion`
+
+### `ApplicationQuestionType` enum
+
+Defined in `packages/db/prisma/enums.prisma`:
+
+```prisma
+enum ApplicationQuestionType {
+  SHORT_TEXT
+  LONG_TEXT
+  MULTI_CHOICE
+  SINGLE_CHOICE
+}
+```
+
+### `EventApplicationGate`
+
+Shared UI in `packages/ui/src/ui/tamagui/components/events/EventApplicationGate.tsx` renders the consumer-facing form based on question definitions. This also needs to work generically.
+
+---
+
+## Changes
+
+### 1. Rename enum: `ApplicationQuestionType` -> `FormQuestionType`
+
+```prisma
+// enums.prisma
+enum FormQuestionType {
+  SHORT_TEXT
+  LONG_TEXT
+  MULTI_CHOICE
+  SINGLE_CHOICE
+}
+```
+
+**Migration**: Prisma `@map` or a migration rename. Update all references:
+- `EventApplicationQuestion.type` field
+- Any volunteer form question model (uses the same enum)
+- TypeScript types in `@th/types`
+- Transport layer schemas
+- UI components
+
+### 2. Extract generic `FormBuilder` component
+
+Create `packages/ui/src/ui/tamagui/components/forms/FormBuilder.tsx` (or `apps/web/src/components/forms/FormBuilder.tsx` if it depends on web-only tRPC hooks).
+
+**Design**: The generic `FormBuilder` accepts callbacks rather than hardcoding tRPC mutations.
+
+```typescript
+interface FormBuilderProps {
+  /** Current list of questions */
+  questions: FormQuestion[];
+  /** Intro/header text */
+  introText?: string;
+  /** Callbacks for CRUD operations */
+  onQuestionAdd: (question: Omit<FormQuestion, "id">) => Promise<void>;
+  onQuestionUpdate: (id: string, updates: Partial<FormQuestion>) => void;
+  onQuestionDelete: (id: string) => void;
+  onQuestionReorder: (orderedIds: string[]) => void;
+  onIntroTextChange?: (text: string) => void;
+  /** Optional: restrict available question types */
+  allowedTypes?: FormQuestionType[];
+  /** Optional: read-only mode */
+  readOnly?: boolean;
+}
+
+interface FormQuestion {
+  id: string;
+  type: FormQuestionType;
+  label: string;
+  description?: string;
+  options?: string[];   // For SINGLE_CHOICE / MULTI_CHOICE
+  isRequired: boolean;
+  order: number;
+}
+```
+
+### 3. `ApplicationFormBuilder` becomes a thin wrapper
+
+```typescript
+// ApplicationFormBuilder.tsx — simplified
+export function ApplicationFormBuilder({ eventId }: { eventId: string }) {
+  const { data: form } = trpc.applicationForms.get.useQuery({ eventId });
+  const upsertForm = trpc.applicationForms.upsert.useMutation();
+  const upsertQuestion = trpc.applicationForms.upsertQuestion.useMutation();
+  const deleteQuestion = trpc.applicationForms.deleteQuestion.useMutation();
+
+  return (
+    <FormBuilder
+      questions={form?.questions ?? []}
+      introText={form?.introText ?? ""}
+      onQuestionAdd={(q) => upsertQuestion.mutateAsync({ formId: form!.id, ...q })}
+      onQuestionUpdate={(id, updates) => upsertQuestion.mutate({ id, ...updates })}
+      onQuestionDelete={(id) => deleteQuestion.mutate({ id })}
+      onQuestionReorder={(ids) => /* batch reorder mutation */}
+      onIntroTextChange={(text) => upsertForm.mutate({ eventId, introText: text })}
+    />
+  );
+}
+```
+
+### 4. `VolunteerFormBuilder` — new thin wrapper
+
+```typescript
+// VolunteerFormBuilder.tsx
+export function VolunteerFormBuilder({ eventId }: { eventId: string }) {
+  // Uses volunteer-specific tRPC mutations
+  const { data: form } = trpc.volunteer.form.get.useQuery({ eventId });
+  // ... same pattern, different tRPC endpoints
+  return (
+    <FormBuilder
+      questions={form?.questions ?? []}
+      introText={form?.introText ?? ""}
+      onQuestionAdd={...}
+      onQuestionUpdate={...}
+      onQuestionDelete={...}
+      onQuestionReorder={...}
+      onIntroTextChange={...}
+    />
+  );
+}
+```
+
+### 5. Generic `FormRenderer` for consumer-facing forms
+
+Extract the rendering logic from `EventApplicationGate` into a generic `FormRenderer`:
+
+```typescript
+interface FormRendererProps {
+  questions: FormQuestion[];
+  introText?: string;
+  /** Current answers (controlled) */
+  answers: Record<string, unknown>;
+  onAnswersChange: (answers: Record<string, unknown>) => void;
+  onSubmit: () => void;
+  submitLabel?: string;
+  isSubmitting?: boolean;
+}
+```
+
+`EventApplicationGate` and the new `VolunteerSignupForm` both use `FormRenderer` internally.
+
+---
+
+## Migration strategy
+
+This is a pure refactor with one schema rename. Order of operations:
+
+1. **Prisma enum rename**: Create migration renaming `ApplicationQuestionType` -> `FormQuestionType`. Since this is an enum rename (not value change), Prisma handles it with `ALTER TYPE ... RENAME TO ...`.
+2. **Generate client**: `pnpm -F @th/db prisma generate`.
+3. **Update types**: Rename in `@th/types` and re-export for backward compat if needed.
+4. **Extract `FormBuilder`**: Pull the generic logic out of `ApplicationFormBuilder`. Keep the old component working as a wrapper.
+5. **Extract `FormRenderer`**: Pull from `EventApplicationGate`. Keep the old component working.
+6. **Update imports**: Sweep all consumers of the old names.
+7. **Tests**: Existing application form tests should pass with the wrapper. Add unit tests for the generic `FormBuilder` and `FormRenderer`.
+
+---
+
+## Files affected
+
+| File | Change |
+| --- | --- |
+| `packages/db/prisma/enums.prisma` | Rename enum |
+| `packages/db/prisma/application.prisma` | Update field type reference |
+| `packages/types/src/**` | Rename type exports |
+| `packages/ports/src/**` | Update port signatures if they reference the type |
+| `apps/web/.../ApplicationFormBuilder.tsx` | Extract logic, become thin wrapper |
+| `packages/ui/.../EventApplicationGate.tsx` | Extract FormRenderer |
+| New: `FormBuilder.tsx` | Generic form builder component |
+| New: `FormRenderer.tsx` | Generic form renderer component |
+| Transport schemas | Update Zod schemas referencing the enum |

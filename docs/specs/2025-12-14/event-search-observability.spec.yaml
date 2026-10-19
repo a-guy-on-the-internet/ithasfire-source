@@ -1,0 +1,85 @@
+# Owner note 2026-10-08: "At some point we will come back to wanting this when we do go back to meilisearch or something like it."
+# Spec: Event Search Observability & Operations
+meta:
+  owner: platform-observability
+  status: draft
+  reviewers:
+    - search-platform
+    - ops
+    - data
+  last_updated: 2025-11-25
+summary: |
+  Define the metrics, logging, alerting, and runbooks for the end-to-end event search system
+  (indexing jobs, search adapters, transport, and UI telemetry). Ensures we meet SLOs and can
+  debug ranking issues quickly.
+objectives:
+  - Track user-facing SLOs: autocomplete latency, search latency, zero-result rate.
+  - Instrument indexing pipeline health (lag, DLQ, embedding spend).
+  - Provide alerts + dashboards for anomalies.
+  - Document rollback/feature-flag procedures.
+
+slos:
+  - autocomplete_latency_p95 < 150 ms (measured at transport layer).
+  - search_latency_p95 < 350 ms (transport).
+  - index_freshness_p99 < 5 minutes (time between event publish + indexed).
+  - zero_result_rate < 8% per day.
+
+metrics:
+  ingestion:
+    - `search.index.lag_ms` (derived from event updatedAt vs upsert timestamp).
+    - `search.embedding.calls_total{status}`.
+    - `search.index.dlq_total`.
+  query:
+    - `search.autocomplete.latency_ms` histogram with labels {orgScope, region}.
+    - `search.query.latency_ms` histogram.
+    - `search.zero_results_total` counter (labels: query_length_bucket, orgScope).
+    - `search.prompts_used_total` counter.
+  transport:
+    - `api.rate_limit.search.limited_total` counter.
+    - `api.search.requests_total{endpoint, status}`.
+  ui telemetry:
+    - `web.search.impressions_total` gauge per session.
+    - `web.search.click_through_rate` computed via analytics job.
+
+logging:
+  - Structured logs at each hop (jobs, adapter, transport) include `traceId`, `queryHash`, `orgId`, `resultCount`, `latencyMs`, `matchReasons[]`.
+  - Sensitive data (raw query) hashed using SHA-256 before logging unless `feature.search.logRawQueries` flag true for debugging windows.
+  - DLQ entries capture payload snapshot + stack trace for postmortems.
+
+alerting:
+  - PagerDuty: `search-indexing-lag` when `search.index.lag_ms p99 > 2m` for 10 minutes.
+  - PagerDuty: `search-autocomplete-latency` when p95 > 200 ms for 5 minutes.
+  - Slack warning: `zero_result_rate` > 12% daily.
+  - Budget alert: embedding spend > 80% of monthly allotment (hooks into finance webhook).
+
+runbooks:
+  - `RUNBOOK: search-indexing-lag`
+    steps:
+  1. Check Redis queue depth via `pnpm -C apps/jobs queue:inspect event-search-index`.
+      2. If backlog > 50k, scale workers (env var `SEARCH_INDEX_WORKER_CONCURRENCY`).
+  3. Inspect DLQ; replay after fixes using `pnpm -C apps/jobs queue:replay event-search-index.dlq --limit 500`.
+  - `RUNBOOK: search-latency`
+    steps:
+      1. Verify adapter health (OpenSearch ping) via `pnpm -C packages/adapters search:health`.
+      2. Enable lexical-only fallback: set `search.vector.enabled=false`.
+      3. If still failing, toggle transport flag `search.transport.enabled=false` to revert UI to featured-only suggestions.
+
+feature_flags:
+  - `search.vector.enabled` — disables vector scoring if provider degraded.
+  - `search.indexing.enabled` — halts upserts (already defined in jobs spec, repeated here for ops context).
+  - `search.transport.enabled` — falls back to static featured suggestions.
+
+tracing:
+  - Adopt OpenTelemetry instrumentation: span `SearchQueryPort.autocomplete` includes attributes {query_length, result_count, adapter}.
+  - Worker spans: `event-search-index.fetch`, `.embed`, `.upsert`.
+  - Propagate `traceparent` from Fastify -> adapter -> job telemetry for correlated traces.
+
+dashboards:
+  - `Search Overview` (Looker): SLOs, zero-result rate, trending queries, embedding spend.
+  - `Search Indexing` (Grafana): queue depth, lag, DLQ.
+  - `Search User Experience` (Datadog RUM): client timings, error overlays.
+
+open_questions:
+  - Should we sample raw queries (with encryption) for manual QA, and where do we store them securely?
+  - Do we need per-org SLOs or just global? (Large organizers might demand dedicated views.)
+  - How to visualize semantic vs lexical contribution to score for debugging false positives?

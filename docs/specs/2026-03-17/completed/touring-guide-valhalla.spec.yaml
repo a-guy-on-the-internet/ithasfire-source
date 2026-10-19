@@ -1,0 +1,267 @@
+# Superseded by docs/specs/2026-04-15/artist-tour-routing.spec.md (2026-10-08 docs consolidation)
+status: superseded  # 2026-10-08 docs consolidation; was: draft
+priority: backlog
+prerequisite_signal: >
+  Only worth building once Ithas Fire has enough density in at least a few
+  metros (e.g., 20+ events/weekend in a single city) AND enough active users
+  in those metros to justify the feature.  Track the "events per metro per
+  weekend" metric and revisit when it consistently exceeds 15-20 in 3+ cities.
+
+task: >
+  Add a "touring guide" feature that helps users plan an optimised multi-event
+  itinerary.  Given a set of events (user-picked or system-suggested), compute
+  the best visit order, display the route on an in-app map, and hand off to
+  Google Maps / Apple Maps / Waze for actual turn-by-turn navigation.
+
+goal: >
+  Differentiate Ithas Fire from pure-ticketing competitors by turning the
+  app into a discovery + planning tool.  Reduce the friction of attending
+  multiple events in one day/weekend, which increases ticket purchases per user.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Context: Current Map Stack
+# ───────────────────────────────────────────────────────────────────────────────
+
+current_stack:
+  tile_rendering:
+    service: TileServer GL (maptiler/tileserver-gl)
+    data_format: PMTiles (OpenMapTiles schema, sourced from OSM)
+    hosting: Self-hosted on Cloud Run, GCS FUSE for tile data
+    purpose: Interactive vector maps (MapLibre GL JS) + static map images for emails
+
+  geocoding:
+    service: Geoapify (hosted, API key)
+    purpose: Forward/reverse geocoding in event and place creation forms
+
+  directions:
+    service: Deep links only (Google Maps, Apple Maps, Waze)
+    code: apps/web/src/lib/maps/directions.ts
+    purpose: Single-destination "get directions" from event detail pages
+
+  notes: >
+    No routing engine exists today. The tileserver renders map visuals but has
+    zero knowledge of the road network graph.  Valhalla and TileServer GL are
+    complementary — both consume OSM data but in different formats and for
+    entirely different purposes.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Proposed Addition: Valhalla Routing Engine
+# ───────────────────────────────────────────────────────────────────────────────
+
+valhalla:
+  what: >
+    Open-source C++ routing engine (maintained by community, originally Mapzen).
+    Self-hosted, zero per-request cost.  Consumes OSM PBF extracts and builds a
+    tiled routing graph.
+
+  image: ghcr.io/valhalla/valhalla-scripted:latest
+  data_source: Geofabrik OSM PBF extracts (e.g., us-latest.osm.pbf ~9 GB)
+  built_graph_size: ~15-18 GB for US-only
+  port: 8002
+
+  api_endpoints:
+    - endpoint: /optimized_route
+      purpose: >
+        Multi-stop Traveling Salesman Problem solver.  Given N venue locations,
+        returns them reordered for minimum travel time plus the full route
+        geometry (polyline).  This IS the touring guide engine.
+      min_locations: 4
+
+    - endpoint: /sources_to_targets
+      purpose: >
+        Time-distance matrix (one-to-many, many-to-one, many-to-many).
+        "Which 5 events tonight are closest to each other?" or "rank nearby
+        events by actual drive time, not crow-flies distance."
+
+    - endpoint: /isochrone
+      purpose: >
+        Reachability polygons.  "Show me all events within a 30-minute drive."
+        Renders as a shaded overlay on the MapLibre map.
+
+    - endpoint: /route
+      purpose: >
+        Standard A-to-B turn-by-turn directions with polyline.  Useful for
+        drawing a single route segment on the map preview.
+
+  limitations:
+    - No live traffic data (uses statistical/historical speeds from OSM).
+      ETAs are directionally correct but can drift in heavy congestion.
+    - No public transit routing out of the box (driving, cycling, walking only).
+      Transit support exists but requires separate GTFS feed ingestion.
+    - OSM data freshness depends on how often we re-download PBF extracts.
+      Monthly updates are typical and sufficient for road networks.
+
+  resource_estimates:
+    us_only:
+      ram_to_build: 16 GB
+      ram_to_serve: 4-8 GB (tiled graph, not fully in-memory)
+      disk: ~18 GB
+      build_time: 4-6 hours (one-time, then cached)
+      cold_start: 5-10 seconds with pre-built tile tarball
+
+    cloud_run:
+      instance: 2 vCPU / 4 GB RAM (sufficient for moderate traffic with US tiles)
+      min_instances: 0 (scales to zero, cold start acceptable for this feature)
+      tile_storage: GCS bucket (~$0.30/month for 18 GB)
+      estimated_monthly_cost: $5-15 at low traffic
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Infrastructure Plan
+# ───────────────────────────────────────────────────────────────────────────────
+
+infrastructure:
+  local_dev:
+    approach: >
+      Add a `valhalla` service to infra/docker/docker-compose.yml, mirroring
+      the existing tileserver pattern.  Volume-mount pre-built tiles from
+      infra/docker/valhalla/custom_files/.
+    download_script: >
+      New script scripts/dev/download-valhalla-tiles.sh — downloads a small
+      regional extract (e.g., Texas or a single state) for local dev.  Full US
+      extract is too large for every dev machine.
+
+  production:
+    approach: >
+      New Terraform module (infra/terraform/modules/valhalla) mirroring
+      tileserver module.  Pre-built tile tarball stored in GCS, mounted via
+      FUSE.  Cloudflare in front for caching + CORS (same pattern as
+      tiles-dev.hearthfire.community).
+    domain: routing.hearthfire.community (or similar)
+
+  tile_updates:
+    approach: >
+      Monthly cron (Cloud Build or GitHub Actions) that downloads fresh PBF,
+      builds tiles in a large ephemeral VM, uploads tarball to GCS.  The Cloud
+      Run service picks up new tiles on next cold start.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Application Architecture
+# ───────────────────────────────────────────────────────────────────────────────
+
+architecture:
+  port:
+    name: RoutingPort
+    location: packages/ports/src/routing.port.ts
+    methods:
+      - name: optimizeStopOrder
+        input: "{ locations: { lat: number; lng: number; label?: string }[]; mode: 'auto' | 'bicycle' | 'pedestrian' }"
+        output: "{ orderedLocations: { lat: number; lng: number; originalIndex: number }[]; routeGeometry: string; totalTimeSeconds: number; totalDistanceMeters: number }"
+
+      - name: getTimeDistanceMatrix
+        input: "{ sources: { lat: number; lng: number }[]; targets: { lat: number; lng: number }[]; mode: 'auto' | 'bicycle' | 'pedestrian' }"
+        output: "{ matrix: { timeSeconds: number; distanceMeters: number }[][] }"
+
+      - name: getIsochrone
+        input: "{ origin: { lat: number; lng: number }; mode: 'auto' | 'bicycle' | 'pedestrian'; contours: { timeMinutes: number }[] }"
+        output: "{ polygons: GeoJSON.FeatureCollection }"
+
+  adapter:
+    name: ValhallRoutingAdapter
+    location: packages/adapters/src/routing/valhalla-adapter.ts
+    notes: >
+      HTTP client that calls the self-hosted Valhalla service.  Configured via
+      VALHALLA_URL env var.  Falls back gracefully (returns null / empty) when
+      the service is unavailable so the app never hard-fails on routing.
+
+  use_cases:
+    - name: generateTouringGuide
+      location: packages/core/src/use-cases/touring/generate-touring-guide.ts
+      input: "{ humanId: string; eventIds: string[]; mode?: 'auto' | 'bicycle' | 'pedestrian' }"
+      flow:
+        - Fetch event locations from repos
+        - Call routingPort.optimizeStopOrder with venue coordinates
+        - Return ordered itinerary with ETAs, distances, and route polyline
+
+    - name: suggestNearbyItinerary
+      location: packages/core/src/use-cases/touring/suggest-nearby-itinerary.ts
+      input: "{ humanId: string; origin: { lat: number; lng: number }; date: string; maxEvents?: number }"
+      flow:
+        - Fetch published events near origin on the given date
+        - Call routingPort.getTimeDistanceMatrix to rank by actual drive time
+        - Call routingPort.optimizeStopOrder on the top N
+        - Return suggested itinerary
+
+  ui:
+    web:
+      - Route polylines rendered on existing MapLibre maps via GeoJSON source
+      - Isochrone overlay on event discovery map ("events within 30 min")
+      - "Plan my night" button on event listings page
+      - Itinerary view with ordered event cards + time/distance between stops
+      - "Navigate" button per stop generates deep links via existing directions.ts
+        pattern, extended to support ordered multi-stop waypoints
+
+    mobile:
+      - Same features, using react-native-maps or MapLibre Native
+      - Deep links to native Google Maps / Apple Maps / Waze apps
+
+  deep_link_handoff:
+    google_maps: >
+      https://www.google.com/maps/dir/Stop1Lat,Stop1Lng/Stop2Lat,Stop2Lng/...
+      (practical limit ~10 waypoints, which is plenty for a night out)
+    apple_maps: >
+      https://maps.apple.com/?daddr=Stop1Lat,Stop1Lng&daddr=Stop2Lat,Stop2Lng...
+    waze: >
+      Waze only supports single destination.  For multi-stop, navigate to
+      first stop; surface "next stop" prompt after arrival/proximity.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Alternatives Considered
+# ───────────────────────────────────────────────────────────────────────────────
+
+alternatives:
+  mapbox_directions:
+    verdict: viable_fallback
+    notes: >
+      Uses Valhalla internally.  Free tier is 100K requests/month, then
+      $0.50-5 per 1K.  Optimization API is a paid add-on.  Good if we want
+      to skip self-hosting entirely, but costs scale linearly with usage and
+      route optimization is expensive.
+
+  google_routes_api:
+    verdict: too_expensive
+    notes: >
+      $5-10 per 1K Directions requests, waypoint optimization costs more.
+      ToS prohibits caching results or displaying on non-Google maps.
+      Vendor lock-in.
+
+  osrm:
+    verdict: insufficient
+    notes: >
+      Open-source, faster than Valhalla for simple A-to-B.  But no isochrones,
+      weaker multi-modal support, no built-in TSP optimiser.
+
+  graphhopper:
+    verdict: viable_alternative
+    notes: >
+      Open-source Java routing engine.  TSP/vehicle routing solver available
+      in commercial tier (Directions API).  Self-hosted open-source version
+      has basic routing but optimization requires the paid product.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Open Questions
+# ───────────────────────────────────────────────────────────────────────────────
+
+open_questions:
+  - question: What metro density threshold triggers building this feature?
+    context: >
+      Need enough events in a single metro on a single weekend for multi-event
+      itineraries to make sense.  15-20 events/weekend in 3+ cities is the
+      proposed threshold.  Need to instrument this metric first.
+
+  - question: Do we need transit routing?
+    context: >
+      Many target users in cities like NYC, Chicago, DC rely on transit.
+      Valhalla supports GTFS feeds but it's additional complexity.  Could
+      start with driving/walking only and add transit later.
+
+  - question: Regional extracts vs. full US vs. international?
+    context: >
+      Start with US-only (~18 GB).  International expansion would require
+      larger extracts or per-region deployments.  Cross that bridge when
+      Ithas Fire expands internationally.
+
+  - question: Should the isochrone feature be decoupled and shipped earlier?
+    context: >
+      "Events within 30 min of me" is valuable independent of the full
+      touring guide.  Could ship isochrones on the discovery page as a
+      standalone feature before the full itinerary planner.

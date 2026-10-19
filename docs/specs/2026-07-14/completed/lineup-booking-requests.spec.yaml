@@ -1,0 +1,174 @@
+# Superseded by docs/specs/2026-09-25/completed/lineup-booking-requests-v2.spec.yaml, itself superseded by docs/specs/2026-09-25/lineup-booking-requests-v3.spec.yaml (2026-10-08 docs consolidation)
+# lineup-booking-requests.spec.yaml
+#
+# Organizers submit a booking request carrying a full bill: tag existing
+# platform artists (notify + confirm) and/or free-text acts. One agreement
+# with the organizer; the confirmed lineup flows into the event created from
+# it (see booking-conversation-and-event-step spec).
+
+version: "1.0"
+updated: "2026-07-14"
+
+# BUILD TRIGGER (deliberate — do not build on vibes):
+# Direction confirmed 2026-07-14, but deferred until observed: a real
+# organizer submits a request with multiple act names stuffed into the pitch
+# or actName field (literally greppable in BookingRequest.message/actName), or
+# asks how to submit a bill. Also gated BEHIND the conversation/event-step
+# spec — lineups without an event step still dead-end.
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    A booking request models exactly one performer. Organizers who book bills
+    (a promoter pitching a 3-band night, a collective booking a showcase)
+    can't represent the lineup — they stuff names into the pitch text, the
+    venue can't see who's actually on the bill, and tagged artists never know
+    their name is being used.
+  solution: >
+    A BookingRequestPerformer junction (modeled on EventHuman): the request
+    form gains "Add artist" — search existing platform artists or add
+    free-text acts, ordered. Tagged platform artists are notified ("{org}
+    included you in a booking request to {venue}") and show as INVITED until
+    they confirm or decline; the inbox renders the lineup with confirmation
+    state. Accepting still creates ONE agreement with the organizer (lineup
+    rides as data); when an event is created from the agreement, confirmed
+    tagged artists and free-text acts become EventHuman lineup rows.
+  users:
+    - Organizer (org or human sender) building the bill
+    - Tagged platform artists (confirm/decline participation)
+    - Venue (sees the real bill + confirmation states in the inbox)
+  surfaces:
+    - web (platform request form, inbox, artist confirmation)
+    - embed (signed-in mode gets the picker; anonymous embed gets free-text acts only)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        New BookingRequestPerformer model mirroring EventHuman: bookingRequestId,
+        humanId? (tagged platform artist) XOR externalName (free-text act,
+        + externalUrl?), role (default PERFORMER), sortOrder (0 = headliner),
+        confirmationStatus (INVITED | CONFIRMED | DECLINED — free-text rows
+        are NOT_APPLICABLE/confirmed-by-definition), invitedAt/respondedAt.
+        @@unique([bookingRequestId, humanId]).
+    - id: FR-002
+      description: >
+        createBookingRequest (owned path) accepts an optional lineup array
+        (≤ 12 entries, each tagged-human or free-text). The SENDER is always
+        implicitly on the request as today (open-pair uniqueness unchanged —
+        keyed on sender only). Tagged humans must exist and be taggable
+        (performer mode enabled OR public performer-ish page — decide by
+        what HumanSearchCombobox/autocompleteAdmin already surfaces; do not
+        invent a new eligibility concept).
+    - id: FR-003
+      description: >
+        Tagging notifies: each tagged human gets notify() (in-app + email +
+        push, variant booking.lineup-invited) with confirm/decline actions.
+        confirmBookingLineupSpot / declineBookingLineupSpot use cases (actor
+        must be the tagged human). Declining removes them from the rendered
+        bill (kept as DECLINED row for the organizer's visibility). No
+        blocking: the request proceeds regardless of confirmation state.
+    - id: FR-004
+      description: >
+        Inbox + sent-view render the lineup: ordered acts with per-artist
+        state (✓ confirmed / ○ invited / struck declined), linked names for
+        platform artists. The venue accept flow is unchanged (one agreement
+        with the sender/organizer).
+    - id: FR-005
+      description: >
+        Embed form: signed-in mode gains the same "Add artist" affordance
+        (picker requires an authed search procedure — verify
+        search.autocomplete surface usable with the embed Bearer client, else
+        add a scoped lightweight performers.searchTaggable). Anonymous embed
+        mode gets free-text act rows only (no platform search for anonymous
+        callers — no enumeration surface).
+    - id: FR-006
+      description: >
+        Flow-through to events: createEventFromAgreement (sibling spec FR-006)
+        attaches CONFIRMED tagged artists as EventHuman{humanId} and free-text
+        acts as EventHuman{externalName}, preserving sortOrder; INVITED-but-
+        unconfirmed artists are surfaced as suggestions in the event editor,
+        not auto-attached (consent principle carries through).
+    - id: FR-007
+      description: >
+        Anti-abuse: per-sender tag budget (e.g. max 30 distinct tagged humans
+        per day) and dedupe (an artist declined on an open request cannot be
+        re-tagged on the same request); tag notifications use per
+        (request, human) idempotency keys.
+
+  non_functional:
+    - id: NFR-001
+      description: Free-text act names sanitized (plainTextRequired); externalUrl http(s)-only.
+    - id: NFR-002
+      description: >
+        Tag consent is honest: an unconfirmed artist is never rendered as
+        confirmed anywhere (inbox, thread, event), and confirm/decline is
+        one click from the notification. Calm copy, no pressure.
+    - id: NFR-003
+      description: Notification swallows follow the ReporterPort convention with regression tests.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: createBookingRequest (modified) — accepts lineup[], writes junction rows in the same tx, fans out lineup-invited notifications post-commit
+      - name: confirm-booking-lineup-spot / decline-booking-lineup-spot — actor = tagged human; CAS on confirmationStatus
+      - name: list side — booking summaries gain lineup[] (ordered, with states)
+      - name: create-event-from-agreement (sibling spec, modified) — lineup flow-through per FR-006
+    ports:
+      existing: [booking-requests repo (+ lineup child), humans, notify pipeline, event-humans, rate-limit, reporter]
+  transport:
+    trpc_procedures:
+      - bookingRequests.create input gains lineup[] (strict, ≤12)
+      - bookingRequests.confirmLineupSpot / declineLineupSpot (authed)
+      - embeds.createBookingInquiry gains free-text lineup[] only (no humanIds accepted on the anonymous path — strict-rejected)
+  ui:
+    components:
+      - Request form (platform RequestToPlayForm + embed SignedInBookingPanel): "Add artist" rows — HumanSearchCombobox for platform artists + free-text fallback, drag/sort
+      - Embed anonymous form: free-text act rows
+      - BookingInbox + SentBookingRequestsList lineup rendering
+      - Lineup-invite notification actions (confirm/decline) + a tiny confirmation surface (notification deep link)
+      - ui-email template booking.lineup_invited
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - BookingRequestPerformer (junction per FR-001)
+  modified_models:
+    - none on BookingRequest itself (sender pair + uniqueness untouched)
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: Tag spam — orgs blasting invites to well-known artists for clout.
+    severity: MEDIUM
+    mitigation: Daily tag budget, per-request dedupe, decline-once-stays-declined, notifications idempotent; artists can decline with one tap.
+  - risk: Anonymous path accepting humanIds would create an enumeration/abuse surface.
+    severity: MEDIUM
+    mitigation: Anonymous embed accepts free-text only (strict schema rejects humanId fields); tagging requires an authenticated sender.
+  - risk: Summary payloads grow (lineup join on every inbox list).
+    severity: LOW
+    mitigation: Single ordered child fetch batched per page; cap 12.
+
+open_questions:
+  - Can a tagged artist see/join the request thread (sibling spec)? Leaning read-only visibility after confirming — decide at build time.
+  - Should confirmed lineup spots surface on the artist's own profile/EPK ("upcoming: pitched for X")? Probably not until the booking is accepted — revisit with the EPK work.
+
+out_of_scope:
+  - Per-artist agreements or automatic splits (single organizer agreement; splits stay the event-level PayoutTermsLine system, which already supports N payees when the organizer wants it)
+  - Retrofitting consent onto EventHuman attach (event lineup tagging stays unilateral for now — separate decision)
+  - Anonymous submitters tagging platform artists
+
+acceptance_criteria:
+  - Organizer submits a request with 2 tagged platform artists + 1 free-text act; venue inbox shows the ordered bill with states; both tagged artists get notified.
+  - Tagged artist confirms → state flips everywhere; declines → struck for organizer, hidden from venue-facing bill.
+  - Accept still mints exactly one agreement with the organizer.
+  - Creating the event from the agreement attaches confirmed + free-text acts as EventHuman rows in order; unconfirmed artists appear only as editor suggestions.
+  - Anonymous embed submission with a smuggled humanId in lineup → strict-schema 400.
+  - The 31st distinct tag in a day is rejected calmly; re-tagging a declined artist on the same request is rejected.

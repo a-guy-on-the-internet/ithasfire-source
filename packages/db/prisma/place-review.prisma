@@ -1,0 +1,277 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Place Review — Artist-submitted venue reviews and aggregated stats.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model GenreTag {
+  id          String   @id @default(uuid())
+  name        String   @unique  // lowercase, trimmed — "indie folk"
+  displayName String             // display casing — "Indie Folk"
+  usageCount  Int      @default(0)
+  isDefault   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@index([name])
+  @@index([usageCount])
+}
+
+model PlaceReview {
+  id              String   @id @default(uuid())
+  placeId         String
+
+  // Auth: nullable for seed-phase anonymous reviews
+  humanId         String?
+
+  // Anonymous reviewer info (seed phase only)
+  anonymousName   String?
+  anonymousEmail  String?
+
+  // ── Payout (actual number + context) ──────────────────────────────
+  payoutCents     Int?              // actual dollar amount in cents — nullable if they skip
+  paymentMethod   PlaceReviewPaymentMethod
+  paymentDetail   String?  @db.VarChar(500)
+
+  // ── Promotion ─────────────────────────────────────────────────────
+  venuePromoted   PlaceReviewPromotionLevel
+  promotionDetail String?  @db.VarChar(500)
+
+  // ── Sound & Stage Equipment ───────────────────────────────────────
+  soundQuality    PlaceReviewSoundQuality
+  soundDetail     String?  @db.VarChar(500)
+
+  stageEquipment        PlaceReviewStageEquipment
+  stageEquipmentDetail  String?  @db.VarChar(500)
+
+  // ── Audience ──────────────────────────────────────────────────────
+  audienceFit     PlaceReviewAudienceFit
+  audienceDetail  String?  @db.VarChar(500)
+
+  // ── Parking & Load-In ─────────────────────────────────────────────
+  parkingLoadIn       PlaceReviewParking
+  parkingDetail       String?  @db.VarChar(500)
+
+  // ── Booker / Staff ────────────────────────────────────────────────
+  bookerRating    PlaceReviewBookerRating
+  bookerDetail    String?  @db.VarChar(500)
+
+  // ── Overall ───────────────────────────────────────────────────────
+  wouldPlayAgain  PlaceReviewPlayAgain
+  comment         String?  @db.VarChar(1000)
+
+  // ── Genre ─────────────────────────────────────────────────────────
+  genre           String?  @db.VarChar(200)   // legacy single-string field
+  genreTags       String[]                     // v3: array of genre tag names
+
+  // ── Draw ──────────────────────────────────────────────────────────
+  estimatedDraw   Int?
+
+  // ── Gig date & time ────────────────────────────────────────────────
+  gigDate         DateTime?                    // exact date of the gig
+  gigTimeOfDay    PlaceReviewTimeOfDay?        // Morning, Afternoon, Evening, Night
+  gigTimeExact    String?   @db.VarChar(10)    // optional specific time, e.g. "21:30"
+  dayOfWeek       Int?      // 0=Sun, 1=Mon, ... 6=Sat — computed from gigDate when available
+
+  // ── Merch ─────────────────────────────────────────────────────────
+  merchAllowed    PlaceReviewMerchPolicy?
+  merchCutPct     Int?      // venue's percentage cut if applicable
+
+  // ── Staff support ─────────────────────────────────────────────────
+  staffSupport    PlaceReviewStaffSupport?
+
+  // ── Photos ────────────────────────────────────────────────────────
+  photoKeys       String[]  // R2 storage keys for uploaded photos
+
+  // ── Independent venue flag ────────────────────────────────────────
+  independentVenue PlaceReviewIndependentVenue?
+
+  // ── Source tracking ───────────────────────────────────────────────
+  source          PlaceReviewSource  @default(SURVEY)
+  eventId         String?  // links to specific event for post-event reviews
+
+  // ── Attribution (campaign/channel tracking) ───────────────────────
+  sourceCampaign  String?  @db.VarChar(200)  // e.g. "launch-outreach-2026-06"
+  sourceChannel   String?  @db.VarChar(50)   // Application-layer validated as email|homepage|direct; DB is nullable VARCHAR
+
+  // ── Venue response ────────────────────────────────────────────────
+  responseText    String?  @db.VarChar(500)
+  responseById    String?
+  respondedAt     DateTime?
+
+  // ── Moderation ────────────────────────────────────────────────────
+  flagged         Boolean  @default(false)
+  flagReason      String?
+  hidden          Boolean  @default(false)
+
+  place           Place    @relation(fields: [placeId], references: [id], onDelete: Cascade)
+  human           Human?   @relation("PlaceReviewAuthor", fields: [humanId], references: [id], onDelete: SetNull)
+  responseBy      Human?   @relation("PlaceReviewResponder", fields: [responseById], references: [id], onDelete: SetNull)
+  event           Event?   @relation("PlaceReviewEvent", fields: [eventId], references: [id], onDelete: SetNull)
+  session         PlaceReviewSession?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([placeId, createdAt])
+  @@index([humanId])
+  @@index([eventId])
+  @@index([source])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Place Review Session — tracks form attempts for funnel analytics and
+// abandonment recovery. One row per browser session per form open.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model PlaceReviewSession {
+  id                      String    @id @default(uuid())
+
+  // Identity — sessionToken is always set; humanId set if logged in or matched via email
+  sessionToken            String
+  humanId                 String?
+
+  // What they were reviewing
+  placeId                 String
+
+  // Email — captured mid-form, before completion
+  email                   String?
+  emailCapturedAt         DateTime?
+
+  // Funnel tracking
+  lastStepKey             String?            // e.g. "page_1_screen_4_promotion"
+  lastStepAt              DateTime?
+  pageReached             Int       @default(1) // 1, 2, or 3
+
+  // Completion
+  completedAt             DateTime?
+  placeReviewId           String?   @unique  // FK to the completed review
+
+  // Abandonment recovery
+  abandonmentEmailSentAt  DateTime?
+
+  // Unsubscribe from recovery emails (per-session, simple approach)
+  recoveryUnsubscribedAt  DateTime?
+
+  // Incentive delivery
+  incentiveShownAt        DateTime?
+
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  place                   Place         @relation(fields: [placeId], references: [id], onDelete: Cascade)
+  human                   Human?        @relation("PlaceReviewSessions", fields: [humanId], references: [id], onDelete: SetNull)
+  placeReview             PlaceReview?  @relation(fields: [placeReviewId], references: [id], onDelete: SetNull)
+
+  @@unique([sessionToken, placeId])
+  @@index([sessionToken])
+  @@index([email])
+  @@index([placeId])
+  @@index([humanId])
+  @@index([completedAt])
+}
+
+model PlaceStats {
+  id                    String   @id @default(uuid())
+  placeId               String   @unique
+
+  reviewCount           Int      @default(0)
+  reviewCountPublic     Int      @default(0)
+
+  // Payout stats — computed from actual payoutCents values
+  payoutMeanCents       Int?
+  payoutMedianCents     Int?
+  payoutMinCents        Int?
+  payoutMaxCents        Int?
+  payoutStdDevCents     Int?
+  payoutSampleSize      Int      @default(0)
+
+  // Payment method distribution (percentages)
+  payoutGuaranteePct    Float?
+  payoutDoorSplitPct    Float?
+  payoutTicketSalesPct  Float?
+  payoutTipsPct         Float?
+  payoutPayToPlayPct    Float?
+  payoutUnpaidPct       Float?
+
+  // Scores (0.0 - 1.0)
+  promotionScore        Float?
+  soundScore            Float?
+  audienceFitScore      Float?
+  wouldPlayAgainPct     Float?
+  bookerScore           Float?
+  parkingScore          Float?
+  stageEquipmentScore   Float?
+
+  // Draw stats
+  drawMean              Int?
+  drawMedian            Int?
+  drawMin               Int?
+  drawMax               Int?
+  drawSampleSize        Int      @default(0)
+
+  // Flags — triggered by pattern, not single review
+  payToPlayFlagged      Boolean  @default(false)
+  equipmentLiedFlagged  Boolean  @default(false)
+  noPromotionFlagged    Boolean  @default(false)
+
+  // Genre cloud — JSON array of { genre: string, count: number }
+  genreCloud            Json     @default("[]")
+
+  // ── Merch ────────────────────────────────────────────────────
+  merchAllowedPct       Float?   // % of reviews where merch was allowed
+  avgMerchCutPct        Float?   // average venue merch cut percentage
+
+  // ── Day of week distribution ─────────────────────────────────
+  dayOfWeekDistribution Json     @default("[]")  // [{ day: 0, count: 12 }, ...]
+
+  // ── Staff support ────────────────────────────────────────────
+  staffSupportScore     Float?   // 0-1 aggregated
+
+  // ── Independent venue ────────────────────────────────────────
+  independentVenuePct   Float?   // % of reviews reporting independent
+
+  // Transaction-derived stats (post-launch, from real Ithas Fire events)
+  totalEventCount       Int      @default(0)
+  totalTicketsSold      Int      @default(0)
+  avgTicketPriceCents   Int?
+  avgAttendance         Int?
+
+  // ── Track record (venue-track-record spec 2026-09-24, FR-009) ────────
+  // Computed from things that HAPPENED at the place — published shows and
+  // door scans — never from testimony. Written by recalculatePlaceStats;
+  // additive, defaults 0/null, no backfill (FR-008's broadened staleness
+  // recomputes every place on the next run).
+  //
+  // `showsHosted` reads the same rows as `totalEventCount` — past PUBLISHED
+  // PUBLIC venue-confirmed events at the place, RSVP-only shows included —
+  // but on an `endsAt <= now` basis (RULED 2026-09-24; `totalEventCount` is
+  // `startsAt <= now`): they differ only by in-progress shows.
+  // `avgAttendance` above is TICKETS SOLD per show and stays untouched for
+  // its existing readers; the track record never surfaces it.
+  /// Past PUBLISHED PUBLIC venue-confirmed events at the place whose `endsAt <= now` (same rows as `totalEventCount`, `endsAt` basis).
+  showsHosted           Int      @default(0)
+  /// `endsAt` of the earliest show counted in `showsHosted`; null when none. The whole track record is on an `endsAt` basis.
+  firstShowAt           DateTime?
+  /// `endsAt` of the latest show counted in `showsHosted`; null when none.
+  lastShowAt            DateTime?
+  /// Shows counted in `showsHosted` with at least ONE admitted ticket — an ACCEPTED `TicketScan` row (R11).
+  scannedEventCount     Int      @default(0)
+  /// Sum of admitted tickets (distinct, from the `TicketScan` log) across the `scannedEventCount` shows (people checked in at the door; a later refund does not erase them).
+  checkedInTotal        Int      @default(0)
+  /// Mean checked-in per show OVER SHOWS WITH ≥1 SCAN only: `checkedInTotal / scannedEventCount`.
+  /// A show with zero scans is EXCLUDED from the mean, never counted as 0 (R4).
+  /// Null when `scannedEventCount = 0`. Never serialised past core — readers derive a band.
+  checkedInAvg          Int?
+
+  // ── Public anonymized snapshot ───────────────────────────────
+  // Coarsened, threshold-gated aggregate served to public surfaces
+  // (place-review-anonymization spec). Written ONLY by the weekly
+  // recompute-public-snapshots job; public reads never touch live rows.
+  publicSnapshot        Json?
+  publicSnapshotAt      DateTime?
+
+  lastCalculatedAt      DateTime @default(now())
+
+  place                 Place    @relation(fields: [placeId], references: [id], onDelete: Cascade)
+
+  @@index([placeId])
+  @@index([reviewCountPublic])
+}

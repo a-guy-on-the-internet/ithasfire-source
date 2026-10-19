@@ -1,0 +1,611 @@
+status: complete
+# legal-documents.spec.yaml
+#
+# Maps every legal document Ithas Fire needs to:
+#   - Its current status and canonical route
+#   - Every app surface where it must be visible or linked
+#   - The acceptance-capture requirement (if any)
+#
+# Status values:
+#   exists       — page is live and substantively complete
+#   stub         — page exists but content is skeletal / placeholder
+#   needed       — no page exists yet; must be created before described milestone
+#
+# Milestone values:
+#   pre-launch   — must be live before the first real transaction
+#   early-growth — needed before meaningful scale, regulatory risk grows
+#   when-ready   — deferred until the feature it governs is built
+
+version: "1.1"
+updated: "2026-04-19"
+
+documents:
+
+  # ── Tier 1: Pre-Launch Blockers ──────────────────────────────────────────────
+  # These must be live before any real money changes hands.
+
+  - id: terms-of-service
+    title: "Terms of Service"
+    nickname: "ToS / Terms of Use"
+    milestone: pre-launch
+    status: stub
+    route: /terms
+    file: apps/web/src/app/terms/page.tsx
+    description: >
+      Master agreement governing all users (buyers and organisers).
+      Covers platform use, account obligations, dispute process, IP,
+      governing law, and liability cap. Must reference and incorporate
+      the Refund Policy, Privacy Policy, and Organiser Terms by reference.
+    surfaces:
+      - surface: site-footer
+        note: "Global footer on every public page — must be a persistent link."
+      - surface: sign-up-flow
+        note: "Shown as 'By creating an account you agree to our Terms of Service' with hyperlink."
+      - surface: checkout-payment-step
+        note: "T&C acceptance checkbox (see acceptance-capture below)."
+      - surface: embed-checkout
+        note: "Inline disclosure below the guest email field alongside Privacy Policy."
+      - surface: organiser-onboarding
+        note: "Organiser must explicitly accept ToS during org creation / first event publish."
+      - surface: order-confirmation-email
+        note: "Footer link to Terms so buyers have a permanent record."
+    acceptance_capture:
+      required: true
+      mechanism: explicit-checkbox
+      description: >
+        A required, unchecked checkbox on the payment step reads:
+        "I agree to the Terms of Service and Refund Policy."
+        The checkbox links /terms and /refund-policy.
+        On submission, store termsVersion + termsAcceptedAt on the Order record
+        and write an audit log entry (entity: order, action: order.terms_accepted).
+      schema_fields:
+        - field: Order.termsVersion
+          type: String
+          nullable: true
+          notes: "Semver or date-slug of the ToS in force at acceptance; e.g. '2026-04'."
+        - field: Order.termsAcceptedAt
+          type: DateTime
+          nullable: true
+    legal_review_needed: true
+    must_include:
+      - section: "Platform Waiver Disclaimer"
+        content: >
+          Ithas Fire provides informational templates and software tools.
+          Ithas Fire is not a law firm, does not provide legal services or
+          legal advice, and does not guarantee the enforceability of any
+          document created using its tools. Use of Ithas Fire does not create
+          an attorney-client relationship. All waiver templates are provided
+          "as-is" without warranty of any kind, including fitness for a
+          particular purpose or enforceability in any jurisdiction. The
+          organizer is solely responsible for compliance with applicable
+          laws and for seeking independent legal counsel. Ithas Fire's total
+          liability for claims arising from the waiver builder shall not
+          exceed $100.
+      - section: "Platform Positioning"
+        content: >
+          Ithas Fire is a technology platform and ticketing agent. Ithas Fire
+          does not organize, produce, or operate events. Events are organized
+          and operated solely by the organizer.
+      - section: "Mutual Indemnification"
+        content: >
+          Organizers defend and indemnify Ithas Fire from all claims arising
+          from their events, including claims related to venue safety, alcohol,
+          injuries, waiver inadequacy, and regulatory non-compliance.
+      - section: "Dynamic Pricing Prohibition"
+        content: >
+          Ithas Fire prohibits algorithmic or demand-based dynamic pricing on
+          its platform. Ticket prices are set by organizers and do not change
+          based on demand signals.
+      - section: "Arbitration and Class-Action Waiver"
+        content: >
+          Individual-only arbitration under AAA Consumer Rules. Batching
+          (not bellwether) protocol for mass filings. 30-day opt-out window.
+          Class-action waiver. Preservation of small-claims-court rights.
+          Davidson County, Tennessee venue.
+      - section: "Liability Cap"
+        content: >
+          Ithas Fire's total aggregate liability shall not exceed $100 per
+          user per event, following the DICE model for platform liability caps.
+    notes: >
+      The current page is a stub — content was scaffolded in June 2025.
+      A lawyer must draft full arbitration, class-action waiver, and governing
+      law sections before this document is complete. Updated 2026-04-19 with
+      waiver disclaimer, platform positioning, indemnification, dynamic pricing
+      prohibition, arbitration, and liability cap requirements from house show
+      and waiver clause library research.
+
+  - id: refund-cancellation-policy
+    title: "Refund and Cancellation Policy"
+    nickname: "Refund Policy"
+    milestone: pre-launch
+    status: needed
+    route: /refund-policy
+    file: ~
+    description: >
+      Explicit rules for buyer refunds, organiser voids, and event cancellations.
+      Must be consistent with what is shown at checkout and referenced from ToS.
+      Stripe Connect and card-network rules require this to be visible at point
+      of sale.
+    surfaces:
+      - surface: checkout-payment-step
+        note: "Linked from the T&C acceptance checkbox alongside Terms of Service."
+      - surface: order-summary-component
+        note: "Brief 'All sales are final unless the event is cancelled' note with link."
+      - surface: site-footer
+        note: "Persistent link in footer legal section."
+      - surface: order-confirmation-email
+        note: "Refund policy summary and link in the email footer."
+      - surface: event-detail-page
+        note: "Visible below the ticket purchase CTA so buyers can review before clicking."
+    acceptance_capture:
+      required: false
+      mechanism: implied
+      description: >
+        Covered by the shared T&C checkbox that links this doc.
+        No separate checkbox needed, but the link must be functional.
+    legal_review_needed: true
+    must_include:
+      - section: "Refund-Protected Processing"
+        content: >
+          Processing fees (2.9% + $0.30) cover the cost of refund protection.
+          Full ticket price is refunded to buyers. Processing fees are not
+          returned on refund (Stripe policy). Platform fee ($0.50) is retained
+          as a service-rendered fee.
+      - section: "Donation Non-Refundability"
+        content: >
+          Contributions made via ADJUSTABLE (pay-what-you-want) ticket types
+          are non-refundable. Exception: organizer-initiated event cancellation
+          triggers automatic refund of all orders including donations.
+      - section: "Auto-Refund on Cancellation"
+        content: >
+          When an organizer cancels an event, all orders are automatically
+          refunded in full. Buyers do not need to request a refund.
+    notes: >
+      Must align with organiser-level refund windows defined in the
+      Organiser Agreement. Updated 2026-04-19 with refund-protected
+      processing language and donation non-refundability from fee structure
+      and house show research.
+
+  - id: privacy-policy
+    title: "Privacy Policy"
+    nickname: "Privacy"
+    milestone: pre-launch
+    status: stub
+    route: /privacy
+    file: apps/web/src/app/privacy/page.tsx
+    description: >
+      Required by CCPA (California users), GDPR (EU users), and Apple App Store.
+      Covers data collection, use, retention, third-party sharing (Stripe, Google
+      Analytics, Meilisearch), and user rights (deletion, portability).
+    surfaces:
+      - surface: site-footer
+        note: "Persistent link in footer legal section."
+      - surface: sign-up-flow
+        note: "Linked beside Terms in the account-creation disclosure."
+      - surface: embed-checkout
+        note: "Already linked from EmbedCheckoutFormSection — keep current link."
+      - surface: cookie-consent-banner
+        note: "Link from the consent banner 'Learn more' path."
+      - surface: account-settings
+        note: "Data deletion / export request workflow must link to this."
+      - surface: order-confirmation-email
+        note: "Footer link."
+      - surface: mobile-app
+        note: "Expo app must surface this in the Settings screen before App Store review."
+    acceptance_capture:
+      required: false
+      mechanism: implied
+      description: >
+        Implied acceptance through account creation; no separate checkbox.
+        However, if material sections change (e.g., new data categories shared
+        with third parties), users must be notified and re-accept via in-app
+        banner.
+    legal_review_needed: true
+    notes: >
+      Current stub was written June 2025.  Needs CCPA/CPRA rights section
+      (opt-out of sale, data deletion request), GDPR lawful basis table,
+      and retention schedule per data category.
+
+  - id: organiser-terms
+    title: "Organiser / Marketplace Terms"
+    nickname: "Organiser Terms"
+    milestone: pre-launch
+    status: needed
+    route: /organiser-terms
+    file: ~
+    description: >
+      Governs the relationship between Ithas Fire and event organisers.
+      Distinct from the buyer ToS.  Covers: data ownership, payout timing,
+      event obligations, content standards, chargeback liability, tax
+      responsibility, and platform right to cancel or restrict events.
+    surfaces:
+      - surface: organiser-onboarding
+        note: >
+          Must be presented during org creation or first event publish.
+          Explicit checkbox with version capture (separate from buyer T&C).
+      - surface: admin-event-creation
+        note: "Link in the event-publish confirmation dialog."
+      - surface: sell-landing-page
+        note: "apps/web/src/app/sell — add link to organiser terms in the feature list."
+      - surface: site-footer
+        note: "Optional but recommended for discoverability."
+    acceptance_capture:
+      required: true
+      mechanism: explicit-checkbox
+      description: >
+        During org creation (create-org use case) or first-event publish,
+        store organisersTermsVersion + organisersTermsAcceptedAt on the Org
+        record.  Write audit log entry (entity: organization, action: org.terms_accepted).
+      schema_fields:
+        - field: Organization.organisersTermsVersion
+          type: String
+          nullable: true
+        - field: Organization.organisersTermsAcceptedAt
+          type: DateTime
+          nullable: true
+    legal_review_needed: true
+    must_include:
+      - section: "Organizer as Event Operator"
+        content: >
+          The organizer is solely responsible for organizing and operating
+          their events. Ithas Fire provides technology tools only. Ithas Fire
+          does not organize, produce, or operate events.
+      - section: "Volunteer Disclaimer"
+        content: >
+          Volunteers recruited through the Ithas Fire platform work for
+          the organizer, not for Ithas Fire. The organizer is the employer
+          or engager of all volunteers and is responsible for compliance
+          with applicable labor laws.
+      - section: "Waiver Responsibility"
+        content: >
+          Organizers are solely responsible for the waiver they deploy at
+          their events, including waivers assembled using the Ithas Fire
+          clause library. Ithas Fire does not guarantee the enforceability
+          of any waiver in any jurisdiction.
+      - section: "House Show Attestation"
+        content: >
+          Organizers of private residential events attest that they have
+          the legal right to use the property, will comply with local noise
+          and zoning ordinances, will not sell alcohol, and understand that
+          contributions received are taxable income.
+    notes: >
+      This is the highest legal-risk document for the payout side.
+      Template from Rocket Lawyer or LegalZoom is a starting point only;
+      a lawyer must customise payout/chargeback clauses and ensure alignment
+      with Stripe Connect's platform agreement. Updated 2026-04-19 with
+      volunteer disclaimer, waiver responsibility, and house show attestation
+      from Sofar/house show research.
+
+  # ── NEW: Waiver Builder Disclaimers ──────────────────────────────────────────
+
+  - id: waiver-builder-disclaimer
+    title: "Waiver Builder Disclaimer"
+    nickname: "Waiver Disclaimer"
+    milestone: pre-launch
+    status: needed
+    route: ~
+    file: ~
+    description: >
+      Two distinct disclaimer texts used in the waiver clause library system.
+      Not a standalone page — these are inline UI text and document footers.
+    surfaces:
+      - surface: waiver-builder-ui
+        text: >
+          Ithas Fire provides waiver templates as informational tools only.
+          Ithas Fire is not a law firm and does not provide legal advice. Use
+          of the waiver builder does not create an attorney-client relationship.
+          Templates are not guaranteed to be enforceable in any jurisdiction.
+          Waiver law varies by state — including states where pre-injury
+          liability waivers are unenforceable. You are responsible for the
+          waiver you deploy and should consult a licensed attorney in your
+          state for events involving significant risk.
+        note: >
+          Shown in the waiver section of the event builder, above the clause
+          toggles. Always visible, not collapsible.
+      - surface: assembled-waiver-footer
+        text: >
+          This document was assembled by {organizerName} using the Ithas Fire
+          platform. Ithas Fire is a technology provider and did not draft,
+          review, or approve this document. Ithas Fire makes no representation
+          regarding its enforceability.
+        note: >
+          Appended as the final paragraph of every assembled waiver document.
+          Uses the organizer's name from the Event or Organization record.
+          This positions the organizer as the drafter for contra proferentem
+          purposes and protects against UPL (unauthorized practice of law)
+          claims. See docs/records/2026-04-19-waiver-clause-legal.md.
+    acceptance_capture:
+      required: false
+      mechanism: none
+      description: >
+        No acceptance needed — these are informational disclosures, not
+        agreements. The waiver-builder-ui text is shown passively. The
+        assembled-waiver-footer is part of the document the attendee accepts.
+    legal_review_needed: false
+    notes: >
+      Modeled on Smartwaiver, WaiverForever, Jotform, and DocuSign disclaimers.
+      See docs/specs/2026-04-19/waiver-clause-library.spec.md for full context.
+      Spec reference: docs/records/2026-04-19-waiver-clause-legal.md.
+
+  # ── Tier 2: Early Growth ─────────────────────────────────────────────────────
+  # Required before meaningful user scale; regulatory surface grows quickly.
+
+  - id: cookie-policy
+    title: "Cookie Policy + Consent Language"
+    nickname: "Cookie Policy"
+    milestone: early-growth
+    status: exists
+    route: /cookie-policy
+    file: apps/web/src/app/cookie-policy/page.tsx
+    description: >
+      Documents all cookies and tracking technologies (analytics, session,
+      preference, advertising).  Required by ePrivacy Directive (EU), CCPA,
+      and most app-store review processes.
+    surfaces:
+      - surface: site-footer
+        note: "Persistent link in footer legal section."
+      - surface: cookie-consent-banner
+        note: >
+          Banner fires on first visit for EU/CA visitors.  Analytics are NOT
+          loaded until consent is given.  See GoogleAnalyticsLoader.tsx which
+          already gates on consent.  Link 'Learn more' to /cookie-policy.
+          A 'Reset cookie preferences' link must exist somewhere accessible
+          (footer or account settings) — see TODO in GoogleAnalyticsLoader.tsx.
+      - surface: privacy-policy
+        note: "Privacy policy already cross-links to /cookie-policy — keep current link."
+    acceptance_capture:
+      required: true
+      mechanism: consent-banner
+      description: >
+        Managed client-side by the consent banner (already partially
+        implemented in GoogleAnalyticsLoader.tsx).  No server-side capture
+        required unless you later run targeted advertising.
+    legal_review_needed: false
+    notes: >
+      The /cookie-policy page exists.  The consent banner implementation
+      referenced in GoogleAnalyticsLoader.tsx is partial — confirm the
+      banner actually renders before GA loads; see the 'Reset consent'
+      footer link TODO in that file.
+
+  - id: acceptable-use-policy
+    title: "Acceptable Use Policy"
+    nickname: "AUP"
+    milestone: early-growth
+    status: needed
+    route: /acceptable-use
+    file: ~
+    description: >
+      Defines prohibited conduct: fraud, ticket scalping/bot abuse, spam,
+      harassment, illegal content in event listings, impersonation.  Gives
+      Ithas Fire grounds for account suspension and is referenced from ToS.
+    surfaces:
+      - surface: terms-of-service
+        note: "Referenced from ToS section on 'Prohibited uses'."
+      - surface: admin-event-moderation
+        note: >
+          Platform admins reviewing flagged events should see a link to
+          the AUP so they can cite the violated clause.
+      - surface: account-suspension-email
+        note: "Cite the specific AUP clause in any suspension notice."
+    acceptance_capture:
+      required: false
+      mechanism: implied
+      description: >
+        Implied by ToS acceptance.  No separate checkbox.
+    legal_review_needed: false
+    notes: >
+      Can be drafted internally as a policy document.  Does not require
+      lawyer review, but should be reviewed before any high-profile enforcement action.
+
+  - id: dmca-policy
+    title: "DMCA / Copyright Policy"
+    nickname: "DMCA"
+    milestone: early-growth
+    status: needed
+    route: /dmca
+    file: ~
+    description: >
+      Required if organisers upload event images, video, or other copyrighted
+      content.  Must include: designated agent name + contact, notice-and-takedown
+      procedure, repeat-infringer policy, counter-notification process.
+    surfaces:
+      - surface: site-footer
+        note: "Link in footer legal section."
+      - surface: admin-event-creation
+        note: "Link in image-upload interface so uploaders are on notice."
+    acceptance_capture:
+      required: false
+      mechanism: implied
+    legal_review_needed: false
+    notes: >
+      DMCA safe harbor registration with the US Copyright Office is required
+      to benefit from the safe harbor.  Registration costs $6 and must be
+      renewed every 3 years.  Do this as soon as organiser image uploads are live.
+
+  - id: payment-terms-addendum
+    title: "Payment Terms Addendum"
+    nickname: "Payment Terms"
+    milestone: early-growth
+    status: needed
+    route: /payment-terms
+    file: ~
+    description: >
+      Clarifies the processor's role (Stripe as payment facilitator),
+      authorization holds, failed payment handling, payout timing, reversals,
+      and dispute procedures.  Can live as a standalone page or as a section
+      inside the ToS; a separate page is easier to link at checkout.
+    surfaces:
+      - surface: checkout-payment-step
+        note: "Brief disclosure: 'Payments processed by Stripe. View Payment Terms.' with link."
+      - surface: order-confirmation-email
+        note: "Footer link."
+      - surface: site-footer
+        note: "Link in footer legal section."
+    acceptance_capture:
+      required: false
+      mechanism: implied
+      description: >
+        Implied by the T&C checkbox which should cross-reference this doc.
+    legal_review_needed: true
+    notes: >
+      Content should align with Stripe Connect's own documentation on holds
+      and reversals.  Payout timing stated here must exactly match what's
+      in the Organiser Agreement.
+
+  # ── Tier 3: When the Governed Feature Ships ──────────────────────────────────
+
+  - id: organiser-agreement
+    title: "Organiser Payout Agreement"
+    nickname: "Payout Agreement"
+    milestone: when-ready
+    status: needed
+    route: ~
+    file: ~
+    description: >
+      Custom contract (not a template) governing the financial relationship
+      between Ithas Fire and an organiser: payout schedule, fee structure,
+      tax 1099 obligations, chargeback liability, event cancellation duties,
+      and indemnification.  Separate from Organiser Terms which covers
+      conduct/content.  Typically presented once during Stripe Connect
+      onboarding for an org.
+    surfaces:
+      - surface: stripe-connect-onboarding
+        note: >
+          Must be presented and accepted as part of the Stripe Connect
+          onboarding flow before the organiser's first payout.
+    acceptance_capture:
+      required: true
+      mechanism: explicit-checkbox
+      description: >
+        Same pattern as organiser-terms but separate version field.
+        Consider payoutAgreementVersion + payoutAgreementAcceptedAt on Org.
+    legal_review_needed: true
+    notes: >
+      Rocket Lawyer / LegalZoom will not generate an adequate payout agreement
+      for a payment-facilitator model.  This requires a lawyer familiar with
+      FinTech / marketplace payments.  Do not go to scale without this.
+
+  - id: arbitration-class-action-waiver
+    title: "Arbitration and Class-Action Waiver"
+    nickname: "Arbitration Clause"
+    milestone: when-ready
+    status: needed
+    route: ~
+    file: ~
+    description: >
+      Clause set embedded inside the ToS (not a standalone page).
+      Enforceability is highly jurisdiction-dependent.  California has
+      limitations; EU cannot enforce class-action waivers.  Must be drafted
+      by a lawyer and reviewed per operating jurisdiction.
+    surfaces:
+      - surface: terms-of-service
+        note: "Embedded as a numbered section within /terms."
+    acceptance_capture:
+      required: false
+      mechanism: implied
+      description: >
+        Implied by ToS acceptance.  Some jurisdictions require an additional
+        opt-out window noticed at the time of first acceptance.
+    legal_review_needed: true
+    notes: >
+      Draft this in tandem with the ToS lawyer review.  Do not self-draft.
+
+  - id: disclaimer-liability-clauses
+    title: "Disclaimer and Limitation of Liability"
+    nickname: "Liability Disclaimer"
+    milestone: when-ready
+    status: needed
+    route: ~
+    file: ~
+    description: >
+      Limitation of Ithas Fire's liability for cancelled events, venue issues,
+      or third-party acts.  Must address live-event specifics (weather, venue
+      safety, organiser default).  Embedded in ToS.
+    surfaces:
+      - surface: terms-of-service
+        note: "Embedded as a numbered section within /terms."
+      - surface: event-detail-page
+        note: >
+          Brief notice near ticket purchase CTA: 'Ithas Fire is not responsible
+          for event cancellations or changes by the organiser.'
+    acceptance_capture:
+      required: false
+      mechanism: implied
+    legal_review_needed: true
+    notes: >
+      Must be conspicuous (visually set apart) under US contract law to be
+      enforceable.  Lawyer should advise on formatting requirements.
+
+  - id: e-commerce-terms
+    title: "E-commerce / Online Sales Terms"
+    nickname: "Checkout Terms"
+    milestone: when-ready
+    status: needed
+    route: ~
+    file: ~
+    description: >
+      Checkout-specific layer covering: digital goods delivery, failed
+      delivery procedures, electronic receipt obligations, right of
+      withdrawal notice (EU DSR), and auto-renewal disclosures (if any
+      subscription feature is added).  Can be a section inside ToS or
+      a separate checkout-specific page linked directly from the payment step.
+    surfaces:
+      - surface: checkout-payment-step
+        note: "Can be merged into the T&C checkbox or displayed as a sub-link."
+      - surface: terms-of-service
+        note: "Incorporated by reference in ToS section on Purchases."
+    acceptance_capture:
+      required: false
+      mechanism: implied
+      description: "Covered by the T&C checkbox when properly cross-referenced."
+    legal_review_needed: true
+    notes: >
+      For EU users specifically, the right-of-withdrawal for digital goods
+      has a statutory 14-day window that can be waived by buyer consent at
+      the time of purchase.  This consent must be explicit and recorded.
+      Scope this for when EU user count is material.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# App surfaces glossary
+# ─────────────────────────────────────────────────────────────────────────────
+# site-footer                  apps/web/ global footer (every public page)
+# sign-up-flow                 apps/web/src/app/sign-up/
+# checkout-payment-step        apps/web/src/app/events/checkout/[...slug]/_components/StripePaymentCard.tsx
+# embed-checkout               apps/web/src/app/embed/[embedId]/_components/EmbedCheckoutFormSection.tsx
+# organiser-onboarding         apps/web/src/app/orgs/ create-org flow
+# admin-event-creation         apps/web/src/app/admin/[slug]/events/new/
+# sell-landing-page            apps/web/src/app/sell/page.tsx
+# event-detail-page            apps/web/src/app/events/ event detail surface
+# order-confirmation-email     packages/ui-email/ order confirmation template
+# order-summary-component      apps/web/src/app/events/checkout/[...slug]/_components/OrderSummary.tsx
+# cookie-consent-banner        apps/web/src/components/analytics/GoogleAnalyticsLoader.tsx
+# account-settings             apps/web/src/app/account/
+# mobile-app                   apps/mobile/ Settings screen
+# admin-event-moderation       apps/web/src/app/platform/
+# account-suspension-email     packages/ui-email/
+# stripe-connect-onboarding    apps/web/ org onboarding flow
+# waiver-builder-ui            Event builder waiver section (clause toggle UI)
+# assembled-waiver-footer      Final paragraph of every assembled waiver PDF/HTML
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Prioritised work order
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 1 — Pre-launch (do before first real transaction):
+#   1. Wire acceptance capture on Order (termsVersion + termsAcceptedAt)
+#   2. Add T&C checkbox to checkout payment step + embed checkout
+#   3. Create /refund-policy page (needs-content, not complex)
+#   4. Create /organiser-terms page (stub, lawyer fills in)
+#   5. Legal review of /terms, /privacy (upgrade stubs to full docs)
+#   6. Add waiver-builder-disclaimer text to event builder waiver section
+#   7. Add assembled-waiver-footer to waiver assembly output
+#
+# Phase 2 — Early growth:
+#   8. Confirm cookie consent banner is fully wired (see GoogleAnalyticsLoader TODO)
+#   9. Create /acceptable-use page
+#  10. Create /payment-terms page
+#  11. DMCA agent registration + /dmca page
+#
+# Phase 3 — Scale:
+#  12. Organiser payout agreement (lawyer-drafted)
+#  13. Arbitration clause embedded in /terms
+#  14. EU right-of-withdrawal consent at checkout

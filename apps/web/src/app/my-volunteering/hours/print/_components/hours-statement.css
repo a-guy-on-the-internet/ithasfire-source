@@ -1,0 +1,467 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   THE VOLUNTEER HOURS STATEMENT — document-specific styles
+   ═══════════════════════════════════════════════════════════════════════════
+
+   Layers on top of `src/app/_print/print.css`, which owns the `--print-*`
+   palette, the paper wrapper and the shared primitives (`__rule`, `__label`,
+   `__value`, `__mono`, `__keep`, `__sr`). Only rules TRUE OF THIS DOCUMENT
+   belong here — the ticket sheet keeps its own file and neither imports the
+   other.
+
+   Every rule is class-scoped, for the reason spelled out at the top of
+   `print.css`: Next does not unload a route's stylesheet on client-side
+   navigation, so a bare-element or `@page` rule here would follow the reader
+   onto the next page they print. Document-lifetime rules live in
+   `PaperSheet`'s un-hoisted <style>; there are none of them in this file.
+
+   No colour literals — same reason as the ticket sheet. This document is a
+   FIXED LIGHT artefact whatever theme the account is on, which is what makes
+   it legible on paper and photocopiable.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Sheet header ──────────────────────────────────────────────────────────── */
+
+.th-hours-sheet__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 4mm;
+  padding-bottom: 3mm;
+  /* Never orphan the masthead at the foot of a page. */
+  break-after: avoid;
+  page-break-after: avoid;
+}
+
+/* Replaced content always prints, even with Chrome's "Background graphics"
+   default of off — the same reason the ticket sheet uses an <img>. */
+.th-hours-sheet__wordmark {
+  display: block;
+  width: 34mm;
+  height: auto;
+}
+
+.th-hours-sheet__stamp {
+  margin: 0;
+  font-size: 7pt;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--print-muted);
+  text-align: right;
+}
+
+/* ── Title + document fields ───────────────────────────────────────────────── */
+
+.th-hours-sheet__title {
+  margin: 4mm 0 0;
+  font-size: 15pt;
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  break-after: avoid;
+  page-break-after: avoid;
+}
+
+/* Volunteer · Period. Two columns so the labels align across the pair — the
+   grid test (columns aligning across rows), not decoration. */
+.th-hours-sheet__fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3mm 8mm;
+  margin: 3mm 0 0;
+  break-after: avoid;
+  page-break-after: avoid;
+}
+
+.th-hours-field {
+  min-width: 0;
+}
+
+/* <dd> carries a 40px UA indent. */
+.th-hours-field dd {
+  margin: 0.8mm 0 0;
+}
+
+/* ── The record table ──────────────────────────────────────────────────────────
+   A REAL <table>, deliberately, where the design system would otherwise reach
+   for a CSS grid: this is a genuine tabular record, and a table is the one
+   construct whose <thead> the browser REPEATS at the top of every printed
+   page. A grid produces a multi-page statement whose second page is a wall of
+   unlabelled columns.
+
+   Ruled, not boxed: hairline row rules, no verticals, no fills. */
+
+.th-hours-table {
+  width: 100%;
+  margin-top: 5mm;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 9pt;
+}
+
+/* Explicitly `table-header-group` so the repeat survives the narrow-screen
+   override below being scoped to `@media screen`. */
+.th-hours-table thead {
+  display: table-header-group;
+}
+
+.th-hours-table th {
+  /* The Swiss field label at paper scale — same values as `.th-paper__label`,
+     restated because a <th> also needs the table-cell box rules. */
+  font-size: 6.5pt;
+  font-weight: 700;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+  color: var(--print-muted);
+  text-align: left;
+  padding: 0 3mm 1.5mm 0;
+  border-bottom: 1px solid var(--print-rule);
+}
+
+.th-hours-table td {
+  padding: 2mm 3mm 2mm 0;
+  border-bottom: 1px solid var(--print-rule-soft);
+  vertical-align: top;
+  /* A long event title wraps; it never clips and never blows the column out. */
+  overflow-wrap: anywhere;
+}
+
+/* Column budget. Letter content box is 191.8mm inside the 12mm @page margin.
+     date 26 + role 40 + hours 29 = 95mm  ⇒  activity ≈ 96.8mm
+   Wide enough for an ordinary event title on one line; a long one wraps and
+   pushes the row, which is correct — nothing here has a fixed height. */
+.th-hours-table th:nth-child(1),
+.th-hours-table td:nth-child(1) {
+  width: 26mm;
+}
+
+.th-hours-table th:nth-child(3),
+.th-hours-table td:nth-child(3) {
+  width: 40mm;
+}
+
+/*
+ * Hours: right-aligned, tabular, flush to the right margin so the column lines
+ * up with the total figure below it. Every figure carries exactly TWO fraction
+ * digits (see `HOURS_FORMAT`), so the decimal points align down the column
+ * without a decimal-alignment hack.
+ *
+ * ── Why 29mm, measured rather than reasoned ───────────────────────────────
+ *
+ * The binding constraint is not a row (9pt) but the TOTAL (15pt), which is the
+ * widest figure on the sheet. Measured in Chrome, in print media, at the
+ * shipped font:
+ *
+ *     4.00       12.50mm
+ *     83.75      16.21mm
+ *     236.25     19.91mm   ← 0.09mm inside the old 20mm track
+ *     1,234.50   25.00mm   ← overflowed it by 5mm
+ *     12,345.50  28.71mm
+ *
+ * The column was budgeted at 20mm while the total still printed ONE decimal;
+ * the 1dp→2dp correction (which is what makes the column add up) added a glyph
+ * and quietly broke it. A real 1,204-hour statement rendered with
+ * `scrollWidth 25.14mm` in a 20mm box — a clipped grand total, on the document
+ * of the volunteer with the most hours to show. 29mm clears the 5-digit case
+ * outright, and the 9mm comes out of the activity column, which had it spare.
+ */
+.th-hours-table th:nth-child(4),
+.th-hours-table td:nth-child(4) {
+  width: 29mm;
+  padding-right: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.th-hours-table tbody tr {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.th-hours-row__date {
+  font-weight: 600;
+}
+
+/* `nowrap` belongs to a REAL date only. A formatted date is short enough for
+   the 26mm column in every locale we ship, and keeping it on one line stops
+   "Aug 10, / 2026" reading as two entries. The "date not recorded" fallback is
+   a sentence, not a date: under nowrap it would run straight out of its column
+   and across the event title. It wraps instead. */
+.th-hours-row__date--exact {
+  white-space: nowrap;
+}
+
+.th-hours-row__title {
+  font-weight: 600;
+}
+
+.th-hours-row__sub {
+  display: block;
+  margin-top: 0.6mm;
+  font-size: 7.5pt;
+  font-weight: 500;
+  color: var(--print-muted);
+}
+
+.th-hours-row__hours {
+  font-weight: 700;
+}
+
+/* The neutral marker for a shift with no recorded length. Muted and clearly
+   not a numeral — it must never be mistaken for 0.0. The screen-reader text
+   that accompanies it lives in the markup, not here. */
+.th-hours-row__nohours {
+  color: var(--print-muted);
+  font-weight: 500;
+}
+
+/* ── Total ─────────────────────────────────────────────────────────────────────
+   Mirrors the table's last column width so the total figure sits directly
+   under the Hours column and the decimals line up.
+
+   Outside the <table> on purpose: a <tfoot> is `table-footer-group`, which the
+   browser repeats at the foot of EVERY printed page — a grand total reprinted
+   on page 1 of 3 reads as a per-page subtotal. */
+
+.th-hours-total {
+  display: grid;
+  /*
+   * The floor MUST match the table's Hours column (29mm) — that is the whole
+   * point of this grid. If the two drift, the total's decimal stops sitting
+   * under the column it totals and the sheet stops reading as arithmetic.
+   *
+   * `minmax(29mm, max-content)` rather than a bare `29mm`: a number has no
+   * line-break opportunity, so a fixed track CLIPS rather than wraps, and the
+   * figure it would clip is the grand total. The floor keeps the normal case
+   * pixel-aligned with the column; the ceiling lets an unforeseen figure steal
+   * width from the label instead of vanishing off the sheet. Losing alignment
+   * beyond five digits is a far better failure than losing digits.
+   */
+  grid-template-columns: minmax(0, 1fr) minmax(29mm, max-content);
+  align-items: baseline;
+  column-gap: 3mm;
+  padding-top: 3mm;
+  break-inside: avoid;
+  page-break-inside: avoid;
+  /*
+   * `break-before: avoid` — keep the total with the rows it totals.
+   *
+   * A standing volunteer's statement is one row per WORKED DATE, so a weekly
+   * regular's sheet runs to several pages. Without this the grand total can
+   * land alone at the top of a fresh page under a 2px rule with nothing above
+   * it — a figure floating over blank paper, reading like a summary of the
+   * page it sits on rather than of the record. The repeating <thead> handles
+   * the other half of the multi-page problem: a continuation page always
+   * carries its column labels.
+   */
+  break-before: avoid;
+  page-break-before: avoid;
+}
+
+.th-hours-total__label {
+  margin: 0;
+  font-size: 8pt;
+  font-weight: 700;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+  text-align: right;
+}
+
+.th-hours-total__value {
+  margin: 0;
+  font-size: 15pt;
+  font-weight: 700;
+  line-height: 1;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.th-hours-total__shifts {
+  grid-column: 1 / -1;
+  margin: 1.5mm 0 0;
+  font-size: 7.5pt;
+  font-weight: 500;
+  color: var(--print-muted);
+  text-align: right;
+}
+
+/* The accounting close under a grand total. 2px — the app's Swiss divider
+   weight, spent once, on the one figure the whole document exists to state.
+
+   `break-before: avoid` for the same reason `.th-hours-total` has it: a bare
+   2px rule alone at the top of a fresh page is a rule that closes nothing. */
+.th-hours-sheet__close {
+  border: 0;
+  border-top: 2px solid var(--print-rule);
+  margin: 2mm 0 0;
+  break-before: avoid;
+  page-break-before: avoid;
+}
+
+/* ── Footnote + footer ─────────────────────────────────────────────────────── */
+
+/* The footnote EXPLAINS the dashes in the table and the total's relationship to
+   them, so it must not be separated from the figure it qualifies — an
+   unexplained "—" is the one reading of this document we are trying to prevent.
+   `break-inside` too: the explanation is two sentences and splitting it across
+   a page break loses the half that does the work. */
+.th-hours-sheet__footnote {
+  margin: 3mm 0 0;
+  font-size: 7.5pt;
+  line-height: 1.45;
+  color: var(--print-muted);
+  max-width: 90ch;
+  break-before: avoid;
+  page-break-before: avoid;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.th-hours-sheet__footer {
+  margin: 4mm 0 0;
+  padding-top: 2mm;
+  border-top: 1px solid var(--print-rule-soft);
+  font-size: 7.5pt;
+  line-height: 1.45;
+  color: var(--print-muted);
+  /* States what the document IS. Splitting that sentence across a page break
+     leaves half a disclaimer on each. */
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+/* Screen-only note pointing at the browser's own Save-as-PDF. */
+.th-hours-sheet__hint {
+  margin: 5mm 0 0;
+  font-size: 8pt;
+  line-height: 1.45;
+  color: var(--print-muted);
+}
+
+/* ── Screen-only states (loading / empty / error) ──────────────────────────── */
+
+.th-hours-sheet__notice {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 24px 0;
+}
+
+.th-hours-sheet__notice-title {
+  margin: 0;
+  font-size: 13pt;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+.th-hours-sheet__notice-body {
+  margin: 0;
+  font-size: 10pt;
+  line-height: 1.45;
+  color: var(--print-muted);
+  max-width: 60ch;
+}
+
+/* ── Narrow screens ────────────────────────────────────────────────────────────
+   A four-column paper table does not survive 320px. Below the same threshold
+   the paper preview itself gives up (`print.css`), each row re-declares as a
+   stacked block with its column label in front of the value.
+
+   NOTHING IS HIDDEN — grids and tables collapse by re-declaring their layout,
+   never by dropping content, and every cell on the printed sheet is still
+   here. The <thead> becomes screen-reader-only rather than `display: none`,
+   and the explicit ARIA roles in the markup keep the table's semantics after
+   `display: block` strips the implicit ones.
+
+   `@media screen` only: print media is untouched, so paper always gets the
+   real table with its repeating header. */
+
+@media screen and (max-width: 820px) {
+  .th-hours-table,
+  .th-hours-table tbody,
+  .th-hours-table tr,
+  .th-hours-table td {
+    display: block;
+    width: 100%;
+  }
+
+  .th-hours-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .th-hours-table tr {
+    padding-block: 3mm;
+    border-bottom: 1px solid var(--print-rule-soft);
+  }
+
+  .th-hours-table td {
+    padding: 0;
+    border-bottom: 0;
+  }
+
+  .th-hours-table td + td {
+    margin-top: 1.5mm;
+  }
+
+  /* The column label, restored in front of each value now that the header row
+     is out of view. `data-label` is the TRANSLATED header string, passed from
+     the component — never a hard-coded English word in CSS. */
+  .th-hours-table td::before {
+    content: attr(data-label);
+    display: block;
+    font-size: 6.5pt;
+    font-weight: 700;
+    letter-spacing: 1.4px;
+    text-transform: uppercase;
+    color: var(--print-muted);
+    margin-bottom: 0.4mm;
+  }
+
+  /* Widths and the right-alignment belong to the paper layout only. */
+  .th-hours-table th:nth-child(1),
+  .th-hours-table td:nth-child(1),
+  .th-hours-table th:nth-child(3),
+  .th-hours-table td:nth-child(3),
+  .th-hours-table th:nth-child(4),
+  .th-hours-table td:nth-child(4) {
+    width: auto;
+    text-align: left;
+  }
+
+  .th-hours-sheet__stamp {
+    text-align: left;
+  }
+
+  /* One column: the total's label sits above its figure rather than beside a
+     column that no longer exists. */
+  .th-hours-total {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* A 320px column is not 26mm wide; a wrapped date is better than one that
+     pushes the row sideways. */
+  .th-hours-row__date--exact {
+    white-space: normal;
+  }
+
+  .th-hours-total__label,
+  .th-hours-total__value,
+  .th-hours-total__shifts {
+    text-align: left;
+  }
+
+  .th-hours-sheet__fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

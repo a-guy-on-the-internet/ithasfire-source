@@ -8,6 +8,7 @@
 import type { FastifyPluginAsync } from "fastify";
 import { hashPassword } from "better-auth/crypto";
 import { prisma } from "@th/db";
+import { CURRENT_CHARGEBACK_TERMS_VERSION } from "@th/core/lib/payments";
 import { env } from "../../lib/env.js";
 import {
   assertE2eAuthorized,
@@ -34,6 +35,13 @@ const seedPaidCheckout: FastifyPluginAsync = async (app) => {
       sellerStripeAccountId?: string;
       startsAt?: string;
       refundCutoffAt?: string;
+      /**
+       * Default TRUE: checkout gates on the org having accepted the CURRENT
+       * chargeback terms (chargeback-terms.ts), so a seeded org must arrive
+       * accepted or every paid-checkout spec fails at createCheckout. Pass
+       * `false` to seed an org that has NOT accepted (chargeback-terms-gate).
+       */
+      acceptChargebackTerms?: boolean;
       /** Admission tax rate in basis points, e.g. 975 = 9.75%. */
       admissionTaxRateBps?: number;
       location?: {
@@ -89,6 +97,20 @@ const seedPaidCheckout: FastifyPluginAsync = async (app) => {
         slugPrefix: "e2e-org",
         humanId,
       });
+
+      // The mounted handler lost this when the route was split out of e2e.ts:
+      // the inline copy there stamps the terms, this one never did, so the
+      // org failed `chargeback_terms_required` on its first paid checkout.
+      if (body.acceptChargebackTerms !== false) {
+        await prisma.organization.update({
+          where: { id: org.id },
+          data: {
+            chargebackTermsVersion: CURRENT_CHARGEBACK_TERMS_VERSION,
+            chargebackTermsAcceptedAt: now,
+            chargebackTermsAcceptedByHumanId: humanId,
+          },
+        });
+      }
 
       const feePolicy = await seedFeePolicy({
         createdBy: humanId,
@@ -163,7 +185,6 @@ const seedPaidCheckout: FastifyPluginAsync = async (app) => {
               settlementCurrency: currency,
               status: "ACTIVE",
               feePolicyId: feePolicy.id,
-              resaleSellerMarkupShareBps: 5000,
               resalePayoutReleaseDays: 7,
               lines: {
                 create: {

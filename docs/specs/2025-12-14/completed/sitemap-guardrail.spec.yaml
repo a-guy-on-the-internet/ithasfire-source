@@ -1,0 +1,64 @@
+# Spec: Sitemap Guardrail Validator Job
+meta:
+  owner: platform-ops
+  status: draft
+  reviewers:
+    - platform-eng
+    - data-platform
+  linked_docs:
+    - ../platform/sitemaps-architecture.spec.yaml
+    - ../platform/sitemaps-observability.spec.yaml
+summary: |
+  Scheduled job that compares generated sitemap shards against expected dataset counts,
+  validates guardrail exclusions, and posts alerts/digests when discrepancies are detected.
+scope:
+  included:
+    - Fetching sitemap shard manifests from R2.
+    - Querying Postgres materialized views (`seo_expected_event_urls`, etc.).
+    - Calculating coverage ratios and guardrail deltas.
+    - Pushing metrics and Slack summaries to the SEO/Platform channel.
+  excluded:
+    - Regenerating shards (delegated to sitemap generator).
+    - Fixing data anomalies (handed off via ticket/alert).
+execution:
+  orchestration: keda-cronjob
+  image: ghcr.io/ithasfire/jobs:sitemaps-latest
+  command: ["node", "dist/sitemaps/validate.js"]
+  schedule:
+    cron: "0 */4 * * *"  # every 4 hours
+  scaling:
+    concurrency_policy: Forbid
+inputs:
+  postgres:
+    database: analytics-read
+    tables:
+      - seo_expected_event_urls
+      - seo_expected_org_urls
+      - seo_expected_venue_urls
+      - seo_expected_human_urls
+  storage:
+    bucket: seo-sitemaps
+    index_key: sitemaps/index.xml
+  messaging:
+    slack_webhook: SEO_PLATFORM_ALERTS
+outputs:
+  metrics:
+    - sitemap.validator.coverage_ratio
+    - sitemap.validator.guardrail_gap
+  alerts:
+    - slack message summarizing missing/extra URLs and top offenders.
+    - optional PagerDuty trigger if coverage < 0.9 three runs in a row.
+  artifacts:
+    - JSON diff stored under `sitemaps/validation/{YYYYMMDDHH}.json` in R2.
+failure_modes:
+  - name: expected_view_stale
+    action: refresh materialized view; coordinate with data team.
+  - name: index_missing
+    action: trigger sitemap generator full run; escalate if persists.
+acceptance_criteria:
+  - Coverage ratios published to Grafana within 10 minutes of job start.
+  - Slack digest posts only when drift exceeds configured thresholds.
+  - Paging alert fires when error budget breached (coverage < 0.95 for 12 hours).
+rollout_notes:
+  - Run in dry-run mode (no alerts) for first week; compare dashboards manually.
+  - Enable PagerDuty integration after dry-run signoff.

@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// Importing the full job registry (to assert this job is actually wired in)
-// pulls `lib/env.ts`, which parses `process.env` at module load. `vi.hoisted`
-// runs before the hoisted imports, so this has to be here rather than in a
-// `beforeAll`.
+// Importing `../jobs/stripe-connect` pulls `lib/env.ts`, which parses
+// `process.env` at module load. `vi.hoisted` runs before the hoisted imports,
+// so this has to be here rather than in a `beforeAll`.
+// (The registry itself no longer needs it — `../jobs` is metadata only and
+// imports no job module.)
 vi.hoisted(() => {
   process.env.DATABASE_URL ??= "postgresql://test:test@127.0.0.1:5432/test";
 });
@@ -88,14 +89,20 @@ beforeEach(() => {
 });
 
 describe("stripe-connect.reconcile-capabilities", () => {
-  it("is registered in the job registry AND the manifest", () => {
+  it("is registered in the job registry AND the manifest", async () => {
     // Both halves matter: a job missing from the registry never runs, and one
     // missing from the manifest gets no Cloud Scheduler entry (Terraform reads
     // the same file), so it would only ever run if triggered by hand.
-    expect(allJobs.some((j) => j.name === JOB_NAME)).toBe(true);
+    const registered = allJobs.find((j) => j.name === JOB_NAME);
+    expect(registered).toBeDefined();
     expect(
       (manifest.scheduled as Record<string, unknown>)[JOB_NAME],
     ).toBeDefined();
+
+    // The registry entry is metadata, so "registered" alone no longer proves a
+    // handler exists behind it — resolve the lazy handle and check.
+    const definition = await registered!.load();
+    expect(definition.handler).toBe(stripeConnectJobs[0]!.handler);
   });
 
   it("runs before the nightly payout batch", () => {
@@ -194,7 +201,7 @@ describe("stripe-connect.reconcile-capabilities", () => {
     );
   });
 
-  it("alerts on a demotion — those payees get skipped in 100 minutes", async () => {
+  it("alerts on a demotion — those payees get skipped in 90 minutes", async () => {
     // This used to be deliberately silent ("fails safe, publish refuses"),
     // which was wrong for money already owed: run-batch skips them at the
     // eligibility gate, so the payout is DELAYED until someone fixes the

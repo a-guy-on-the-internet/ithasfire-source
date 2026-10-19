@@ -97,6 +97,94 @@ export const buildStartDate = (daysFromNow: number, hour = 19): Date => {
   return base;
 };
 
+/**
+ * IANA zone for a seed region code (`<state>-<city>`, e.g. `ca-sf`). Keyed by
+ * the two-letter state prefix so a new city in a known state needs no entry.
+ * Unknown states throw: a silent Chicago default is the bug this replaces.
+ */
+const STATE_TIMEZONES: Record<string, string> = {
+  ca: "America/Los_Angeles",
+  wa: "America/Los_Angeles",
+  or: "America/Los_Angeles",
+  co: "America/Denver",
+  az: "America/Phoenix",
+  ny: "America/New_York",
+  ma: "America/New_York",
+  dc: "America/New_York",
+  tx: "America/Chicago",
+  il: "America/Chicago",
+  mn: "America/Chicago",
+  tn: "America/Chicago",
+};
+
+export const timezoneForRegionCode = (regionCode: string): string => {
+  const state = regionCode.split("-")[0]?.toLowerCase() ?? "";
+  const zone = STATE_TIMEZONES[state];
+  if (!zone) {
+    throw new Error(
+      `No seed timezone for region "${regionCode}"; add its state to STATE_TIMEZONES in seed/utils.ts`,
+    );
+  }
+  return zone;
+};
+
+/** Offset (ms, east positive) of `zone` from UTC at the instant `at`. */
+const zoneOffsetMs = (zone: string, at: number): number => {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: zone,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "numeric",
+    minute: "numeric",
+    second: "numeric",
+  }).formatToParts(new Date(at));
+  const n = (type: string) =>
+    Number(parts.find((p) => p.type === type)?.value ?? 0);
+  const asUtc = Date.UTC(
+    n("year"),
+    n("month") - 1,
+    n("day"),
+    n("hour"),
+    n("minute"),
+    n("second"),
+  );
+  return asUtc - Math.floor(at / 1000) * 1000;
+};
+
+/**
+ * Like `buildStartDate`, but the calendar day and the wall-clock `hour` are
+ * read in `zone`, so "7 PM" is 7 PM at the event, not on the seeding machine.
+ */
+export const buildStartDateInZone = (
+  daysFromNow: number,
+  hour: number | undefined,
+  zone: string,
+  now: number = Date.now(),
+): Date => {
+  const wallHour = hour ?? 19;
+  // Calendar date at `now` in the zone, then add whole days to that date, so
+  // a DST change between now and the target never shifts the day.
+  const local = new Date(now + zoneOffsetMs(zone, now));
+  const guess = Date.UTC(
+    local.getUTCFullYear(),
+    local.getUTCMonth(),
+    local.getUTCDate() + daysFromNow,
+    wallHour,
+  );
+  // Try the offsets in force a day either side; keep one that reproduces the
+  // wall time. A nonexistent wall time (spring-forward gap) matches neither
+  // and resolves forward with the pre-gap offset (02:00 becomes 03:00).
+  const before = zoneOffsetMs(zone, guess - dayInMs);
+  const after = zoneOffsetMs(zone, guess + dayInMs);
+  const valid = [before, after]
+    .map((offset) => guess - offset)
+    .filter((instant) => zoneOffsetMs(zone, instant) === guess - instant);
+  const instant = valid.length ? Math.min(...valid) : guess - before;
+  return new Date(instant);
+};
+
 // ── Idempotency ──────────────────────────────────────────────────────────
 
 export function createInMemoryIdempotency(): IdempotencyPort {

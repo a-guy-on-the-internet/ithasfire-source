@@ -1,0 +1,770 @@
+# seat-price-overrides.spec.yaml
+#
+# Filed because time-based-ticket-pricing.spec.yaml Q-006 says, in its own
+# `owner:` field, "FILE AS ITS OWN SPEC — do not fold into this one".
+#
+# THIS IS A LIVE QUOTE-ONE-CHARGE-ANOTHER DEFECT. It has nothing to do with
+# time-based pricing; it predates that work and survived it. A seat with a
+# price override is shown to the buyer at the override amount in three places
+# and charged at the ticket type's price. The wrong number then snapshots into
+# OrderItem.unitPriceCents and propagates to refunds, resale face value and the
+# wallet pass.
+#
+# WHY THIS IS A SPEC AND NOT A PATCH. The code change is small and obvious
+# (per-seat lines + a locked re-read). The part that needed settling first is
+# what a per-seat amount MEANS to refunds and settlement, because the whole
+# point of the pricing spec was to stop the order side from disagreeing with
+# itself. That is settled below in D-001..D-008 — and the answer turned out to
+# be that the order side needs no new policy at all. See D-001; it is the
+# finding this spec exists to record, and it is the reason this can ship as one
+# change rather than a phased migration.
+
+version: "1.0"
+updated: "2026-10-08"
+status: "IN BUILD — charge fix landed a559fb7b9 (FR-001..FR-003, FR-007); FR-004..FR-006 and the override editor (FR-008) in progress. Plan in memory/session_seat_price_overrides_fix.plan.md"
+supersedes_question: time-based-ticket-pricing.spec.yaml Q-006
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Seat.priceOverride is quoted to buyers and never charged. The picker shows
+    it, the money function has never heard of it. A $30 GA tier with seat A1
+    overridden to $50 sells A1 for $30; an override BELOW the tier price
+    overcharges instead, which is the worse direction because the buyer agreed
+    to a smaller number than the one that hit their card.
+  solution: >
+    Make each seat its own line. A seated AggregatedItem expands into one
+    priced line per seat, each at its own resolved unitAmount, and the seat
+    rows are re-read FOR UPDATE inside the transaction that already locks them
+    so a quoted override cannot be edited between quote and charge. Nothing
+    downstream changes: OrderItem is already one row per ticket at qty=1, and
+    every consumer already reads per-item.
+  not_solving: >
+    Per-seat fee policy, per-seat resale caps, per-seat tax rates, seat pricing
+    in the door/POS surfaces (see R-004), and any UI for authoring overrides
+    (that already exists — set-seat-price-overrides.ts).
+
+# ── Evidence ─────────────────────────────────────────────────────────────────
+# Every claim below was read from the tree at 51312383 on 2026-08-12. Line
+# numbers rot; the symbol names are the durable part.
+
+evidence:
+  charge_path_ignores_override: >
+    computeOrderAmounts (packages/core/src/use-cases/orders/checkout-helpers.ts)
+    derives `unitAmount` from the TicketTypeSummary alone — `isAdjustable ?
+    donationAmountCents : resolveUnitPriceCents(ticketType, {mode, now})`. The
+    only use of `item.seatIds` in the whole function is stamping
+    `perTicketMeta.seatId` in the per-ticket loop. There is no seat repo access
+    in the money function at all.
+  quote_path_shows_override: >
+    SeatMapPicker renders the override as the seat's price in three places
+    (apps/web/src/app/events/checkout/[...slug]/_components/SeatMapPicker.tsx),
+    fed by list-event-seat-availability.ts, which builds a SYNTHETIC
+    ticket-type-shaped object per distinct override amount purely to run it
+    through the buyer-fee estimator, and by list-embed-available-seats.ts.
+  invariant_test_records_it: >
+    packages/core/src/lib/orders/__tests__/price-read-invariant.test.ts exempts
+    set-seat-price-overrides.ts with a reason that states the defect in full and
+    ends "Do not read this exemption as saying seat pricing is correct."
+  schema_comment_is_wrong_today: >
+    packages/db/prisma/place.prisma, model Seat: "When set, this takes
+    precedence over the ticket type's priceCents for this specific seat."
+    That sentence describes the intended behaviour, not the shipped one. It is
+    a documentation defect in its own right and FR-007 corrects it.
+
+# ── Settled decisions ────────────────────────────────────────────────────────
+# These are the "settle before writing code" items. They are decisions, not
+# open questions — an implementer should not need to re-derive them.
+
+decisions:
+  - id: D-001
+    title: Refund and settlement semantics need NO new policy. This is the finding.
+    decision: >
+      Per-seat amounts require no apportionment rule, no rounding-remainder
+      policy, and no changes to refunds or settlement. The order side is
+      ALREADY per-ticket:
+
+        * checkout-helpers.ts creates one OrderItem per ticket at qty=1 — its
+          own comment says "to enable partial refunds" — carrying
+          unitPriceCents, amountCents and a per-ticket meta blob.
+        * quote-item-refund.ts quotes per OrderItem. It derives that item's
+          share of the order-level Stripe fee and order-level tax as
+          `computeItemBuyerPaid(item) / computeExpectedPaymentAmount(order)`.
+          That ratio is computed from the item's OWN buyer total, so an
+          expensive seat automatically absorbs a proportionally larger share of
+          both, with no code change.
+        * resale face value is resolvePurchasedUnitPriceCents, which is a
+          straight read of `orderItem.unitPriceCents` for the ticket's own
+          order item.
+        * settlement and payout track paidOutAt per OrderItem.
+
+      So the ONLY thing that has to become seat-aware is the number written
+      into that per-ticket row. Everything downstream is already shaped for it.
+    contrast_with_q004: >
+      This is exactly why this defect can be fixed while Q-004 (promo discounts
+      not reflected in unitPriceCents) stays deferred, even though they look
+      like the same bug. A promo discount is an ORDER-LEVEL line that would
+      have to be apportioned DOWN onto ticket items, which needs a rounding
+      policy that refunds must then agree with. A seat override is already a
+      PER-SEAT amount being aggregated UP and lost. Pushing a per-ticket number
+      into a per-ticket row invents no policy; splitting an order-level number
+      across per-ticket rows invents one. Do not cite this spec as precedent
+      for Q-004.
+
+  - id: D-002
+    title: The override REPLACES the resolved tier price. It does not add to it.
+    decision: >
+      `priceOverride.priceCents` is an absolute per-seat amount, not a delta,
+      not a multiplier. This matches how set-seat-price-overrides.ts writes it
+      and how list-event-seat-availability.ts already displays it. An override
+      of 0 is a legitimate free seat and MUST be distinguishable from absent —
+      read the key's presence, never `override.priceCents || tierPrice`.
+
+  - id: D-003
+    title: Override wins over the scheduled price, and does not flip.
+    decision: >
+      When a seat has an override, that seat's price is the override at all
+      times; the tier's scheduledPriceCents/scheduledPriceAt do not apply to
+      it. Seats without an override resolve through resolveUnitPriceCents as
+      today. Rationale: the override is an absolute statement about ONE seat
+      ("the piano-side table is $50"), while the schedule is a statement about
+      a tier's timeline. Composing them (e.g. applying the tier's delta to the
+      override at flip time) would require inventing a delta semantics that
+      D-002 explicitly rejects, and would make the picker's displayed number —
+      which shows the raw override — wrong again in a new way.
+    consequence_accepted: >
+      An early-bird tier that flips $20 → $30 leaves an overridden $50 seat at
+      $50 through the flip. An organizer who wants overridden seats to move
+      with the schedule has to edit the overrides. FR-008 surfaces this in the
+      seat-override editor so it is a choice rather than a surprise.
+
+  - id: D-004
+    title: ADJUSTABLE tiers ignore seat overrides.
+    decision: >
+      If `pricingMode === "ADJUSTABLE"` the buyer names the price and the seat
+      override is not applied — the buyer's donationAmountCents stands. An
+      override on a seat in an ADJUSTABLE tier is a configuration mistake;
+      FR-006 refuses it at the write boundary rather than silently picking a
+      winner at charge time. Existing rows in that state are reported, not
+      migrated (see R-003).
+
+  - id: D-005
+    title: Fees are computed per seat line, from that seat's own amount.
+    decision: >
+      computeTicketPriceForAgreement is called per line with that line's
+      unitPriceCents, so a percentage platform fee, minFeeCents and
+      maxFeeCents all apply per seat at that seat's real price — which is the
+      only defensible reading of a per-ticket fee policy. The order-level
+      maxPlatformFeeCents cap and its last-item remainder distribution operate
+      over orderItems unchanged and stay integral by construction.
+    waiver_ladder_is_safe: >
+      The fee-waiver ladder ranks fee-bearing tickets most-expensive-first and
+      that ordering is load-bearing because FeeWaiversRepo.reserve is handed
+      the same ladder. reserveFeeWaiverForCheckout receives the FIRST-PASS
+      `orderComputation`, so once pass 1 contains per-seat lines both sides see
+      the same per-seat prices automatically. No change needed — but this is
+      the one place where a partial implementation (per-seat prices in pass 2
+      only) would silently mis-price a waiver, so it is called out here.
+
+  - id: D-006
+    title: The quoted override is the CHARGED override, enforced by the existing lock.
+    decision: >
+      holdSeatsForCheckout already calls `tx.seats.findByIdsForUpdate({seatIds,
+      eventId})` and validates status. The per-seat price is read from THOSE
+      locked rows — not from the client, not from a pre-transaction read — and
+      the priced computation is (re)run inside the transaction against them.
+      An organizer editing an override between quote and charge therefore
+      either commits before the lock (buyer is charged the new price, and
+      FR-004 decides what the buyer sees) or blocks on it.
+    client_supplied_prices_are_never_trusted: >
+      The client never sends a price to charge. Since FR-004 it may send the
+      per-seat price it showed the buyer (`seatQuotes`), and the server only
+      compares it: a mismatch refuses the order with seat_price_changed, and
+      the charge is always the server's own resolved price.
+
+  - id: D-007
+    title: A quote/charge divergence REFUSES the order. It does not silently re-price.
+    decision: >
+      If the price resolved under the lock differs from the price the buyer was
+      quoted, checkout fails with a conflict the buyer can see and retry
+      ("the price of one of your seats changed"), in the same shape as the
+      existing `seat_unavailable` conflict. Silently charging the new number is
+      the exact defect this spec exists to remove, and silently honouring the
+      stale quote lets a stale client dictate price. Requires the quoted
+      per-seat amount to travel with the checkout request (FR-004) — as an
+      ASSERTION to compare against, never as an input to the charge.
+
+  - id: D-008
+    title: Wallet pass, emails and resale inherit the fix for free.
+    decision: >
+      They read OrderItem.unitPriceCents / per-item meta, so they become
+      correct the moment the write is correct. No changes in those surfaces,
+      and no backfill of already-sold tickets (see R-002).
+
+# ── Functional requirements ──────────────────────────────────────────────────
+
+requirements:
+  - id: FR-001
+    title: Seated aggregate items expand into per-seat priced lines.
+    detail: >
+      AggregatedItem keeps its {ticketTypeId, qty, seatIds} shape at the
+      transport boundary. Inside computeOrderAmounts, an item with seatIds
+      expands to seatIds.length priced lines, each with its own unitAmount
+      resolved per D-002/D-003, plus (qty - seatIds.length) unseated lines at
+      the tier price. The existing per-ticket OrderItem loop then writes one
+      row per line, and `perTicketMeta.seatId` is set from the line rather than
+      indexed positionally out of `item.seatIds`.
+    note: >
+      The current code assigns seats by ticketIndex (`item.seatIds[ticketIndex]`)
+      which already assumes seat order matches ticket order. Making the seat
+      the line removes that assumption instead of preserving it.
+
+  - id: FR-002
+    title: computeOrderAmounts receives resolved seat prices; it does not fetch them.
+    detail: >
+      Pass a `seatPrices: Map<seatId, number | null>` (null = no override)
+      alongside ticketTypes, built by the caller from the FOR UPDATE read.
+      computeOrderAmounts stays a pure money function with no repo access —
+      the property that makes it testable and the reason the resolver lives
+      there. A seatId present in an item but missing from the map is a THROW,
+      never a fallback to the tier price: a silent fallback is how this defect
+      behaves today.
+
+  - id: FR-003
+    title: Seat prices are read from the FOR UPDATE rows inside the locking tx.
+    detail: >
+      holdSeatsForCheckout already fetches the locked SeatRecords; surface
+      their priceOverride to the caller so the priced pass uses them. No new
+      lock, no second query, no widening of the lock's scope.
+
+  - id: FR-004
+    title: The buyer's quoted per-seat price (face, before fees) travels with the checkout request.
+    detail: >
+      Per D-007, so divergence is detectable. Compared against, never charged
+      from. Absent assertion (older clients) = charge the locked price; this is
+      strictly better than today and must not block the fix on a client
+      release.
+
+  - id: FR-005
+    title: The estimator and the charge site agree by construction.
+    detail: >
+      list-event-seat-availability.ts and list-embed-available-seats.ts today
+      fabricate a synthetic ticket-type per distinct override amount to reuse
+      the buyer-fee estimator. Once per-seat lines exist, both should quote
+      through the SAME per-seat pricing helper the charge path uses. The
+      synthetic pseudo-type is a workaround for the missing seam and should be
+      deleted with it, not preserved alongside it.
+
+  - id: FR-006
+    title: Refuse an override on an ADJUSTABLE tier at the write boundary.
+    detail: >
+      set-seat-price-overrides.ts validates the seat's section maps to a tier
+      whose pricingMode is FIXED. Per D-004.
+
+  - id: FR-007
+    title: Correct the Seat.priceOverride schema comment and the invariant exemption.
+    detail: >
+      place.prisma's comment currently describes behaviour that does not exist.
+      Update it to describe what ships. Update the
+      set-seat-price-overrides.ts exemption in price-read-invariant.test.ts —
+      it is written as a standing description of a live defect and becomes
+      false the moment this lands. Add exemptions (or route through the
+      resolver) for the new per-seat read sites.
+
+  - id: FR-008
+    title: Surface the schedule/override interaction in the override editor.
+    detail: >
+      Per D-003's accepted consequence: when the tier has a schedule, the seat
+      override editor says plainly that overridden seats do not follow it.
+
+# ── Tests that must exist before this is called done ─────────────────────────
+
+acceptance:
+  - id: A-001
+    test: >
+      $30 tier, seat A1 overridden to $50, buy A1 ⇒ charged 5000 AND
+      OrderItem.unitPriceCents === 5000. This is the headline defect; assert
+      BOTH the charge and the snapshot, because today the charge is wrong and
+      the snapshot is wrong in the same direction and a test asserting only one
+      of them can pass on a half fix.
+  - id: A-002
+    test: >
+      Override BELOW tier price ($30 tier, A1 at $10) ⇒ charged 1000. The
+      overcharge direction, which is the one that generates chargebacks.
+  - id: A-003
+    test: >
+      Mixed cart: 2× GA unseated at $30 + seat A1 at $50 + seat A2 unoverridden
+      ⇒ four OrderItems at 3000/3000/5000/3000, and the order total equals
+      their sum plus fees. Catches an expansion that drops or duplicates lines.
+  - id: A-004
+    test: >
+      priceOverride {priceCents: 0} ⇒ that seat is FREE, not tier-priced.
+      Guards the `|| tierPrice` mistake named in D-002.
+  - id: A-005
+    test: >
+      Refund of the $50 seat from A-003's order refunds against 5000 and takes
+      a Stripe-fee and tax share proportional to 5000/total — not a quarter of
+      each. This is the D-001 claim, asserted rather than assumed.
+  - id: A-006
+    test: >
+      Resale of the $50 seat records face value 5000, so markup on a $60 ask is
+      1000. Closes the loop to the FR-001 resale bug this shares a shape with.
+  - id: A-007
+    test: >
+      Override edited between quote and charge ⇒ conflict, not a silent
+      re-price (D-007), and the seat is not left held.
+  - id: A-008
+    test: >
+      Fee waiver on a mixed-price cart waives the MOST EXPENSIVE tickets, and
+      the ladder handed to reserve matches the ladder used to apply (D-005).
+
+# ── Risks ────────────────────────────────────────────────────────────────────
+
+risks:
+  - id: R-001
+    risk: >
+      Two passes exist (waiver reservation re-prices). Per-seat prices must be
+      present in BOTH or the waiver is priced off tier prices while the charge
+      uses seat prices. D-005 explains why passing the first-pass computation
+      makes this correct — but it is the most likely way to ship this half-done.
+  - id: R-002
+    risk: >
+      Already-sold overridden seats carry a wrong unitPriceCents forever. NOT
+      backfilled: those buyers were charged the tier price and the snapshot
+      honestly records what was charged. Rewriting it would make refunds quote
+      an amount that was never taken. Accepted; the defect window is closed
+      going forward, not retroactively.
+  - id: R-003
+    risk: >
+      Existing overrides on ADJUSTABLE tiers (D-004) may exist in live data.
+      Report them before FR-006 starts refusing writes, so an organizer is not
+      blocked from editing an unrelated seat by a row they did not create.
+      Read-only query, no migration.
+  - id: R-004
+    risk: >
+      The door/POS surfaces (start-pos-sale, record-cash-sale) compute their
+      own lines with mode DOOR and are OUT OF SCOPE. They do not sell seated
+      inventory today. If that changes, they inherit this defect — the
+      per-seat pricing helper from FR-005 is the seam they would use.
+  - id: R-005
+    risk: >
+      No database migration is required — Seat.priceOverride is an existing
+      Json? column. If implementation discovers one is needed, HAND-WRITE the
+      SQL and leave it unapplied.
+
+# ── As built (2026-10-08) ────────────────────────────────────────────────────
+# Where the build departs from the text above, and why.
+
+as_built:
+  - ref: D-006 / FR-003
+    note: >
+      Prices are NOT computed from the locked rows. Pricing feeds the fee-waiver
+      reservation, which must take its locks before ticket capacity, and capacity
+      before Seat (the door's lock order), so a Seat lock cannot precede pricing.
+      Checkout reads overrides unlocked (SeatsRepo.findPriceOverridesByIds),
+      prices with them, then holdSeatsForCheckout compares every FOR UPDATE row
+      against the priced value and refuses with seat_price_changed before any
+      seat is HELD. One extra unlocked query; the guarantee is the same.
+  - ref: R-004
+    note: >
+      Wrong as written: the door DOES sell seated inventory. startPosSale and
+      recordCashSale auto-pick seats through pickContiguousAvailable. That pick
+      (and online auto-assign, reserveForHold) now skips overridden seats, so the
+      door never sells one at the tier price.
+  - ref: auto-assign
+    note: >
+      Not in the original text: a seated tier bought by quantity alone gets
+      seats assigned by the server. Those never include an overridden seat; an
+      overridden seat sells only by explicit pick, at its shown price.
+  - ref: corrupt values
+    note: >
+      A stored price_override that is not { priceCents: number } (or is negative
+      or fractional) refuses checkout for that seat (INTERNAL
+      seat_price_override_invalid). Mint, the ticket email and resale ignore it.
+  - ref: FR-004 / D-007
+    note: >
+      The quote is item-level seatQuotes [{ seatId, unitPriceCents }] on
+      createCheckout, updateOrderItems, claimFreeTickets and the embed guest
+      checkout. It is compared, never charged from, before any hold, carried-cart
+      settle or PaymentIntent; ADJUSTABLE tiers skip it. The web hold quotes only
+      seats with an override (a plain seat on a tier with a pending schedule flip
+      goes unquoted), and Pay quotes the HELD lines, not the map. A resumed cart
+      is quoted per seat from getActiveCartHolds ticketSummary.seats. On
+      seat_price_changed the page re-holds at the new prices and shows a notice;
+      a held order that already has a PaymentIntent is released and held fresh.
+      The embed quotes the same way: a seat-picker confirmation keeps each
+      picked seat's shown override (plain seats unquoted; a seat the loaded
+      seat data does not cover keeps its earlier quote, and Confirm waits for
+      the data), its pre-order lines and estimate price those seats at it, and
+      the guest checkout sends them as seatQuotes (FIXED tiers only). On
+      seat_price_changed it re-reads the picked seats' sections and re-quotes
+      the cart in place, so the summary shows the new price and the retry
+      quotes it; a section whose re-read fails keeps its quote (refused again,
+      never charged unseen). Once the order exists, the embed's summary lines
+      are the server's lineItems, not the cart.
+  - ref: FR-004 / promo preview
+    note: >
+      promos.preview takes optional per-selection seatIds (at most qty, no seat
+      twice, in one line or across lines). On a PUBLISHED event (the public
+      seat map's gate) a FIXED tier's seats are priced like computeOrderAmounts
+      prices them (the same unlocked override read and seat resolver, lines per
+      distinct unit price, first-seen order), so the previewed discount is the
+      charged one. Tolerant where checkout refuses: a seat that is gone, on
+      another event or outside the tier's section, or any seat of an
+      unpublished event, prices at the tier; a corrupt override prices at the
+      tier and is reported (throttled public-read reporter). ADJUSTABLE tiers
+      ignore seatIds (D-004). Old clients (door/POS, scanner) send none. The
+      preview still has no read gate beyond PUBLISHED (password-gated events:
+      tracked follow-up).
+  - ref: FR-006 / write rules
+    note: >
+      setSeatPriceOverrides refuses a price (never a clear) when a written seat's
+      section sells through an ADJUSTABLE tier (SEAT_PRICE_OVERRIDE_ADJUSTABLE_TIER)
+      or has no FIXED tier (SEAT_PRICE_OVERRIDE_NO_FIXED_TIER). On a PUBLISHED
+      event only ACTIVE tiers count; on a DRAFT every tier counts, since publish
+      activates them. Both codes are user-facing with en/es copy as of
+      2026-10-10 (errors.seatPriceOverrideAdjustableTier / NoFixedTier). The cap is the INT4 column bound (the ticket price input
+      has no other maximum). A paid price on a seat whose tier is free runs the
+      same Stripe Connect and fee-policy gates as making that tier paid.
+  - ref: seat status on write
+    note: >
+      Only AVAILABLE and BLOCKED seats are written, for a set and a clear. SOLD
+      seats keep the price they were charged; HELD seats belong to a checkout
+      already priced. The write takes its seats with FOR NO KEY UPDATE OF Seat
+      SKIP LOCKED in id order, so it never waits on checkout, the door or mint;
+      a seat locked right now is skipped as busy. The result reports
+      { updated, skipped: { sold, held, busy, notFound } } for the editor to show.
+  - ref: FR-008 / editor read
+    note: >
+      The editor reads through events.listEventSeatPriceOverridesForEdit
+      (listEventSeatPriceOverridesForEdit). Its gate is the write's own, from
+      one shared module (use-cases/events/_shared/seat-price-override-rules.ts):
+      EVENT_NOT_FOUND first, then ORG_EDIT_ROLES on the event's org
+      (INSUFFICIENT_ROLE) or the owner / an edit-role delegate on a person's
+      event (NOT_RESOURCE_OWNER). Any event status is readable; `editable` is
+      false once the event is cancelled, completed or archived, where the write
+      refuses EVENT_NOT_EDITABLE. Per section it returns the tiers an override
+      replaces (the write's counting rule), `overrideRefusal` (FR-006, the
+      write's predicate), `paidOverrideBlockedBy` (STRIPE or FEE_POLICY: a free
+      tier sells the section and a paid price would hit the write's free→paid
+      gate right now; $0 is still allowed; same predicates and gate functions,
+      Stripe first) and `hasPendingScheduledPriceChange` (a FIXED tier's flip
+      is still ahead, which overridden seats do not follow, per D-003). Per seat
+      it returns the override WITH its private reason, and `overrideInvalid`
+      for a stored value checkout refuses, which is reported to Sentry once
+      per read.
+  - ref: FR-008 / glyph mapping
+    note: >
+      Each seat carries `glyphKey`, the id of the layout glyph it was
+      materialised from. Glyph ids are `<section>-<row>-<seat>` from the layout
+      CSV. Materialising parses each id under its section's prefix (row = up to
+      the last dash, number = parseInt of the rest, label = row + number, or the
+      raw id when there is no row or integer) and makes one Seat per label. The
+      read replays that same parser (lib/seating/layout-seat-id.ts, now shared
+      with the materialiser) over the layout's seatIds and looks the seat up by
+      label. Rebuilding `<layoutSectionId>-<row>-<number>` is wrong: parseInt
+      drops zero padding, so glyph ORCH-A-01 makes seat A1, and the rebuilt
+      ORCH-A-1 matches no glyph. `glyphKey` is null for a manually created
+      section, a seat no current glyph derives, or a layout that cannot be
+      read. The prefix match is ambiguous: with sections A and A-B, the glyph
+      A-B-C-1 is materialised into both. The editor must take a glyph's section
+      from the layout's own section data (the glyph's `sectionId`) and look it
+      up only in the section with that `layoutSectionId`, never by splitting
+      the id string.
+  - ref: publish gate (7d)
+    note: >
+      publishEvent treats an event as taking money when a tier is ever-paid OR
+      a seat a FIXED tier sells stores an override above 0. That one answer
+      drives the chargeback-terms backstop, the Stripe Ready gate
+      (STRIPE_NOT_CONNECTED_OWNER) and the fee-policy gate
+      (FEE_POLICY_NOT_FOUND). The seats are read only when every tier is free
+      and one sells a seat section at a FIXED price: one unlocked query inside
+      the publish transaction (SeatsRepo.listDistinctPriceOverridesByEvent),
+      seats of every status. Counting is the write's rule on a DRAFT (every
+      tier, archived included). A $0 override, and any override in a section
+      no FIXED tier sells, does not gate. A stored value checkout refuses
+      counts as paid and is reported (tag fault: seat_price_override_invalid);
+      the organizer sees the Stripe refusal, which carries meta
+      { cause: seat_price_override_invalid, seatSectionIds } when the corrupt
+      value is the only reason the event takes money. A free FIXED tier
+      attached to a section that already holds paid overrides, before or after
+      publish, is gated at the tier write (see "tier write gate (7e)"). Not
+      covered: the builder's readiness rail, which still reads tiers only.
+  - ref: tier write gate (7e)
+    note: >
+      A write that makes a free FIXED tier start selling a seat section that
+      already stores a paid override runs the override write's own gates
+      first, judging the tier as that one write will store it. The gate reads
+      without a lock, so two concurrent writes can still slip past it, and a
+      paid tier edited to $0 is not re-gated: see "Accepted, not closed"
+      below. Three writes can start the sale and all three call one helper
+      (ensureStoredOverridesGatedForTierWrites in
+      use-cases/events/_shared/seat-price-override-rules.ts):
+      assignTicketTypeSections (a tier put on a section, or moved to another),
+      upsertTicketType (a tier created on a section) and updateTicketType (a
+      switch from ADJUSTABLE to FIXED). No other core write sets a tier's
+      section: series generation and ticket type templates create tiers with
+      none. The gates are the override write's (ensurePaidOverrideGates): a
+      Linked Stripe account (PAID_TICKETING_REQUIRES_STRIPE), then a resolvable
+      fee policy (PAID_TICKETING_REQUIRES_FEE_POLICY), on DRAFT and PUBLISHED
+      events alike. Ready is not required here, as for every other paid
+      authoring write; publish and checkout require it. A stored value
+      checkout refuses, in a section such a tier starts selling, counts as
+      paid and is reported (tags fault: seat_price_override_invalid and
+      useCase: the calling write); the organizer sees the Stripe or fee-policy
+      refusal. Both refusals carry meta (the wire's error.data.meta):
+      { cause, seatSectionIds, invalidSeatSectionIds }. cause is
+      stored_seat_price, or seat_price_override_invalid when a value checkout
+      refuses is the only reason (publish's cause for the same case);
+      seatSectionIds is every section behind the refusal;
+      invalidSeatSectionIds is the ones holding a value checkout refuses. A
+      refusal of the tier's own price (a paid tier, no Linked account) carries
+      no such meta. The editors' copy does not read the meta yet: both still
+      show the paid-tier wording for these codes.
+      Never refused by this gate: an unassign, a delete, a switch to
+      ADJUSTABLE, and a section whose overrides are all $0 or absent. Not
+      re-gated: a tier already FIXED on that section, a tier that is itself
+      paid (it passed the same gates when it was priced), and, on a PUBLISHED
+      event, a tier that is not ACTIVE (it sells nothing until the next
+      publish, which runs the 7d gate). Cost: at most one unlocked query per
+      write (SeatsRepo.listDistinctPriceOverridesByEvent), inside the write's
+      transaction, and none in the cases just listed or for a tier with no
+      section. In one assign call each assignment is judged against the stored
+      tier, so the same tier assigned twice is gated for both sections.
+      Accepted, not closed (2026-10-11). In each of (1) to (3) a free FIXED
+      tier ends up selling a paid stored override with no gate run at that
+      moment. Checkout still needs a Ready account in all of them and
+      refuses the buyer with STRIPE_NOT_CONNECTED. Since 2026-10-11 (owner
+      ruling) that includes an order covered in full by platform credit:
+      createCheckout runs the Ready gate before any credit is spent, so such
+      an order no longer completes for an organizer who is not Ready. Before
+      that date it completed with no gate run. That is true of any paid
+      ticket type added after publish, not only of these gaps.
+      (1) Mode switch and assign of the same tier at once. updateTicketType
+      (ADJUSTABLE to FIXED at $0, tier unassigned) and
+      assignTicketTypeSections (the same tier onto the section) each read the
+      tier unlocked and see no FIXED tier on the section; the row ends FIXED,
+      $0, on the section. Needs no other tier.
+      (2) Override write and assign at once. With a paid FIXED tier already
+      on the section, setSeatPriceOverrides sees only the paid tier (no gate)
+      while a free tier's assign sees no override yet (no gate).
+      (3) Paid to free. A paid FIXED tier already on the section is edited to
+      $0. It starts selling nothing, so it is not re-gated; it passed the
+      same gates when it was priced.
+      (4) Linked, not Ready. The gate asks for a Linked account, like every
+      paid authoring write. A published free event can therefore gain a paid
+      seat that fails at checkout with STRIPE_NOT_CONNECTED until the account
+      is Ready, the same as a paid tier added after publish.
+      Why (1) and (2) are not closed with the event row lock publish takes
+      (events.lockRows, FOR UPDATE): checkout and mint lock Seat and
+      SeatSection rows first (SeatsRepo.findByIdsForUpdate joins both tables
+      and names no OF) and touch the Event row afterwards, through the
+      foreign key of the Order or Ticket they insert. A tier write holding
+      the event row FOR UPDATE and then pointing the tier at a section waits
+      on that section row while the checkout waits on the event row:
+      Postgres aborts one with 40P01. Measured on Postgres 16 with the same
+      statement shapes: the checkout was the one aborted. The same lock in
+      setSeatPriceOverrides would also make it wait on every checkout in
+      flight, which its SKIP LOCKED design rules out. A per-event advisory
+      lock taken first by the four writes sits outside the row-lock graph
+      (the reasoning behind ticket_type_capacity) and would close both; not
+      built.
+      Open, not fixed here: neither upsertTicketType nor
+      assignTicketTypeSections checks that the seat section belongs to the
+      event (the Prisma write and the foreign key only require the section to
+      exist).
+  - ref: Q-001 / resale cap
+    note: >
+      The resale cap is per ticket (owner ruling 2026-10-10, Q-001): the
+      tier's resaleCapCents, lifted to the ticket's own price when that is
+      higher. A $50 seat on a $30 tier capped at $35 lists for up to $50; a
+      ticket bought at the tier's $30 keeps the $35 cap; a tier with no cap
+      has none, whatever the ticket cost. The rule is one pure function,
+      effectiveResaleCapCents
+      (packages/core/src/lib/pricing/effective-resale-cap.ts), and no site
+      compares an ask against TicketType.resaleCapCents itself. The ticket's
+      own price is the unitPriceCents of the OrderItem that Ticket.orderItemId
+      points at, the number resale already calls face value
+      (resolvePurchasedUnitPriceCents): the price charged for that ticket
+      online or at the door (the override when the seat has one), before
+      fees, tax and promo discounts; the ask it was bought at for a ticket
+      bought on resale, not its first sale's price; 0 for a comp, a door comp
+      or a volunteer reward, so those stay on the tier's cap; unchanged by a
+      transfer. An unknown own price (no reachable OrderItem) never raises
+      the cap. Consequences. The rule covers every ticket priced above the
+      tier's cap, whatever put it there, not only overridden seats. A cap
+      below a ticket's price no longer binds that ticket: on a $30 tier
+      capped at $20, every ticket bought at $30 lists for up to $30. A cap of
+      0 means "up to what the ticket cost", not "no resale"; a comp, priced
+      0, still cannot be listed under a 0 cap, because an ask must be above
+      0. Own price is the list price before discounts: a ticket a promo took
+      to $0 keeps its list price as its own price, and a comp's is 0. A
+      ticket bought on resale above the tier's cap (from a holder whose own
+      price allowed it) relists for up to what its buyer paid. Own price
+      cannot climb from resale to resale: each ask is bounded by its seller's
+      cap, and the tier's cap cannot change once the event has a sale
+      (TICKET_TYPE_LOCKED_BY_SALES). A tier cap that is set but not a finite
+      number fails closed: the ticket's cap is its own price, or 0 when that
+      is unknown too. Sites.
+      createResaleListing refuses an ask above the ticket's cap
+      (RESALE_PRICE_EXCEEDS_CAP); a ticket with no reachable OrderItem is
+      refused before that (RESALE_PURCHASE_PRICE_UNKNOWN). createResaleCheckout
+      re-checks the cap only for a legacy listing without a full pricing
+      snapshot, as before, now against the ticket's cap (own price = the
+      listing's frozen face value, else the seller's OrderItem).
+      estimateResalePrice clamps its suggestion to the ticket's cap and
+      returns that cap as resaleCapCents, per order item, so the prefilled ask
+      is one the server accepts. The nightly ResalePriceSnapshot row is per
+      ticket type and has no ticket, so computeResalePriceSnapshots no longer
+      clamps suggestedPriceCents (it still records the tier's cap beside it);
+      estimateResalePrice, its only reader, clamps for the ticket. Rows
+      written before this change hold a value already clamped to the tier's
+      cap until the next nightly run. This replaces the earlier reading (the
+      cap is an absolute ask ceiling whatever the ticket cost), under which a
+      ticket bought above the cap could not be listed at its own price. What
+      people are told: the resell form shows "You can list this ticket for up
+      to {amount}" from the estimate's resaleCapCents when the tier has a
+      cap; the refusal reads "Your resale price is above the most this ticket
+      can be listed for."; the organizer's cap field says sellers cannot list
+      above it, or above what their own ticket cost if that is higher. Guard:
+      packages/core/src/lib/pricing/resale-cap-invariant.test.ts fails when a
+      core file compares or clamps against the bare resaleCapCents, or when
+      the set of files that read it (each listed with a reason) changes. Not
+      changed: a listing with a full pricing snapshot is not re-checked at
+      checkout, no use case edits a listing's price, and the organizer's
+      ticket type editor still shows the tier's own cap as the cap.
+  - ref: D-005 / a $0 ticket pays no fee
+    note: >
+      Two owner rulings, 2026-10-10, verbatim. First: "If $0 is the cost of
+      the tickets there shouldn't be any fee." Then, asked whether that covers
+      a ticket a promo code discounts to $0: "yes a promo brought down to $0
+      should have no fee too."
+      D-005 as written charged a $0 seat the policy's fixed part or minimum
+      whenever the cart also held a paid ticket (the per-ticket fee is
+      max(min(round(price x pct), maxFee) + fixed, minFee), which at $0 is
+      max(fixed, minFee)), and the order-level free path only zeroes fees
+      when the whole order is $0. Built instead:
+      (1) A ticket whose unit price is $0 has no platform fee: a seat
+      overridden to $0, a free ticket type, a pay-what-you-want line set to
+      $0. computePlatformFeePerTicketCents returns 0 for a $0 price, before
+      the fixed part and the minimum, so the charge (computeOrderAmounts),
+      the door (priceCart) and every estimate share the rule. A paid ticket in
+      the same cart pays exactly what it pays alone; the minimum still applies
+      to a paid ticket.
+      (2) A ticket a promo code or a membership benefit brings down to $0 has
+      no platform fee either. A discount is one order line and was never tied
+      to a ticket, so "brought down to $0" is defined in
+      packages/core/src/lib/orders/discounted-to-zero.ts: each applied
+      discount is spread over the tickets it applies to (its ticket type's
+      when it is scoped to one, every ticket on the order otherwise) in
+      proportion to price, and a ticket is at $0 when the shares cover its
+      price. So 100% off a ticket type, or a fixed amount that covers that
+      type's tickets, frees those tickets; a discount on the whole order
+      frees a ticket only when it frees the order. A ticket discounted to any
+      amount above $0 keeps the fee on its list price, as before.
+      computeOrderAmounts({ discounts }) takes the fee off before the
+      order-level cap and before the fee waiver; the ticket keeps its list
+      price on its order item (the discount line cancels it) and is marked
+      meta.discountedToZero. Promo evaluation now runs BEFORE the fee-waiver
+      reservation in createCheckout, startPosSale and quotePosCart, so no
+      waiver allowance is spent on a ticket that has no fee (this replaces
+      waiver_ladder_is_safe's "first-pass computation": the ladder is built
+      from the pass that knows the discounts).
+      (3) With no fee, such a ticket takes no share of the processing fee and
+      adds nothing to a tax base that includes fees. The rounding remainder of
+      the order cap and of the processing-fee spread goes to the last ticket
+      that pays a fee, not to whichever ticket is last (D-005 said "last-item
+      remainder"; a free ticket last in the cart used to pick up those cents).
+      Door cash is unchanged (it never charged a fee). Orders already written
+      are unchanged: settlement, refunds and platform revenue read the amounts
+      stored on the order and its items and never re-run this arithmetic.
+      For a new order the organiser's settlement basis (order gross minus
+      platform fee) rises by the fee no longer taken.
+      Which ticket a discount frees has two edges, both in the module's doc
+      and pinned in its test. Rounding: a share is rounded to whole cents, so
+      $99.60 off a $1.00 and a $99.00 ticket frees the $1.00 ticket with 40
+      cents of the order left to pay; ties go to the earlier ticket, so every
+      caller (the preview included) lists tickets in the charge's order.
+      Order of entry: codes apply in the order entered, each to what is left,
+      so $10 off the order then $45 off VIP frees a $50 VIP that the reverse
+      order leaves at $3.57; the discount total is the same both ways.
+      What the page shows, two figures from previewPromos:
+      (a) BEFORE THE HOLD, platformFeeReductionCents: how much of the fee the
+      public rates give comes off. estimateOrderTotal / estimateCartTotal take
+      it next to the discount. It knows no fee waiver, like the rates it is
+      measured against: exact without one, high with one (step 1 has always
+      been high for a waiver cart).
+      (b) ON THE HELD STEP, heldCartFees: the fee createCheckout will charge
+      for the buyer's own pending cart with the codes as they stand, STATED,
+      not a change to a figure the page holds. Computed by the charge's own
+      steps (orders/_shared/held-cart-fees.ts: computeOrderAmounts with the
+      discounts, then the waiver ladder over the tickets that still carry a
+      fee), counting the allowance the cart itself has reserved, which the
+      charge releases before it reserves again. The page puts it on the held
+      order (apps/web/src/lib/pricing/held-order-fees.ts) and every held
+      surface reads that one order. A first design subtracted (a) from the
+      order's fee on the page; it quoted a cart createCheckout had already
+      priced one fee too low and a waiver cart a few cents too low, and was
+      replaced. The statement is only made for the session buyer's own PENDING
+      order on the event; anyone else gets null.
+      heldCartFees.withoutDiscounts is the same cart's fee with no discount.
+      A statement is for one set of codes; while the server has not answered
+      for a changed set the page shows no discount, and beside it this
+      no-discount fee from the last statement for the same cart.
+      Not exact, by design or by limit: another buyer can take the last ticket
+      of a shared allowance between the quote and the charge (the charge then
+      takes a fee the quote waived; the payment step shows it); and a cart for
+      which no statement has ever arrived (the preview is down) keeps the fee
+      its order carries, which is low by a freed ticket's fee if createCheckout
+      priced it with a freeing code that has since been removed. The payment
+      step shows createCheckout's own figures before the buyer pays.
+      Wired: the web checkout (steps 1 and 2, the summary, the mobile tray).
+      NOT wired: the embed checkout, which still quotes such a cart high by
+      the freed fee plus processing and tax on it until it passes (a) and (b);
+      its charge is right.
+  - ref: FR-008 / the editor (step 5b)
+    note: >
+      The organiser screen is /admin/<slug>/events/<id>/seat-prices
+      (apps/web/src/app/admin/[slug]/events/[id]/seat-prices/), the owner's
+      pick "a map with a List switch": one selection and one price panel
+      shared by a Map view and a List view. It reads
+      listEventSeatPriceOverridesForEdit and writes setSeatPriceOverrides in
+      chunks of 500, and after a save it states how many seats changed and how
+      many were skipped as sold, in a cart, busy or gone. The panel says before
+      any typing when a section refuses a price (FR-006) or a paid price needs
+      payouts or a fee policy, names every ticket type a custom price
+      replaces, shows the FR-008 schedule notice, and warns before a save or a
+      clear deletes private notes. The Map draws seats from the event's place
+      layout through the public layout read; a glyph is resolved to a seat
+      inside the section its own sectionId names (sections A and A-B are
+      tested). Entry points: a "Seat prices" item in the event navigation and
+      a link under the builder's Seating map button, both behind the
+      seatingLayouts feature gate like that button. Closed events are
+      read-only. Help: apps/web/content/help/organising-events/price-individual-seats.md.
+
+# ── Open questions ───────────────────────────────────────────────────────────
+
+questions:
+  - id: Q-001
+    question: >
+      Should an overridden seat be excluded from the tier's resale cap
+      (resaleCapCents), which is expressed as an absolute amount against a tier
+      price the seat no longer pays? A $50 seat in a $30 tier with a $35 cap
+      cannot be resold at face value.
+    owner: "RULED (owner, 2026-10-10). Built: see as_built 'Q-001 / resale cap'."
+    ruling: >
+      Owner, 2026-10-10, verbatim. First: "Each section has a generalized price
+      by that section and has the ability to have it's own custom price. The
+      way ticket resells work is by that associated ticket price." Then, asked
+      "should a ticket's resale cap never fall below its own price? I'd say
+      yes.": "Resale cap is determined by ticke ttype so yes."
+      Recorded reading: the resale cap is set on the ticket type
+      (TicketType.resaleCapCents, unchanged), AND a ticket's effective cap
+      never falls below what that ticket itself was priced at. The $50 seat in
+      the $30 tier with a $35 cap can be resold for up to $50; a ticket bought
+      at the tier's own $30 keeps the $35 cap.
+    note: >
+      The charge fix makes this VISIBLE rather than causing it; the cap is
+      already tier-absolute today. Left open deliberately rather than settled
+      badly, and it is confined to resale.

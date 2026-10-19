@@ -1,0 +1,258 @@
+# Not built yet (2026-10-08 docs consolidation): Slice 3 (3-field quick-create) not found
+# event-builder-regroup.spec.yaml
+#
+# The event builder regrouped around the admin side rail. Design direction and
+# hi-fi mockups: https://claude.ai/code/artifact/67d7d65b-21b5-4c0d-965e-4283e13e8ea2
+# (v2 — contextual rail). Decisions D1–D6 recorded there and restated here as
+# requirements. Three slices, shipped in order; each slice is independently
+# releasable.
+#
+# Source of the problem: EventBuilder.tsx (4,183 ln) — 8 flat tabs mixing
+# authoring with operations, an "Advanced settings" drawer hiding Lineup and
+# Revenue splits, two competing "visibility" concepts, and 3 publish-blocker
+# banners interjected between sections.
+#
+# Related:
+#   - docs/design/design-system-v2.md (canon; Stub default, radius 0)
+#   - Admin nav regroup (pushed 2026-07-25: ec3f91f5/ef166dd1/b7b9583b) — the
+#     NavigationRail organism (collapsible groups + identity rail) this spec
+#     extends with event-context sections. REUSE, DO NOT FORK.
+#   - Memory: badges deferred on admin nav for lack of count endpoints — same
+#     constraint applies here (FR-208).
+
+version: "1.0"
+updated: "2026-07-27"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Authoring and operating an event share one overloaded surface. The features
+    the product pitch rests on (lineup, revenue splits) are buried behind an
+    anonymous "Advanced" toggle; location visibility and access gating are two
+    far-apart "visibility" stories; publish blockers ambush as banners; create
+    mode silently hides most of the builder behind 42 isEditMode gates.
+  solution: >
+    Slice 1 regroups the Edit tab: Lineup and Splits promoted to top-level,
+    remaining settings in four named accordion groups with collapsed-state
+    summaries, and a sticky publish-readiness rail replacing the banners.
+    Slice 2 hands navigation to the admin rail: entering an event swaps the
+    workspace rail to event context — Build (scroll anchors) and Manage
+    (routes) groups + "← All events" back slot. Slice 3 makes creation an
+    honest 3-field quick-create that lands in the full builder.
+  users:
+    - Organizer (org OWNER/ADMIN/EDITOR) — authors and operates events
+    - Door crew / finance roles — reach Manage surfaces without authoring noise
+  surfaces:
+    - web
+
+# ── Decisions (from design review, 2026-07-27) ───────────────────────────────
+
+decisions:
+  - id: D1
+    call: Splits is top-level in Build, collapsed to its summary bar when no lineup exists.
+  - id: D2
+    call: >
+      Location visibility moves to Settings · Access & privacy with default
+      "exact address, shown immediately"; the venue field gains a
+      "Hide the address?" link that jumps to that group.
+  - id: D3
+    call: >
+      Seating editor launches from the Tickets card as a full-screen takeover
+      with its own save/exit; no longer a peer tab.
+  - id: D4
+    call: Preview is a header action opening the live draft page in a new pane; not a tab.
+    reversed: >
+      2026-07-28 — user feedback after live use; preview is an in-view toggle
+      again (unsaved-state preview), new-tab link demoted to secondary
+      affordance.
+  - id: D5
+    call: "Sequencing: slice 1 = Edit-tab regroup + readiness rail; slice 2 = contextual rail; slice 3 = quick create."
+  - id: D6
+    call: >
+      Full rail swap with "← All events" (no compact workspace icon strip).
+      Same NavigationRail component with different sections + back slot;
+      collapse persistence keyed per event.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    # ── Slice 1 — Edit-tab regroup + readiness rail (no route changes) ──
+    - id: FR-101
+      description: >
+        Promote LineupEditor and SplitsEditor out of the Advanced drawer to
+        top-level sections in the Edit tab, ordered after Ticket Types
+        (Essentials → Details → Tickets → Lineup → Revenue splits → Settings).
+        Per D1, the Splits section renders collapsed to its allocation summary
+        bar when the event has no lineup entries.
+    - id: FR-102
+      description: >
+        Replace the single Advanced toggle with four named groups, each an
+        accordion on BOTH desktop and mobile (desktop adopts the existing
+        MobileAdvancedSection pattern): Scheduling (Recurrence),
+        Access & privacy (event visibility/gate/password/waitlist from
+        EventGateSettings + address visibility & reveal from
+        LocationVisibilitySection), Money & compliance (Tax, Waiver when
+        feature-gated, Payout schedule when payouts enabled), Sharing
+        (Short link). Collapsed group headers show a live state summary
+        (e.g. "public · address at RSVP"), derived from data already loaded —
+        no new endpoints.
+    - id: FR-103
+      description: >
+        Per D2, LocationVisibilitySection leaves Essentials. New events default
+        to visibilityMode "exact" with immediate address reveal. The venue
+        field in Essentials gains a "Hide the address?" link that expands the
+        Access & privacy group and scrolls to it. Existing events keep their
+        saved values; no data migration.
+    - id: FR-104
+      description: >
+        Add a publish-readiness rail: sticky right column on desktop (grid
+        minmax(0,1fr) / ~280–300px), a collapsed summary block above the
+        Publish CTA on mobile. Checks, derived from existing state/queries:
+        essentials complete (title/date/venue), details non-empty, ≥1 ticket
+        type, Stripe payouts onboarded (only when paid ticket types exist),
+        chargeback terms accepted, host attestation complete. Lineup confirmed
+        is informational, never blocking. Each unmet item deep-links to its
+        fix (section scroll, /admin/{slug}/payments, or opens the existing
+        terms/attestation dialogs).
+    - id: FR-105
+      description: >
+        The readiness rail REPLACES the chargeback-terms banner, the
+        Stripe-Connect banner, and interstitial attestation prompts. Publish
+        remains blocked by the same server-side rules; the disabled Publish
+        button's tooltip enumerates unmet numbered items matching the rail.
+        No publish-gating behavior may change — only its presentation.
+    - id: FR-106
+      description: >
+        Decompose EventBuilder.tsx as part of slice 1: extract at minimum the
+        essentials form, the readiness computation (pure, unit-tested), the
+        settings-groups container, and the publish flow (hook). Target:
+        EventBuilder.tsx under ~1,500 lines after slice 1. Behavior-preserving
+        except where FRs above say otherwise.
+
+    # ── Slice 2 — contextual rail (routes + navigation) ──
+    - id: FR-201
+      description: >
+        Event surfaces get real routes under /admin/[slug]/events/[id]:
+        edit (Build), attendees, volunteers, comps, suggestions, feedback.
+        Legacy ?tab= URLs 301/redirect to the new routes (deep links in
+        emails/bookmarks must keep working).
+    - id: FR-202
+      description: >
+        On event routes, AdminShell swaps the NavigationRail sections to event
+        context: a back slot ("← All events" → /admin/[slug]/events), a Build
+        group whose items are scroll anchors into the edit surface with
+        scroll-spy active state (Essentials, Details, Tickets, Lineup,
+        Revenue splits, Settings), and a Manage group whose items are the
+        FR-201 routes. Identity rail stays. NavigationRail is EXTENDED
+        (back slot + anchor-item support), never forked; collapse persistence
+        keyed per event id.
+    - id: FR-203
+      description: >
+        RBAC parity with today's tab gating: Build group hidden without edit
+        rights; comps and suggestions items disabled with a "post-pub" note
+        until the event is PUBLISHED; feedback/attendees/volunteers follow
+        current tab visibility rules exactly.
+    - id: FR-204
+      description: >
+        Per D4, Preview becomes a header action opening the event's public
+        (draft-preview) page in a new tab; the preview tab is removed.
+    - id: FR-205
+      description: >
+        Per D3, the seating layout editor becomes a full-screen takeover
+        launched from the Tickets section (visible only when the event has a
+        placeLayoutId and the seatingLayouts gate is on); the seating tab is
+        removed and its old URL opens the takeover over Build.
+    - id: FR-206
+      description: >
+        Mobile: event context integrates with the existing mobile nav pattern
+        (bottom-bar flattening / sheet), preserving access to every Manage
+        surface; Build remains a single scrollable page with the slice-1
+        accordions.
+    - id: FR-207
+      description: >
+        The Build/Manage segmented control and the 8-tab row are removed; the
+        builder header reduces to title, status chip, Preview, Publish.
+    - id: FR-208
+      description: >
+        Rail badge counts only from data already loaded by the surface (e.g.
+        ticket-type count from the edit query). No new count endpoints in this
+        spec — same deferral as the admin nav regroup.
+
+    # ── Slice 3 — quick create ──
+    - id: FR-301
+      description: >
+        /admin/[slug]/events/new becomes a 3-field quick create: title,
+        starts-at, venue (place search). Submit creates a DRAFT via the
+        existing draft-upsert path and routes to the new event's Build route.
+        The workspace rail (not event rail) shows on this page. The community
+        listing entry point (/events/new/community) is untouched.
+    - id: FR-302
+      description: >
+        Remove create-mode rendering from the full builder once quick create
+        lands: the builder always has an eventId, deleting the isEditMode
+        create branch and its gates.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        i18n: every new string added to BOTH en and es catalogs (dual-catalog
+        merge; a missing key renders raw). No hardcoded UI strings.
+    - id: NFR-002
+      description: >
+        DS v2 compliance: semantic tokens only, radius 0 content, accent ≤5%,
+        gap-not-margins, one primary button per viewport (Publish). Accordion
+        and rail interactions keyboard-accessible with WAI-ARIA disclosure /
+        existing rail semantics; scroll-spy must not trap focus.
+    - id: NFR-003
+      description: >
+        No regressions to publish server-side validation, autosave, recurrence
+        series behavior, or suggestion/feedback gating. Existing EventBuilder
+        tests keep passing (updated for new structure, not weakened).
+    - id: NFR-004
+      description: >
+        Readiness computation is a pure function with unit tests covering:
+        free-only events (no Stripe check), paid + not onboarded, terms
+        pending, attestation pending, all-clear.
+
+out_of_scope:
+  - New count/badge endpoints (deferred with admin-nav badges)
+  - Mobile apps (scanner/consumer) — web only
+  - Seating editor internals (only its entry point moves)
+  - Community listing form changes
+  - Ember theme enablement (Stub-only, matches shipped reality)
+
+build_plan:
+  - step: 1
+    slice: 1
+    what: Extract readiness computation (pure fn + tests) and publish-flow hook from EventBuilder
+    agent: coder
+  - step: 2
+    slice: 1
+    what: Edit-tab regroup — promote Lineup/Splits, settings groups with summaries, D2/D3 essentials changes
+    agent: ui
+  - step: 3
+    slice: 1
+    what: Readiness rail component + banner removal + mobile summary
+    agent: ui
+  - step: 4
+    slice: 2
+    what: Routes + redirects for event surfaces; builder header reduction
+    agent: coder
+  - step: 5
+    slice: 2
+    what: NavigationRail back-slot/anchor extension + AdminShell event-context swap + scroll-spy
+    agent: ui
+  - step: 6
+    slice: 2
+    what: Seating takeover entry from Tickets; preview header action
+    agent: ui
+  - step: 7
+    slice: 3
+    what: Quick-create page + create-branch removal from builder
+    agent: coder
+  - step: 8
+    slice: all
+    what: Review after each step (reviewer), final typecheck/test/lint sweep
+    agent: reviewer

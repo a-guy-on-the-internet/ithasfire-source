@@ -1,0 +1,370 @@
+status: complete
+# human-jobs-and-genre-identity.spec.yaml
+#
+# Adds self-declared job roles and genre tags to the Human model, with a reusable
+# picker component and conditional genre display based on job type.
+
+version: "1.0"
+updated: "2026-04-14"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    There is no way for a Human to declare what kind of creative or industry
+    professional they are. The PlaceReview form asks "what genre do you play?"
+    but has no context about whether the reviewer is a musician, comedian, or
+    photographer — so genre is presented to everyone even when it's irrelevant.
+    BookingRequest.genre is a free-text field that duplicates whatever the
+    artist would have set on their profile, if a profile existed.
+  solution: >
+    Add a HumanJob enum and a jobs HumanJob[] array + genreTags String[] array
+    directly to the Human model. Build a reusable <HumanJobsPicker> component
+    that saves eagerly — the PlaceReview form adopts it on step 1, and the
+    profile settings page reuses the same component. Genre tags are only
+    surfaced to MUSICIAN job holders; all other jobs can optionally tag genre
+    but are never prompted to. OTHER job type captures a free-text description
+    for unrecognized roles so we can promote them to first-class enum values
+    later.
+  users:
+    - Any authenticated Human filling in the PlaceReview form
+    - Any authenticated Human editing their profile/settings
+  surfaces:
+    - web (PlaceReview multi-step form — step 0 "About You")
+    - web (profile settings page)
+    - mobile (profile settings — future, not in scope now)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        A Human can select one or more jobs from a fixed enum list. The selection
+        is persisted on Human.jobs as an array.
+    - id: FR-002
+      description: >
+        A Human with MUSICIAN in their jobs array is shown a genre tag picker.
+        All other job combinations hide the genre picker.
+    - id: FR-003
+      description: >
+        A Human who selects OTHER as a job is shown an optional free-text field
+        (max 200 chars) persisted on Human.otherJobDescription. This value is
+        not displayed publicly — it is used by the platform to track demand for
+        new enum values.
+    - id: FR-004
+      description: >
+        The <HumanJobsPicker> component is self-contained and reusable. It
+        accepts current jobs + optional genreTags + callbacks and saves eagerly
+        (debounced 800ms) via the update-human-jobs use case so the user never
+        has to tap a save button separately.
+    - id: FR-005
+      description: >
+        The PlaceReview multi-step form gains a new step 0 ("About You") that
+        renders <HumanJobsPicker>. If the Human already has jobs set on their
+        profile, the step pre-populates and can be skipped. Genre tags collected
+        in this step replace PlaceReview.genreTags on submit.
+    - id: FR-006
+      description: >
+        BookingRequest.genre (free-text String?) is pre-filled from
+        Human.genreTags when the booking request form mounts, reducing friction.
+        It remains editable. No schema change to BookingRequest in this spec.
+    - id: FR-007
+      description: >
+        The GENRE_JOBS constant in packages/core exports the set of job types
+        for which genre is contextually relevant. Currently: ['MUSICIAN'].
+        All genre-gating logic imports this constant — no string literals in
+        components or use cases.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        jobs and genreTags arrays default to [] — the migration must not break
+        existing Human rows. No backfill needed.
+    - id: NFR-002
+      description: >
+        The update-human-jobs use case is idempotent — calling it twice with the
+        same payload produces the same result without side effects.
+    - id: NFR-003
+      description: >
+        otherJobDescription is not exposed via any public-facing tRPC query or
+        EntityPage. It is visible only in the user's own settings.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: update-human-jobs
+        file: packages/core/src/use-cases/humans/update-human-jobs.ts
+        description: >
+          Accepts humanId, jobs (HumanJob[]), genreTags (String[], optional),
+          and otherJobDescription (String?, required only when OTHER in jobs).
+          Validates with Zod. Persists to Human via HumansRepo. Emits an audit
+          log entry human.jobs_updated. No money involved.
+        input: "{ humanId, jobs: HumanJob[], genreTags?: string[], otherJobDescription?: string }"
+        output: "{ jobs: HumanJob[], genreTags: string[] }"
+        idempotent: true
+        money: false
+        auth: "caller humanId must match authenticated session — no org-scope needed"
+
+    constants:
+      - name: GENRE_JOBS
+        file: packages/core/src/lib/human-jobs.ts
+        description: >
+          Set<HumanJob> of job types for which the genre picker is contextually
+          relevant. Exported alongside HumanJob type re-export. Currently
+          contains only MUSICIAN.
+
+      - name: Review Tier System
+        file: packages/core/src/lib/human-jobs.ts
+        description: >
+          PERFORMER_JOBS, CREW_JOBS, INDUSTRY_JOBS sets + getReviewTier()
+          helper that collapses 15 HumanJob values into 3 form behavior
+          tiers. Performer > Crew > Industry priority when a user holds
+          jobs across tiers. Returns null for empty jobs.
+
+          Tier behavior controls which PlaceReview questions are shown:
+
+          Performer tier (MUSICIAN, DJ, COMEDIAN, DANCER, POET, MAGICIAN):
+          - All core questions shown
+          - Genre picker: only MUSICIAN (via GENRE_JOBS)
+          - Sound quality: full PA/monitors for MUSICIAN/DJ; mic-focused for COMEDIAN
+          - Stage equipment: instrument-focused for MUSICIAN; booth for DJ;
+            minimal (mic stand, stool) for COMEDIAN
+          - Audience fit: shown, copy varies by job ("your music"/"your comedy"/"your set")
+          - Would play again: verb varies ("play" for MUSICIAN/DJ, "perform" for others)
+          - Merch: only MUSICIAN
+          - Draw estimate: shown
+
+          Crew tier (SOUND_ENGINEER, LIGHTING_ENGINEER, PHOTOGRAPHER, VIDEOGRAPHER):
+          - Hide: audience fit, genre, draw estimate, merch, stage equipment (musician ver.)
+          - Show: payout, payment method, parking/load-in, booker/staff, photos, comments
+          - Replace sound quality with: "Rate the house technical setup"
+          - "Would you work there again?" instead of "would you play again?"
+
+          Industry tier (PROMOTER, EVENT_ORGANIZER, BOOKING_AGENT, OTHER):
+          - Hide: sound quality, stage equipment, audience fit, genre, draw, merch
+          - Show: payout, payment method, promotion, parking/load-in, booker/staff,
+            comments, photos
+          - "Would you book/work there again?"
+
+      - name: HUMAN_JOB_LABELS
+        file: packages/core/src/lib/human-jobs.ts
+        description: >
+          Record<string, string> mapping each HumanJob enum value to a
+          human-readable label for UI pickers.
+
+  ports:
+    existing:
+      - HumansRepo — needs update() method to accept jobs + genreTags +
+          otherJobDescription (check if patch-style update already exists)
+
+  adapters:
+    existing:
+      - packages/adapters/src/db/prisma/humans.ts — update to include new
+          fields in the update payload
+
+  transport:
+    trpc_procedures:
+      - name: human.updateJobs
+        router: packages/transport/trpc/src/routers/human.ts
+        description: >
+          Thin wrapper — validates session, calls update-human-jobs use case,
+          returns updated jobs + genreTags. Protected procedure.
+
+  ui:
+    components:
+      - name: HumanJobsPicker
+        file: apps/web/src/components/HumanJobsPicker.tsx
+        description: >
+          Multi-select chip grid of all HumanJob values with display labels.
+          When MUSICIAN is selected, renders a GenreTagPicker below it.
+          When OTHER is selected, renders a text input for otherJobDescription.
+          Calls human.updateJobs mutation on change (debounced 800ms).
+          Accepts initialJobs, initialGenreTags, initialOtherJobDescription props.
+          No internal save button — saves are automatic.
+
+      - name: GenreTagPicker
+        file: apps/web/src/components/GenreTagPicker.tsx
+        description: >
+          Reusable multi-select tag input. Queries GenreTag table for
+          autocomplete suggestions ordered by usageCount. Supports adding custom
+          tags. Lifted out of any existing genre input code in the review form.
+
+    pages:
+      - name: PlaceReview form step 0 — About You
+        file: apps/web/src/app/(reviews)/place-review/[step]/page.tsx (or
+          wherever the review form stepper lives)
+        description: >
+          New first step in the review flow. Renders <HumanJobsPicker>.
+          If Human.jobs is non-empty, shows a "Looks right? Continue" shortcut
+          so repeat reviewers skip it in one tap. Genre tags collect here and
+          are passed to the review form state for submission as
+          PlaceReview.genreTags.
+
+      # Profile settings "Your work" section — Phase 2 only.
+      # No backend changes needed; <HumanJobsPicker> drops in once phase 1 ships.
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+
+  modified_models:
+    - model: Human (packages/db/prisma/auth.prisma)
+      changes:
+        - "jobs           HumanJob[]   @default([])  // multi-select job roles"
+        - "genreTags      String[]     @default([])  // genre tag names (refs GenreTag.name)"
+        - "otherJobDescription String? @db.VarChar(200)  // free-text when OTHER in jobs; not public"
+
+    - model: enums (packages/db/prisma/enums.prisma)
+      changes:
+        - |
+          enum HumanJob {
+            MUSICIAN
+            DJ
+            COMEDIAN
+            DANCER
+            VISUAL_ARTIST
+            POET
+            MAGICIAN
+            SOUND_ENGINEER
+            LIGHTING_ENGINEER
+            PHOTOGRAPHER
+            VIDEOGRAPHER
+            PROMOTER
+            EVENT_ORGANIZER
+            BOOKING_AGENT
+            OTHER
+          }
+
+  migrations_needed: true
+  migration_notes: >
+    Single migration: add jobs HumanJob[] DEFAULT '{}', genreTags TEXT[] DEFAULT '{}',
+    otherJobDescription VARCHAR(200) to the Human table. No backfill — empty
+    arrays are the correct default for existing rows.
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Adding a new step 0 to the PlaceReview form increases drop-off before
+      reviewers reach the core questions.
+    severity: MEDIUM
+    mitigation: >
+      If Human.jobs is already populated (repeat reviewer), auto-skip step 0
+      and show it only as an editable summary banner. First-time reviewers
+      see the full step; returning reviewers skip it in one tap.
+
+  - risk: >
+      OTHER + otherJobDescription creates an unbounded text field that requires
+      manual curation to extract useful signal.
+    severity: LOW
+    mitigation: >
+      Store the field, but don't expose it in any UI beyond the user's own
+      settings. Periodically review distinct values to decide which warrant
+      promotion to the enum. No automated processing needed.
+
+  - risk: >
+      The HumansRepo update interface may not support partial array updates
+      today — could require repo interface changes that ripple to other callers.
+    severity: MEDIUM
+    mitigation: >
+      Audit HumansRepo.update() before writing the use case. If the interface
+      is too narrow, extend it with a dedicated updateIdentity() method rather
+      than overloading the general update.
+
+open_questions:
+  # All questions resolved:
+  # Q: Does HumansRepo expose a patch-style update?
+  # A: Support both — extend with updateIdentity() if needed.
+  #
+  # Q: Should Human.genreTags and PlaceReview.genreTags sync?
+  # A: They remain independent. PlaceReview.genreTags captures the genre
+  #    context at the time of that review (a snapshot). Human.genreTags is the
+  #    user's current declared genre. When the PlaceReview form step 0 mounts,
+  #    it pre-populates from Human.jobs + Human.genreTags if they exist — data
+  #    flows from profile INTO the form, never back out from the review.
+
+# ── Phasing ─────────────────────────────────────────────────────────────────
+
+phasing:
+  phase_1:
+    name: PlaceReview form integration
+    description: >
+      Build the data layer (schema + migration + use case + tRPC procedure)
+      and the <HumanJobsPicker> + <GenreTagPicker> components. Wire them into
+      the PlaceReview multi-step form as step 0 "About You". This is the
+      primary consumer and the reason we need the data model at all — review
+      prompt tailoring can begin as soon as jobs are captured here.
+    delivers:
+      - HumanJob enum in enums.prisma
+      - jobs, genreTags, otherJobDescription on Human
+      - migration
+      - update-human-jobs use case + tests
+      - human.updateJobs tRPC procedure
+      - HumanJobsPicker component
+      - GenreTagPicker component (extracted/generalized from PlaceReview genre input)
+      - PlaceReview form step 0 rendered before the existing step 1
+
+  phase_2:
+    name: Profile settings integration
+    description: >
+      Drop <HumanJobsPicker> into the profile/settings page. No new backend
+      work — phase 1 delivers everything needed. This is purely a UI placement
+      task and can be done in a single PR after phase 1 ships.
+    delivers:
+      - Profile settings "Your work" section rendering HumanJobsPicker
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - >
+    Changing BookingRequest.genre from String? to String[] — noted as a future
+    improvement but requires its own migration and form changes.
+  - >
+    Mobile profile settings — HumanJobsPicker is web-only in this spec; mobile
+    profile editing is a separate surface.
+  - >
+    Org-level job/type classification — bands, labels, promoter companies are
+    modeled at the Org level and are out of scope here.
+  - >
+    Public display of Human.jobs on EntityPage — storing the data is in scope;
+    surfacing it on public profile pages is a separate UI spec.
+  - >
+    Discovery / venue-matching features that consume Human.jobs — the data
+    model and picker are the foundation; the matching logic is a future spec.
+  - >
+    DJ genre tagging — DJs are excluded from GENRE_JOBS in this iteration.
+    Can be added to GENRE_JOBS with a one-line change if the decision reverses.
+  - >
+    BAND, INSTRUCTOR, SPEAKER enum values — deferred; can be added without a
+    breaking migration if needed later.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - >
+    A Human with jobs=[] sees no genre picker anywhere.
+  - >
+    A Human with jobs=['MUSICIAN'] sees the genre tag picker in both the
+    PlaceReview form step 0 and their profile settings.
+  - >
+    A Human with jobs=['COMEDIAN'] does not see a genre picker but can still
+    add genreTags via profile settings (under an "optional" label).
+  - >
+    A Human who selects OTHER sees a text input; submitting with OTHER but
+    no otherJobDescription is valid (the field is optional).
+  - >
+    Calling update-human-jobs twice with the same payload returns the same
+    result and does not create duplicate audit log entries.
+  - >
+    A repeat PlaceReview submitter with jobs already set sees a pre-populated
+    step 0 with a one-tap skip affordance.
+  - >
+    Existing Humans with no jobs set are unaffected — no null reference errors
+    anywhere jobs is accessed in core or UI.
+  - >
+    GENRE_JOBS is the single control point — removing MUSICIAN from it hides
+    the genre picker sitewide with no other code changes needed.

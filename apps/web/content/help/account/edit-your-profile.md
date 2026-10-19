@@ -11,7 +11,7 @@ related:
     "account/performer-mode-and-booking-requests",
     "organising-events/edit-and-preview-your-page",
   ]
-specs: ["2026-08-18/place-editor-and-entity-page-batch"]
+specs: ["2026-08-18/completed/place-editor-and-entity-page-batch"]
 ---
 
 Your account settings live at [/account/settings](/account/settings). Each area — Profile, Email, Security, Notifications, and so on — is its own page, listed in the settings navigation (a sidebar on a wide screen, a tappable list on a phone).
@@ -64,7 +64,7 @@ If you signed up with Google or Apple and never set a password, you normally can
 
 ## 03 — Notifications
 
-Per-category switches for each channel — in-app, email, push, and SMS. Order confirmations and receipts are always delivered in-app, and SMS unlocks once you verify a phone number. Full details in [notification settings](/help/account/notification-settings).
+Per-category switches for each channel — in-app, email, push, and SMS where texts are offered. Order confirmations and receipts are always delivered in-app. Full details in [notification settings](/help/account/notification-settings).
 
 :::tip
 If your email address hard-bounces or reports spam, Ithas Fire may pause email until you verify a reachable address — so keep [your email settings](/account/settings/email) up to date.

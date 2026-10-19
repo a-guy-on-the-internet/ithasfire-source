@@ -1,0 +1,248 @@
+# scanner-operator-rollout.spec.yaml
+#
+# Getting the dedicated scanner app into staff hands: distribution, onboarding,
+# operator access, and fallback policy.
+
+version: "0.1"
+status: draft
+updated: "2026-04-24"
+related:
+  - docs/specs/2026-04-24/scanner-foundation.spec.yaml
+  - docs/specs/2026-04-24/volunteer-scanner-check-in.spec.yaml
+  - docs/roles.md
+  - docs/engineering-standards.md
+
+scope_note: >
+  This spec covers the operational path from "staff member needs to scan" to
+  "staff member is authenticated in the dedicated scanner app and scanning a live
+  event." It defines install flows, distribution channels, onboarding, and role
+  assignment. It does not redefine scanner-shell UX or event-day scan business
+  rules.
+
+summary:
+  problem: >
+    A separate scanner app only helps if operators can actually install it,
+    authenticate, get pointed at the right event, and recover when something goes
+    wrong. Today there is no coherent staff delivery path; at best, people would
+    be told to find a build manually or fall back to the admin web page.
+  solution: >
+    Add an explicit operator rollout system: admin-issued scanner access,
+    install links/QRs, internal-distribution builds during pilot, streamlined
+    first-run auth, event handoff, and a documented fallback path. This turns the
+    scanner from a code artifact into an operational tool. v1 is BYOD-first,
+    uses Better Auth magic links for sign-in, and intentionally defers dedicated
+    shared-device work.
+  users:
+    - Org admins granting scanner access
+    - Event staffing leads handing scanners to volunteers/door staff
+    - Scanner operators installing and signing in on their own phones
+    - Support/admin users handling recovery and fallback
+  surfaces:
+    - web-admin
+    - scanner
+    - email
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Org admins must be able to grant `SCANNER` role access to a human using
+        the existing org-membership model, without needing to grant broader admin
+        privileges.
+    - id: FR-002
+      description: >
+        The admin web app must expose a "Get Scanner App" / "Scanner Setup" panel
+        that provides:
+          - iOS install path
+          - Android install path
+          - operator instructions
+          - fallback web scan link
+          - current rollout channel (`pilot`, `preview`, `production`)
+    - id: FR-003
+      description: >
+        During pilot, the scanner app must ship through internal distribution:
+          - iOS via TestFlight internal/external testing
+          - Android via EAS internal distribution or equivalent APK delivery
+        Production store rollout is a later phase, but build profiles/channels
+        must be designed for it from the start.
+    - id: FR-004
+      description: >
+        The first-run scanner auth flow must be optimized for field use. v1 uses
+        Better Auth magic-link sign-in only. One-time operator codes are out of
+        scope for this spec.
+        The operator should not need to discover the correct org/event manually if
+        launched from an admin-issued scanner install/onboarding link.
+    - id: FR-005
+      description: >
+        Admin-issued scanner install/onboarding links may deep-link the scanner
+        app to a preselected org or event, but server-side auth/RBAC remains the
+        source of truth. A deep link cannot expand access beyond the operator's
+        real permissions.
+    - id: FR-006
+      description: >
+        v1 rollout is BYOD only: the operator installs the scanner app on their
+        own phone and authenticates as themselves. Shared-device and dedicated
+        venue-owned scanner flows are explicitly deferred to a later follow-up
+        spec.
+    - id: FR-007
+      description: >
+        The scanner app must display a clear support/recovery path when install,
+        auth, or network fails:
+          - re-send magic link
+          - switch event
+          - open/copy fallback admin scan URL
+          - contact staffing lead instruction block
+    - id: FR-008
+      description: >
+        Build channels must separate preview/pilot from production so field staff
+        can receive safe incremental updates without shipping unfinished scanner
+        work to all operators.
+    - id: FR-009
+      description: >
+        The system must record operator rollout telemetry sufficient to answer:
+          - who installed the scanner app
+          - which version/channel they are on
+          - whether first-run auth succeeded
+          - which event they scanned for last
+        This may begin as lightweight application analytics; dedicated device
+        registry is out of scope for v1.
+    - id: FR-010
+      description: >
+        The admin scan page remains the day-zero fallback while the scanner app is
+        piloted. Staff instructions must explicitly say when to use fallback,
+        rather than leaving operators to improvise.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        A new operator starting from an admin-issued install/onboarding link should be able to
+        install/authenticate/reach the first scan screen within 2 minutes p90 on a
+        healthy network.
+    - id: NFR-002
+      description: >
+        Preview/pilot builds must be separately identifiable in-app to prevent
+        field confusion about whether a device is on a test or production build.
+    - id: NFR-003
+      description: >
+        Recovery documentation for common failures (camera denied, wrong Apple ID,
+        stale build, no network) must be concise enough for an event lead to use
+        mid-shift without engineering assistance.
+
+architecture:
+  core:
+    use_cases:
+      - name: createScannerSetupLink
+        description: >
+          Generate a short-lived scanner install/onboarding link that opens the
+          right install/auth entry point for an already-authorized operator.
+        input: { actorHumanId, targetHumanId, orgId, eventId? }
+        output: { setupUrl, expiresAt }
+        idempotent: false
+        money: false
+      - name: recordScannerOperatorBootstrap
+        description: >
+          Log first-run auth success/failure, selected event, app version, and
+          rollout channel for support visibility.
+        input: { actorHumanId, appVersion, channel, eventId?, outcome }
+        output: { ok }
+        idempotent: false
+        money: false
+  ports:
+    new:
+      - Optional short-link / deep-link generator port for install/onboarding links
+      - Optional analytics / telemetry port for rollout events
+    existing:
+      - Existing org membership + invite flows
+      - Existing Better Auth session stack used by mobile/web
+  adapters:
+    new:
+      - Scanner install/onboarding-link adapter (deep link + web fallback URL composition)
+    existing:
+      - Expo EAS build/update configuration in `apps/scanner`
+      - Better Auth magic-link plugin / email-delivery flow in `apps/api`
+      - Existing email / comms adapter if setup links are emailed
+  transport:
+    trpc_procedures:
+      - scanner.createSetupLink
+      - scanner.recordBootstrap
+    webhooks: []
+  ui:
+    pages:
+      - web-admin: Scanner Setup panel
+      - scanner: first-run auth bootstrap
+      - scanner: recovery/help sheet
+    components:
+      - web-admin: install QR / link card
+      - scanner: pilot-vs-production build badge
+      - scanner: fallback guidance card
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+
+risks:
+  - risk: >
+      Field adoption fails because install/auth takes too many steps and staff
+      fall back to whatever browser page happens to work.
+    severity: HIGH
+    mitigation: >
+      Treat NFR-001 as a hard product requirement; admin-issued setup links and a
+      Treat NFR-001 as a hard product requirement; admin-issued install/onboarding links and a
+      documented fallback are part of the feature, not afterthoughts.
+  - risk: >
+      Preview builds leak into production use and create inconsistent event-day
+      behavior.
+    severity: MEDIUM
+    mitigation: >
+      Separate build channels, explicit in-app channel badges, and admin-visible
+      rollout channel status in the setup panel.
+  - risk: >
+      The team burns time prematurely designing device provisioning, kiosk mode,
+      or fleet management before operators are even using the app on their own
+      phones.
+    severity: MEDIUM
+    mitigation: >
+      Keep v1 BYOD-only. Capture lightweight operator telemetry now and defer
+      dedicated-device workflows to a later, separate spec.
+
+resolved_questions:
+  - id: OQ-1
+    resolution: >
+      v1 uses magic links only. One-time operator codes are deferred. In this
+      spec, a "scanner install/onboarding link" means a link generated from admin
+      that takes the operator to the right install/auth entry point and may carry
+      an org/event hint. The actual sign-in is handled by Better Auth magic-link
+      email, not by a separate custom code system.
+  - id: OQ-2
+    resolution: >
+      Pilot distribution is direct/internal (TestFlight on iOS, internal Android
+      distribution). A generic public app-store listing is the preferred later
+      production end state, but is not required for v1 rollout.
+  - id: OQ-3
+    resolution: >
+      For v1, install/onboarding links may include an event hint when launched
+      from a known admin context, but the app should still support ordinary org-
+      scoped event selection after auth. Do not require every setup flow to be
+      event-specific.
+
+out_of_scope:
+  - Replacing the underlying auth provider
+  - Full MDM / kiosk-device management
+  - Dedicated venue-owned or shared-device scanner provisioning
+  - Offline write queueing
+  - Volunteer check-in UX details
+  - Ticket-admission UX details
+  - One-time code sign-in flows
+
+acceptance_criteria:
+  - >
+    An org admin can grant `SCANNER` access and produce a working install/onboarding
+    link for a staff member without involving engineering.
+  - >
+    A new operator can install the scanner app from the distributed build,
+    authenticate, land in the correct org/event context, and reach the first scan
+    screen within the target onboarding time.
+  - >
+    If install/auth fails, the operator and staffing lead have an explicit fallback
+    path to the admin web scanner.

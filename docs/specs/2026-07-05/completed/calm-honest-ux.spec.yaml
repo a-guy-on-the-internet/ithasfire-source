@@ -1,0 +1,389 @@
+# calm-honest-ux.spec.yaml
+#
+# Formalize a "calm, honest UX" principle as a checkable gate for future
+# features, retire stale docs/dead code describing manipulative patterns
+# that were already dropped from the live site, fully remove the
+# still-live-but-consumerless trending/hot-events pipeline, and revive the
+# two honest disclosures that got lost alongside the manipulative ones.
+
+version: "1.0"
+updated: "2026-07-05"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The March 2026 "Competitive UX Features" spec
+    (docs/specs/2026-03-06/competitive-ux-features.md) shipped low-availability
+    urgency badges ("Almost gone" / "Only N left"), a countdown timer
+    ("Starts in N hours"), and an attendee "N going" social-proof counter on
+    the event detail page, copied from Eventbrite/Dice/AXS. A later redesign
+    (the current numbered-section EventContent.tsx) silently dropped all
+    three along with two genuinely honest disclosures (organizer
+    "Presented by" badge, refund-policy disclosure). Nothing was updated to
+    reflect this: the March spec still says "SHIPPED", and
+    apps/web/src/components/events/__tests__/competitive-ux-features.test.ts
+    still unit-tests the urgency/countdown logic as if it were live.
+
+    A full pipeline audit (2026-07-05) also found the "trending events"
+    system is not simple dead code. The read side (search.trendingEvents
+    tRPC procedure, useTrendingEvents hook) has no UI consumer, but
+    apps/web/src/server/home-discovery.ts calls
+    client.search.trendingEvents.query({ limit: 8 }) server-side on every
+    homepage render (edge-cached 60s) to hydrate a cache key nothing ever
+    reads. Worse, the write side is fully live: every finalized order
+    (finalize-from-payment-intent.ts) and every waitlist join records a
+    scoring signal into Redis via HotEventsPort, and an hourly Cloud Run job
+    (hot-events.decay) prunes that data — all feeding a consumer (the
+    trending rail) that was removed from the UI in the same redesign and
+    never wired back. That's live write-amplification on the order
+    confirmation critical path for zero product value.
+
+    Org stance (verbatim): "We need more calm and honest UX. We're not
+    trying to dopamine mine shit... just get rid of the trending shit
+    because if we actually want that it'll come to us at some point." The
+    product competes on trust and grassroots relationships (see TuneHatch
+    competitive positioning), not funnel optimization, so engagement-bait
+    patterns and their supporting infrastructure should not linger by
+    accident.
+  solution: >
+    Write down the calm/honest principle in this spec so it's a reviewable
+    gate for future PRs. Correct the stale March spec to reflect what's
+    actually live. Delete the orphaned test file describing dead urgency/
+    countdown logic. Fully remove the trending/hot-events pipeline end to
+    end: core use cases, the HotEventsPort, the Redis adapter, the tRPC
+    procedure, the hourly decay job, the web hook, and the server-side
+    prefetch call in home-discovery.ts. Revive the two honest disclosures
+    that were accidental casualties of the redesign: the organizer
+    "Presented by" badge and the plain refund-policy line — both state true
+    facts with no manufactured urgency, so they pass the same calm/honest
+    bar this spec sets.
+  users:
+    - buyer (public event-detail page visitor)
+    - organizer (benefits from "Presented by" attribution)
+    - engineer (future reader checking a new feature against the principle)
+  surfaces:
+    - web
+    - api
+    - jobs
+
+# ── Principles (the actual gate) ─────────────────────────────────────────────
+# Every future UX decision on ithasfire.com should be checkable against these.
+
+principles:
+  - id: P1
+    name: Plain facts, no manufactured urgency
+    rule: >
+      Show real state (sold out, N remaining, event starts at <time>) without
+      threshold-triggered scarcity framing, countdown styling, or urgency
+      copy ("Almost gone!", "Hurry", red flame/timer icons). If a number is
+      true and useful, state it plainly; don't dress it up to create
+      pressure.
+  - id: P2
+    name: No engagement-optimized ranking on discovery surfaces
+    rule: >
+      Discovery surfaces (homepage, search) rank by relevance, recency, or
+      geographic proximity — not by real-time "hotness"/velocity scoring
+      designed to maximize return visits. A live-refreshing "trending now"
+      rail is out, full stop — including its supporting write-side
+      infrastructure. If real-time trending is wanted later, it gets
+      re-scoped and re-built deliberately, not left running unused.
+  - id: P3
+    name: No vanity social-proof mechanics
+    rule: >
+      Don't add counters designed to create FOMO (live "N people viewing
+      this event right now", streaks, badges for engagement). Real,
+      useful counts (e.g. an honest attendee total) are judged case-by-case
+      against P1 — the bar is "is this true and useful to a buyer deciding
+      whether to attend," not "does this drive urgency."
+  - id: P4
+    name: Notifications carry real information only
+    rule: >
+      Badges/counters (e.g. the navbar unread-notification count) must
+      reflect real, actionable state the user asked for (their own unread
+      inbox), polled at a reasonable interval — not manufactured to
+      maximize checking behavior. (Current 30s-poll unread-count badge in
+      AppNavbar.tsx already satisfies this — no change needed.)
+  - id: P5
+    name: No infinite, endless-feeling scroll on discovery
+    rule: >
+      Paginated/bounded lists over infinite auto-loading feeds on
+      browse/search surfaces. (Current /search implementation already has no
+      infinite-scroll wiring — no change needed.)
+  - id: P6
+    name: No orphaned infrastructure for retired UX patterns
+    rule: >
+      If a UX pattern is removed, its supporting backend (write-side signal
+      recording, scoring jobs, adapters) is removed in the same pass — not
+      left running silently. Dead reads are a docs problem; live writes to
+      nowhere are a cost and complexity problem.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Update docs/specs/2026-03-06/competitive-ux-features.md: mark items
+        2 (low-availability urgency), 4 (attendee count / social proof), and
+        9 (countdown timer) as SUPERSEDED, with a note pointing at this spec
+        and explaining they are intentionally not implemented — not an
+        unfinished backlog item.
+    - id: FR-002
+      description: >
+        Delete apps/web/src/components/events/__tests__/competitive-ux-features.test.ts.
+        It tests pure functions (isLowAvailability, lowAvailLabel,
+        computeCountdown) that are not called from any shipped component —
+        dead code describing a rejected pattern. The waitlist-CTA-state-machine
+        and refund-policy-display-logic describe blocks in the same file cover
+        logic worth keeping (see FR-004); port those specific `describe`
+        blocks into real tests colocated with the components they end up
+        describing (WaitlistJoinForm, the revived refund section) rather than
+        deleting them outright.
+    - id: FR-003
+      description: >
+        Add organizer attribution back to the event detail page: extend
+        `buildEventSeo` (packages/core/src/use-cases/events/_shared/build-event-seo.ts:172,
+        currently hardcodes `organizer: null`) to join the event's org name
+        and slug. Add `organizerName?: string | null` and
+        `organizerHref?: string | null` to EventContentProps; render a
+        "Presented by {name}" badge below the title row (linking to
+        `/orgs/{slug}`, the site's own org page — not an external URL,
+        avoiding an off-site link dependency). Hidden when organizer data is
+        absent. Mirrors the original March spec item 1, adjusted to link
+        internally instead of to `organizer.url` (no such field exists on
+        `Organization` — see architecture.data below).
+    - id: FR-004
+      description: >
+        Add a plain refund-policy line back to the event detail page, reusing
+        the existing constant in
+        packages/core/src/lib/payout-scheduling/refund-eligibility.ts
+        (INSTANT_REFUND_CUTOFF_HOURS = 4). Add `refundCutoffHours?: number | null`
+        to EventContentProps; render "Full refund available until {hours}
+        hours before event." when > 0, "No refunds available for this event."
+        when 0, hidden when null (e.g. RSVP/community listings with no
+        ticketing). Plain, factual, no urgency framing — passes P1.
+    - id: FR-005
+      description: >
+        Fully remove the trending/hot-events pipeline. Delete entirely:
+        packages/ports/src/hot-events.ts; packages/adapters/src/hot-events/
+        (adapter + test); packages/core/src/use-cases/events/record-event-traffic-ping.ts
+        and record-waitlist-join-signal.ts (+ their tests); packages/core/src/use-cases/events/hot-event-signal-helpers.ts;
+        apps/jobs/src/jobs/hot-events.ts. Edit to remove all references:
+        packages/ports/src/index.ts; packages/adapters/src/index.ts;
+        packages/core/src/use-cases/orders/finalize-from-payment-intent.ts
+        (the emitTicketSaleSignal call + helper + HotEventsPort dep) and its
+        test; packages/core/src/use-cases/orders/confirm-payment.ts
+        (pass-through dep only); packages/transport/trpc/src/routers/orders.ts;
+        packages/transport/trpc/src/context.ts;
+        packages/transport/trpc/src/routers/unified-search.ts (the
+        trendingEvents procedure + its schema + its imports — keep
+        tieredPopularEvents/discoverEventsByCategory untouched);
+        packages/transport/trpc/src/event-summary-mapper.ts (the
+        TrendingEventShape block); apps/api/src/lib/dep.ts + env.ts (adapter
+        instantiation + HOT_EVENTS_* env vars); apps/jobs/src/jobs/index.ts,
+        lib/container.ts, lib/define-job.ts, lib/env.ts, jobs.manifest.json
+        (job registration — manifest change cascades to Terraform
+        automatically on next apply, removing the Cloud Scheduler entry);
+        apps/jobs test fixtures that stub hotEvents: null;
+        apps/web/src/app/_components/home/useHomeEventSections.ts (the
+        useTrendingEvents hook) and home/index.ts (its export);
+        apps/web/src/server/home-discovery.ts (the server-side
+        trendingEvents prefetch/hydrate call — this one is not optional,
+        page.tsx depends on this file compiling); apps/web/src/i18n/messages/en.ts
+        and es.ts (trendingNow/trendingSubtitle keys). Also trim
+        apps/web/src/app/_components/__tests__/HomeLayout.test.tsx down to
+        remove the trending-specific mock and two `it()` blocks — note for
+        whoever picks this up that this test file is already failing on 11/12
+        tests for unrelated reasons (written against a pre-redesign
+        HomeLayout); that pre-existing breakage is out of scope here, flag
+        it but do not attempt to fix the rest of the file.
+    - id: FR-006
+      description: >
+        Update docs to match: mark docs/specs/2026-04-27/home-discovery-consolidation.spec.md
+        (status draft, proposes consolidating around trendingEvents) as
+        superseded/abandoned. Remove or archive docs/jobs/hot-events-decay.md
+        and its docs/jobs/README.md row. Update docs/records/2026-04-07-infra-cost-analysis.md's
+        hot-events.decay line item.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        No behavior change to any currently-shipped surface other than the
+        two additive, factual sections in FR-003/FR-004, and the removal in
+        FR-005 (which must not change order-confirmation success/failure
+        behavior — only remove the fire-and-forget signal-recording side
+        effect, which already catches its own errors and returns void).
+    - id: NFR-002
+      description: >
+        i18n: new copy needs `en`/`es` keys following existing
+        `eventDetail.*` naming (`eventDetail.presentedBy`,
+        `eventDetail.refundPolicySection`, `eventDetail.refundPolicyInstant`,
+        `eventDetail.refundPolicyNone`) — these keys were already reserved by
+        the March spec; confirm they don't already exist stale in the
+        messages files before adding.
+    - id: NFR-003
+      description: >
+        The shared Redis client (also used by idempotency, DLQ, and
+        rate-limit adapters) must not be touched — only the
+        RedisHotEventsAdapter instantiation that consumes it is removed.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: get-event-seo (modify existing)
+        description: >
+          buildEventSeo currently hardcodes `organizer: null`. Change to join
+          through the event's `orgId` → `Organization.name` / `Organization.slug`
+          and populate `organizer: { name, slug }`.
+        input: existing event/org join already available via orgId FK
+        output: "organizer: { name: string; slug: string } | null"
+        idempotent: true
+        money: false
+      - name: trending-events (delete)
+        description: Remove entirely — see FR-005.
+        input: n/a
+        output: n/a
+        idempotent: true
+        money: false
+      - name: record-event-traffic-ping (delete)
+        description: Remove entirely — unused, zero call sites. See FR-005.
+        input: n/a
+        output: n/a
+        idempotent: true
+        money: false
+      - name: record-waitlist-join-signal (delete)
+        description: Remove entirely — unused, zero call sites. See FR-005.
+        input: n/a
+        output: n/a
+        idempotent: true
+        money: false
+      - name: finalize-from-payment-intent (modify existing)
+        description: >
+          Remove the emitTicketSaleSignal fire-and-forget call and its
+          HotEventsPort dependency. Isolated deletion — the function catches
+          its own errors internally and nothing downstream depends on its
+          return value. Order finalization logic itself is untouched.
+        input: unchanged
+        output: unchanged
+        idempotent: true
+        money: true
+
+  ports:
+    new: []
+    existing:
+      - refund-eligibility (packages/core/src/lib/payout-scheduling/refund-eligibility.ts) — read-only constant reuse, no port change
+    removed:
+      - HotEventsPort (packages/ports/src/hot-events.ts) — deleted, see FR-005
+
+  adapters:
+    new: []
+    existing: []
+    removed:
+      - RedisHotEventsAdapter (packages/adapters/src/hot-events/) — deleted, see FR-005
+
+  transport:
+    trpc_procedures: []   # getEventSeo output shape grows (organizer.slug); search.trendingEvents removed
+    webhooks: []
+
+  ui:
+    pages:
+      - apps/web/src/app/events/[...slug]/page.tsx (pass organizerName/organizerHref/refundCutoffHours through to EventContent)
+    components:
+      - apps/web/src/components/events/EventContent.tsx (render organizer badge + refund line)
+      - apps/web/src/components/events/event-content-types.ts (new optional props)
+      - apps/web/src/components/events/event-content-styled.ts (organizer badge styling, reuse existing pill/badge patterns if present)
+
+  jobs:
+    removed:
+      - hot-events.decay (apps/jobs/src/jobs/hot-events.ts, jobs.manifest.json entry) — see FR-005
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false   # Organization.name/slug already exist; hot-events data lived only in Redis, no Postgres schema involved
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Reviving the organizer badge could visually crowd the already-dense
+      meta row (date/location/price) on mobile.
+    severity: LOW
+    mitigation: >
+      Render as its own row below the title, per the original March spec's
+      placement — not inline in the meta row.
+  - risk: >
+      The hot-events removal touches a money-path file
+      (finalize-from-payment-intent.ts) and its test, plus DI wiring across
+      api/jobs/transport layers — wide blast radius for what is
+      conceptually a simple deletion.
+    severity: MEDIUM
+    mitigation: >
+      The signal-recording call is a self-contained, error-swallowing,
+      fire-and-forget side effect with no control-flow dependents (confirmed
+      by audit). Remove it plus its test assertions in the same change;
+      run full core/transport/api/jobs typecheck and test suites before
+      calling it done, since a missed reference (e.g. an excess-property
+      type error in a deps object) will fail the build rather than fail
+      silently.
+  - risk: >
+      Deleting competitive-ux-features.test.ts loses test coverage for
+      countdown/low-availability math if someone tries to revive those
+      patterns later without reading this spec.
+    severity: LOW
+    mitigation: >
+      This spec (principles P1-P3) is the durable record of the decision;
+      the math being untested is fine since the code implementing it no
+      longer exists.
+
+open_questions:
+  - Does "Presented by {org}" need an opt-out for orgs that prefer not to be
+    named (e.g. a personal host running under a generic org)? Not currently
+    supported by the data model — assumed out of scope unless raised.
+  - apps/web/src/app/_components/__tests__/HomeLayout.test.tsx is already
+    failing 11/12 tests for reasons unrelated to this spec (written against
+    a pre-redesign HomeLayout). Flagged, not fixed, here — separate cleanup
+    task.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - "Related events" / "About the organizer" mini-card (March spec items 3
+    and 10, both marked [FUTURE] originally and unrelated to the
+    calm/honest concern — no dopamine-pattern risk either way).
+  - Apple/Google Wallet passes (March spec item 7, blocked on external
+    credentials, unrelated to this spec).
+  - Any change to the navbar unread-notification badge (already compliant
+    with P4, see principles).
+  - Any change to /search pagination (already compliant with P5).
+  - Fixing the pre-existing, unrelated breakage in HomeLayout.test.tsx
+    beyond removing the trending-specific mock/tests (see open_questions).
+  - Renaming the HOT_EVENTS_REDIS_PORT docker-compose env var (cosmetic,
+    harmless to leave).
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - docs/specs/2026-03-06/competitive-ux-features.md items 2, 4, 9 are
+    marked SUPERSEDED with a pointer to this spec.
+  - apps/web/src/components/events/__tests__/competitive-ux-features.test.ts
+    is deleted; its waitlist-CTA and refund-policy `describe` blocks are
+    ported into real, colocated tests for the components they now describe.
+  - EventContent renders a "Presented by {org}" badge when organizer data is
+    present, linking to /orgs/{slug}, hidden when absent.
+  - EventContent renders a plain refund-policy line using the existing
+    4-hour cutoff constant, hidden when refundCutoffHours is null.
+  - No urgency badge, countdown timer, live-refreshing trending rail, or
+    social-proof counter exists anywhere in the shipped web app.
+  - HotEventsPort, RedisHotEventsAdapter, the trendingEvents tRPC procedure,
+    the hot-events.decay job, and all their call sites (including the
+    order-finalization signal emission and the home-discovery server
+    prefetch) are removed from the codebase.
+  - Full typecheck and test suites pass across core, transport, api, jobs,
+    and web after the removal.
+  - This spec is linked from docs/README.md under Product & domain.

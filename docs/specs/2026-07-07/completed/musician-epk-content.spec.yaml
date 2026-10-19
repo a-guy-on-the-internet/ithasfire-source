@@ -1,0 +1,381 @@
+# musician-epk-content.spec.yaml
+#
+# Turns the "musician" EntityPage template (entity-page-templates.spec.yaml)
+# into an actual Electronic Press Kit: real renderers for the five stub
+# HUMAN block kinds, a verified-not-self-reported stats section sourced from
+# our own ticketing data, curated discography, downloadable press assets,
+# and a booking-info block for Humans. Supersedes docs/specs/2026-03-18/artist-epk-book-me.spec.yaml.
+
+version: "1.0"
+updated: "2026-07-07"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Five HUMAN block kinds already exist in block-config.ts (`shows`,
+    `music`, `tracks`, `stats`, `past_shows`) but every one renders
+    "Content coming soon." — there is no working musician EPK today, only
+    scaffolding. Separately, HUMAN has no booking-contact block at all
+    (booking_info is PLACE-only), and every EPK tool on the market
+    (ReverbNation, Sonicbids, Bandzoogle) can only show SELF-REPORTED draw
+    numbers, which talent buyers have learned to discount. Our own
+    ticketing data gives us something no competitor can fake.
+  solution: >
+    Build real renderers for the five stub blocks, backed by two kinds of
+    data source: (a) auto-computed, read-only blocks (`shows`, `past_shows`,
+    `stats`) sourced from EventHuman lineup attachments + order/settlement
+    data — nothing to type in, nothing to fake; (b) owner-curated blocks
+    (`music`, `tracks`) where the artist picks specific platform embeds and
+    labels them, per the "link the track that does the work, not a bare
+    profile link" principle. Extend `booking_info` to HUMAN so artists have
+    a dedicated contact block. Add a verified-stats snapshot option to the
+    existing booking-request flow, independent of the public page's stats
+    visibility.
+  users:
+    - Performer-mode Humans (musicians) building/maintaining their EPK
+    - Venue owners reviewing a Request to Play / evaluating an artist's page
+    - Festival/booking contacts viewing a public artist page
+  surfaces:
+    - web
+
+# ── Dependencies ─────────────────────────────────────────────────────────────
+# (informal — not part of the standard template, called out because this
+# spec is inert without it)
+
+depends_on:
+  - docs/specs/2026-07-07/completed/entity-page-templates.spec.yaml (musician category
+    + template registry; this spec assumes it ships first or alongside)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        `shows` block: real renderer listing the Human's upcoming
+        PUBLISHED, publicly-visible performances — sourced from `EventHuman`
+        rows attached to this Human (roles filtered to `PERFORMER_ROLES`
+        from packages/core/src/lib/event-human-roles.ts — a VOLUNTEER or
+        VENDOR attachment is not a performance credit; any organizer, not
+        just self-organized events), joined to `Event` filtered to
+        `startsAt > now`, ordered by date ascending. Read-only — no
+        owner-editable fields beyond `heading` (already in block-config).
+        Reuses the data path in `list-public-event-humans.ts`.
+    - id: FR-002
+      description: >
+        `past_shows` block: same data path as FR-001, filtered to
+        `startsAt <= now`, ordered by date descending, capped at a
+        reasonable page size (e.g. 20, "view all" out of scope for v1).
+    - id: FR-003
+      description: >
+        `stats` block: real renderer backed by the EXISTING `HumanStats`
+        aggregate (`compute-human-stats.ts`, already scheduled as the
+        `humans.compute-human-stats` job; read via `get-human-stats.ts` /
+        `repos.humanStats`) — do NOT build a parallel stats computation.
+        Display in v1: shows performed (`totalEventsPerformed`), average
+        verified draw (`avgDrawPerEvent` — built on ticket ATTRIBUTIONS,
+        i.e. buyers who explicitly picked this artist at checkout, which
+        is the honest artist-level metric on multi-act bills), repeat-fan
+        count (`repeatFanCount`, already consent-gated), tickets moved
+        via the artist's own share links (the `ref_link` entry already in
+        `channelBreakdown` — the strongest honest metric for support
+        acts, since it proves draw independent of billing position), and
+        last-90-day activity. Label draw as attribution-based ("fans who bought for
+        this artist"), since it undercounts vs. gross event attendance —
+        undercounting is acceptable; overclaiming is not. Eligibility
+        threshold: `totalEventsPerformed >= MIN_SHOWS_FOR_STATS`
+        (recommend 3) — below it the block renders an owner-only "not yet
+        eligible" state and nothing publicly.
+    - id: FR-004
+      description: >
+        Stats visibility is OPT-IN, OFF BY DEFAULT on the public page —
+        implemented via the template seeding the `stats` PageBlock with
+        `visible: false` (the existing per-block visibility toggle already
+        built in `PageBlocksEditor.tsx` — no new visibility mechanism
+        needed). The owner must explicitly toggle it on once eligible
+        (FR-003 threshold met).
+    - id: FR-005
+      description: >
+        `music` block: owner-curated "listen" widget — a short list
+        (max 3) of platform-embed links (Spotify/Apple Music/
+        Bandcamp/SoundCloud, reusing the existing
+        `MEDIA_EMBED_PROVIDER_IDS` allowlist from
+        `packages/core/src/lib/embeds/providers.ts`) intended for a
+        primary artist-profile embed, not individual tracks. Replaces the
+        current placeholder `source: readonly` field with a real
+        `embeds: {provider, url}[]` field.
+    - id: FR-006
+      description: >
+        `tracks` block: owner-curated list of SPECIFIC track embeds (not a
+        bare profile link), each with a required `url` (same provider
+        allowlist as FR-005) and an optional short `label` (e.g. "festival
+        closer", "sync-friendly", freeform, max 60 chars) so an artist can
+        flag which track does which job, per the "link the track that
+        sells exactly what you're pitching for" principle. Max 10 tracks.
+    - id: FR-007
+      description: >
+        Add `"HUMAN"` to `booking_info`'s `ownerTypes` in block-config.ts —
+        the existing schema (`contactEmail`, `contactPhone`, `bookingUrl`,
+        `notes`) already fits an artist's booking contact with no changes.
+        Add `booking_info` to the HUMAN/"musician" template's default
+        block list (entity-page-templates.spec.yaml FR-002) as a follow-on
+        addition — musicians get a dedicated contact block, the #1 most
+        commonly forgotten EPK section per industry practice.
+    - id: FR-008
+      description: >
+        Downloadable press assets: extend the existing universal `photos`
+        block's per-item schema with an optional `downloadable: boolean`
+        flag. When true, the public renderer shows a direct download link/
+        button for that image (in addition to normal display), covering
+        the "print-quality photo + logo file for someone else's press use"
+        need without a new block kind. No changes to the `photos` block's
+        ownerTypes (already universal).
+    - id: FR-009
+      description: >
+        Booking-request verified-stats sharing: extend
+        `createBookingRequestInputSchema` with an optional
+        `includeVerifiedStats: z.boolean().optional()`. When true AND the
+        sender meets the FR-003 threshold, `createBookingRequest` copies
+        a server-side snapshot from the sender's current `HumanStats` row
+        (including its `computedAt` timestamp; never trusts a
+        client-supplied number) onto the created `BookingRequest` row,
+        independent of whether the public `stats` block is visible
+        (FR-004). This is the mechanism behind the product decision:
+        stats stay private on the public page by default, but an artist
+        can choose to include them in a specific pitch. HUMAN senders
+        only in v1 (org performers have no OrgStats-equivalent aggregate;
+        the checkbox simply doesn't render for org senders).
+    - id: FR-010
+      description: >
+        `BookingInbox.tsx` (venue-side booking request review) renders the
+        verified-stats snapshot when present, displayed alongside (not
+        replacing) the existing self-reported `expectedDraw` field —
+        labeled distinctly (e.g. "Artist's estimate" vs. "Verified
+        platform stats") so a venue can see both the artist's pitch and
+        the platform-checked reality.
+    - id: FR-011
+      description: >
+        Randomize the option order in `ArtistAttributionPicker` (checkout
+        "who are you here to see") per buyer instead of the current
+        `sortOrder: "asc"` lineup order, which always lists the headliner
+        first and systematically deflates opener attributions (position
+        bias). Must be hydration-safe: shuffle once client-side on mount
+        (or seed from the checkout/session id), never differently between
+        server and client render. Display-order randomization only — the stored lineup
+        `sortOrder` and every other lineup surface are unchanged. This is
+        a data-quality fix at the source for every attribution-derived
+        stat, not just the EPK block.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Stats must never accept client-supplied numbers as truth — the
+        `HumanStats` aggregate (server-computed by the scheduled job) is
+        the single source for both the public `stats` block and the
+        booking-request snapshot. `HumanStats.computedAt` may lag by up
+        to one job interval; both surfaces display/persist that timestamp
+        rather than pretending the numbers are live.
+    - id: NFR-002
+      description: >
+        `shows`/`past_shows`/`stats` queries must respect event visibility
+        rules already enforced elsewhere (no drafts, no unpublished, no
+        events the Human was removed from post-hoc) — reuse existing
+        public-event visibility filters rather than re-deriving them.
+    - id: NFR-003
+      description: >
+        Embed URLs in `music`/`tracks` validate against the same
+        provider-domain allowlist used elsewhere for embeds (no arbitrary
+        iframe src injection).
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: reuse:get-human-stats / compute-human-stats (existing)
+        description: >
+          NO new stats computation. `compute-human-stats.ts` already
+          aggregates totalEventsPerformed, avgDrawPerEvent (attribution-
+          based), repeatFanCount, topCities/topGenres, last-90-day
+          activity into `HumanStats` on a schedule
+          (`humans.compute-human-stats` job). The stats block and the
+          booking-request snapshot both read from it. Only addition: a
+          small eligibility helper (`totalEventsPerformed >=
+          MIN_SHOWS_FOR_STATS`) shared by both call sites.
+        input: humanId
+        output: "existing HumanStats record + eligible: boolean"
+        idempotent: true
+        money: false
+      - name: list-human-shows (upcoming + past)
+        description: >
+          Reuses/extends `list-public-event-humans.ts`'s data path, split
+          by date into upcoming (FR-001) and past (FR-002) views.
+        input: "humanId, when: 'upcoming' | 'past'"
+        output: "ordered list of event summaries"
+        idempotent: true
+        money: false
+      - name: modify:create-booking-request
+        description: >
+          Adds the `includeVerifiedStats` branch (FR-009) — reads the
+          sender's HumanStats row and snapshots the relevant fields (+
+          computedAt) onto the created BookingRequest row when eligible
+          and requested. HUMAN senders only.
+        input: "existing input + includeVerifiedStats?: boolean"
+        output: "existing output (bookingRequestId), unchanged shape"
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - bookingRequests (repo) — extend create() to persist the snapshot
+      - humanStats (repo) — read-only; the aggregate is already computed
+        and persisted by the humans.compute-human-stats scheduled job
+      - eventHumans / events (repos) — back the shows/past_shows listings
+        via the list-public-event-humans data path
+
+  adapters:
+    new: []
+    existing:
+      - packages/adapters/src/db/prisma/booking-requests.ts — persist
+        verifiedStatsSnapshot
+      - packages/adapters/src/db/prisma/entity-pages.ts — persist new
+        photos/music/tracks block data shapes (no schema change needed,
+        JSON `data` column already flexible)
+
+  transport:
+    trpc_procedures:
+      - "bookingRequests.create — extend input with includeVerifiedStats"
+    webhooks: []
+
+  ui:
+    pages: []
+    components:
+      - "apps/web/src/app/p/[slug]/_components/blocks/ShowsBlock.tsx (new, replaces stub)"
+      - "apps/web/src/app/p/[slug]/_components/blocks/PastShowsBlock.tsx (new, replaces stub)"
+      - "apps/web/src/app/p/[slug]/_components/blocks/StatsBlock.tsx (new, replaces stub)"
+      - "apps/web/src/app/p/[slug]/_components/blocks/MusicBlock.tsx (new, replaces stub)"
+      - "apps/web/src/app/p/[slug]/_components/blocks/TracksBlock.tsx (new, replaces stub)"
+      - "apps/web/src/app/admin/[slug]/places/[placeId]/bookings/_components/BookingInbox.tsx (modify — render stats snapshot)"
+      - "apps/web/src/app/p/[slug]/_components/blocks/PhotosBlock.tsx (modify — downloadable flag)"
+      - "apps/web/src/app/events/checkout/[...slug]/_components/ArtistAttributionPicker.tsx (modify — randomize display order, FR-011)"
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models:
+    - BookingRequest: "+ verifiedStatsSnapshot Json?"
+    - "block-config.ts (code, not DB): booking_info ownerTypes gains HUMAN; music/tracks/photos data schemas gain new fields (JSON column, no migration)"
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      A brand-new artist with 0-2 shows sees an empty/embarrassing stats
+      block if the threshold gate isn't enforced consistently between the
+      public block and the booking-request snapshot option.
+    severity: MEDIUM
+    mitigation: >
+      Single `get-human-performer-stats` use case is the only place
+      eligibility is computed (FR-003/NFR-001); both call sites check
+      `eligible` before rendering/offering the checkbox.
+  - risk: >
+      Publicly surfacing HumanStats numbers that were designed for the
+      owner-facing analytics dashboard exposes something privacy- or
+      accuracy-sensitive (e.g. topCities is consent-gated fan location
+      data; avgDrawPerEvent undercounts because attribution is buyer
+      opt-in at checkout).
+    severity: MEDIUM
+    mitigation: >
+      The public stats block renders ONLY the five whitelisted aggregate
+      metrics in FR-003 (never topCities/topPlaceIds, and from
+      channelBreakdown only the ref_link ticket total — never the full
+      source breakdown), and labels draw as attribution-based. compute-human-stats already
+      dedupes by event, restricts to PERFORMER role, and excludes
+      CANCELLED/ARCHIVED and future events (isEligibleDrawEvent) — no new
+      counting logic to get wrong.
+  - risk: >
+      `includeVerifiedStats` on a booking request becomes stale if a
+      venue reviews the request weeks after submission and the artist's
+      real numbers have since changed.
+    severity: LOW
+    mitigation: >
+      Snapshot is explicitly a point-in-time artifact (labeled with the
+      snapshotted `HumanStats.computedAt`), not a live number —
+      acceptable per the product framing ("verified data, not live
+      dashboard access").
+
+open_questions:
+  - Is MIN_SHOWS_FOR_STATS = 3 the right threshold? Recommend starting
+    at 3 for all metrics and revisiting with real usage data.
+  - >
+    Billing-position draw split — segmenting avgDraw into "as headliner
+    (sortOrder 0)" vs. "as support" using EventHuman.sortOrder, so an
+    artist taking many opener slots doesn't drag down the number a venue
+    reads as their headline draw. Deliberately DEFERRED from v1 (requires
+    a compute-human-stats change + two HumanStats fields); the ref_link
+    metric (FR-003) covers the support-act case in the meantime. Revisit
+    once real stats blocks are live.
+  - >
+    HumanStats.totalEventsPerformed may count ownerless COMMUNITY/RSVP
+    listings a performer was attached to — those contribute 0 attributed
+    tickets while incrementing the event count, diluting avgDrawPerEvent.
+    Decide at build time whether to exclude non-ticketed events from the
+    aggregate (a compute-human-stats change) or accept the dilution and
+    footnote it.
+  - Should Organization-owner (band/collective) performer profiles get
+    the same stats treatment, or is this Human-only for v1? Recommend
+    Human-only for v1 — ORG_BLOCK_KINDS has no stats-equivalent today and
+    adding one is a bigger modeling question (whose draw — the org's or
+    its members'?).
+  - >
+    `music` vs `tracks` naming is a little ambiguous to a future
+    implementer (both are HUMAN/"music" category). Recommend renaming
+    `music` to `music_embed` (singular profile widget) in the same PR
+    that builds the renderer, to avoid confusion with the curated
+    `tracks` list — flagging here rather than silently renaming in a spec
+    doc.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Sell-through rate (tickets ÷ capacity) as an artist metric. It is an
+    EVENT-level metric (already computed in compute-event-daily-stats.ts)
+    and attributing a whole event's sell-through to one member of a
+    multi-act bill overclaims; attribution-based avgDrawPerEvent is the
+    honest artist-level equivalent and is what ships (FR-003).
+  - PDF/one-sheet export of the EPK.
+  - Audience-weighted "multiple pitch view" pages (festival vs. sync vs.
+    label vs. playlist-curator framing).
+  - Mailing-list / SMS-list size as a displayed metric (no real list
+    infrastructure exists; adding a self-reported number would repeat the
+    exact trust problem this spec is solving for draw stats).
+  - Video quality gating/warnings (the article's "no video is better than
+    a bad video" advice) — editorial guidance for help-center content, not
+    a product feature.
+  - Any change to Organization or Place block content/rendering.
+  - >
+    "View all past shows" pagination beyond the FR-002 cap.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A performer-mode Human's public page shows real upcoming/past shows
+    (not stub copy) sourced from their EventHuman lineup attachments,
+    regardless of who organized those events.
+  - A Human with 3+ completed ticketed shows as a performer sees a real
+    stats block available to toggle on; a Human with fewer sees no stats
+    block (or a clearly-labeled "not yet eligible" state, not a
+    zero/blank one).
+  - The public stats block is OFF by default for every Human and requires
+    an explicit owner action to show.
+  - An artist can attach a verified-stats snapshot to a specific booking
+    request without ever making their public page's stats visible.
+  - A venue reviewing a booking request with an attached snapshot sees it
+    clearly distinguished from the artist's self-reported expected draw.
+  - Artists have a booking_info (contact) block available on their page.
+  - An artist can curate a specific labeled track list distinct from a
+    generic profile embed.

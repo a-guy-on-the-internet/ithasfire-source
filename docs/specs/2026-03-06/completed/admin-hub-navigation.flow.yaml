@@ -1,0 +1,149 @@
+# Spec: Admin Hub Navigation Flow
+meta:
+  owner: apps-web
+  status: draft
+  reviewers:
+    - product
+    - design
+    - platform
+    - ops
+  last_updated: 2025-11-26
+summary: |
+  Define the organizer-facing Admin Hub landing experience that unifies creation, monitoring,
+  and follow-up tasks for both individual creators and organization teams. Covers desktop and
+  tablet breakpoints (web), highlights how the hub handoffs into sub-navigation, and specifies
+  data dependencies, alerts, and history behavior. The consumer discovery flow lives in a
+  separate spec.
+scope:
+  in_scope:
+    - `/admin` landing experience for individuals and org members.
+    - Left rail + top bar navigation states for organizers (excluding consumer surfaces).
+    - Hub tiles (Today, Needs Attention, Experiments, Org Insights) and alert trays.
+    - Context switching between personal and org accounts (UI behaviors only).
+    - Entry shortcuts into Events, Orders, Audience, Messaging, Payouts, Settings.
+  out_of_scope:
+    - Super-admin tooling (own spec).
+    - Consumer discovery site.
+    - Deep feature content (handled in respective specs/components).
+personas:
+  - solo_creator: needs lightweight overview of their upcoming events and urgent tasks.
+  - org_operator (OrgRole.OWNER or OrgRole.ADMIN): oversees multiple venues/orgs, requires RBAC-aware alerts and team metrics.
+  - ops_specialist (OrgRole.FINANCE): focuses on payouts/issues, consumes "Needs Attention" list daily.
+entry_points:
+  - /admin → default hub view after authentication for organizer context.
+  - /admin?context=<orgId> → pre-selects an org; fall back to last-used context.
+  - Deep links from email/slack alerts should preserve query params to scrolled sections.
+layout:
+  shell:
+    top_bar:
+      - brandMark + environment indicator (staging).
+      - global search / command palette launcher (`cmd+k`).
+      - quick actions: Create Event, Invite teammate (org only), Notification bell.
+      - account switcher pill with avatar + dropdown for personal/org contexts + settings/logout.
+    left_rail:
+      sections:
+        - Hub (pinned at top, highlight when active).
+        - Events
+        - Orders
+        - Audience
+        - Messaging
+        - Payouts
+        - Insights (org-only)
+        - Settings
+        - Team & Roles (org-only)
+      behavior:
+        - Collapse to icons at ≤1200px; shift to hamburger/overlay below 960px.
+        - Badge counts for Alerts + Pending approvals.
+    content:
+      - 2-column responsive grid (desktop) collapsing to stacked cards (≤1024px).
+      - Tiles support skeleton/loading states and per-card actions.
+hub_tiles:
+  today:
+    - Shows current date, upcoming events (next 7 days) with CTA to view run sheet.
+    - KPI chips: tickets sold today, gross revenue, check-ins.
+  needs_attention:
+    - prioritized list combining failed payouts, disputes, expiring inventory, unresolved support tickets.
+    - Each row: icon, summary, linked destination, severity color.
+    - Supports dismiss (local) and "Assign to" for org roles.
+  experiments:
+    - Highlights active experiments or growth tasks (e.g., try waitlist, enable upsells).
+    - Pulls from Feature Flag/Experiments API w/ start/end dates.
+  insights:
+    - Placeholder for future metrics spec; hidden until dedicated insights/data contracts exist.
+    - Solo creator "Audience Snapshot" returns once data spec is defined.
+  ordering:
+    - Tile order fixed (Today → Needs Attention → Experiments → Insights placeholder) in v1.
+    - Reordering awaits a dedicated tile layout component + Storybook coverage before re-introducing as a feature.
+alert_tray:
+  - Slide-over tray triggered from notification bell or persistent banner.
+  - Sections: System Alerts, Financial Alerts, Collaborator Activity sourced from the notifications platform (NotificationDigest + push specs) rather than bespoke hub storage.
+  - Supports ack + deep link; ack writes through the notification system so persistence/offline behavior remains centralized.
+context_switching:
+  - Account pill dropdown lists personal context + orgs (searchable when >8 entries).
+  - Switch remembers last hub filters per context.
+  - RBAC gating: hide Team & Roles unless context role is `OrgRole.OWNER` or `OrgRole.ADMIN`; hide Payouts unless role is `OrgRole.OWNER`, `OrgRole.ADMIN`, or `OrgRole.FINANCE`.
+  - Loading indicator overlays hub when switching contexts (>500ms): dim content + show spinner.
+route_map:
+  - /admin → aggregated personal context view.
+  - /admin/orgs/[orgId] → org-specific hub view; Needs Attention deep links always direct into this namespace so issues stay scoped per organization even if notifications fire globally.
+flows:
+  - Hero CTA flow: Create Event opens modal/drawer with quick templates.
+  - Alert CTA flow: clicking item navigates to target route with `?alertId` for toast linking back.
+  - Needs Attention bulk actions: select multiple issues → mark resolved / assign.
+  - Experiments acceptance: enable/disable toggles inline (feature flag mutations).
+states_and_edge_cases:
+  empty_state:
+    - No events yet → show "Launch your first event" checklist, hide Insights tile.
+    - Org with no alerts → show "All clear" illustration.
+  degraded_state:
+    - If alerts API fails, show inline error + retry; keep other tiles functional.
+    - Missing payouts permission hides Payouts nav item and removes related alerts.
+  loading_state:
+    - Shell skeleton for nav + hero; tiles show shimmer skeletons with descriptive labels.
+    - For context switches, preserve previous data until new payload arrives; highlight with subtle transition.
+  offline_state:
+    - Banner "You're offline"; disable action buttons except cached navigation.
+  feature_flags:
+    - `feature.adminHub` gates entire hub; fallback to legacy dashboard route.
+    - `feature.adminHub.experimentsTile` toggles experiments tile without removing others.
+data_dependencies:
+  queries:
+    - `adminHub.getSummary(contextId)` → KPIs, tiles data, alerts counts.
+    - `adminHub.getNeedsAttention(filters)` → paginated alert objects with `ctaRoute`.
+    - `adminHub.getExperiments()` → list of experiment cards w/ CTA metadata.
+    - `adminHub.getNotifications(cursor)` → feed for alert tray.
+  mutations:
+    - `adminHub.dismissAlert({ alertId })`.
+    - `adminHub.assignAlert({ alertId, assigneeId })`.
+    - `adminHub.toggleExperiment({ experimentId, enabled })`.
+    - `adminHub.setContext({ contextId })`.
+analytics:
+  events:
+    - adminHub.view
+    - adminHub.tile_click (properties: tile, action)
+    - adminHub.alert_acknowledge (properties: severity, type)
+    - adminHub.context_switch (properties: from, to, latencyMs)
+    - adminHub.quick_action (create_event, invite_teammate)
+  metrics:
+    - Average time to resolve needs-attention items.
+    - Context switch latency budget: <1200ms P95.
+accessibility:
+  - Provide logical tab order: top bar → left rail → content columns.
+  - Tiles announce summary + action via `aria-describedby`.
+  - Notification bell exposes `aria-live="polite"` region for new alerts.
+  - Ensure color usage meets contrast; severity indicated with icon+text.
+  - Keyboard shortcuts documented in help modal (cmd+/).
+performance:
+  - Preload events/orders list APIs after hub data resolves.
+  - Cache hub summary per context for 60s (stale-while-revalidate) to keep nav snappy.
+  - Lazy-load Experiments + Insights sections below the fold.
+decisions:
+  - Needs Attention issues remain scoped per org; notifications can fire regardless of active tab but CTAs jump into `/admin/orgs/[orgId]` routes.
+  - Tile order is fixed in v1; any personalization waits for a reusable tile layout component + story.
+  - Alert acknowledgement persists via the notifications platform; no bespoke offline logic in the hub layer.
+open_questions:
+  - Should we surface additional personas (e.g., marketing-only roles) in v1 or defer?
+next_steps:
+  - Design to deliver high-fidelity wireframes for desktop/tablet.
+  - Platform team to expose `adminHub.*` routers with context gating + caching hints.
+  - Write Cypress smoke test for hub hero + alerts once UI implemented.

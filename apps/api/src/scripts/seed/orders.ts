@@ -2,43 +2,59 @@ import type { PrismaClient } from "@prisma/client";
 import { type OrderStatus } from "@prisma/client";
 import { hashPassword } from "better-auth/crypto";
 import Stripe from "stripe";
+import { createPrismaRepos } from "@th/adapters/db/prisma";
 import { DEMO_IDS } from "./ids.js";
 import { BUYER_FIXTURES } from "./fixtures.js";
+import {
+  STRIPE_MIN_AMOUNT_CENTS,
+  createConfirmedPaymentIntent,
+  priceSeedCart,
+  priceSeedOrder,
+  pricedOrderColumns,
+  refundSeedOrderOnStripe,
+  refundStampsFor,
+  seedRefundedAt,
+  seedStripeFromEnv,
+  tryLoadSeedEventPricing,
+  writeSeedTaxLines,
+  type SeedEventPricing,
+  type SeedOrderPricing,
+  type SeedTicketItem,
+} from "./order-pricing.js";
 import { pMap } from "./utils.js";
 
-// ── Stripe test-mode helper ──────────────────────────────────────────────
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Creates a real Stripe PaymentIntent and immediately confirms it with a test
- * card (`pm_card_visa`). Returns the `pi_xxx` ID that Stripe actually knows
- * about so downstream flows (refund quotes, balance-transaction lookups, etc.)
- * work against real objects.
+ * The status a generated web order may carry, and the shape it is written in.
  *
- * Only used during dev seeding when `STRIPE_SECRET_KEY` is available.
+ * Every product path that writes PART_REFUNDED refunds a ticket item first
+ * and leaves another live, so it needs 2+ tickets and a real charge to
+ * refund; otherwise the order is SUCCEEDED. (Order.status DISPUTED is never
+ * rolled: no production path writes it — the dispute lifecycle only sets the
+ * `disputeStatus` / `disputedAt` mirror columns.)
+ *
+ * PENDING and CANCELLED are carts: `updateOrderItems` holds them (no charge,
+ * no tax persisted) and every cancel path only flips the status, so they take
+ * `priceSeedCart`'s shape. Everything else took the checkout charge.
  */
-async function createConfirmedPaymentIntent(
-  stripe: Stripe,
-  opts: {
-    amountCents: number;
-    currency: string;
-    metadata: Record<string, string>;
-  },
-): Promise<string> {
-  const pi = await stripe.paymentIntents.create({
-    amount: opts.amountCents,
-    currency: opts.currency,
-    metadata: opts.metadata,
-    automatic_payment_methods: { enabled: true, allow_redirects: "never" },
-    confirm: true,
-    // Use the "bypass pending" test card so funds land in the available
-    // balance immediately, allowing settlement transfers to succeed locally.
-    payment_method: "pm_card_bypassPending",
-  });
-  return pi.id;
-}
-
-/** Stripe's minimum charge for USD ($0.50). */
-const STRIPE_MIN_AMOUNT_CENTS = 50;
+const planWebOrder = (
+  pricing: SeedEventPricing,
+  lines: Array<{ ticketTypeId: string; qty: number }>,
+  occurredAt: Date,
+  rolled: OrderStatus,
+): { status: OrderStatus; priced: SeedOrderPricing } => {
+  const qty = lines.reduce((sum, line) => sum + line.qty, 0);
+  const checkout = priceSeedOrder(pricing, lines, occurredAt);
+  if (rolled === "PENDING" || rolled === "CANCELLED") {
+    return { status: rolled, priced: priceSeedCart(pricing, lines, occurredAt) };
+  }
+  const charged = checkout.chargeCents >= STRIPE_MIN_AMOUNT_CENTS;
+  if (rolled === "PART_REFUNDED" && (!charged || qty < 2)) {
+    return { status: "SUCCEEDED", priced: checkout };
+  }
+  return { status: rolled, priced: checkout };
+};
 
 // ── Demo orders (random buyers against org-owned events) ─────────────────
 
@@ -48,7 +64,8 @@ const STRIPE_MIN_AMOUNT_CENTS = 50;
  *
  * Each published event gets 4-6 orders from random buyer humans.
  * Each order has 1-4 tickets. Statuses are distributed across SUCCEEDED,
- * PART_REFUNDED, PENDING, CANCELLED, and DISPUTED.
+ * PART_REFUNDED, PENDING and CANCELLED (see `planWebOrder` for which rolls
+ * are demoted to SUCCEEDED and why DISPUTED is never written).
  *
  * When `stripeSecretKey` is provided, SUCCEEDED and PART_REFUNDED orders get
  * real Stripe PaymentIntents. Without it the function is **skipped entirely**
@@ -173,12 +190,7 @@ export const seedDemoOrders = async (
 
   console.log(`  Created ${buyerIds.length} buyer humans`);
 
-  // Minimal fee-policy snapshot (required JSON column on Order)
-  const feePolicySnapshot = {
-    platformFeePct: 0.05,
-    buyerFeePct: 0.065,
-    currency: "usd",
-  };
+  const repos = createPrismaRepos(prisma);
 
   // Deterministic seeded random (simple LCG so re-runs produce same data)
   let rngState = 42;
@@ -190,26 +202,24 @@ export const seedDemoOrders = async (
   // Seed up to 8 published events with orders (covers multiple orgs)
   const eventsToSeed = publishedEvents.slice(0, 8);
 
-  // Pre-fetch ticket types for all events in parallel
+  // Pre-fetch the sellable ticket types for all events in parallel
   const eventTicketTypes = await Promise.all(
     eventsToSeed.map((event) =>
       prisma.ticketType.findMany({
-        where: { eventId: event.id },
+        where: { eventId: event.id, status: "ACTIVE" },
         select: { id: true, name: true, priceCents: true },
       }),
     ),
   );
 
-  // Pre-compute all order plans (pure math -- fast)
+  // Plan every order (checkout pricing is read once per event)
   type OrderPlan = {
     orderId: string;
     eventId: string;
     buyerHumanId: string;
     ticketTypeId: string;
-    priceCents: number;
     ticketCount: number;
-    amountGrossCents: number;
-    platformFeeCents: number;
+    priced: SeedOrderPricing;
     status: OrderStatus;
     occurredAt: Date;
     evtHex: string;
@@ -221,6 +231,8 @@ export const seedDemoOrders = async (
     const event = eventsToSeed[evtIdx]!;
     const ticketTypes = eventTicketTypes[evtIdx]!;
     if (ticketTypes.length === 0) continue;
+    const eventPricing = await tryLoadSeedEventPricing(prisma, repos, event.id);
+    if (!eventPricing) continue;
 
     const orderCount = 4 + Math.floor(nextRng() * 3);
     for (let orderIdx = 0; orderIdx < orderCount; orderIdx++) {
@@ -228,33 +240,35 @@ export const seedDemoOrders = async (
       const ticketType =
         ticketTypes[Math.floor(nextRng() * ticketTypes.length)]!;
       const ticketCount = 1 + Math.floor(nextRng() * 4);
-      const amountGrossCents = ticketType.priceCents * ticketCount;
-      const platformFeeCents = Math.round(amountGrossCents * 0.05);
 
       const statusRoll = nextRng();
-      let status: OrderStatus;
-      if (statusRoll < 0.7) status = "SUCCEEDED";
-      else if (statusRoll < 0.8) status = "PART_REFUNDED";
-      else if (statusRoll < 0.88) status = "PENDING";
-      else if (statusRoll < 0.94) status = "CANCELLED";
-      else status = "DISPUTED";
+      let rolled: OrderStatus;
+      if (statusRoll < 0.7) rolled = "SUCCEEDED";
+      else if (statusRoll < 0.8) rolled = "PART_REFUNDED";
+      else if (statusRoll < 0.88) rolled = "PENDING";
+      else if (statusRoll < 0.94) rolled = "CANCELLED";
+      else rolled = "SUCCEEDED"; // was DISPUTED — no product path writes it
 
       const daysAgo = Math.floor(nextRng() * 30);
-      const occurredAt = new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000);
+      const occurredAt = new Date(Date.now() - daysAgo * DAY_MS);
 
       const evtHex = evtIdx.toString(16).padStart(2, "0");
       const ordHex = orderIdx.toString(16).padStart(3, "0");
       const orderId = `00000000-0000-4000-8000-e0${evtHex}0${ordHex}0000`;
+      const { status, priced } = planWebOrder(
+        eventPricing,
+        [{ ticketTypeId: ticketType.id, qty: ticketCount }],
+        occurredAt,
+        rolled,
+      );
 
       orderPlans.push({
         orderId,
         eventId: event.id,
         buyerHumanId,
         ticketTypeId: ticketType.id,
-        priceCents: ticketType.priceCents,
         ticketCount,
-        amountGrossCents,
-        platformFeeCents,
+        priced,
         status,
         occurredAt,
         evtHex,
@@ -268,16 +282,25 @@ export const seedDemoOrders = async (
   let totalTickets = 0;
 
   await pMap(orderPlans, 5, async (plan) => {
-    // Create a real Stripe PaymentIntent for statuses that need one
-    const needsStripePI =
-      plan.status === "SUCCEEDED" ||
-      plan.status === "PART_REFUNDED" ||
-      plan.status === "DISPUTED";
-    const buyerFeeCents = Math.round(plan.amountGrossCents * 0.065);
-    const totalChargeCents = plan.amountGrossCents + buyerFeeCents;
+    let status = plan.status;
+    const totalChargeCents = plan.priced.chargeCents;
     let stripePaymentIntentId: string | null = null;
 
-    if (needsStripePI && totalChargeCents >= STRIPE_MIN_AMOUNT_CENTS) {
+    // One OrderItem per ticket (qty:1 each). A PART_REFUNDED order had its
+    // LAST ticket refunded by refundOrderItems; carts (PENDING / CANCELLED)
+    // were never charged and no cancel path touches their items.
+    const orderItems = plan.priced.items.map((item, t) => ({
+      ...item,
+      id: `00000000-0000-4000-8000-a1${plan.evtHex}0${plan.ordHex}${t.toString(16).padStart(2, "0")}00`,
+      amountCents: item.unitPriceCents,
+    }));
+    let refundedItemIds = new Set<string>(
+      status === "PART_REFUNDED" ? [orderItems[orderItems.length - 1]!.id] : [],
+    );
+
+    // Create a real Stripe PaymentIntent for charged orders
+    const isCart = status === "PENDING" || status === "CANCELLED";
+    if (!isCart && totalChargeCents >= STRIPE_MIN_AMOUNT_CENTS) {
       stripePaymentIntentId = await createConfirmedPaymentIntent(stripe, {
         amountCents: totalChargeCents,
         currency: "usd",
@@ -288,6 +311,23 @@ export const seedDemoOrders = async (
         },
       });
     }
+    // Refund state is written only if Stripe actually refunded.
+    if (refundedItemIds.size > 0) {
+      const refunded =
+        stripePaymentIntentId !== null &&
+        (await refundSeedOrderOnStripe(stripe, {
+          kind: "items",
+          paymentIntentId: stripePaymentIntentId,
+          orderId: plan.orderId,
+          ticketItems: orderItems,
+          order: plan.priced,
+          refundedItemIds,
+        }));
+      if (!refunded) {
+        status = "SUCCEEDED";
+        refundedItemIds = new Set();
+      }
+    }
 
     await prisma.order.upsert({
       where: { id: plan.orderId },
@@ -296,44 +336,35 @@ export const seedDemoOrders = async (
         id: plan.orderId,
         eventId: plan.eventId,
         buyerHumanId: plan.buyerHumanId,
-        amountGrossCents: plan.amountGrossCents,
-        feesPlatformCents: plan.platformFeeCents,
+        ...pricedOrderColumns(plan.priced),
         currency: "usd",
-        status: plan.status,
-        feePolicySnapshot,
+        status,
         occurredAt: plan.occurredAt,
         stripePaymentIntentId,
         source: "PRIMARY",
       },
     });
+    await writeSeedTaxLines(prisma, repos, plan.orderId, plan.priced);
 
-    // One OrderItem per ticket (qty:1 each)
-    const isRefunded =
-      plan.status === "CANCELLED" || plan.status === "REFUNDED";
-    const itemBuyerFeeCents = Math.round(plan.priceCents * 0.065);
-    const itemBuyerTotalCents = plan.priceCents + itemBuyerFeeCents;
-    for (let t = 0; t < plan.ticketCount; t++) {
-      const tHex = t.toString(16).padStart(2, "0");
-      const orderItemId = `00000000-0000-4000-8000-a1${plan.evtHex}0${plan.ordHex}${tHex}00`;
+    const refundStamps = refundStampsFor(orderItems, plan.priced);
+    for (const item of orderItems) {
       await prisma.orderItem.upsert({
-        where: { id: orderItemId },
+        where: { id: item.id },
         update: {},
         create: {
-          id: orderItemId,
+          id: item.id,
           orderId: plan.orderId,
           kind: "ticket",
-          ticketTypeId: plan.ticketTypeId,
+          ticketTypeId: item.ticketTypeId,
           qty: 1,
-          unitPriceCents: plan.priceCents,
-          amountCents: plan.priceCents,
-          meta: {
-            buyerTotalCents: itemBuyerTotalCents,
-            buyerUnitTotalCents: itemBuyerTotalCents,
-          },
-          ...(isRefunded
+          unitPriceCents: item.unitPriceCents,
+          amountCents: item.amountCents,
+          meta: item.meta,
+          ...(refundedItemIds.has(item.id)
             ? {
                 status: "refunded",
-                refundedAt: new Date(plan.occurredAt.getTime() + 86400_000),
+                refundedAt: seedRefundedAt(plan.occurredAt, DAY_MS),
+                ...refundStamps(item.id),
               }
             : {}),
         },
@@ -341,18 +372,10 @@ export const seedDemoOrders = async (
     }
 
     // Skip ticket creation for PENDING orders (not yet paid) and CANCELLED orders
-    if (plan.status === "PENDING" || plan.status === "CANCELLED") {
+    if (isCart) {
       totalOrders++;
       return;
     }
-
-    // Create Ticket records (one per ticket count)
-    const ticketStatus =
-      plan.status === "DISPUTED"
-        ? ("INVALID" as const)
-        : plan.status === "REFUNDED"
-          ? ("REFUNDED" as const)
-          : ("VALID" as const);
 
     await Promise.all(
       Array.from({ length: plan.ticketCount }, (_, t) => {
@@ -372,7 +395,10 @@ export const seedDemoOrders = async (
             ticketTypeId: plan.ticketTypeId,
             ownerHumanId: plan.buyerHumanId,
             code: ticketCode,
-            status: ticketStatus,
+            // A refunded item's ticket is REFUNDED, as the refund paths set it.
+            status: refundedItemIds.has(matchingOrderItemId)
+              ? ("REFUNDED" as const)
+              : ("VALID" as const),
             issuedAt: plan.occurredAt,
           },
         });
@@ -405,6 +431,20 @@ export const seedDemoOrders = async (
  * Events that receive real Stripe orders are tagged with `[STRIPE]` in their
  * title so devs can visually identify which events have working payment data.
  */
+/** The dev-login PART_REFUNDED order's two ticket items, as the allocators read them. */
+const partRefundItems = (
+  priced: SeedOrderPricing,
+  ordIdx: string,
+): SeedTicketItem[] =>
+  [
+    `00000000-0000-4000-8000-c10500${ordIdx}0000`,
+    `00000000-0000-4000-8000-c20500${ordIdx}0000`,
+  ].map((id, t) => ({
+    id,
+    amountCents: priced.items[t]!.unitPriceCents,
+    meta: priced.items[t]!.meta,
+  }));
+
 export const seedDevLoginOrders = async (
   prisma: PrismaClient,
   publishedEvents: Array<{ id: string; slug: string; title: string }>,
@@ -467,11 +507,7 @@ export const seedDevLoginOrders = async (
   });
 
   const devHumanId = DEMO_IDS.devUser;
-  const feePolicySnapshot = {
-    platformFeePct: 0.05,
-    buyerFeePct: 0.065,
-    currency: "usd",
-  };
+  const repos = createPrismaRepos(prisma);
 
   // Limit dev-login seeded events to 3 for a small, focused dev dataset
   const events = publishedEvents.slice(0, Math.min(3, publishedEvents.length));
@@ -485,30 +521,44 @@ export const seedDevLoginOrders = async (
   for (let i = 0; i < events.length; i++) {
     const event = events[i]!;
     const ticketTypes = await prisma.ticketType.findMany({
-      where: { eventId: event.id },
+      where: { eventId: event.id, status: "ACTIVE" },
       select: { id: true, name: true, priceCents: true },
     });
 
     if (ticketTypes.length === 0) continue;
+    const eventPricing = await tryLoadSeedEventPricing(prisma, repos, event.id);
+    if (!eventPricing) continue;
 
     const ordIdx = i.toString(16).padStart(2, "0");
     const orderId = `00000000-0000-4000-8000-d00500${ordIdx}0000`;
     const ticketType = ticketTypes[0]!;
     const ticketCount = 2;
-    const amountGrossCents = ticketType.priceCents * ticketCount;
-    const platformFeeCents = Math.round(amountGrossCents * 0.05);
-
-    // With 3 events: SUCCEEDED, SUCCEEDED, PART_REFUNDED
-    let status: OrderStatus;
-    if (i === 2) status = "PART_REFUNDED";
-    else status = "SUCCEEDED";
 
     const daysAgo = [3, 7, 14][i] ?? 5;
     const occurredAt = new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000);
 
+    // With 3 events: SUCCEEDED, SUCCEEDED, PART_REFUNDED. The PART_REFUNDED
+    // order is one ticket of each of the first two types (the second is
+    // refunded below), so it needs two types; otherwise it is two of the
+    // first type and SUCCEEDED.
+    const isPartRefundCart = i === 2 && ticketTypes.length >= 2;
+    const priced = priceSeedOrder(
+      eventPricing,
+      isPartRefundCart
+        ? [
+            { ticketTypeId: ticketTypes[0]!.id, qty: 1 },
+            { ticketTypeId: ticketTypes[1]!.id, qty: 1 },
+          ]
+        : [{ ticketTypeId: ticketType.id, qty: ticketCount }],
+      occurredAt,
+    );
+    let status: OrderStatus =
+      isPartRefundCart && priced.chargeCents >= STRIPE_MIN_AMOUNT_CENTS
+        ? "PART_REFUNDED"
+        : "SUCCEEDED";
+
     // Every dev-login order gets a real Stripe PI — no fallback to fakes
-    const buyerFeeCents = Math.round(amountGrossCents * 0.065);
-    const totalChargeCents = amountGrossCents + buyerFeeCents;
+    const totalChargeCents = priced.chargeCents;
     let stripePaymentIntentId: string | null = null;
 
     if (totalChargeCents >= STRIPE_MIN_AMOUNT_CENTS) {
@@ -520,6 +570,20 @@ export const seedDevLoginOrders = async (
       console.log(
         `    Order ${orderId.slice(-6)} → real PI ${stripePaymentIntentId}`,
       );
+      if (status === "PART_REFUNDED") {
+        // refundOrderItems on the second ticket — the stamps below come off
+        // the same allocation. Refund state is written only if Stripe
+        // actually refunded.
+        const refunded = await refundSeedOrderOnStripe(stripe, {
+          kind: "items",
+          paymentIntentId: stripePaymentIntentId,
+          orderId,
+          ticketItems: partRefundItems(priced, ordIdx),
+          order: priced,
+          refundedItemIds: new Set([partRefundItems(priced, ordIdx)[1]!.id]),
+        });
+        if (!refunded) status = "SUCCEEDED";
+      }
     } else {
       console.log(
         `    Order ${orderId.slice(-6)} → skipped Stripe PI (amount ${totalChargeCents}¢ < minimum ${STRIPE_MIN_AMOUNT_CENTS}¢)`,
@@ -534,23 +598,27 @@ export const seedDevLoginOrders = async (
         id: orderId,
         eventId: event.id,
         buyerHumanId: devHumanId,
-        amountGrossCents,
-        feesPlatformCents: platformFeeCents,
+        ...pricedOrderColumns(priced),
         currency: "usd",
         status,
-        feePolicySnapshot,
         occurredAt,
         stripePaymentIntentId,
         source: "PRIMARY",
       },
     });
+    await writeSeedTaxLines(prisma, repos, orderId, priced);
 
-    if (i === 2 && ticketTypes.length >= 2) {
+    if (status === "PART_REFUNDED") {
       // PART_REFUNDED: 2 items (one refunded, one active)
-      const item1BuyerTotal =
-        ticketTypes[0]!.priceCents +
-        Math.round(ticketTypes[0]!.priceCents * 0.065);
       const item1Id = `00000000-0000-4000-8000-c10500${ordIdx}0000`;
+      const item2Id = `00000000-0000-4000-8000-c20500${ordIdx}0000`;
+      const item1 = priced.items[0]!;
+      const item2 = priced.items[1]!;
+      const refundStamps = refundStampsFor(
+        partRefundItems(priced, ordIdx),
+        priced,
+      );
+
       await prisma.orderItem.upsert({
         where: { id: item1Id },
         update: {},
@@ -558,21 +626,14 @@ export const seedDevLoginOrders = async (
           id: item1Id,
           orderId,
           kind: "ticket",
-          ticketTypeId: ticketTypes[0]!.id,
+          ticketTypeId: item1.ticketTypeId,
           qty: 1,
-          unitPriceCents: ticketTypes[0]!.priceCents,
-          amountCents: ticketTypes[0]!.priceCents,
-          meta: {
-            buyerTotalCents: item1BuyerTotal,
-            buyerUnitTotalCents: item1BuyerTotal,
-          },
+          unitPriceCents: item1.unitPriceCents,
+          amountCents: item1.unitPriceCents,
+          meta: item1.meta,
         },
       });
 
-      const item2BuyerTotal =
-        ticketTypes[1]!.priceCents +
-        Math.round(ticketTypes[1]!.priceCents * 0.065);
-      const item2Id = `00000000-0000-4000-8000-c20500${ordIdx}0000`;
       await prisma.orderItem.upsert({
         where: { id: item2Id },
         update: {},
@@ -580,15 +641,15 @@ export const seedDevLoginOrders = async (
           id: item2Id,
           orderId,
           kind: "ticket",
-          ticketTypeId: ticketTypes[1]!.id,
+          ticketTypeId: item2.ticketTypeId,
           qty: 1,
-          unitPriceCents: ticketTypes[1]!.priceCents,
-          amountCents: ticketTypes[1]!.priceCents,
-          meta: {
-            buyerTotalCents: item2BuyerTotal,
-            buyerUnitTotalCents: item2BuyerTotal,
-          },
-          refundedAt: new Date(occurredAt.getTime() + 2 * 24 * 60 * 60 * 1000),
+          unitPriceCents: item2.unitPriceCents,
+          amountCents: item2.unitPriceCents,
+          meta: item2.meta,
+          // As refund-order-items stamps it via orderItems.updateStatus.
+          status: "refunded",
+          refundedAt: seedRefundedAt(occurredAt, 2 * DAY_MS),
+          ...refundStamps(item2Id),
         },
       });
 
@@ -628,9 +689,8 @@ export const seedDevLoginOrders = async (
 
       totalTickets += 2;
     } else {
-      const devItemBuyerTotal =
-        ticketType.priceCents + Math.round(ticketType.priceCents * 0.065);
-      for (let t = 0; t < ticketCount; t++) {
+      for (let t = 0; t < priced.items.length; t++) {
+        const item = priced.items[t]!;
         const tHex = t.toString(16).padStart(2, "0");
         // 12 hex chars: c1050(5) + ord(2) + t(2) + 000(3) = 12. Drop one
         // leading zero from the prefix so the total length is correct
@@ -643,20 +703,17 @@ export const seedDevLoginOrders = async (
             id: orderItemId,
             orderId,
             kind: "ticket",
-            ticketTypeId: ticketType.id,
+            ticketTypeId: item.ticketTypeId,
             qty: 1,
-            unitPriceCents: ticketType.priceCents,
-            amountCents: ticketType.priceCents,
-            meta: {
-              buyerTotalCents: devItemBuyerTotal,
-              buyerUnitTotalCents: devItemBuyerTotal,
-            },
+            unitPriceCents: item.unitPriceCents,
+            amountCents: item.unitPriceCents,
+            meta: item.meta,
           },
         });
       }
 
       // All dev-login orders are SUCCEEDED or PART_REFUNDED — always create tickets
-      for (let t = 0; t < ticketCount; t++) {
+      for (let t = 0; t < priced.items.length; t++) {
         const tHex = t.toString(16).padStart(2, "0");
         // Must match the OrderItem template above — both share the
         // `c1050${ordIdx}${tHex}000` shape so the Ticket FK resolves.
@@ -670,7 +727,7 @@ export const seedDevLoginOrders = async (
             eventId: event.id,
             orderId,
             orderItemId: matchingOrderItemId,
-            ticketTypeId: ticketType.id,
+            ticketTypeId: priced.items[t]!.ticketTypeId,
             ownerHumanId: devHumanId,
             code: `DEV-${ordIdx}-${t}`,
             status: "VALID",
@@ -792,11 +849,7 @@ export const seedHumanEventOrders = async (
     apiVersion: "2025-08-27.basil" as any,
   });
 
-  const feePolicySnapshot = {
-    platformFeePct: 0.05,
-    buyerFeePct: 0.065,
-    currency: "usd",
-  };
+  const repos = createPrismaRepos(prisma);
 
   // Re-use the buyer humans already created by seedDemoOrders
   const buyerIds = await prisma.human.findMany({
@@ -822,10 +875,12 @@ export const seedHumanEventOrders = async (
   for (let evtIdx = 0; evtIdx < humanEvents.length; evtIdx++) {
     const event = humanEvents[evtIdx]!;
     const ticketTypes = await prisma.ticketType.findMany({
-      where: { eventId: event.id },
+      where: { eventId: event.id, status: "ACTIVE" },
       select: { id: true, name: true, priceCents: true },
     });
     if (ticketTypes.length === 0) continue;
+    const eventPricing = await tryLoadSeedEventPricing(prisma, repos, event.id);
+    if (!eventPricing) continue;
 
     const orderCount = 3 + Math.floor(nextRng() * 3);
     for (let ordIdx = 0; ordIdx < orderCount; ordIdx++) {
@@ -834,38 +889,71 @@ export const seedHumanEventOrders = async (
       const ticketType =
         ticketTypes[Math.floor(nextRng() * ticketTypes.length)]!;
       const qty = 1 + Math.floor(nextRng() * 3);
-      const amountGrossCents = ticketType.priceCents * qty;
-      const platformFeeCents = Math.round(amountGrossCents * 0.05);
       const statusRoll = nextRng();
-      let status: OrderStatus;
-      if (statusRoll < 0.7) status = "SUCCEEDED";
-      else if (statusRoll < 0.8) status = "PART_REFUNDED";
-      else if (statusRoll < 0.88) status = "PENDING";
-      else if (statusRoll < 0.94) status = "CANCELLED";
-      else status = "DISPUTED";
+      let rolledStatus: OrderStatus;
+      if (statusRoll < 0.7) rolledStatus = "SUCCEEDED";
+      else if (statusRoll < 0.8) rolledStatus = "PART_REFUNDED";
+      else if (statusRoll < 0.88) rolledStatus = "PENDING";
+      else if (statusRoll < 0.94) rolledStatus = "CANCELLED";
+      else rolledStatus = "SUCCEEDED"; // was DISPUTED — no product path writes it
 
       const daysAgo = Math.floor(nextRng() * 20);
-      const occurredAt = new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000);
+      const occurredAt = new Date(Date.now() - daysAgo * DAY_MS);
 
       const evtHex = evtIdx.toString(16).padStart(2, "0");
       const ordHex = ordIdx.toString(16).padStart(3, "0");
       const orderId = `00000000-0000-4000-8000-f0${evtHex}0${ordHex}0000`;
+      const plan = planWebOrder(
+        eventPricing,
+        [{ ticketTypeId: ticketType.id, qty }],
+        occurredAt,
+        rolledStatus,
+      );
+      const priced = plan.priced;
+      let status = plan.status;
 
-      // Create a real Stripe PaymentIntent for statuses that need one
-      const needsStripePI =
-        status === "SUCCEEDED" ||
-        status === "PART_REFUNDED" ||
-        status === "DISPUTED";
-      const buyerFeeCents = Math.round(amountGrossCents * 0.065);
-      const totalChargeCents = amountGrossCents + buyerFeeCents;
+      // One OrderItem per ticket (qty:1 each). A PART_REFUNDED order had its
+      // LAST ticket refunded by refundOrderItems; carts (PENDING / CANCELLED)
+      // were never charged and no cancel path touches their items.
+      const orderItems = priced.items.map((item, t) => ({
+        ...item,
+        id: `00000000-0000-4000-8000-f1${evtHex}0${ordHex}${t.toString(16).padStart(2, "0")}00`,
+        amountCents: item.unitPriceCents,
+      }));
+      let refundedItemIds = new Set<string>(
+        status === "PART_REFUNDED"
+          ? [orderItems[orderItems.length - 1]!.id]
+          : [],
+      );
+
+      // Create a real Stripe PaymentIntent for charged orders
+      const isCart = status === "PENDING" || status === "CANCELLED";
+      const totalChargeCents = priced.chargeCents;
       let stripePaymentIntentId: string | null = null;
 
-      if (needsStripePI && totalChargeCents >= STRIPE_MIN_AMOUNT_CENTS) {
+      if (!isCart && totalChargeCents >= STRIPE_MIN_AMOUNT_CENTS) {
         stripePaymentIntentId = await createConfirmedPaymentIntent(stripe, {
           amountCents: totalChargeCents,
           currency: "usd",
           metadata: { orderId, eventId: event.id, source: "human-event-seed" },
         });
+      }
+      // Refund state is written only if Stripe actually refunded.
+      if (refundedItemIds.size > 0) {
+        const refunded =
+          stripePaymentIntentId !== null &&
+          (await refundSeedOrderOnStripe(stripe, {
+            kind: "items",
+            paymentIntentId: stripePaymentIntentId,
+            orderId,
+            ticketItems: orderItems,
+            order: priced,
+            refundedItemIds,
+          }));
+        if (!refunded) {
+          status = "SUCCEEDED";
+          refundedItemIds = new Set();
+        }
       }
 
       await prisma.order.upsert({
@@ -875,44 +963,35 @@ export const seedHumanEventOrders = async (
           id: orderId,
           eventId: event.id,
           buyerHumanId,
-          amountGrossCents,
-          feesPlatformCents: platformFeeCents,
+          ...pricedOrderColumns(priced),
           currency: "usd",
           status,
-          feePolicySnapshot,
           occurredAt,
           stripePaymentIntentId,
           source: "PRIMARY",
         },
       });
+      await writeSeedTaxLines(prisma, repos, orderId, priced);
 
-      // One OrderItem per ticket (qty:1 each)
-      const isRefunded =
-        status === "CANCELLED" || (status as string) === "REFUNDED";
-      const hItemBuyerFeeCents = Math.round(ticketType.priceCents * 0.065);
-      const hItemBuyerTotalCents = ticketType.priceCents + hItemBuyerFeeCents;
-      for (let t = 0; t < qty; t++) {
-        const tHex = t.toString(16).padStart(2, "0");
-        const orderItemId = `00000000-0000-4000-8000-f1${evtHex}0${ordHex}${tHex}00`;
+      const refundStamps = refundStampsFor(orderItems, priced);
+      for (const item of orderItems) {
         await prisma.orderItem.upsert({
-          where: { id: orderItemId },
+          where: { id: item.id },
           update: {},
           create: {
-            id: orderItemId,
+            id: item.id,
             orderId,
             kind: "ticket",
-            ticketTypeId: ticketType.id,
+            ticketTypeId: item.ticketTypeId,
             qty: 1,
-            unitPriceCents: ticketType.priceCents,
-            amountCents: ticketType.priceCents,
-            meta: {
-              buyerTotalCents: hItemBuyerTotalCents,
-              buyerUnitTotalCents: hItemBuyerTotalCents,
-            },
-            ...(isRefunded
+            unitPriceCents: item.unitPriceCents,
+            amountCents: item.amountCents,
+            meta: item.meta,
+            ...(refundedItemIds.has(item.id)
               ? {
                   status: "refunded",
-                  refundedAt: new Date(occurredAt.getTime() + 86400_000),
+                  refundedAt: seedRefundedAt(occurredAt, DAY_MS),
+                  ...refundStamps(item.id),
                 }
               : {}),
           },
@@ -920,13 +999,7 @@ export const seedHumanEventOrders = async (
       }
 
       // Skip ticket creation for PENDING (not paid) and CANCELLED orders
-      if (status !== "PENDING" && status !== "CANCELLED") {
-        const ticketStatus =
-          status === "DISPUTED"
-            ? ("INVALID" as const)
-            : (status as string) === "REFUNDED"
-              ? ("REFUNDED" as const)
-              : ("VALID" as const);
+      if (!isCart) {
 
         await Promise.all(
           Array.from({ length: qty }, (_, t) => {
@@ -946,7 +1019,10 @@ export const seedHumanEventOrders = async (
                 ticketTypeId: ticketType.id,
                 ownerHumanId: buyerHumanId,
                 code: ticketCode,
-                status: ticketStatus,
+                // A refunded item's ticket is REFUNDED, as the refund paths set it.
+                status: refundedItemIds.has(matchingOrderItemId)
+                  ? ("REFUNDED" as const)
+                  : ("VALID" as const),
                 issuedAt: occurredAt,
               },
             });
@@ -972,11 +1048,14 @@ export const seedHumanEventOrders = async (
  * and event reports show the new `paymentChannel="CASH"` channel in action.
  *
  * Includes one $0 "comp" sale per event to exercise the comp-as-cash path.
+ * `recordCashSale` writes it like any other cash sale — `source: "PRIMARY"`
+ * at $0 — so it is not a COMP-source order.
  *
  * No Stripe key required — cash sales never touch a payment processor.
- * Tickets are minted with status=SCANNED to match the FR-013 auto-admit
- * behavior (audit TicketScan rows are intentionally omitted here; the
- * real auto-admit wiring is M6 work).
+ * Tickets are minted SCANNED with `scannedAt` and an ACCEPTED `TicketScan`
+ * row (`message: "POS_CASH_AUTO_ADMIT"`), mirroring `recordCashSale`'s
+ * FR-013 auto-admit. The row is what the venue track record counts as
+ * attendance (R11), so without it these walk-ins vanish from dev stats.
  */
 export const seedDemoCashSales = async (
   prisma: PrismaClient,
@@ -989,11 +1068,9 @@ export const seedDemoCashSales = async (
 
   console.log("Seeding demo POS cash + comp sales (no Stripe required)...");
 
-  const feePolicySnapshot = {
-    platformFeePct: 0.05,
-    buyerFeePct: 0.065,
-    currency: "usd",
-  };
+  // `recordCashSale` records no platform fee and an EMPTY snapshot — there is
+  // no fee mode on a cash sale — and its items carry no buyer totals.
+  const feePolicySnapshot = {};
 
   // Use first 3 published events for cash demo data
   const events = publishedEvents.slice(0, 3);
@@ -1021,7 +1098,7 @@ export const seedDemoCashSales = async (
     const event = events[evtIdx]!;
     const ticketTypes = await prisma.ticketType.findMany({
       where: { eventId: event.id },
-      select: { id: true, name: true, priceCents: true, doorPriceCents: true },
+      select: { id: true, name: true, priceCents: true },
     });
     if (ticketTypes.length === 0) continue;
 
@@ -1039,10 +1116,7 @@ export const seedDemoCashSales = async (
       const sale = sales[sIdx]!;
       const ticketType = ticketTypes[sale.ttIdx]!;
       const ticketCount = sale.kind === "double" ? 2 : 1;
-      const unitPriceCents =
-        sale.kind === "comp"
-          ? 0
-          : (ticketType.doorPriceCents ?? ticketType.priceCents);
+      const unitPriceCents = sale.kind === "comp" ? 0 : ticketType.priceCents;
       const amountCents = unitPriceCents * ticketCount;
 
       const sHex = sIdx.toString(16).padStart(2, "0");
@@ -1065,7 +1139,7 @@ export const seedDemoCashSales = async (
           feePolicySnapshot,
           occurredAt,
           stripePaymentIntentId: null,
-          source: sale.kind === "comp" ? "COMP" : "PRIMARY",
+          source: "PRIMARY",
         },
       });
 
@@ -1089,10 +1163,7 @@ export const seedDemoCashSales = async (
             qty: 1,
             unitPriceCents,
             amountCents: unitPriceCents,
-            meta: {
-              buyerTotalCents: unitPriceCents,
-              buyerUnitTotalCents: unitPriceCents,
-            },
+            meta: {},
           },
         });
 
@@ -1119,6 +1190,24 @@ export const seedDemoCashSales = async (
             code: `CASH-E${evtHex}-${sHex}-${codeSuffix}`,
             status: "SCANNED",
             issuedAt: occurredAt,
+            scannedAt: occurredAt,
+          },
+        });
+        // The auto-admit's scan-log row, as `recordCashSale` writes it. The
+        // seed's buyer doubles as the operator (see `operatorBuyerId`).
+        // 12 hex chars: cd5(3) + evt(2) + 0(1) + s(2) + t(2) + 00(2) = 12.
+        const scanId = `00000000-0000-4000-8000-cd5${evtHex}0${sHex}${tHex}00`;
+        await prisma.ticketScan.upsert({
+          where: { id: scanId },
+          update: {},
+          create: {
+            id: scanId,
+            ticketId,
+            eventId: event.id,
+            actorHumanId: operatorBuyerId,
+            scannedAt: occurredAt,
+            outcome: "ACCEPTED",
+            message: "POS_CASH_AUTO_ADMIT",
           },
         });
         totalTickets++;
@@ -1145,13 +1234,15 @@ export const seedDemoCashSales = async (
  *     Ticket and buyerHumanId on the Order both point at this phantom row.
  *   - Includes one sale that is REFUNDED to populate the gate-refund UI.
  *
- * Note: this does NOT mint a real Stripe PaymentIntent — the seed runs
- * offline. We stamp a fake `stripePaymentIntentId` so admin views render
- * a "card · ending in 4242" line without API calls.
+ * With a Stripe key each sale gets a real confirmed test-mode PaymentIntent
+ * (the refunded one is refunded on Stripe too), so the processor-fee sweep
+ * and refund flows see real objects. Without one `stripePaymentIntentId` is
+ * null — never a fake `pi_seed_*`, which the sweep fails on and parks.
  */
 export const seedDemoPosOrders = async (
   prisma: PrismaClient,
   publishedEvents: Array<{ id: string; slug: string; title: string }>,
+  opts?: { stripeSecretKey?: string },
 ) => {
   if (publishedEvents.length === 0) {
     console.log("  No published events -- skipping POS order seed.");
@@ -1160,11 +1251,12 @@ export const seedDemoPosOrders = async (
 
   console.log("Seeding demo POS Tap-to-Pay sales (paymentChannel=POS)...");
 
-  const feePolicySnapshot = {
-    platformFeePct: 0.05,
-    buyerFeePct: 0.065,
-    currency: "usd",
-  };
+  // The caller does not pass the key yet; fall back to the env it loaded.
+  const stripe = seedStripeFromEnv(opts?.stripeSecretKey);
+
+  // `startPosSale` records no platform fee and an EMPTY snapshot — there is
+  // no fee mode on a door sale — and its items carry no buyer totals.
+  const feePolicySnapshot = {};
 
   // Use 3 events for variety; pick events 3-5 so they don't collide with
   // the cash-sales fixtures using events 0-2.
@@ -1202,14 +1294,14 @@ export const seedDemoPosOrders = async (
   for (let evtIdx = 0; evtIdx < events.length; evtIdx++) {
     const event = events[evtIdx]!;
     const ticketTypes = await prisma.ticketType.findMany({
-      where: { eventId: event.id },
-      select: { id: true, name: true, priceCents: true, doorPriceCents: true },
+      where: { eventId: event.id, status: "ACTIVE" },
+      select: { id: true, name: true, priceCents: true },
     });
     if (ticketTypes.length === 0) continue;
 
     const evtHex = evtIdx.toString(16).padStart(2, "0");
     const ticketType = ticketTypes[0]!;
-    const unitPriceCents = ticketType.doorPriceCents ?? ticketType.priceCents;
+    const unitPriceCents = ticketType.priceCents;
 
     // Three POS sales per event:
     //   - sale 0: single, walkup1, SCANNED (auto-admit)
@@ -1229,6 +1321,50 @@ export const seedDemoPosOrders = async (
       const orderId = `00000000-0000-4000-8000-b05${evtHex}0${sHex}0000`;
       const occurredAt = new Date(Date.now() - (evtIdx + 1) * 30 * 60 * 1000);
 
+      // The card-present charge is exactly the door total (no fee, no tax).
+      let stripePaymentIntentId: string | null = null;
+      const itemIdFor = (t: number) =>
+        // Prefix `b06` (was `pos6` — non-hex). 12 hex chars: b06(3)+evt(2)+0(1)+s(2)+t(2)+00(2) = 12.
+        `00000000-0000-4000-8000-b06${evtHex}0${sHex}${t.toString(16).padStart(2, "0")}00`;
+      const ticketItems = Array.from({ length: sale.qty }, (_, t) => ({
+        id: itemIdFor(t),
+        amountCents: unitPriceCents,
+        meta: {},
+      }));
+      const orderMoney = {
+        amountGrossCents: amountCents,
+        feesPlatformCents: 0,
+        taxAmountCents: 0,
+      };
+
+      if (stripe && amountCents >= STRIPE_MIN_AMOUNT_CENTS) {
+        stripePaymentIntentId = await createConfirmedPaymentIntent(stripe, {
+          amountCents,
+          currency: "usd",
+          metadata: {
+            orderId,
+            eventId: event.id,
+            paymentChannel: "POS",
+            source: "pos-seed",
+          },
+        });
+      }
+      // The gate refund (refundPosSale → refundFullOrder: every item, less
+      // Stripe's fee) is written only if Stripe actually refunded; keyless,
+      // there is no charge to refund and the sale stays SUCCEEDED.
+      const refunded =
+        sale.refunded &&
+        stripe !== null &&
+        stripePaymentIntentId !== null &&
+        (await refundSeedOrderOnStripe(stripe, {
+          kind: "full",
+          paymentIntentId: stripePaymentIntentId,
+          orderId,
+          ticketItems,
+          order: orderMoney,
+          refundedItemIds: new Set(ticketItems.map((item) => item.id)),
+        }));
+
       await prisma.order.upsert({
         where: { id: orderId },
         update: {},
@@ -1237,25 +1373,24 @@ export const seedDemoPosOrders = async (
           eventId: event.id,
           buyerHumanId: sale.walkupId,
           amountGrossCents: amountCents,
-          feesPlatformCents: Math.round(
-            amountCents * feePolicySnapshot.platformFeePct,
-          ),
+          feesPlatformCents: 0,
           currency: "usd",
-          status: sale.refunded ? "REFUNDED" : "SUCCEEDED",
+          status: refunded ? "REFUNDED" : "SUCCEEDED",
           paymentChannel: "POS",
           feePolicySnapshot,
           occurredAt,
-          stripePaymentIntentId: `pi_seed_pos_${orderId.slice(-12)}`,
+          stripePaymentIntentId,
           source: "PRIMARY",
         },
       });
 
       // One OrderItem per ticket — Ticket.orderItemId is @unique.
-      const ticketStatus = sale.refunded ? "REFUNDED" : "SCANNED";
+      const ticketStatus = refunded ? "REFUNDED" : "SCANNED";
+      // refundPosSale delegates to refundFullOrder, which stamps every item.
+      const refundStamps = refundStampsFor(ticketItems, orderMoney);
       for (let t = 0; t < sale.qty; t++) {
         const tHex = t.toString(16).padStart(2, "0");
-        // Prefix `b06` (was `pos6` — non-hex). 12 hex chars: b06(3)+evt(2)+0(1)+s(2)+t(2)+00(2) = 12.
-        const orderItemId = `00000000-0000-4000-8000-b06${evtHex}0${sHex}${tHex}00`;
+        const orderItemId = itemIdFor(t);
         await prisma.orderItem.upsert({
           where: { id: orderItemId },
           update: {},
@@ -1267,10 +1402,14 @@ export const seedDemoPosOrders = async (
             qty: 1,
             unitPriceCents,
             amountCents: unitPriceCents,
-            meta: {
-              buyerTotalCents: unitPriceCents,
-              buyerUnitTotalCents: unitPriceCents,
-            },
+            meta: {},
+            ...(refunded
+              ? {
+                  status: "refunded",
+                  refundedAt: seedRefundedAt(occurredAt, 5 * 60 * 1000),
+                  ...refundStamps(orderItemId),
+                }
+              : {}),
           },
         });
 
@@ -1289,13 +1428,34 @@ export const seedDemoPosOrders = async (
             code: `POS-E${evtHex}-${sHex}-T${t}`,
             status: ticketStatus as never,
             issuedAt: occurredAt,
+            // A refund clears the stamp; the scan-log row below stays.
+            scannedAt: refunded ? null : occurredAt,
+          },
+        });
+        // Every POS card sale is auto-admitted on payment success
+        // (`finalizeFromPaymentIntent`, `message: "POS_AUTO_ADMIT"`) — the
+        // gate-refunded sale too, BEFORE its refund. Actor falls back to the
+        // buyer exactly as the use case does without `metadata.actorHumanId`.
+        // 12 hex chars: b08(3) + evt(2) + 0(1) + s(2) + t(2) + 00(2) = 12.
+        const scanId = `00000000-0000-4000-8000-b08${evtHex}0${sHex}${tHex}00`;
+        await prisma.ticketScan.upsert({
+          where: { id: scanId },
+          update: {},
+          create: {
+            id: scanId,
+            ticketId,
+            eventId: event.id,
+            actorHumanId: sale.walkupId,
+            scannedAt: occurredAt,
+            outcome: "ACCEPTED",
+            message: "POS_AUTO_ADMIT",
           },
         });
         totalTickets++;
       }
 
       totalOrders++;
-      if (sale.refunded) totalRefunds++;
+      if (refunded) totalRefunds++;
     }
   }
 

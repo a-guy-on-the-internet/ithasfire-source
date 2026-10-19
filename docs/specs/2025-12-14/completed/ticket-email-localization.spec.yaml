@@ -1,0 +1,77 @@
+# Spec: Ticket Email Localization
+meta:
+  owner: jobs
+  status: complete
+  reviewers:
+    - notifications
+    - platform
+    - design-system
+  last_updated: 2025-11-14
+summary: |
+  Localize all ticket-related transactional emails (purchase confirmations,
+  resend, transfer, refund, event reminders) using the shared `@th/locale`
+  dictionaries. Ensure background jobs select the correct locale, render HTML +
+  text content with ICU messages, and attach localized ticket PDFs when
+  applicable.
+objectives:
+  - Adopt `createTranslator(locale)` from `@th/locale` within `apps/jobs` email jobs to translate copy and format money/dates.
+  - Persist locale preference per human/organization and default gracefully when unavailable.
+  - Snapshot test each email template in default and secondary locales, covering HTML + plaintext variants.
+  - Support localized attachments (PDF tickets) by passing translator into PDF rendering pipeline.
+  - Enable logging/monitoring for fallback scenarios (when translation missing, fallback to English with structured warning).
+scope:
+  in_scope:
+    - Jobs: `queue-transactional-email`, `queue-ticket-issuance`, transfer notifications, reminder jobs.
+    - Templates under `packages/ui-email/src/templates/tickets/**`.
+    - PDF generator invoked by issuance job (if bundling React-PDF).
+    - Storage of locale preferences (read from `humans.locale`, `organizations.default_locale`, env default).
+    - Email metadata (subject line, preview text) localization.
+  out_of_scope:
+    - Marketing/broadcast campaigns (handled by marketing automation platform).
+    - SMS/push notifications (separate spec under notifications).
+workflow:
+  locale_resolution:
+    - Determine locale priority: explicit job payload override → recipient profile locale → organizer default → event default → `DEFAULT_LOCALE`.
+    - Jobs store resolved locale in log context and include in audit trail.
+  rendering:
+    - Translator passed to template functions `renderTicketEmail({ translator, ticket, order, attachments })`.
+    - Templates use ICU pluralization for ticket counts, conditional copy for seating vs GA.
+    - Monetary amounts formatted via core money helpers then translator `formatCurrency`.
+  attachments:
+    - PDF generation receives translator + locale to render headings, seat labels, QR instructions.
+    - File naming uses localized suffix (e.g., `Ticket-1234-es.pdf`).
+  fallbacks:
+    - Missing key triggers warning via `jobs.localization.missing_key` metric and includes key + template ID.
+    - Subject lines fall back to English string with `[EN]` prefix to flag QA.
+testing:
+  - Unit tests per template verifying localized subject/body snapshots for `en` + `es`.
+  - Integration test: enqueue job with locale override, assert rendered payload stored in test transport.
+  - Lint: `@formatjs/cli` check ensures template keys align with dictionaries.
+observability:
+  metrics:
+    - jobs.localization.email.render_ms
+    - jobs.localization.email.fallback_count
+    - jobs.localization.pdf.render_ms
+  logs:
+    - Structured log when fallback occurs or translator initialization fails.
+rollout_plan:
+  - Phase 0: Add locale preference fields to humans/orgs (if missing) via migration.
+  - Phase 1: Migrate templates to translator usage behind feature flag `feature.localization.email`.
+  - Phase 2: Enable for internal orgs; monitor fallback metrics.
+  - Phase 3: Expand to public locales, update runbooks.
+risks:
+  - PDF generation performance may degrade with extra font embedding; assess caching of font subsets.
+  - Missing preference data may cause unexpected fallback; ensure analytics to spot high fallback counts.
+  - Email length expansion in some locales could affect deliverability (Gmail clipping). Review with design.
+open_questions:
+  - Should we expose locale selection in organizer dashboard per-email type?
+  - Do we need per-ticket locale (e.g., multi-locale orders) or stick to buyer preference per email send?
+  - How do we handle support-triggered resend when agent picks a locale manually?
+dependencies:
+  - `@th/locale` package with ticket email namespaces defined.
+  - Database migration for locale preference storage (backend spec).
+  - Feature flag configuration for email rollout.
+references:
+  - ../queue-transactional-email.spec.yaml
+  - ../queue-ticket-issuance.spec.yaml
+  - ../../platform/localization-platform.spec.yaml

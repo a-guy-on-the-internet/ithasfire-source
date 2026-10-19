@@ -1,6 +1,16 @@
 import type { PrismaClient } from "@prisma/client";
+import { createPrismaRepos } from "@th/adapters/db/prisma";
 
 import { DEMO_IDS } from "./ids.js";
+import {
+  STRIPE_MIN_AMOUNT_CENTS,
+  createConfirmedPaymentIntent,
+  priceSeedOrder,
+  pricedOrderColumns,
+  seedStripeFromEnv,
+  tryLoadSeedEventPricing,
+  writeSeedTaxLines,
+} from "./order-pricing.js";
 
 // ── Attendee-review ("Rate this show") fixture ───────────────────────────
 //
@@ -19,9 +29,11 @@ import { DEMO_IDS } from "./ids.js";
 // so the same order also surfaces under my-tickets "Past" (which keys off the
 // event start being in the past).
 //
-// Self-contained + Stripe-free: this order never goes through the refund /
-// fee-lookup flows, so it needs no real PaymentIntent. Idempotent via fixed
-// IDs + upserts, matching the rest of the seed.
+// Self-contained: with a Stripe key (the env the seed loaded) the order gets a
+// real confirmed test-mode PaymentIntent, as every paid checkout has; without
+// one it has none. Its money is priced by the same checkout functions as the
+// rest of the seeded orders (`order-pricing.ts`). Idempotent via fixed IDs +
+// upserts, matching the rest of the seed.
 
 /** Slug of the recent-past show reused as the rateable event. */
 const RECENT_PAST_SHOW_SLUG = "ca-sf-past-recent-recap";
@@ -68,7 +80,7 @@ export const seedAttendeeReviewShow = async (
 
   // Prefer a paid tier so the my-tickets card shows a realistic amount.
   const ticketType = await prisma.ticketType.findFirst({
-    where: { eventId: event.id },
+    where: { eventId: event.id, status: "ACTIVE" },
     orderBy: { priceCents: "desc" },
     select: { id: true, priceCents: true },
   });
@@ -83,20 +95,42 @@ export const seedAttendeeReviewShow = async (
   const orderItemId = DEMO_IDS.reviewShowOrderItem;
   const ticketId = DEMO_IDS.reviewShowTicket;
 
-  const amountGrossCents = ticketType.priceCents;
-  const platformFeeCents = Math.round(amountGrossCents * 0.05);
-  const buyerFeeCents = Math.round(amountGrossCents * 0.065);
-  const buyerTotalCents = amountGrossCents + buyerFeeCents;
-  const feePolicySnapshot = {
-    platformFeePct: 0.05,
-    buyerFeePct: 0.065,
-    currency: "usd",
-  };
+  const repos = createPrismaRepos(prisma);
+  const pricing = await tryLoadSeedEventPricing(prisma, repos, event.id);
+  if (!pricing) {
+    console.log(
+      `  [attendee-review] "${RECENT_PAST_SHOW_SLUG}" has no checkout pricing — skipping rateable-show fixture.`,
+    );
+    return null;
+  }
 
   // Bought ~5 days before the show, scanned in shortly before it ended.
   const endsAt = event.endsAt ?? event.startsAt;
   const occurredAt = new Date(endsAt.getTime() - 5 * 24 * 60 * 60 * 1000);
   const scannedAt = new Date(endsAt.getTime() - 30 * 60 * 1000);
+  const priced = priceSeedOrder(
+    pricing,
+    [{ ticketTypeId: ticketType.id, qty: 1 }],
+    occurredAt,
+  );
+  const item = priced.items[0]!;
+
+  // The upsert below never re-prices an existing order, so only a NEW order
+  // is charged. Keyless-seed exception: with no Stripe key a paid order has
+  // no PI.
+  const existingOrder = await prisma.order.findUnique({
+    where: { id: orderId },
+    select: { id: true },
+  });
+  const stripe = existingOrder ? null : seedStripeFromEnv();
+  const stripePaymentIntentId =
+    stripe && priced.chargeCents >= STRIPE_MIN_AMOUNT_CENTS
+      ? await createConfirmedPaymentIntent(stripe, {
+          amountCents: priced.chargeCents,
+          currency: "usd",
+          metadata: { orderId, eventId: event.id, source: "attendee-review-seed" },
+        })
+      : null;
 
   await prisma.order.upsert({
     where: { id: orderId },
@@ -109,15 +143,15 @@ export const seedAttendeeReviewShow = async (
       id: orderId,
       eventId: event.id,
       buyerHumanId: humanId,
-      amountGrossCents,
-      feesPlatformCents: platformFeeCents,
+      ...pricedOrderColumns(priced),
       currency: "usd",
       status: "SUCCEEDED",
-      feePolicySnapshot,
       occurredAt,
+      stripePaymentIntentId,
       source: "PRIMARY",
     },
   });
+  await writeSeedTaxLines(prisma, repos, orderId, priced);
 
   await prisma.orderItem.upsert({
     where: { id: orderItemId },
@@ -128,12 +162,9 @@ export const seedAttendeeReviewShow = async (
       kind: "ticket",
       ticketTypeId: ticketType.id,
       qty: 1,
-      unitPriceCents: amountGrossCents,
-      amountCents: amountGrossCents,
-      meta: {
-        buyerTotalCents,
-        buyerUnitTotalCents: buyerTotalCents,
-      },
+      unitPriceCents: item.unitPriceCents,
+      amountCents: item.unitPriceCents,
+      meta: item.meta,
     },
   });
 

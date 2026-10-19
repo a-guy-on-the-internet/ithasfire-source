@@ -1,0 +1,75 @@
+# Spec: Sell-Through Rollup Job
+meta:
+  owner: platform-eng
+  status: complete
+  reviewers:
+    - revenue-ops
+    - product-eng
+summary: |
+  Lightweight nightly job that computes per-event, per-ticket-type sell-through rates
+  and writes them into EventDailyStats rows. This is the specific aggregation that
+  feeds the resale pricing engine and organizer dashboards with accurate availability data.
+  
+  While EventDailyStats captures broad metrics (revenue, refunds, etc.), this job focuses
+  specifically on the ticket inventory dimension: how many tickets of each type have been
+  sold vs total capacity, accounting for refunds, transfers, and voided tickets.
+scope:
+  included:
+    - For each active event + ticket type, count:
+        a. Tickets issued (status VALID or SCANNED).
+        b. Tickets refunded/voided.
+        c. Tickets transferred via resale.
+        d. Remaining capacity (capacity - issued + refunded).
+    - Computing sell-through = issued / capacity (clamped 0-1).
+    - Writing per-ticket-type breakdown into EventDailyStats.ticketTypeStats JSON column.
+    - Flagging events approaching sell-out (>90% sell-through) for organizer alerts.
+  excluded:
+    - Real-time availability checks (those query Ticket/OrderItem tables directly).
+    - Modifying ticket availability or blocking sales.
+    - Per-seat inventory for reserved seating (handled by place-layout subsystem).
+execution:
+  orchestration: keda-cronjob
+  image: ghcr.io/ithasfire/jobs:analytics-latest
+  command: ["node", "dist/analytics/sell-through-rollup.js"]
+  schedule:
+    cron: "15 3 * * *"   # 03:15 UTC daily — runs before event-daily-stats
+inputs:
+  postgres_tables:
+    - events
+    - ticket_types
+    - tickets
+    - order_items
+  config:
+    # Only process events starting within this window
+    lookback_days: 7     # recently ended events (for final stats)
+    lookahead_days: 180
+outputs:
+  postgres_tables:
+    - EventDailyStats.ticketTypeStats (JSON column, upsert)
+  metrics:
+    - analytics.sell_through.events_processed
+    - analytics.sell_through.near_sellout_count
+    - analytics.sell_through.duration_ms
+  notifications:
+    - Organizer digest flag when sell-through > 90% (consumed by notification-digests job).
+failure_modes:
+  - name: ticket_count_mismatch
+    mitigation: >
+      If issued + refunded > capacity, log anomaly and cap sell-through at 1.0.
+      Feed discrepancy into inventory-reconciliation for investigation.
+  - name: event_with_no_ticket_types
+    mitigation: Skip event, log warning. No stats row created.
+acceptance_criteria:
+  - sell-through rate for each ticket type is accurate to within 1 ticket of the actual count.
+  - Events with 0 capacity ticket types are skipped (no division by zero).
+  - Near-sellout flag (>90%) matches manual spot checks on sample events.
+  - Job completes in under 3 minutes for 5 000 events.
+  - Idempotent: re-run for the same date produces identical results.
+rollout_notes:
+  - This job should run before event-daily-stats so the sell-through data is available
+    for the broader stats aggregation.
+  - Validate against manual queries for a week before enabling organizer alerts.
+depends_on: []
+depended_on_by:
+  - event-daily-stats
+  - resale-price-snapshots

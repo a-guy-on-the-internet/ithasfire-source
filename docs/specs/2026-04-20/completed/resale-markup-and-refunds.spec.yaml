@@ -1,0 +1,324 @@
+# resale-markup-and-refunds.spec.yaml
+#
+# Resale pricing, markup splitting, and refund/cancellation handling for ticket resales.
+
+version: "1.0"
+updated: "2026-04-20"
+
+summary:
+  problem: >
+    Ithas Fire's resale marketplace currently supports resale enablement, listing caps,
+    and checkout creation, but it does not yet define the seller-profit economics,
+    organizer markup participation, or refund reversal behavior for resale purchases.
+    Without these rules, resale proceeds, buyer disclosures, and cancellation outcomes
+    are ambiguous.
+  solution: >
+    Extend resale payout terms to support a default markup split, allow ticket types to
+    override that split, and compute seller vs venue/artist proceeds from face value plus
+    markup. Reuse the existing platform-collects resale checkout path, show live listing-time
+    proceeds UI, and add explicit refund/cancellation reversal flows for resale orders.
+  users:
+    - resale sellers
+    - resale buyers
+    - organizers and venue operators
+    - finance and support admins
+  surfaces:
+    - web
+    - api
+    - jobs
+    - stripe webhooks
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        A resale listing must allow the seller to set the ask price directly, subject to
+        `TicketType.resaleCapCents` when a cap exists.
+    - id: FR-002
+      description: >
+        Resale payout terms must support a default markup split percentage that applies only to
+        profit above original face value. The default is 50% of markup to venue/artist payees
+        and 50% of markup to the reseller unless overridden. Splits are applied only when
+        markup is positive; there is no loss-sharing clause that takes additional funds from
+        the reseller when a listing sells at or below face value.
+    - id: FR-003
+      description: >
+        Ticket types may override the resale markup split defined by the resale payout terms.
+        Ticket-type override wins over the payout-terms default.
+    - id: FR-004
+      description: >
+        Resale proceeds must be computed as: seller base recovery equal to
+        min(askPrice, originalFaceValue), plus the seller's configured share of any positive
+        markup (askPrice − faceValue, floored at 0). Venue/artist payees receive only the
+        configured share of positive markup and receive nothing from a below-face resale.
+        Ithas Fire never pulls additional funds from the reseller beyond what is required to
+        process a refund or chargeback on that specific resale order.
+    - id: FR-005
+      description: >
+        Stripe processing fees must be charged on the full resale purchase price, not just
+        the markup portion.
+    - id: FR-006
+      description: >
+        Ithas Fire charges no margin-bearing platform fee on resale. Instead, the resale buyer
+        is charged a processing pass-through fee equal to the Stripe processing cost on the
+        total charge, grossed up so that fee-on-fee is covered (i.e., the final Stripe-charged
+        amount leaves Ithas Fire at $0 processing loss on a clean transaction or on a full
+        refund where Stripe retains its fee). The percentage and flat components must come
+        from the Stripe account/pricing config used by the resale fee policy, not from
+        hard-coded values, so rate changes flow through automatically. Waiving the fee to zero
+        requires an explicit admin/config action.
+    - id: FR-007
+      description: >
+        Listing-time web UI must show live seller proceeds disclosure in the form:
+        "You get $X back + $Y profit. $Z goes to the artist/venue." using the active terms,
+        ticket-type override if present, and full resale fee math.
+    - id: FR-008
+      description: >
+        Resale checkout must persist enough pricing metadata to reconstruct face value,
+        markup amount, seller markup share, venue/artist markup share, and processing-fee basis
+        for refunds, settlements, receipts, and admin review.
+    - id: FR-009
+      description: >
+        Before the configured refund cutoff, a resale buyer may self-serve a refund and an
+        organizer/admin may also initiate one. The refund flow must refund the resale buyer at the
+        resale purchase price, reverse the resale purchase, transfer ticket ownership/control from
+        the resale buyer back to the original reseller, and relist the ticket if the reseller
+        remains eligible.
+    - id: FR-010
+      description: >
+        In a pre-event resale refund, Stripe processing fees are not clawed back from Stripe.
+        The processing pass-through charged to the buyer (FR-006) is what covers this cost,
+        so a full refund must leave Ithas Fire at $0 processing loss without touching reseller
+        proceeds or organizer funds for processing recovery. The refund path must record the
+        processing-fee-retained amount as a separate accounting line item for reporting.
+    - id: FR-011
+      description: >
+        On event cancellation, all completed resale purchases must be auto-refunded at the resale
+        purchase price and the original ticket must be returned to the reseller rather than the
+        resale buyer.
+    - id: FR-012
+      description: >
+        Refund and cancellation flows must prevent duplicate payouts by cancelling or reversing any
+        pending resale settlements tied to the refunded resale order.
+    - id: FR-013
+      description: >
+        Stripe webhook processing must distinguish primary vs resale refunds/cancellations and run
+        resale-specific reversal logic without relying on primary-order ticket issuance behavior.
+    - id: FR-014
+      description: >
+        Resale checkout must use the existing `ResaleListingHold` flow so a pending buyer payment
+        does not block other buyers indefinitely. If a resale checkout attempt fails payment,
+        expires, or is abandoned, the hold must release and the listing must return to active
+        state until the listing itself expires or the sale cutoff passes.
+    - id: FR-015
+      description: >
+        Resale listings must have a hard sale cutoff tied to the event (for example, event start
+        or a configured pre-event offset). After the cutoff the listing must move to a terminal
+        unsold state; no new checkouts, hold renewals, or relist-after-refund operations may
+        create a new sellable listing past the cutoff. Any in-flight hold at the cutoff must be
+        cancelled and its buyer notified. Tickets whose listings expire unsold remain with the
+        original holder.
+    - id: FR-016
+      description: >
+        Seller proceeds from a completed resale purchase must be held by Ithas Fire and not
+        released to the reseller's payout until a post-event release window has elapsed.
+        Default window is 7 days after event end, configurable on the resale payout terms.
+        A per-event override of the release window is supported but gated behind a
+        platform-enable control granted per organization or per human (i.e., the override is
+        not available by default; an admin must enable the capability on a given org or user
+        before a per-event value can be set). Before the window elapses, the reseller share is
+        visible as pending but not payable. This aligns with industry norms
+        (StubHub/SeatGeek/Ticketmaster fan-to-fan typically release 5–8 days after event) and
+        protects against post-event chargebacks and "ticket didn't work" disputes.
+    - id: FR-017
+      description: >
+        If a resale purchase is disputed, refunded post-capture, or charged back, loss must be
+        allocated in this order:
+        (1) the processing pass-through fee covers Stripe's retained processing cost;
+        (2) any remaining loss is debited from the reseller's pending resale payout for that
+        order, and from other pending resale payouts to the same reseller if needed, before any
+        primary funds owed to organizer payees are touched;
+        (3) if reseller pending balance is insufficient, Ithas Fire fronts the residual and
+        records it as a collectible obligation against the reseller. Organizer/artist funds are
+        never used to cover a resale dispute loss.
+    - id: FR-018
+      description: >
+        A resale dispute or chargeback that resolves after the reseller's payout has already been
+        released must open a negative-balance obligation on that reseller and block further
+        resale payouts until resolved. New resale listings by that reseller may continue, but
+        future resale payouts apply against the outstanding obligation first.
+    - id: FR-019
+      description: >
+        A reseller's outstanding negative balance must surface in their account UI with the
+        amount owed and the dispute(s) that caused it. If the balance is not cleared by future
+        resale payouts within an aging window (default 60 days), it must escalate to a
+        finance/admin workflow for manual collection or documented write-off. The system must
+        never silently write off an uncollectible balance without an admin action and audit
+        record.
+    - id: FR-020
+      description: >
+        When it is time to release a reseller's held proceeds, the system must verify the
+        reseller's Stripe payout readiness. If the reseller is not payout-ready (no connected
+        Stripe account, failed KYC, disabled payouts, etc.), funds must remain held
+        indefinitely and the reseller must be notified by email that they need to connect or
+        repair their Stripe account to receive the funds. Reminder cadence is a one-week
+        campaign: an initial notice at the release attempt, one follow-up reminder partway
+        through the week (approximately day 3–4), and a final notice on day 7, after which
+        automated reminders stop. Held funds never expire into Ithas Fire revenue silently;
+        after the one-week cadence, resolution requires either the reseller completing
+        onboarding or an admin-initiated resolution with audit record.
+    - id: FR-021
+      description: >
+        The per-event release-window override referenced in FR-016 must be controlled by a
+        platform-level capability flag that can be enabled per organization or per human.
+        Without that flag enabled for the owning org/human of the event, the event falls back
+        to the payout-terms default.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        All resale money-moving mutations must be idempotent and keyed so webhook retries,
+        refund retries, and cancellation replays do not duplicate refunds, transfers, or relists.
+    - id: NFR-002
+      description: >
+        Seller proceeds UI must use the exact same pricing computation path as the backend
+        checkout path to avoid display vs settlement drift.
+    - id: NFR-003
+      description: >
+        Refund and cancellation audit logs must capture the resale listing, original order,
+        resale order, actor, refund amount, and ticket reversion outcome.
+
+architecture:
+  core:
+    use_cases:
+      - name: update-resale-listing-pricing
+        description: >
+          Validates seller ask price against resale caps and computes the seller/venue markup split
+          preview for listing-time UI.
+        input: sellerHumanId, ticketId or listingId, askPriceCents, ticketTypeId
+        output: askPriceCents, faceValueCents, markupCents, sellerRecoveryCents, sellerProfitCents, venueMarkupCents
+        idempotent: false
+        money: true
+      - name: create-resale-checkout
+        description: >
+          Existing use case extended to persist markup split metadata and apply resale-specific fee policy.
+        input: listingId, buyerHumanId, clientKey
+        output: orderId, paymentIntent client secret, pricing breakdown
+        idempotent: true
+        money: true
+      - name: refund-resale-purchase
+        description: >
+          Reverses a completed resale purchase before the refund cutoff, refunds the buyer, moves
+          ticket ownership/control back to the original reseller, and optionally relists the ticket.
+        input: resaleOrderId, actorHumanId, reason
+        output: refundId, ticketRestored, relisted
+        idempotent: true
+        money: true
+      - name: cancel-event-resale-purchases
+        description: >
+          Batch cancellation path that auto-refunds completed resale buyers and restores tickets to sellers.
+        input: eventId, actorSystem or actorHumanId
+        output: refundedCount, restoredCount, failedCount
+        idempotent: true
+        money: true
+
+  ports:
+    new:
+      - resale pricing metadata persistence on resale listings/orders or refund records
+      - resale refund/reversal repo operations for ticket restoration plus optional relist
+    existing:
+      - Repos
+      - PaymentsPort
+      - IdempotencyPort
+      - Audit repo/port
+      - SettlementsRepo
+
+  adapters:
+    new:
+      - Prisma support for markup-split configuration and resale refund state tracking
+    existing:
+      - Prisma resale listings adapter
+      - Prisma orders/tickets/settlements adapters
+      - Stripe payments adapter
+
+  transport:
+    trpc_procedures:
+      - resale.updateListingPricePreview
+      - resale.requestRefund
+      - organizer/admin resale refund mutation
+    webhooks:
+      - stripe payment success/refund handlers for resale reversal
+      - event cancellation orchestration path for resale purchase refunds
+
+  ui:
+    pages:
+      - seller resale listing flow
+      - organizer ticket-type resale settings in event builder/admin
+    components:
+      - resale pricing breakdown panel
+      - refund request UI for resale buyer
+      - organizer/admin resale refund controls
+
+data:
+  new_models: []
+  modified_models:
+    - PayoutTerms or related resale terms config to store default markup split percentage,
+      processing pass-through fee config reference, and post-event payout release offset
+      (default 7 days)
+    - TicketType to store optional resale markup split override percentage
+    - ResaleListing snapshot metadata for face value, markup split inputs, processing
+      pass-through, and sale cutoff
+    - ResaleListingHold lifecycle states covering payment failure/expiry release
+    - Order or OrderItem resale pricing snapshot fields for refund-safe reconstruction,
+      including buyer processing pass-through amount and payout release timestamp
+    - Reseller-scoped pending balance and negative-balance obligation tracking with aging
+      for admin-escalation workflow
+    - Platform capability flag (per org and per human) enabling per-event release-window
+      overrides
+    - Held-payout state and notification history for resellers lacking Stripe payout
+      readiness
+  migrations_needed: true
+
+risks:
+  - risk: >
+      Mixing face-value recovery, markup sharing, platform fees, and Stripe processing can create
+      drift between listing UI, checkout, and settlement if multiple computations diverge.
+    severity: HIGH
+    mitigation: >
+      Use one shared resale pricing calculator for preview, checkout, receipts, refunds, and settlement creation.
+  - risk: >
+      Moving ticket ownership/control back to the reseller after refund/cancellation can conflict
+      with scans, claims, or later resale actions if the reversal is not fully serialized.
+    severity: HIGH
+    mitigation: >
+      Gate reversal on ticket state checks, run within a single transaction where possible, and use
+      idempotent reversal markers plus settlement cancellation.
+  - risk: >
+      Ticket-type override semantics could become ambiguous if payout terms already use ticket-type-specific lines.
+    severity: MEDIUM
+    mitigation: >
+      Limit the override to markup split percentage only and document that payout-terms lines still govern payee routing.
+
+open_questions: []
+
+out_of_scope:
+  - scanner-specific resale door logic
+  - mobile resale flows
+  - external marketplace imports beyond the existing `source` seam
+  - post-event claims policy changes unrelated to pre-event refund and cancellation reversal
+
+acceptance_criteria:
+  - Seller listing UI shows face value recovery, seller profit, venue/artist markup share, and the buyer-visible processing pass-through fee before the listing is submitted. Below-face listings show zero profit for seller and zero markup share for venue/artist.
+  - Ask price validation rejects listings above `TicketType.resaleCapCents` at both listing time and checkout time.
+  - Resale checkout stores enough pricing metadata to reproduce the exact split, processing pass-through, and payout release timestamp later without re-reading mutable config.
+  - A full resale refund leaves Ithas Fire at $0 net processing loss because the buyer's pass-through fee covered Stripe's retained processing cost.
+  - A failed, expired, or abandoned resale checkout releases the `ResaleListingHold` and returns the listing to active state, up to the sale cutoff.
+  - After the sale cutoff no new resale checkouts, hold renewals, or post-refund relists may create a sellable listing; in-flight holds at the cutoff are cancelled.
+  - A pre-cutoff self-serve or organizer/admin resale refund returns the resale buyer's payment, moves ticket ownership/control back to the reseller, and prevents payout on the refunded resale order.
+  - Event cancellation auto-refunds completed resale buyers at resale price and returns ticket ownership/control to the original sellers.
+  - Reseller proceeds from completed resale orders are held until 7 days after event end by default, and only then become payable.
+  - A per-event override of the payout release window is only available when the platform capability flag is enabled for the event's owning org or human; otherwise the payout-terms default applies.
+  - When a reseller's held proceeds are due for release but Stripe payout readiness is missing, funds remain held, the reseller receives an email prompting them to connect/repair their Stripe account, and no silent expiration of those funds occurs.
+  - A disputed or charged-back resale order is covered by (1) the buyer's processing pass-through for Stripe costs, then (2) reseller pending balance; organizer funds are never consumed for resale dispute losses.
+  - A reseller with an outstanding negative balance sees it in their account UI; if unresolved past the 60-day aging window, it escalates to an admin workflow rather than being silently written off.
+  - Webhook retries and refund retries do not duplicate refunds, ticket reversals, relists, or payouts.

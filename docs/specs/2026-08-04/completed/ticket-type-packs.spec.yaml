@@ -1,0 +1,623 @@
+# ticket-type-packs.spec.yaml
+#
+# Platform-curated ticket-type packs living in the EXISTING TicketTypeTemplate
+# table: platform rows (ownerId null, isPlatform true) shown read-only to
+# organizers with a "From Ithas Fire" tag, plus one thin TicketPack metadata
+# table. Mirrors docs/specs/2026-07-27/completed/volunteer-role-packs.spec.yaml — the
+# same install-only seed, fork-with-provenance, and staff-curation shape,
+# transplanted onto tickets.
+#
+# REALITY CHECK ENCODED UP FRONT: unlike the volunteer spec's starting point,
+# the org/human template layer here ALREADY EXISTS and is live. Migration
+# 20260723120000_add_ticket_type_template shipped the TicketTypeTemplate
+# model (Json entries), the create/list/apply/archive use cases
+# (packages/core/src/use-cases/ticket-type-templates/), the
+# ticketTypeTemplates tRPC router, and the event-builder dialogs
+# (SaveTicketTypeTemplateDialog / ApplyTicketTypeTemplateDialog). This spec
+# adds ONLY the platform layer on top; it does not re-specify what shipped.
+
+version: "1.0"
+updated: "2026-08-04"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Ticket-type templates start empty. An organizer's first event begins from
+    a blank ticket step; the save-as-template flow (shipped 2026-07-23) only
+    pays off on their SECOND event, and only with their own prior work. There
+    is no curated catalogue showing what a sane ticket structure looks like —
+    "GA with a door price", "capacity-limited early-bird tiers", "pay what
+    you can" — even though the pricing model (FIXED | ADJUSTABLE with
+    minimumCents/suggestedCents) and doorPriceCents already support all of
+    them. The volunteer side solved the identical cold-start with platform
+    packs (2026-07-27); tickets should mirror it rather than invent a second
+    pattern.
+  solution: >
+    Platform-curated rows live in the table that already exists.
+    TicketTypeTemplate.ownerId becomes nullable and gains isPlatform +
+    packId; a catalogue template is (ownerId null, isPlatform true, packId
+    set). One thin new table (TicketPack) holds pack metadata — key, name,
+    blurb, DRAFT/LIVE status, sort order — because a blurb has to live
+    somewhere. Organizers see LIVE platform templates inside the existing
+    ApplyTicketTypeTemplateDialog, tagged and read-only, applicable directly
+    to an event through the existing applyTicketTypeTemplate path (which
+    already copies entries onto real TicketType rows via upsertTicketType);
+    "Customise" forks one into an owned copy. Staff curate at
+    /platform/ticket-packs, next to /platform/volunteer-packs. The launch
+    catalogue is seeded install-only — CREATE missing, never update or
+    delete; refresh/prune are operator opt-ins — exactly the
+    volunteer-packs.ts contract, because this seed also runs on every deploy
+    dispatch. Applied ticket types are COPIES with no live linkage: editing
+    or retiring a catalogue template never touches any event.
+  users:
+    - Platform staff curating the catalogue (ADMIN, DEVELOPER)
+    - Organizers building their first event's ticket step
+    - Organizers who want a starting point to customise
+  surfaces:
+    - web
+    - api
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+#
+# Phasing: FR-001..FR-013 are PHASE A (pack layer on today's schema — no new
+# ticket-type capabilities). FR-014..FR-016 are PHASE B (relative sales
+# windows), split out because TicketType has NO sales-window columns today —
+# there is nothing for a relative encoding to materialize into until the
+# columns and their checkout enforcement exist. Phase A ships alone.
+
+requirements:
+  functional:
+    - id: FR-001
+      phase: A
+      description: >
+        Schema — TicketPack (metadata only): key (stable slug, unique), name,
+        blurb, status (DRAFT | LIVE), sortOrder, curatedByHumanId (SetNull),
+        timestamps. Mirrors VolunteerPack minus targeting —
+        targetCategoryIds stays off until the volunteer side's inert
+        category-ranking path (their FR-013 amendment) proves useful. It
+        holds no ticket types of its own; templates point at it.
+    - id: FR-002
+      phase: A
+      description: >
+        Schema — TicketTypeTemplate: ownerId becomes String? and the model
+        gains isPlatform (Boolean, default false) and packId (String?,
+        SetNull). A catalogue row is ownerId=null + isPlatform=true + packId
+        set; ownerScope on such a row is ORGANIZATION by convention and
+        ignored. An org/human row is unchanged: ownerId set,
+        isPlatform=false, packId null. The zod DTO's `ownerId: z.uuid()`
+        (ticket-type-templates/schemas.ts) widens to nullable — every
+        consumer of that field is a compile-visited audit point, same as the
+        volunteer spec's FR-008 typed-audit-list rule: no non-null
+        assertions, no `?? ""`, each resolution deliberate.
+    - id: FR-003
+      phase: A
+      description: >
+        Idempotent catalogue identity. Postgres treats NULLs as distinct, so
+        nothing constrains two platform templates sharing a name inside one
+        pack. Add a raw partial unique index ("packId", "name") WHERE
+        "ownerId" IS NULL in the migration — SQL-only, invisible to Prisma,
+        documented as expected drift, following
+        VolunteerRoleTemplate_platform_pack_name_key and the two older
+        partial-index precedents. Per PACK, not per catalogue (the
+        volunteer spec's FR-003 amendment learned this the hard way): two
+        different packs may both ship a "General admission".
+    - id: FR-004
+      phase: A
+      description: >
+        Template entries gain doorPriceCents (Int?, cents). This
+        deliberately REVERSES half of the 2026-07-23 exclusion ("deliberately
+        excludes seatSectionId, doorPriceCents — they would dangle"):
+        doorPriceCents is a scalar, not a reference to an event-scoped row,
+        and it is exactly what an "advance + door" pack exists to
+        demonstrate. seatSectionId stays excluded — it genuinely dangles.
+        upsertTicketType already accepts doorPriceCents via its input schema
+        path, so apply passes it through instead of hardcoding null.
+        Existing stored templates (Json entries without the key) read as
+        doorPriceCents null — no backfill.
+    - id: FR-005
+      phase: A
+      description: >
+        BLOCKING SECURITY REQUIREMENT — platform rows are read-only to
+        organizers. Every mutating template path (archiveTicketTypeTemplate
+        today; any future update) must reject isPlatform rows BEFORE any
+        owner-access check, returning the same TEMPLATE_NOT_FOUND it uses
+        for a foreign template. ensureTemplateOwnerAccess (event-templates/
+        permissions.ts) currently derives authz from the row's
+        ownerScope/ownerId; a null ownerId leaves "who owns this"
+        unanswerable on a row anyone can name by id — the exact FR-007 trap
+        the volunteer spec closed.
+    - id: FR-006
+      phase: A
+      description: >
+        Read paths include the catalogue. listTicketTypeTemplates returns
+        the caller's own rows PLUS LIVE platform templates, each carrying
+        isPlatform + packId so the UI can tag and group them. DRAFT packs'
+        templates appear in no organizer-facing response. Shadowing: an
+        owned fork matched on (packId, name) case-insensitively hides its
+        catalogue source in that owner's list, so nobody sees two rows for
+        the same template — the volunteer FR-011 pair identity, which is
+        exactly what the FR-003 index enforces.
+    - id: FR-007
+      phase: A
+      description: >
+        Applying a platform template to an event works through the EXISTING
+        applyTicketTypeTemplate use case. Its guard chain
+        (ensureTemplateOwnerAccess with purpose "view") widens to "LIVE
+        platform row, or a row the actor may view" — and to nothing wider: a
+        template owned by a different org/human still yields
+        TEMPLATE_NOT_FOUND without confirming existence, and a DRAFT pack's
+        template is indistinguishable from absent. Everything downstream is
+        untouched and inherited on purpose: per-entry creation via
+        upsertTicketType (validation, status derivation, per-entry
+        idempotency `tpl:${clientKey}:${index}`), skip-existing-names,
+        payload-hash outer idempotency, and the resale gate-off clamp
+        (deps.resaleEnabled), which matters doubly here since resale is
+        platform-default-OFF.
+    - id: FR-008
+      phase: A
+      description: >
+        Applied ticket types are COPIES — no live linkage, stated as a
+        product guarantee, not an implementation accident. Apply copies
+        entry values onto real TicketType rows; nothing records which
+        template produced them beyond the existing "applied" AuditLog row.
+        Later edits to the catalogue template, pack retirement, or pack
+        deletion change NOTHING on any event, published or draft. Template
+        drift is invisible to events by design; there is no "update applied
+        events" affordance anywhere in this spec.
+    - id: FR-009
+      phase: A
+      description: >
+        "Customise" forks a platform template into an owned copy —
+        ownerScope/ownerId from the caller's context, isPlatform=false,
+        packId RETAINED as provenance (which powers FR-006 shadowing and
+        lets the fork outlive its pack via SetNull). Entries are copied
+        verbatim, doorPriceCents included. Name collisions never destroy
+        existing work: if the owner already has a template with the target
+        name that is NOT this catalogue row's fork, fail with
+        TEMPLATE_NAME_TAKEN and let the UI re-submit with an explicit new
+        name; an existing live fork of the same source is returned unchanged
+        rather than duplicated (re-copying would clobber the owner's
+        edits).
+    - id: FR-010
+      phase: A
+      description: >
+        Fork idempotency and authz ordering. Idempotent per (ownerId, source
+        template id) via the Idempotency store, so a double-clicked
+        Customise creates one copy. AUTHZ RUNS BEFORE THE IDEMPOTENCY STORE
+        IS TOUCHED — the volunteer fork's documented NFR-002 lesson
+        (fork-platform-template.ts "AUTHZ FIRST" block): the replay path
+        returns a full owned template for whichever owner the key names, so
+        a membership check placed after the cache read hands an ex-member
+        another org's customised template. Replay also re-verifies tenancy
+        on the cached id rather than trusting it. Failed keys are retained
+        near-zero (FAILURE_KEEP_SECONDS=1 precedent) so the documented
+        rename-and-retry after TEMPLATE_NAME_TAKEN is not locked out for 15
+        minutes.
+    - id: FR-011
+      phase: A
+      description: >
+        Organizer UI: extend the EXISTING ApplyTicketTypeTemplateDialog (the
+        ticket step's FromTemplatesDialog analog — already wired to
+        listTicketTypeTemplates / applyTicketTypeTemplate) with a "From
+        Ithas Fire" section grouped by pack, blurbs shown, ranked by pack
+        sortOrder. Platform rows carry the tag and offer Apply + Customise
+        instead of Archive. Entry previews show face price, capacity,
+        pricing mode, and door price. Per team convention, DRAFT/ACTIVE
+        ticket-type status stays unsurfaced — packs introduce no status UI;
+        applied rows get their status from upsertTicketType's event-status
+        derivation exactly as today.
+    - id: FR-012
+      phase: A
+      description: >
+        Staff catalogue at /platform/ticket-packs — list packs with status,
+        template and entry counts, fork count; create, edit, reorder,
+        publish/unpublish, delete. Gated on STAFF_TECH (ADMIN + DEVELOPER),
+        matching /platform/volunteer-packs. Entry editing goes through the
+        same zod schemas the org flow uses (ticketTypeTemplateEntriesSchema
+        + the FR-004 doorPriceCents extension), so a catalogue entry is
+        always one an organizer could have typed. Every pack and
+        platform-template mutation writes an AuditLog row (entity
+        "ticket_pack"). Staff can preview a pack as an organizer sees it,
+        DRAFT included; preview authorizes on STAFF_TECH, never on status.
+        Deleting a pack deletes its platform templates (Cascade); owned
+        forks survive via SetNull packId.
+    - id: FR-013
+      phase: A
+      description: >
+        Launch catalogue, seeded INSTALL-ONLY through the normal seed path
+        (a sibling of volunteer-packs.ts with the same contract — CREATE
+        missing packs/templates keyed on pack.key and (packId, name); never
+        update or delete by default; `--refresh` pushes git content over
+        rows, `--prune` removes rows the baseline no longer names, both OFF
+        in deploy workflows, both ON under seed:dev's full wipe; converged
+        re-seed writes nothing and audits nothing; changes audit as
+        ticket_pack.seed_installed/refreshed/pruned; entries validated
+        through the staff editor's zod schema so seeded content always
+        round-trips). DB-managed after first insert — curation fields
+        (status, sortOrder) are applied on first insert only. Four packs,
+        all LIVE, one template each, prices as editable starting points:
+
+          1. "general-admission" — General admission: one FIXED GA type
+             (2000¢, cap 100).
+          2. "advance-plus-door" — Advance + door: one FIXED GA type
+             (1500¢, doorPriceCents 2000, cap 100) — the doorPriceCents
+             showcase; one capacity pool, two prices.
+          3. "early-bird-tiers" — Early-bird tiers: Early bird (1200¢, cap
+             30), Advance (1800¢, cap 60), Day of show (2200¢, cap 30).
+             CAPACITY-limited tiering only — each tier closes by selling
+             out. Time-based tier flips are PHASE B; the pack blurb must not
+             promise them.
+          4. "pay-what-you-can" — Pay what you can: one ADJUSTABLE type
+             (minimumCents 0, suggestedCents 1000, cap 60). Supported today:
+             TicketTypePricingMode.ADJUSTABLE with minimumCents /
+             suggestedCents is live in schema, checkout, and the entry
+             schema's suggested>=minimum refinement.
+
+        All entries: resaleAllowed false (platform default-OFF gate),
+        transferAllowed true, USD integer cents.
+    - id: FR-014
+      phase: B
+      description: >
+        Schema — TicketType gains salesOpenAt (DateTime?) and salesCloseAt
+        (DateTime?), null meaning "no window bound" (today's behaviour for
+        every existing row — no backfill). PREREQUISITE STATED PLAINLY:
+        these columns do not exist today; no on-sale/off-sale concept exists
+        anywhere in the schema, which is why every window FR is Phase B.
+        Enforcement lands with the columns, not after them: create-checkout
+        (and the POS path) rejects purchases outside the window — a stored
+        window with no checkout guard is UI theatre.
+    - id: FR-015
+      phase: B
+      description: >
+        Relative sales-window encoding on template entries — the analog of
+        VolunteerRoleTemplateShift's anchor + offsetMinutes, which exists so
+        presets materialize against event dates instead of baking wall-clock
+        times. Entries gain salesOpen / salesClose, each nullable and shaped
+        { anchor: EVENT_START | EVENT_PUBLISH, offsetMinutes: Int (signed;
+        negative = before) }. Examples: early-bird closes { EVENT_START,
+        -20160 } (14 days before); day-of opens { EVENT_START, -1440 };
+        general on-sale opens { EVENT_PUBLISH, 0 }. There is no doors
+        anchor — Event has no doorsAt (same finding as the volunteer spec).
+    - id: FR-016
+      phase: B
+      description: >
+        Window materialization at apply time. applyTicketTypeTemplate
+        resolves each entry's relative window against the target event
+        (publish anchor resolving against apply time when the event is
+        already published) into concrete salesOpenAt/salesCloseAt on the
+        created TicketType — resolved in absolute time, previewed to the
+        organizer in the event's timezone before confirm (the volunteer
+        FR-006 timezone lesson: never browser-local arithmetic). Applying a
+        windowed entry to an event whose start makes the window inverted or
+        already fully past creates the type with a null window and surfaces
+        a per-entry warning — never a silent unsellable type. Existing
+        stored templates without window fields apply exactly as today.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Zero behaviour change for existing org/human templates and the
+        existing apply flow. A regression test asserts a pre-existing stored
+        template (Json entries without doorPriceCents or windows) applies to
+        byte-identical upsertTicketType inputs before and after the
+        migration.
+    - id: NFR-002
+      description: >
+        Tenancy. Owner A must never see, apply, fork, or mutate a template
+        owned by B; nullable ownerId means "not mine" is no longer the same
+        test as "not null", and every filter states which it means. Platform
+        rows are visible to all (LIVE only) and mutable by none outside
+        STAFF_TECH. Negative tests per mutating path, mirroring the
+        volunteer acceptance set.
+    - id: NFR-003
+      description: >
+        Money handling. All amounts are integer cents (priceCents,
+        minimumCents, suggestedCents, doorPriceCents), USD — TicketType
+        carries no currency column and templates do not add one. Templates
+        store FACE PRICE ONLY and never bake fees: platform fees live in DB
+        rows and PASS_THROUGH is grossed up at checkout, so a template
+        carrying a fee-inflated price would double-charge the fee.
+        Template/pack amounts never enter computeOrderSplits — splits
+        operate on order money under the zero-sum invariant, and FIXED
+        amounts must not be fed into it; nothing in this feature touches
+        splits, and a test pins that the apply path writes TicketType rows
+        without creating or altering any PayoutTermsLine.
+    - id: NFR-004
+      description: >
+        Idempotency. Seed converges (second run writes nothing); apply
+        replays by payload hash and never duplicates entries (inherited,
+        re-asserted with a platform template); fork is idempotent per
+        (ownerId, sourceTemplateId) with authz ahead of every store touch
+        (FR-010).
+    - id: NFR-005
+      description: >
+        Pack blurbs and platform template/entry names are staff-authored
+        free text rendered to organizers — escaped on output, no HTML
+        passthrough; plainTextRequired stays the input gate.
+    - id: NFR-006
+      description: >
+        Any new catch-and-fallback branch (e.g. the FR-016 degraded-window
+        warning path) declares reportError?: ReporterPort and reports the
+        swallow per the CLAUDE.md convention — never a bare logger.warn.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: list-ticket-type-templates (MODIFIED)
+        description: >
+          Returns the caller's rows plus LIVE platform rows, each flagged
+          isPlatform + packId, with FR-006 fork shadowing.
+        input: actorHumanId, ownerScope, ownerId
+        output: items[] with isPlatform, packId, pack metadata for grouping
+        idempotent: true
+        money: false
+        authz: existing owner-access check, unchanged for owned rows
+
+      - name: archive-ticket-type-template (MODIFIED)
+        description: Gains the FR-005 isPlatform rejection ahead of owner access.
+        input: unchanged
+        output: unchanged
+        idempotent: true
+        money: false
+        authz: owner, and never on a platform row
+
+      - name: apply-ticket-type-template (MODIFIED)
+        description: >
+          View-guard widened to LIVE platform rows (FR-007); passes
+          doorPriceCents through (FR-004); Phase B adds window
+          materialization (FR-016). Everything else inherited.
+        input: unchanged (actorHumanId, eventId, templateId, clientKey)
+        output: unchanged ({ created, skipped })
+        idempotent: true
+        money: false
+        authz: event access via existing ensureEventAccessible chain
+
+      - name: fork-platform-ticket-template
+        description: >
+          "Customise" — copies a LIVE platform template into an owned copy
+          with packId provenance. Structured on
+          volunteering/fork-platform-template.ts: authz first, idempotency
+          store second, in-tx re-check, durable (packId, name) re-read as
+          the second guard, TEMPLATE_NAME_TAKEN recovery.
+        input: ownerScope, ownerId, templateId, actorHumanId, name?
+        output: template DTO
+        idempotent: true
+        money: false
+        authz: org OWNER | ADMIN (or the human themself for HUMAN scope)
+
+      - name: list-ticket-packs
+        description: LIVE packs with their templates, for the dialog's catalogue section.
+        input: actorHumanId
+        output: packs[] with templates[] and entries
+        idempotent: true
+        money: false
+        authz: any authed organizer context that can open the ticket step
+
+      - name: list-ticket-packs-admin / upsert-ticket-pack /
+              set-ticket-pack-status / remove-ticket-pack
+        description: >
+          Staff CRUD over packs and their platform templates, mirroring the
+          volunteerPacks admin set. Each writes AuditLog ("ticket_pack").
+        input: pack fields, templates[] (entries via the shared zod schema), actorHumanId
+        output: pack
+        idempotent: false
+        money: false
+        authz: STAFF_TECH
+
+  ports:
+    new: []
+    existing:
+      - TicketTypeTemplatesRepo (packages/types/src/repos/ticket-type-templates.ts
+        record gains isPlatform + packId + nullable ownerId; list gains the
+        platform union; pack CRUD attaches here — no new port, same collapse
+        as the volunteer spec)
+      - IdempotencyPort
+      - AuditLogRepo
+      - ReporterPort (NFR-006)
+
+  adapters:
+    new: []
+    existing:
+      - packages/adapters/src/db/prisma/ticket-type-templates.ts — every
+        query site audited for "owned rows", "catalogue rows", or "both"
+        once ownerId is nullable (the volunteer 11-site audit, smaller here)
+
+  transport:
+    trpc_procedures:
+      - ticketTypeTemplates.forkPlatformTemplate (authed, owner-scoped)
+      - ticketPacks.list (authed)
+      - ticketPacks.admin.list | get | upsert | setStatus | remove (staff)
+    webhooks: []
+
+  ui:
+    pages:
+      - apps/web/src/app/platform/ticket-packs/page.tsx (catalogue)
+      - apps/web/src/app/platform/ticket-packs/[key]/page.tsx (editor + preview)
+    components:
+      - TicketPackCatalogueView (staff list, status pills, fork counts)
+      - TicketPackEditorView (pack metadata + templates + entries + publish)
+      - PlatformTemplateTag ("From Ithas Fire" — shared look with the
+        volunteer tag)
+      - ApplyTicketTypeTemplateDialog (MODIFIED — pack section, tag,
+        Customise action, entry preview incl. door price; Phase B adds a
+        resolved window preview in the event's timezone)
+      - SaveTicketTypeTemplateDialog (unchanged)
+      - TicketTypeEditor (unchanged — applied rows are ordinary ticket types)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - TicketPack
+  new_enums:
+    - TicketPackStatus (DRAFT | LIVE)
+    - TicketSalesAnchor (EVENT_START | EVENT_PUBLISH) — Phase B, entry-Json
+      vocabulary + column enum for any future denormalization
+  modified_models:
+    - TicketTypeTemplate (ownerId → nullable, + isPlatform, + packId;
+      entries Json gains doorPriceCents, Phase B salesOpen/salesClose)
+    - TicketType (Phase B only — + salesOpenAt, + salesCloseAt)
+  migrations_needed: true
+  migration_notes: >
+    Widening ownerId to nullable is not reversible without data loss once
+    catalogue rows exist. The FR-003 partial unique index is raw SQL in the
+    migration (documented Prisma drift, per precedent). Entry-Json changes
+    need no migration — absent keys read as null. Phase B's TicketType
+    columns default null (no backfill; null = unbounded, today's
+    behaviour). Dev DB gets a real migration, never db push (P2022
+    precedent).
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      An organizer archives (or a future edit path mutates) a platform
+      template, changing the catalogue for every org — the authz derives
+      from the row, and the row's ownerId is now null.
+    severity: HIGH
+    mitigation: >
+      FR-005 rejects isPlatform before any owner check, in every mutating
+      path, with explicit negative tests. First thing reviewed, as it was
+      on the volunteer side.
+  - risk: >
+      A query meaning "my templates" silently returns catalogue rows (or
+      vice versa) once ownerId: null matches rows that used to be
+      impossible.
+    severity: HIGH
+    mitigation: >
+      FR-002's compile-surfaced audit of every ownerId consumer; adapter
+      site audit; NFR-002 cross-tenant tests.
+  - risk: >
+      Catalogue prices read as endorsements — an organizer applies "GA
+      2000¢" untouched and it is wrong for their room, their scene, their
+      night.
+    severity: MEDIUM
+    mitigation: >
+      Entries are explicit starting points: the dialog shows editable
+      previews, blurbs say "edit to fit", and applied rows are ordinary
+      fully-editable ticket types. No pack ships without a price a Nashville
+      house show could actually charge.
+  - risk: >
+      Phase B windows stored but not enforced at checkout — a visible
+      "closes Friday" that keeps selling Saturday.
+    severity: HIGH (Phase B)
+    mitigation: >
+      FR-014 lands columns and create-checkout/POS enforcement in the same
+      change; acceptance criterion pins a past-window purchase rejection.
+  - risk: >
+      Seed churns staff-curated catalogue content on unrelated deploys.
+    severity: MEDIUM
+    mitigation: >
+      FR-013 install-only contract, copied from volunteer-packs.ts verbatim
+      semantics (refresh/prune opt-ins OFF in deploy workflows, audited
+      writes, converged re-seed writes nothing).
+  - risk: >
+      Fork replay leaks another owner's customised template via the
+      idempotency cache.
+    severity: HIGH
+    mitigation: >
+      FR-010: authz before any store touch + tenancy re-verified on replay,
+      lifted directly from the volunteer fork's documented fix.
+
+open_questions:
+  - >
+      Does Customise belong in v1, given ApplyTicketTypeTemplateDialog
+      already lets an organizer apply-then-edit on the event and re-save as
+      their own template? Lean yes for parity with volunteering, but Apply
+      alone may cover 90% — worth confirming before building FR-009/FR-010.
+  - >
+      Pack targeting (targetCategoryIds) is omitted (FR-001). The volunteer
+      side shipped it inert for lack of an org-category signal; confirm
+      tickets should stay leaner rather than matching field-for-field.
+  - >
+      i18n: pack blurbs and template names are staff-authored DB text,
+      outside the dual-catalog message system — English-only at launch,
+      same accepted limitation as volunteer packs.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Auto-sync of applied ticket types when a catalogue template changes —
+    applied types are copies, forever (FR-008). No "update my events"
+    affordance.
+  - Fee configuration of any kind on templates or packs — fees are DB rows
+    resolved at checkout; templates carry face price only (NFR-003).
+  - Per-template Stripe config (Connect accounts, payout terms, tax
+    behaviour) — templates know nothing about money movement.
+  - Seat sections in entries (seatSectionId stays excluded — it dangles
+    across events).
+  - Surfacing DRAFT/ACTIVE ticket-type status anywhere in pack or apply UI
+    (standing team convention).
+  - Org-authored packs shared with other orgs; the catalogue is
+    platform-only.
+  - Promo codes, comps, resale terms, and payout-terms lines — untouched.
+  - Scheduled price changes on live TicketType rows (auto price flip at a
+    timestamp) — Phase B stops at sales windows; tier flips remain
+    capacity-based or manual.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  # FR-005 / NFR-002
+  - An org OWNER calling archive with a platform template id gets
+    TEMPLATE_NOT_FOUND and the platform row is byte-identical afterwards;
+    the same call with ANOTHER owner's template id also gets
+    TEMPLATE_NOT_FOUND with no existence signal.
+  # FR-006
+  - listTicketTypeTemplates for owner A returns A's rows plus LIVE platform
+    rows and zero rows belonging to B; a DRAFT pack's templates appear in no
+    organizer-facing response while staff preview shows them.
+  # FR-003 / FR-013
+  - One pack cannot hold two platform templates both named "General
+    admission" (partial unique index); two different packs each holding one
+    is allowed; re-running the seed against a converged database performs
+    zero writes and emits zero audit rows.
+  # FR-013 install-only
+  - After staff edit a seeded template's price at /platform/ticket-packs, a
+    subsequent default-mode seed run leaves the edit intact; --refresh
+    restores the git baseline and audits ticket_pack.seed_refreshed.
+  # FR-007
+  - Applying the "pay-what-you-can" pack template to a draft event creates
+    an ADJUSTABLE ticket type with minimumCents 0 / suggestedCents 1000 via
+    upsertTicketType; re-submitting the same clientKey creates nothing more;
+    an entry whose name already exists on the event is reported skipped.
+  # FR-007 resale clamp
+  - With the resale gate off, applying a template whose stored entry has
+    resaleAllowed true creates the type with resaleAllowed false and
+    resaleCapCents null.
+  # FR-004
+  - Applying "advance-plus-door" creates ONE ticket type with priceCents
+    1500 and doorPriceCents 2000 (one capacity pool); a pre-existing stored
+    template without the key applies with doorPriceCents null (NFR-001
+    equivalence).
+  # FR-008
+  - After a template is applied to a published event, editing that catalogue
+    template's price, unpublishing its pack, and deleting the pack each
+    change nothing on the event's ticket types.
+  # FR-009 / FR-010
+  - Customise creates an owned copy (packId retained) that shadows the
+    catalogue row in that owner's list and leaves it untouched for every
+    other org; a double-click creates exactly one copy; a name collision
+    with the owner's own unrelated template fails TEMPLATE_NAME_TAKEN and an
+    immediate rename retry succeeds; a caller who is not org OWNER/ADMIN is
+    rejected before any idempotency-store read or write.
+  # FR-012
+  - A non-STAFF_TECH staff member (REVIEWER, SUPPORT) gets a forbidden error
+    from every ticketPacks.admin.* procedure; deleting a pack removes its
+    platform templates and leaves every owned fork intact (packId nulled).
+  # NFR-003
+  - No code path introduced by this feature reads or writes
+    PayoutTermsLine or invokes computeOrderSplits; a grep-level guard test
+    pins the apply path's writes to TicketType rows only, and every stored
+    amount field rejects non-integer input.
+  # FR-014..FR-016 (Phase B)
+  - A checkout for a ticket type whose salesCloseAt is in the past is
+    rejected; an entry closing { EVENT_START, -20160 } applied to an event
+    starting 2026-10-01T20:00 New York time materializes salesCloseAt
+    2026-09-17T20:00 America/New_York (shown in the event's timezone, not
+    the browser's); applying a windowed entry to an event starting tomorrow,
+    where the window is already fully past, creates the type with a null
+    window and surfaces a warning rather than an unsellable type.

@@ -1,0 +1,72 @@
+# Spec: Ticket Issuance Queue Worker
+meta:
+  owner: ticketing
+  status: draft
+  reviewers:
+    - platform-eng
+    - product-ops
+  linked_docs:
+    - ../../core/use-cases/orders
+    - ../../core/use-cases/tickets
+summary: |
+  BullMQ-backed worker that listens for `order.captured` events and issues tickets,
+  updates ownership, and triggers downstream notifications within seconds of checkout.
+scope:
+  included:
+    - Reserving ticket codes and persisting Ticket rows via core use cases.
+    - Emitting ticket transfer links / QR codes once issued.
+    - Publishing follow-up jobs (transactional email, analytics) through ports.
+  excluded:
+    - Payment capture logic (handled by Order capture use case).
+    - Long-running reporting (handled by batch jobs).
+execution:
+  runtime: bullmq
+  queue: ticket:issue
+  concurrency: 25 workers (configurable per env)
+  handler: `apps/jobs/src/jobs/ticketing/issue-ticket.ts`
+  deployment: Kubernetes Deployment (`jobs-ticketing-worker`)
+  scaling:
+    min_pods: 1
+    max_pods: 10 (HPA on queue depth / CPU)
+inputs:
+  payload_schema:
+    orderId: string (uuid)
+    ticketTypeAllocations: array<{ ticketTypeId: uuid, quantity: number }>
+    purchaserId: string (uuid)
+    context:
+      captureId: string
+      idempotencyKey: string
+  ports:
+    - TicketIssuancePort
+    - AuditLogPort
+    - NotificationPort (for downstream fan-out)
+outputs:
+  side_effects:
+    - Ticket records created/updated via core use case
+    - Audit log entry (ticket.issued)
+    - Job enqueued on notification queue (receipt + QR delivery)
+  metrics:
+    - queue.ticket.issue.process_time_ms
+    - queue.ticket.issue.success_total
+    - queue.ticket.issue.failure_total
+  logs:
+    - structured JSON with orderId, ticketCount, latency
+failure_modes:
+  - name: idempotency_conflict
+    action: core use case returns success with existing ticket refs; worker logs idempotent completion
+  - name: oversell_detected
+    action: fail job, enqueue compensation job, alert revenue-ops
+  - name: downstream_notification_failure
+    action: continue (best-effort) but increment alert counter; notification worker retries separately
+retries:
+  strategy: exponential with jitter
+  max_attempts: 5
+  backoff_ms: 500 → 15000
+acceptance_criteria:
+  - 99% of tickets issued within 5 seconds of order capture under normal load
+  - Zero duplicate tickets when job retried (idempotency verified)
+  - Metrics exported to Prometheus via BullMQ instrumentation
+rollout_notes:
+  - Shadow mode: run worker but discard side effects (dry-run) for first 20% of traffic
+  - Cutover: enable writes region by region; monitor oversell alarms
+  - Decommission legacy synchronous issuance path once queue success rate > 99.9%

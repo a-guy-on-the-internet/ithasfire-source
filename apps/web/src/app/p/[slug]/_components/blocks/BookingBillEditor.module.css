@@ -1,0 +1,436 @@
+/* ── The bill (lineup-booking-requests v3, board F1 — the ledger) ──────────
+   Lives inside the request-to-play form, so it follows that form's theme
+   contract: the entity-page --th-color-* vars with the same neutral greys
+   (RequestToPlayBlock.module.css). Strict Swiss: radius 0, ruled rows, the
+   Plex Mono label idiom for index numbers, badges and the count. */
+
+.bill {
+	display: flex;
+	flex-direction: column;
+	gap: 0.75rem;
+	min-inline-size: 0;
+}
+
+.selfBlock {
+	display: flex;
+	flex-direction: column;
+	gap: 0.25rem;
+}
+
+.selfLabel {
+	font-weight: 700;
+}
+
+.enableRow {
+	display: flex;
+	flex-direction: column;
+	gap: 0.25rem;
+	padding-left: 1.75rem;
+}
+
+/* Text-weight action (board: "Turn on performer mode") — a link-styled
+   button, not a second primary: the submit is the form's one CTA. */
+.textAction {
+	align-self: flex-start;
+	min-height: 44px;
+	padding: 0;
+	border: 0;
+	background: none;
+	font: inherit;
+	font-size: 0.8125rem;
+	font-weight: 700;
+	color: var(--th-color-primary, var(--accentText, #A8300F));
+	text-decoration: underline;
+	text-underline-offset: 2px;
+	cursor: pointer;
+}
+
+.textAction:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
+.textAction:focus-visible,
+.iconButton:focus-visible,
+.addButton:focus-visible {
+	outline: 2px solid var(--th-color-primary, currentColor);
+	outline-offset: 1px;
+}
+
+/* ── Ledger ─────────────────────────────────────────────────────────────── */
+
+.ledger {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	border-top: 2px solid var(--th-color-text, currentColor);
+	container-type: inline-size;
+}
+
+/* Table-like row: fixed index + controls, fluid middle (DS §5). The self
+   row has no controls; its empty cells keep the columns aligned. */
+.row {
+	display: grid;
+	grid-template-columns: 1.75rem minmax(0, 1fr) auto 44px 44px 44px;
+	grid-template-areas: "index main badge up down remove";
+	align-items: center;
+	column-gap: 0.375rem;
+	padding: 0.375rem 0;
+	border-bottom: 1px solid rgba(128, 128, 128, 0.3);
+	min-height: 44px;
+}
+
+.index {
+	grid-area: index;
+	font-family: var(--font-mono, ui-monospace, monospace);
+	font-size: var(--fs-mono-md, 11.5px);
+	letter-spacing: var(--tr-mono-md, 1.4px);
+	font-weight: 600;
+	font-variant-numeric: tabular-nums;
+	color: var(--th-color-text, inherit);
+	opacity: 0.7;
+}
+
+.main {
+	grid-area: main;
+	display: flex;
+	flex-direction: column;
+	gap: 0.125rem;
+	min-width: 0;
+}
+
+.nameLine {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 0.5rem;
+}
+
+.name {
+	font-size: 0.9375rem;
+	font-weight: 700;
+	color: var(--th-color-text, inherit);
+	/* Word boundaries first; a single token longer than the line still breaks
+	   rather than overflowing. Never mid-word for ordinary names. */
+	overflow-wrap: break-word;
+	word-break: normal;
+	min-width: 0;
+}
+
+.headlining {
+	font-family: var(--font-mono, ui-monospace, monospace);
+	font-size: var(--fs-mono-2xs, 9.5px);
+	letter-spacing: var(--tr-mono-2xs, 2.5px);
+	font-weight: 600;
+	text-transform: uppercase;
+	color: var(--th-color-primary, var(--accentText, #A8300F));
+}
+
+.source {
+	font-size: 0.75rem;
+	color: var(--th-color-text, inherit);
+	opacity: 0.7;
+}
+
+.badge {
+	grid-area: badge;
+	justify-self: start;
+	font-family: var(--font-mono, ui-monospace, monospace);
+	font-size: var(--fs-mono-2xs, 9.5px);
+	letter-spacing: var(--tr-mono-2xs, 2.5px);
+	font-weight: 600;
+	text-transform: uppercase;
+	white-space: nowrap;
+	color: var(--th-color-text, inherit);
+	border: 1px solid var(--th-color-text, currentColor);
+	padding: 0.25rem 0.375rem;
+	/* Wide: an `auto` track sized to the badge, capped here, so it can never
+	   reach into the fixed 44px control tracks beside it. (A % cap would be
+	   circular in an auto track; the narrow layout below adds one.) */
+	max-width: 12rem;
+	min-width: 0;
+	box-sizing: border-box;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.iconButton {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 44px;
+	height: 44px;
+	padding: 0;
+	border: 0;
+	border-radius: 0;
+	background: none;
+	color: var(--th-color-text, inherit);
+	cursor: pointer;
+	transition: background-color 0.15s;
+}
+
+.iconButton:hover:not(:disabled) {
+	background-color: rgba(128, 128, 128, 0.12);
+}
+
+.iconButton:disabled {
+	opacity: 0.3;
+	cursor: not-allowed;
+}
+
+.up {
+	grid-area: up;
+}
+
+.down {
+	grid-area: down;
+}
+
+.remove {
+	grid-area: remove;
+}
+
+/* Narrow (phone, or a narrow dialog): three lines. Name and meta take the
+   full width; the role badge gets its own line under them (full width, so a
+   long custom role ellipsizes there); the three 44px controls sit on a third
+   line, right-aligned. The badge and the controls are on different grid ROWS,
+   so they cannot overlap at any width. (Sharing a row overlapped: the badge
+   track was ~52px in a 216px row and "PERFORMER" is ~110px.) */
+@container (max-width: 30rem) {
+	.row {
+		grid-template-columns: 1.5rem minmax(0, 1fr) 44px 44px 44px;
+		grid-template-areas:
+			"index main main main main"
+			"index badge badge badge badge"
+			"index . up down remove";
+		column-gap: 0.125rem;
+		row-gap: 0.25rem;
+		align-items: start;
+	}
+
+	/* The sender's own row has no controls: no empty third line. */
+	.rowSelf {
+		grid-template-areas:
+			"index main main main main"
+			"index badge badge badge badge";
+	}
+
+	.index {
+		padding-top: 0.25rem;
+	}
+
+	/* Here the badge's area is a definite span of the row (1fr + three 44px
+	   tracks), so the % resolves: a 60-character custom role ellipsizes at
+	   the row's edge. `justify-self: start` alone would size it to
+	   fit-content, whose floor is the nowrap text's full width. */
+	.badge {
+		max-width: 100%;
+	}
+}
+
+.rowFlag {
+	font-size: 0.75rem;
+}
+
+/* ── Add an act ─────────────────────────────────────────────────────────── */
+
+.add {
+	display: flex;
+	flex-direction: column;
+	gap: 0.5rem;
+	padding-top: 0.75rem;
+	border-top: 1px solid rgba(128, 128, 128, 0.3);
+}
+
+.addHeading {
+	font-family: var(--font-mono, ui-monospace, monospace);
+	font-size: var(--fs-mono-xs, 10px);
+	letter-spacing: var(--tr-mono-xs, 2.5px);
+	font-weight: 600;
+	text-transform: uppercase;
+	color: var(--th-color-text, inherit);
+}
+
+.addFields {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: flex-start;
+	gap: 0.5rem;
+}
+
+.addName {
+	flex: 1 1 13rem;
+	min-width: 0;
+}
+
+.addLink {
+	flex: 1 1 10rem;
+	min-width: 0;
+}
+
+.addRole {
+	flex: 0 1 9rem;
+	min-width: 8rem;
+}
+
+.addRoleName {
+	flex: 1 1 8rem;
+	min-width: 0;
+}
+
+/* Secondary (outlined) — the submit stays the one primary. Aligned to the
+   inputs' baseline row by its label-height offset. */
+.addButton {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.5rem;
+	align-self: flex-end;
+	min-height: 44px;
+	padding: 0 1rem;
+	border: 2px solid var(--th-color-text, currentColor);
+	border-radius: 0;
+	background: none;
+	font: inherit;
+	font-size: 0.75rem;
+	font-weight: 700;
+	letter-spacing: 1.5px;
+	text-transform: uppercase;
+	color: var(--th-color-text, inherit);
+	cursor: pointer;
+	transition: background-color 0.15s, color 0.15s;
+}
+
+.addButton:hover {
+	background-color: var(--th-color-text, var(--color, #211C16));
+	color: var(--th-color-bg, var(--surface, #FDFAF3));
+}
+
+.count {
+	margin: 0;
+	align-self: flex-end;
+	font-family: var(--font-mono, ui-monospace, monospace);
+	font-size: var(--fs-mono-xs, 10px);
+	letter-spacing: var(--tr-mono-xs, 2.5px);
+	font-weight: 600;
+	text-transform: uppercase;
+	color: var(--th-color-text, inherit);
+	opacity: 0.7;
+}
+
+/* ── Name combobox ──────────────────────────────────────────────────────── */
+
+.comboWrap {
+	position: relative;
+	min-width: 0;
+}
+
+/* The input draws its own box (see BillActCombobox); this only anchors the
+   leading search icon inside it. */
+.comboField {
+	position: relative;
+	display: flex;
+	align-items: center;
+}
+
+.comboIcon {
+	flex-shrink: 0;
+	color: var(--th-color-text, currentColor);
+	opacity: 0.6;
+}
+
+.comboSearchIcon {
+	position: absolute;
+	left: 0.75rem;
+	pointer-events: none;
+}
+
+.comboPopup {
+	position: absolute;
+	top: calc(100% + 2px);
+	left: 0;
+	right: 0;
+	z-index: 20;
+	border: 2px solid var(--th-color-text, currentColor);
+	background-color: var(--th-color-bg, var(--surface, #FDFAF3));
+}
+
+.comboPopup[hidden] {
+	display: none;
+}
+
+.comboStatus {
+	margin: 0;
+	padding: 0.625rem 0.75rem;
+	font-size: 0.8125rem;
+	color: var(--th-color-text, inherit);
+	opacity: 0.75;
+}
+
+.comboList {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	max-height: 18rem;
+	overflow-y: auto;
+}
+
+.comboOption {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+	min-height: 44px;
+	padding: 0.375rem 0.75rem 0.375rem 0.5625rem;
+	border-left: 3px solid transparent;
+	cursor: pointer;
+	color: var(--th-color-text, inherit);
+}
+
+.comboOption[aria-selected="true"] {
+	background-color: rgba(128, 128, 128, 0.16);
+	border-left-color: var(--th-color-primary, var(--accent, #E2481D));
+}
+
+.comboOptionText {
+	display: flex;
+	flex-direction: column;
+	flex: 1;
+	min-width: 0;
+}
+
+.comboOptionName {
+	font-size: 0.9375rem;
+	font-weight: 600;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.comboOptionDetail {
+	font-size: 0.75rem;
+	opacity: 0.7;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.comboOptionKind {
+	flex-shrink: 0;
+	font-family: var(--font-mono, ui-monospace, monospace);
+	font-size: var(--fs-mono-2xs, 9.5px);
+	letter-spacing: var(--tr-mono-2xs, 2.5px);
+	font-weight: 600;
+	text-transform: uppercase;
+	opacity: 0.7;
+}
+
+.srOnly {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	white-space: nowrap;
+	border: 0;
+}

@@ -7,7 +7,8 @@
  * Creates a PASSWORD- or APPLICATION-gated event and, optionally, magic
  * links for direct unlock.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { mintApplicationFormPublicId } from "@th/core/lib/application-form-public-id";
 import type { FastifyPluginAsync } from "fastify";
 import { hashEventPassword } from "@th/core/lib/security/event-password";
 import { prisma } from "@th/db";
@@ -15,6 +16,7 @@ import { env } from "../../lib/env.js";
 import {
   assertE2eAuthorized,
   formatError,
+  resolveHumanId,
   seedFeePolicy,
   seedPayoutTerms,
   snapshotPayoutTermsForE2eEvent,
@@ -30,6 +32,14 @@ const seedGatedEvent: FastifyPluginAsync = async (app) => {
       password?: string;
       email?: string;
       userPassword?: string;
+      /**
+       * Make an EXISTING auth user (e.g. the Playwright storageState user,
+       * who can actually sign in) the org owner, instead of minting a
+       * password-less organiser.
+       */
+      ownerEmail?: string;
+      /** Override the payee's Stripe account (it is unique per payee). */
+      stripeAccountId?: string;
       priceCents?: number;
       applicationQuestions?: Array<{
         prompt: string;
@@ -48,21 +58,34 @@ const seedGatedEvent: FastifyPluginAsync = async (app) => {
 
     try {
       // ── Human + auth ───────────────────────────────────────────────
-      const human = await prisma.human.create({
-        data: { status: "ACTIVE", roles: ["USER"] },
-      });
+      let human: { id: string };
+      if (body.ownerEmail) {
+        const existingId = await resolveHumanId({ email: body.ownerEmail });
+        if (!existingId) {
+          return reply.status(400).send({
+            ok: false,
+            error: "human_not_found",
+            message: `No human found for email ${body.ownerEmail}.`,
+          });
+        }
+        human = { id: existingId };
+      } else {
+        human = await prisma.human.create({
+          data: { status: "ACTIVE", roles: ["USER"] },
+        });
 
-      await prisma.authUser.create({
-        data: {
-          id: human.id,
-          humanId: human.id,
-          email,
-          emailVerified: true,
-          name: "E2E Gated Test User",
-          createdAt: now,
-          updatedAt: now,
-        },
-      });
+        await prisma.authUser.create({
+          data: {
+            id: human.id,
+            humanId: human.id,
+            email,
+            emailVerified: true,
+            name: "E2E Gated Test User",
+            createdAt: now,
+            updatedAt: now,
+          },
+        });
+      }
 
       // ── Org + membership ───────────────────────────────────────────
       const org = await prisma.organization.create({
@@ -87,7 +110,10 @@ const seedGatedEvent: FastifyPluginAsync = async (app) => {
         feePolicyId: feePolicy.id,
         orgId: org.id,
         currency: "usd",
-        stripeAccountId: env.E2E_STRIPE_ACCOUNT_ID ?? `acct_e2e_${Date.now()}`,
+        stripeAccountId:
+          body.stripeAccountId ??
+          env.E2E_STRIPE_ACCOUNT_ID ??
+          `acct_e2e_${Date.now()}`,
       });
 
       // ── Event ──────────────────────────────────────────────────────
@@ -142,7 +168,11 @@ const seedGatedEvent: FastifyPluginAsync = async (app) => {
         ];
 
         const form = await prisma.eventApplicationForm.create({
-          data: { eventId: event.id },
+          data: {
+            eventId: event.id,
+            purpose: "ATTEND",
+            publicId: mintApplicationFormPublicId(),
+          },
         });
         applicationFormId = form.id;
 
@@ -164,10 +194,14 @@ const seedGatedEvent: FastifyPluginAsync = async (app) => {
       return reply.send({
         ok: true,
         seed: {
-          email,
-          password: userPassword,
+          // With `ownerEmail` the owner is that EXISTING user: no account was
+          // minted from `email`/`userPassword`, and this route never learns
+          // the existing user's password, so it must not echo one.
+          email: body.ownerEmail ?? email,
+          password: body.ownerEmail ? null : userPassword,
           humanId: human.id,
           orgId: org.id,
+          orgSlug: org.slug,
           eventId: event.id,
           eventSlug: event.slug,
           gateType,
@@ -193,11 +227,15 @@ const seedGatedEvent: FastifyPluginAsync = async (app) => {
   app.post("/e2e/seed/magic-link", async (request, reply) => {
     if (!assertE2eAuthorized(request, reply)) return;
 
+    // Gated-event invite links (docs/specs/2026-10-02/completed/gated-event-invite-
+    // links.spec.yaml): mints the event's SHARED invite. Only the SHA-256 of
+    // the token is stored; the raw token is handed back once, here. Any live
+    // SHARED invite is revoked first (one live per event, DB-enforced).
+    // `targetHumanId` / `expiresInDays` from the old magic-link contract are
+    // ignored: invites have no target and no timer.
     const body = (request.body ?? {}) as {
       eventId: string;
       creatorHumanId: string;
-      targetHumanId?: string;
-      expiresInDays?: number;
       metadata?: Record<string, unknown>;
     };
 
@@ -209,34 +247,33 @@ const seedGatedEvent: FastifyPluginAsync = async (app) => {
       });
     }
 
-    const now = new Date();
-    const expiresInDays = body.expiresInDays ?? 7;
-    const expiresAt = new Date(
-      now.getTime() + expiresInDays * 24 * 60 * 60 * 1000,
-    );
-
     try {
-      const token = `ml_${randomUUID().replace(/-/g, "")}${randomUUID().replace(/-/g, "")}`;
+      const token = randomBytes(32).toString("base64url");
+      const tokenHash = createHash("sha256").update(token).digest("hex");
 
-      const magicLink = await prisma.eventMagicLink.create({
-        data: {
-          eventId: body.eventId,
-          token,
-          targetHumanId: body.targetHumanId ?? null,
-          createdByHumanId: body.creatorHumanId,
-          expiresAt,
-          metadata: (body.metadata ?? {}) as object,
-        },
+      const invite = await prisma.$transaction(async (tx) => {
+        await tx.eventInvite.updateMany({
+          where: { eventId: body.eventId, kind: "SHARED", revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
+        return tx.eventInvite.create({
+          data: {
+            eventId: body.eventId,
+            kind: "SHARED",
+            tokenHash,
+            createdByHumanId: body.creatorHumanId,
+            metadata: (body.metadata ?? {}) as object,
+          },
+        });
       });
 
       return reply.send({
         ok: true,
         magicLink: {
-          id: magicLink.id,
-          token: magicLink.token,
-          eventId: magicLink.eventId,
-          targetHumanId: magicLink.targetHumanId,
-          expiresAt: magicLink.expiresAt?.toISOString() ?? null,
+          id: invite.id,
+          token,
+          eventId: invite.eventId,
+          kind: invite.kind,
         },
       });
     } catch (err) {

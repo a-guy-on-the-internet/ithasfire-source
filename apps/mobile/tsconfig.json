@@ -1,3 +1,12 @@
+// IN THE TYPECHECK GATE since 2026-09-29 — `scripts/typecheck-targets.mjs`
+// lists it, so `pnpm typecheck:all` and the deploy-dev `typecheck` job both
+// check this app. Keep it at zero; never take it out or put it behind `|| true`.
+//
+// Two things got it there, both worth knowing before editing this file:
+//   - The @th/* mappings below. Mobile imports `AppRouter` from @th/trpc, and
+//     a TYPE import is still a source import: TS follows the router graph into
+//     packages/core and friends. Unmapped, that was 2396 errors.
+//   - The `react` mappings. See the comment on them.
 {
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
@@ -5,6 +14,27 @@
     "baseUrl": ".",
     "paths": {
       "@/*": ["./src/*"],
+      // ONE copy of React's types for the whole program. This app pins
+      // @types/react ~19.1 (it ships React 19.1.4), but web and packages/ui
+      // pin ^19.2, whose 19.2.14 is the HOISTED copy at the repo root.
+      // Compiling packages/ui SOURCE through the @th/ui mapping made its files
+      // resolve `react` from that root copy, so two @types/react versions met
+      // in one program and failed as "Type 'React.Key' is not assignable to
+      // type 'React.Key'" — ten errors in Tamagui components that were fine.
+      // Pinning `react` to THIS app's copy also types the shared UI files this
+      // program reaches against the React mobile actually runs. (Not the
+      // `.native.tsx` variants: tsc has no moduleSuffixes here, so those never
+      // enter this program — only `pnpm typecheck` sees them.)
+      //
+      // The targets MUST end in `.d.ts`. METRO READS THIS `paths` BLOCK: Expo
+      // CLI turns `experiments.tsconfigPaths` on by default, and its resolver
+      // (@expo/cli resolveWithTsConfigPaths) skips any target ending in
+      // `.d.ts`. Point these at a directory instead and Metro tries to resolve
+      // the app's runtime `import React from "react"` to a types-only package;
+      // it only survives because that lookup errors and gets swallowed, and
+      // `react/package.json` would silently become @types/react's.
+      "react": ["./node_modules/@types/react/index.d.ts"],
+      "react/*": ["./node_modules/@types/react/*.d.ts"],
       "@th/errors": ["../../packages/errors/src/index.ts"],
       "@th/errors/*": ["../../packages/errors/src/*"],
       "@th/trpc": ["../../packages/transport/trpc/src/index.ts"],
@@ -12,7 +42,30 @@
       "@th/ui": ["../../packages/ui/src/index.ts"],
       "@th/ui/*": ["../../packages/ui/src/*"],
       "@th/ui-native": ["../../packages/ui-native/src/index.ts"],
-      "@th/ui-native/*": ["../../packages/ui-native/src/*"]
+      "@th/ui-native/*": ["../../packages/ui-native/src/*"],
+      // Why these exist: see the header. Mirrors apps/scanner, which hit the
+      // same wall and fixed it the same way, and apps/web, which has always
+      // mapped them.
+      "@th/types": ["../../packages/types/src/index.ts"],
+      "@th/types/*": ["../../packages/types/src/*"],
+      "@th/core": ["../../packages/core/src/index.ts"],
+      "@th/core/*": ["../../packages/core/src/*"],
+      "@th/adapters": ["../../packages/adapters/src/index.ts"],
+      "@th/adapters/*": ["../../packages/adapters/src/*"],
+      "@th/ports": ["../../packages/ports/src/index.ts"],
+      "@th/ports/*": ["../../packages/ports/src/*"],
+      "@th/schema": ["../../packages/schema/src/index.ts"],
+      "@th/schema/*": ["../../packages/schema/src/*"],
+      "@th/locale": ["../../packages/locale/src/index.ts"],
+      "@th/locale/*": ["../../packages/locale/*"],
+      "@th/test-utils": ["../../packages/test-utils/src/index.ts"],
+      "@th/test-utils/*": ["../../packages/test-utils/src/*"],
+      "@th/services-rich-text-html": [
+        "../../packages/service/rich-text-html/src/index.ts"
+      ],
+      "@th/services-rich-text-html/*": [
+        "../../packages/service/rich-text-html/src/*"
+      ]
     }
   },
   "include": ["**/*.ts", "**/*.tsx"],

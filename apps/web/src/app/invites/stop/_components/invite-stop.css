@@ -1,0 +1,86 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+ * /invites/stop — "Stop invites from this organiser".
+ *
+ * The invite Door with no photo (password-door.css + invite-door.css, used
+ * whole). This file only adds what the Door has never carried: a link inside
+ * its message strip and inside the dead-link strip, the "Or stop invites
+ * from every organiser." line, and no focus ring on the title, which takes
+ * focus once a stop is answered.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/* Links on the scrim: the scrim's own ink, underlined (accent never as text). */
+.th-invite-stop .th-door__message a,
+.th-invite-stop .th-invite-dead a {
+  color: var(--onScrim, #fdfaf3);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.th-invite-stop .th-door__message a:focus-visible,
+.th-invite-stop .th-invite-dead a:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+/* The title takes focus by script once the button is gone (tabIndex -1, not
+   interactive), so the global `[tabindex]:focus-visible` ring would box a
+   ~1,000px-wide heading. No ring: focus is only there to be read. */
+.th-invite-stop .th-door__title:focus,
+.th-invite-stop .th-door__title:focus-visible {
+  outline: none;
+}
+
+/* The button and the "Or stop invites from every organiser." line under it:
+   siblings take a gap, never a margin. */
+.th-invite-stop .th-door__cta {
+  gap: 12px;
+}
+
+/* "Or stop invites from every organiser.": the smaller second choice, in the
+   Door's mono strip type (`.th-door__message`), muted so the button leads. */
+.th-invite-stop__all {
+  max-width: 540px;
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-lg, 13px);
+  font-weight: 500;
+  letter-spacing: var(--tr-mono-lg, 0.4px);
+  line-height: 1.4;
+  color: var(--onScrimMuted, #bdb4a6);
+  overflow-wrap: break-word;
+}
+
+/* A real <button> (it acts) holding the whole sentence, so it wraps as
+   running text; only the link words read as the scrim's link. The rest keeps
+   the line's muted ink. */
+.th-invite-stop__all-button {
+  appearance: none;
+  max-width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  font: inherit;
+  letter-spacing: inherit;
+  text-align: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.th-invite-stop__all-link {
+  color: var(--onScrim, #fdfaf3);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* While it runs the line keeps its place and reads "Stopping all invites…"
+   as plain line text. */
+.th-invite-stop__all-button[data-busy="true"] {
+  cursor: progress;
+}
+
+.th-invite-stop__all-button:focus-visible {
+  outline: 2px solid var(--onScrim, #fdfaf3);
+  outline-offset: 2px;
+}

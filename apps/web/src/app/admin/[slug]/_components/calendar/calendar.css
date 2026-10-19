@@ -1,0 +1,398 @@
+/*
+ * Calendar engine — hover / focus / state rules the raw-DOM views cannot
+ * express inline. Every colour is `var(--token, <stub value>)`: the fallback
+ * is the Stub (warm paper) theme, which is what SSR paints. Radius 0 in
+ * content, 150ms transitions, reduced-motion honoured.
+ */
+
+.th-cal {
+  color: var(--color, #211c16);
+  background: var(--surface, #fdfaf3);
+  border: 2px solid var(--borderColor, #211c16);
+  box-sizing: border-box;
+  min-width: 0;
+  /* The engine never widens its parent: every view that cannot fit scrolls or
+     clips INSIDE the frame (the week grid has its own overflow-x: auto). */
+  max-width: 100%;
+}
+
+.th-cal * {
+  box-sizing: border-box;
+}
+
+.th-cal button {
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
+}
+
+/* Reset — every chip, row and day is a real <button>. */
+.th-cal-btn {
+  appearance: none;
+  border: 0;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 0;
+  transition:
+    background-color 150ms ease-out,
+    border-color 150ms ease-out,
+    opacity 150ms ease-out;
+}
+
+/* One visible ring for every real button in the engine; the conflict ring
+   is an inset box-shadow so it can never mask this. */
+.th-cal-btn:focus-visible,
+.th-cal-chip:focus-visible {
+  outline: 2px solid var(--focus, #e2481d);
+  outline-offset: 2px;
+}
+
+.th-cal-chip:hover {
+  opacity: 0.85;
+}
+
+/* Sold out is a FRAME state, not an opacity state: the neutral tint and bar
+   are set on the chip (`CAL_SOLD_OUT_*` in status-colors.ts) while the title
+   and time keep full ink. Dimming the whole button — `opacity: 0.55`, which
+   used to live here — composited the 12px semibold title to 3.77:1 on paper
+   (3.62:1 over the accent wash), under the 4.5:1 floor. This rule only ever
+   fires in PUBLIC mode, i.e. on a third-party page. See design-system-v2 §7:
+   sold-out stays at full contrast. The `data-sold-out` attribute stays, for
+   tests and for host CSS. */
+
+/*
+ * "Create here" affordance — month cell and week day header.
+ *
+ * ALWAYS rendered and always in the tab order (the keyboard path to a day),
+ * but INVISIBLE AT REST. 42 evenly-spaced glyphs lay a second rhythm of
+ * controls over a grid meant to read as content — exactly the "second grid"
+ * the old engine's own docblock warned about — and each one claimed ~28px at
+ * the bottom of its cell, inflating every month row.
+ *
+ * It reveals on the cell's / header's hover and on its own :focus-visible.
+ * Touch has no hover, so TOUCH CREATE RUNS THROUGH THE CELL ITSELF: a tap on
+ * any blank part of a month cell fires create (see CalendarMonthView's
+ * onCellClick), and a tap on any week slot fires create at that slot's time.
+ * The cell IS the affordance; the glyph is only the mouse hint.
+ *
+ * `pointer-events: none` at rest is load-bearing: the month button is
+ * absolutely positioned over the cell, so a hittable-but-invisible box would
+ * swallow the cell clicks that are now the create path.
+ */
+.th-cal-create {
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--colorMuted, #5c544a);
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Month: OUT OF FLOW, so the cell reserves no height for it — that is the
+   ~28px per row this bought back. The cell sets `position: relative`.
+
+   It sits in the numeral band's TOP-RIGHT corner, a 22px square mirroring the
+   TODAY square at the band's left, and NOT along the cell's bottom: the cell
+   grows with its chips, so a bottom-pinned box lands on the LAST CHIP the
+   moment a day carries two (a 2-chip cell is 110px tall; a 28px band at
+   `bottom: 6px` covers y 76–104 and the second chip occupies 69–104 — the
+   whole of it). The numeral band is a fixed 22px that no chip can enter, so
+   the corner is the only out-of-flow spot that cannot cover content. */
+.th-cal-cell .th-cal-create {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
+  min-height: 22px;
+}
+
+/* Week header: stays IN FLOW at a fixed 28px. The header row is one line of
+   type; keeping the box means the weekday label does not jump sideways when
+   the glyph appears. */
+.th-cal-create[data-inline="true"] {
+  margin-left: auto;
+  width: 28px;
+  flex-shrink: 0;
+}
+
+/* Reveal. Hover is gated on a hovering pointer so a touch tap cannot leave a
+   sticky-hover glyph painted in a cell; :focus-visible is ungated, because
+   the keyboard path must work on every device. */
+@media (hover: hover) {
+  .th-cal-cell:hover .th-cal-create,
+  .th-cal-weekhead:hover .th-cal-create {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+.th-cal-create:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.th-cal-create:hover,
+.th-cal-create:focus-visible,
+.th-cal-create:active {
+  border-color: var(--accent, #e2481d);
+  background: var(--accentSoft, rgba(226, 72, 29, 0.1));
+}
+
+/* Cell click target (internal mode). Every cell, not only the empty ones:
+   with the glyph hidden at rest, the cell is the ONLY create path a touch
+   user has on a day that already carries a show. */
+.th-cal-cell[data-creatable="true"] {
+  cursor: pointer;
+}
+
+.th-cal-cell[data-creatable="true"]:hover {
+  background: var(--backgroundHover, #efe7d6);
+}
+
+.th-cal-cell[data-today="true"][data-creatable="true"]:hover {
+  background: color-mix(in srgb, var(--accent, #e2481d) 9%, transparent);
+}
+
+/* Week slots. */
+.th-cal-slot[data-creatable="true"] {
+  cursor: pointer;
+}
+
+.th-cal-slot[data-creatable="true"]:hover {
+  background: var(--backgroundHover, #efe7d6);
+}
+
+/* Agenda + day-list rows. */
+.th-cal-row {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  display: grid;
+  align-items: center;
+  border-bottom: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+.th-cal-row:hover {
+  background: var(--backgroundHover, #efe7d6);
+}
+
+.th-cal-row:last-child {
+  border-bottom: 0;
+}
+
+/* Filter chips + segmented-style toggles: accent border + wash when on. */
+.th-cal-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 2px solid var(--borderColor, #211c16);
+  background: transparent;
+  color: var(--colorMuted, #5c544a);
+  white-space: nowrap;
+}
+
+.th-cal-filter:hover {
+  border-color: var(--accent, #e2481d);
+}
+
+/* On = pressed chip, or a menu trigger that is narrowing something (a
+   disclosure is not a toggle, so it carries `data-active`, not aria-pressed). */
+.th-cal-filter[aria-pressed="true"],
+.th-cal-filter[data-active="true"] {
+  border-color: var(--accent, #e2481d);
+  background: var(--accentSoft, rgba(226, 72, 29, 0.1));
+  color: var(--color, #211c16);
+}
+
+/* Peek actions — link-buttons (anchors) and buttons share one grammar. */
+.th-cal-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  border: 2px solid var(--borderColor, #211c16);
+  background: transparent;
+  color: var(--color, #211c16);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+  border-radius: 0;
+  transition:
+    background-color 150ms ease-out,
+    border-color 150ms ease-out,
+    color 150ms ease-out;
+}
+
+.th-cal-action:hover {
+  background: var(--structure, #211c16);
+  border-color: var(--structure, #211c16);
+  color: var(--onStructure, #fdfaf3);
+}
+
+/* A long label (the agenda's "Show more · Nov 17 – Dec 16, 2026") wraps and
+   shrinks to its container instead of overflowing a 320px viewport. Keeps the
+   44px touch target; must follow `.th-cal-action` (same specificity). */
+.th-cal-action--wrap {
+  height: auto;
+  min-height: 44px;
+  max-width: 100%;
+  padding: 8px 12px;
+  white-space: normal;
+  text-align: center;
+}
+
+.th-cal-action[data-variant="primary"] {
+  background: var(--brandSecondaryHover, #b93312);
+  border-color: var(--brandSecondaryHover, #b93312);
+  color: var(--onBrandSecondary, #ffffff);
+}
+
+.th-cal-action[data-variant="primary"]:hover {
+  background: var(--brandSecondaryStrong, #94270c);
+  border-color: var(--brandSecondaryStrong, #94270c);
+}
+
+.th-cal-action[data-variant="ghost"] {
+  border-color: transparent;
+  color: var(--colorMuted, #5c544a);
+}
+
+.th-cal-action[data-variant="ghost"]:hover {
+  background: var(--surfaceRaised, #efe7d6);
+  border-color: transparent;
+  color: var(--color, #211c16);
+}
+
+.th-cal-action[data-icon-only="true"] {
+  width: 32px;
+  padding: 0;
+}
+
+/*
+ * Touch targets. The filter chips, the icon-only peek actions, the create
+ * affordances and the text links all reach 44px on a coarse pointer; the
+ * bottom sheet is touch by definition, so it gets them unconditionally
+ * (below). The create affordances are hidden at rest and a coarse pointer
+ * has no hover, so these only ever apply once a paired keyboard has focused
+ * one — the tap path to create is the CELL / SLOT itself.
+ *
+ * TWO documented exceptions, both about the month cell's height budget:
+ *   1. The month grid's own chips (`.th-cal-chip`) stay at their painted
+ *      height. A 96px cell holds a numeral and roughly two chips; three 44px
+ *      chips take it past 170px and the six-week grid past a phone screen.
+ *   2. `.th-cal-textlink` inside a cell settles for 32px (see below).
+ * The narrow layout is the real answer for touch: below 600px the month
+ * becomes the dot grid, whose day buttons are 48px, and the tapped day's rows
+ * are 56px (FR-010).
+ */
+@media (pointer: coarse) {
+  .th-cal-filter {
+    min-height: 44px;
+  }
+
+  .th-cal-action[data-icon-only="true"] {
+    width: 44px;
+    height: 44px;
+  }
+
+  /* No 44px bump for `.th-cal-create`. A coarse primary pointer has no hover,
+     so neither variant is tap-reachable at all — the tap path to create is
+     the CELL (≥85×96px) and the week SLOT, both far past 44px. The only way
+     to reach the glyph on such a device is a paired keyboard, and growing a
+     focused control to 44px there would either reflow the week header or push
+     the month square down over a chip. */
+
+  .th-cal-textlink {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  /* Inside a month cell the same link ("+3 more") settles for 32px — three
+     44px chips plus a 44px link take a 96px cell past 200px and the six-week
+     grid past two screens. It sits inside a cell that is itself a large
+     target, and below 600px this grid is replaced by the 48px dot grid
+     entirely. */
+  .th-cal-cell .th-cal-textlink {
+    min-height: 32px;
+  }
+}
+
+.th-cal-peek[data-sheet="true"] .th-cal-action {
+  height: 44px;
+}
+
+.th-cal-peek[data-sheet="true"] .th-cal-action[data-icon-only="true"] {
+  width: 44px;
+}
+
+/*
+ * The week's capped overlap slot. A group whose blocks cannot all reach the
+ * ~96px readable floor paints the columns that fit and collapses the rest into
+ * this one: a dashed ink column on paper, so it reads as "a slot with more in
+ * it" rather than as another show.
+ */
+.th-cal-week-more {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 4px 2px;
+  overflow: hidden;
+  border: 2px dashed var(--borderColor, #211c16);
+  background: var(--surface, #fdfaf3);
+}
+
+.th-cal-week-more:hover {
+  background: var(--accentSoft, rgba(226, 72, 29, 0.1));
+  border-color: var(--accent, #e2481d);
+}
+
+/* Text-only links (Show all hours, +N more, series). */
+.th-cal-textlink {
+  color: var(--accentText, #a8300f);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.th-cal-textlink:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* Dot-grid day buttons. */
+.th-cal-dot-day {
+  min-height: 48px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+
+.th-cal-dot-day:hover .th-cal-dot-num {
+  background: var(--backgroundHover, #efe7d6);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .th-cal *,
+  .th-cal-action {
+    transition: none !important;
+  }
+}

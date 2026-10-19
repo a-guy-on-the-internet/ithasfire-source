@@ -1,0 +1,118 @@
+# entity-page-block-config.spec.yaml
+# Consolidate entity-page block metadata into one shared registry inspired by Puck component config.
+
+version: "1.0"
+updated: "2026-04-28"
+
+summary:
+  problem: >
+    Entity-page block knowledge is duplicated across core validation, web add-block controls,
+    public block rendering, and mobile rendering plans. This makes it easy for a block kind to
+    be renderable in one surface but invalid in another.
+  solution: >
+    Introduce a core-owned block config registry that keeps owner availability, label keys,
+    default spans, categories, default data, and field descriptors together. Existing helpers
+    continue to expose valid block kinds for use cases while UI surfaces read metadata from the
+    same source of truth.
+  users:
+    - Organizers editing organization pages
+    - Place owners editing venue pages
+    - Humans editing profile pages
+    - Mobile app readers of public entity pages
+  surfaces:
+    - web
+    - mobile
+    - core
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Core exposes a typed block config map keyed by every supported BlockKind.
+    - id: FR-002
+      description: >
+        Each block config includes ownerTypes, labelKey, category, defaultSpan, defaultData,
+        and a serializable field descriptor list suitable for web and mobile editors.
+    - id: FR-003
+      description: >
+        isValidBlockKind and getValidBlockKinds remain available and derive from the registry.
+    - id: FR-004
+      description: >
+        Web entity-page editor options and block spans use the registry instead of local maps.
+    - id: FR-005
+      description: >
+        custom_html_sanitized is removed from editor and public rendering surfaces; the shared
+        registry and renderer registry must not expose it as a supported block.
+  non_functional:
+    - id: NFR-001
+      description: >
+        The registry must be framework-agnostic TypeScript data in core with no React, Tamagui,
+        tRPC, or adapter imports.
+    - id: NFR-002
+      description: >
+        No Prisma migration or transport contract changes are introduced.
+
+architecture:
+  core:
+    use_cases:
+      - name: entity-page-block-config
+        description: >
+          Shared metadata and helpers for validating and describing entity-page block kinds.
+        input: ownerType and block kind strings
+        output: valid block kind arrays and block metadata
+        idempotent: false
+        money: false
+  ports:
+    new: []
+    existing: []
+  adapters:
+    new: []
+    existing: []
+  transport:
+    trpc_procedures: []
+    webhooks: []
+  ui:
+    pages:
+      - apps/web/src/components/entity-pages/PageEditorView.tsx
+    components:
+      - apps/web/src/components/entity-pages/PageBlocksEditor.tsx
+      - apps/web/src/app/p/[slug]/_components/blocks/block-registry.ts
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+
+risks:
+  - risk: >
+      Incorrect ownerType metadata could hide valid blocks or allow invalid ones.
+    severity: MEDIUM
+    mitigation: >
+      Preserve existing block-kinds tests and add coverage that registry-derived helpers match
+      universal, human, place, and organization group expectations.
+  - risk: >
+      Field descriptors can become too UI-specific if they encode component concerns.
+    severity: MEDIUM
+    mitigation: >
+      Keep descriptors limited to data shape, labels, options, and basic control kind; leave
+      rendering choices to web/mobile.
+
+open_questions:
+  - Should existing database rows with kind custom_html_sanitized be deleted through a cleanup migration or hidden at read time?
+
+decisions:
+  - id: DEC-001
+    description: >
+      custom_html_sanitized is not supported. It is excluded from the valid block config registry,
+      removed from public rendering, and rejected by managePageBlocks. Unknown legacy rows should
+      fall through to BlockFallback until data cleanup removes them.
+
+out_of_scope:
+  - Puck dependency adoption.
+  - Editor reducer, undo/redo, autosave, viewport switcher, and nested slots.
+  - Mobile entity-page renderer implementation.
+
+acceptance_criteria:
+  - Core tests prove valid block-kind helpers derive from the config and preserve current behavior.
+  - Web editor no longer carries local block label/span maps when equivalent registry data exists.
+  - Typecheck passes without adding React or UI imports to core.

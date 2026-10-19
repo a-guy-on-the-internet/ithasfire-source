@@ -1,0 +1,40 @@
+// No retrospective backfill: only publication and venue-confirmation mutations enqueue notices.
+// Lineup changes deliberately do NOT (attaching an act needs no consent from the act).
+model EntityEventNotice {
+  id String @id @default(uuid())
+  entityPageId String
+  eventId String
+  createdAt DateTime @default(now())
+  audienceCursor String?
+  expanded Boolean @default(false)
+  /// Why expansion stopped early (e.g. EVENT_STARTED). Null = expanded normally.
+  closedReason String?
+  deliveries EntityEventDelivery[]
+  @@unique([entityPageId, eventId])
+  @@index([expanded, createdAt])
+  @@index([eventId])
+}
+
+model EntityEventDelivery {
+  id String @id @default(uuid())
+  noticeId String
+  /// Copied from the notice: one delivery per (event, follower), whichever
+  /// followed page's notice reached them first.
+  eventId String
+  humanId String
+  followId String
+  inAppDone Boolean @default(false)
+  emailDone Boolean @default(false)
+  pushDone Boolean @default(false)
+  leaseToken String?
+  leaseUntil DateTime?
+  nextAttemptAt DateTime @default(now())
+  attempts Int @default(0)
+  finishedAt DateTime?
+  /// Why the delivery finished (DELIVERED, a skip reason, or DEAD_LETTER).
+  finishReason String?
+  notice EntityEventNotice @relation(fields: [noticeId], references: [id], onDelete: Cascade)
+  @@unique([noticeId, humanId])
+  @@unique([eventId, humanId])
+  @@index([finishedAt, nextAttemptAt])
+}

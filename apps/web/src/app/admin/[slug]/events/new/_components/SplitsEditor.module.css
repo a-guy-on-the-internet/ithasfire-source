@@ -1,0 +1,98 @@
+/* The "Payout lines" disclosure chevron turns as the panel opens. */
+.chevron {
+  flex-shrink: 0;
+  transition: transform 150ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chevron {
+    transition: none;
+  }
+}
+
+/* ── The frozen deal (freeze-the-deal FR-010) ──────────────────────────────
+   The band over the lines while the deal is frozen (raised surface, 2px ink
+   frame, as on The deal above) and the footer that commits a change under a
+   4px ink rule. `.lockable` keeps the panel's 16px rhythm for what it wraps. */
+
+.lockable {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.frozenLines {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 16px;
+  padding: 16px;
+  border: 2px solid var(--borderColor, #211c16);
+  background: var(--surfaceMuted, #efe7d6);
+}
+
+/* At 320 the action's label is wider than the band: wrap it inside. `:root`
+   matches the specificity of Tamagui's atomic `:root ._ws-nowrap`. */
+.frozenLinesAction {
+  min-width: 0;
+  max-width: 100%;
+}
+
+:root .frozenLinesAction > button {
+  max-width: 100%;
+}
+
+:root .frozenLinesAction > button > span {
+  white-space: normal;
+  text-align: center;
+  line-height: 1.4;
+}
+
+.frozenFooter {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 16px;
+  border-top: 4px solid var(--borderColor, #211c16);
+}
+
+/* Frozen lines as text: one row per line, name left, share right, ruled
+   like the editable rows' table. Wraps the share under the name at 320. */
+.frozenList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--borderColor, #211c16);
+}
+
+.frozenLine {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 16px;
+  padding: 12px 16px;
+  min-width: 0;
+}
+
+.frozenLine + .frozenLine {
+  border-top: 1px solid var(--borderColor, #211c16);
+}
+
+.frozenLineWho {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.frozenLineShare {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  font-variant-numeric: tabular-nums;
+}

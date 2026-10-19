@@ -1,0 +1,454 @@
+# Owner note 2026-10-16: "3. Ready" (spec confirmed). Not built yet (2026-10-16): build plan in memory session_arrival_areas_build.plan.md.
+# Owner note 2026-10-16: "I think your answer is fine" (acts on the bill, relayed by session f4e6ca90): EventHumanRole PERFORMER, HOST, DJ, INSTRUCTOR and SPEAKER count for FR-009; VENDOR, VOLUNTEER and OTHER do not.
+# Owner note 2026-10-17: "3. Yes 4. Yes  Otherwise I agree" (the 11 step-3/4 questions, relayed by session 4a4710ec): event editors see the place's load-in at a show the place vouched for; active RSVP-ers see parking and accessible drop-off once the address is released to them, never load-in; every other question stays as built.
+# Owner note 2026-10-17 (Q12-Q19, session d0003d): Q12 "YES" generated series drafts start with their source's event-only areas and hides, only when the new draft is at the same place as the source (orchestrator, review round 1); Q13 "Checkbox, off" copying areas on series sync is optional, off by default; Q14 "YES" place wording in report notices; Q16 "Yes, like holders" an RSVP-er gets the street on the event page once released; Q18 "YES" the FR-010 line in en and es.
+# arrival-areas.spec.yaml
+#
+# Arrival areas: parking, accessible drop-off and load-in drawn on the map for
+# a place or an event, shown under "Getting there".
+
+version: "1.0"
+updated: "2026-10-16"
+
+# ── Rulings (owner, 2026-10-16; full text in memory session_parking_areas_scoping.plan.md) ──
+# R0  "Can our maplibre help draw containers on the maps using open street maps?
+#     Asking because it'd be cool to define parking areas for places and events"
+#     / "Yeah do some feature scoping and grill me" — the ask.
+# R1  "I'm good with everything except the drkmttr timeline." (round 1, Q1–Q12
+#     taken as recommended):
+#   Q1 one model with a kind; parking and accessible drop-off public, load-in
+#      only to acts on that night's bill.
+#   Q2 the place's managing org draws; moderators for unowned places; the
+#      organiser for event-only areas and freeform-address events; community
+#      suggestions later.
+#   Q3 an event starts with its place's areas; the organiser can hide some for
+#      the night and add event-only ones.
+#   Q4 fields: kind, short label, cost free/paid/unknown, optional price text,
+#      note up to 280 characters, accessible-spots flag. No hours, no booking links.
+#   Q5 polygons for lots, lines for street parking, no standalone pins.
+#   Q6 v1 surfaces: web place page and event page maps; the order email gets
+#      one line with a link. Mobile app and embed later.
+#   Q7 an area shows only to a viewer who can see the exact address.
+#   Q8 hand-drawn in v1, with OSM lots shown faintly to trace; one-tap copy later.
+#   Q9 full CRUD, hard delete, CASCADE with place and event, move to the
+#      surviving place on merge, no /platform page.
+#   Q10 no review before publishing; an audit row per change; reports.
+#   Q11 the editor works by touch at 320px, full screen when narrow.
+#   Q12 a Directions link per area to the visitor's maps app; no affiliate or
+#      paid-parking upsell (any parking partner goes to the owner first).
+# R2  "B. Everything else seems good." (round 2):
+#   Q1 build now, not tied to and not shown in the 2026-10-19 Drkmttr demo.
+#   Q2 term "arrival area"; kinds Parking / Accessible drop-off / Load-in;
+#      public heading "Getting there".
+#   Q3 place editor on admin/[slug]/places/[placeId]/edit under the address;
+#      moderators get the same editor on their unowned-place surface;
+#      organisers draw in the event editor's Location section.
+#   Q4 load-in shows to signed-in people listed on the event with a performer
+#      role, and to the managing org's staff.
+#   Q5 drawn by default with a legend, a colour per kind; tap opens a card.
+#   Q6 up to 10 areas per place, 10 more per event, 200 points per shape.
+#   Q7 behind a feature gate with a /platform toggle from the first release.
+#   Q8 GeoJSON in a Json column, validated on save; no PostGIS.
+# R3  "Make it 3km. Like a mile or two out isn't that bad of a distance. Also,
+#     hopefully we can just get the centroid of the polygon and make that the
+#     address or latitude and longitude. Everything else is good" (round 3):
+#   Q6 every area lies within 3 km of the place or event pin.
+#   Q4 Directions targets the shape's centre as lat/lng; no entrance spot.
+#   Q1 being on the bill counts: a listed performer sees the exact address and
+#      load-in once listed, whatever the reveal date.
+#   Q2 "arrival area" becomes a report subject, with a copy of the shape.
+#   Q3 areas move on merge; a merge that would exceed 10 stops on a blocker.
+#   Q5 shapes never move silently (see FR-014).
+#   Q7 keep the faint OSM lots in the editor; one-tap copy waits on L15.
+#   The round-3 list of Claude's defaults was accepted as posted (NFRs below).
+# R4  "A. Looks good to me" — public view is board option A: areas on the
+#     existing Location-card map, with a legend and a "Getting there" list under
+#     the address. Board: https://claude.ai/artifact/8jPs7f4EUDLGtvKfo39B3j
+# Earlier rulings that still bind: always "place", never "venue"
+# (memory feedback_always_place_not_venue.md); no enshittification is a veto
+# (docs/pro-social.md).
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    People arriving at a show do not know where to park, where to drop off
+    someone who needs level access, or (for acts) where to load in. Places
+    answer it in texts and DMs, and act reviews already rate "Parking &
+    Load-In" as a pain point. A place's single map pin cannot carry it.
+  solution: >
+    Place managers, moderators and organisers draw arrival areas (polygons and
+    street lines) on the map. The place and event pages show them on the
+    existing Location map, with a legend, a "Getting there" list, and a
+    Directions link per area. Visibility follows the address rules exactly.
+  principle: >
+    The room is the point (people who can find parking make the night happen).
+    Visible in context decided load-in for acts only; Protect the weaker side
+    decided that areas never leak a withheld address.
+  users:
+    - place managers (managing org members)
+    - community moderators (unowned places)
+    - event organisers
+    - attendees and visitors
+    - acts on the bill
+  surfaces:
+    - web (place page, event page, place editor, event editor)
+    - email (order confirmation line)
+    - api (tRPC)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        An arrival area has a kind (PARKING, ACCESSIBLE_DROP_OFF, LOAD_IN), a
+        GeoJSON geometry (Polygon, or LineString for street parking), a label
+        (required, up to 80 characters), a cost (FREE, PAID, UNKNOWN), an
+        optional price text (up to 40 characters), an optional note (up to 280
+        characters), an accessible-spots flag and a manager-set sort order.
+    - id: FR-002
+      description: >
+        A place's managing org (ensurePlaceOwnerAccess) creates, edits, reorders
+        and removes the place's areas on admin/[slug]/places/[placeId]/edit.
+        A community moderator does the same for an unowned place, through the
+        access check behind get-place-page-edit-access.
+    - id: FR-003
+      description: >
+        An organiser creates, edits and removes event-only areas in the event
+        editor's Location section. This works for events at a place, at a
+        saved location and at a freeform address: event-only areas attach to
+        the event and never need a place.
+    - id: FR-004
+      description: >
+        An event shows its place's current areas live (a later fix to the place
+        reaches the event) minus the ones the organiser hid for this event, plus
+        its event-only areas. Hides reference place areas by id. Hiding every
+        public area shows a warning in the editor; saving is still allowed.
+    - id: FR-005
+      description: >
+        Limits, enforced in core: up to 10 areas per place, up to 10 event-only
+        areas per event, up to 200 points per shape, every point within 3 km of
+        the place pin (place areas) or the event pin (event-only areas).
+        Geometry is rejected when it has non-finite coordinates, an unclosed or
+        self-intersecting polygon, fewer than 3 distinct polygon points, or a
+        zero-length line.
+    - id: FR-006
+      description: >
+        Public view (R4, board option A): on the place page and the event page,
+        the existing Location map draws the visible areas with a legend (colour
+        and pattern per kind), and a "Getting there" list sits under the
+        address. Tapping a shape or a row highlights both and opens a card
+        with label, kind, cost, note and Directions.
+    - id: FR-007
+      description: >
+        Directions for an area opens the shared DirectionsDropdown (Google /
+        Apple / Waze) at a lat/lng inside the shape: a polygon's centre point
+        guaranteed to lie inside it (pole of inaccessibility, so an L-shaped
+        lot never routes to the far side of a fence), a line's midpoint along
+        its length. No reverse geocoding. No third-party booking links.
+    - id: FR-008
+      description: >
+        Visibility. An area is returned to a viewer only when that viewer may
+        see the exact address: the public when the effective location mode is
+        EXACT (redactPlaceLocation / applyPlaceLocationFloor), otherwise a
+        ticket holder or live RSVP-er (Q4, Q16) once resolveHolderAddress
+        releases the address, the
+        managing org's staff, or an act on the bill (FR-009). An obscured
+        or hidden place shows no areas to the public, not even clipped to its
+        circle. LOAD_IN areas go only to acts on the bill and managing staff.
+    - id: FR-009
+      description: >
+        Acts on the bill (R3 Q1): a signed-in human listed on the event
+        (EventHuman) with a performer role sees the exact address and all
+        areas, including load-in, from the moment they are listed, whatever
+        the reveal date. This widens resolveHolderAddress's audience; the
+        change goes through that one function, never a parallel check.
+        Load-in stops showing to acts once the event has ended.
+    - id: FR-010
+      description: >
+        The order confirmation email gets one line, "Parking and drop-off: see
+        the map", linking to the event page, only when the event has a visible
+        public area and the recipient already gets the exact address.
+    - id: FR-011
+      description: >
+        Reporting: EntityReportSubjectType gains ARRIVAL_AREA. The report stores
+        a snapshot (label, kind, geometry, parent id) so moderators see what was
+        reported after an edit or a delete. The list row and the card each
+        carry a report action.
+    - id: FR-012
+      description: >
+        Place merge (merge-places / preview-place-merge): the merged place's
+        areas move to the surviving place. When the total would exceed 10, the
+        preview shows a new ARRIVAL_AREA_LIMIT blocker naming the areas; a
+        moderator deletes some first. Event hides that pointed at moved areas
+        keep pointing at them.
+    - id: FR-013
+      description: >
+        Every create, edit, reorder, hide, unhide and remove writes an AuditLog
+        row (AuditRepo, packages/ports/src/repos/audit.ts) with the actor and
+        the before/after payload; a hard delete keeps its audit row.
+    - id: FR-014
+      description: >
+        Location changes never move shapes silently. When a place's pin moves
+        so that any area falls outside 3 km, the place editor flags those areas
+        for the manager to check. When an event changes place or address, its
+        event-only areas are switched off (not shown) until the organiser
+        repositions or removes them.
+    - id: FR-015
+      description: >
+        Series: a recurrenceSchedule event has one area set for all its dates.
+        In an EventSeries, each occurrence has its own event-only areas and
+        hides; editing applies to this occurrence. Syncing to draft siblings
+        (sync-series-drafts) replaces their areas and hides only when the
+        organiser ticks "Also replace parking and drop-off areas on these
+        shows", unticked by default (Q13); the FR-014 switch-off for a moved
+        sibling runs either way. A draft generated from the series starts with
+        the event-only areas and hides of the generation's copy source (the
+        occurrence its ticket types come from) only when the new draft is at
+        the same place as the source; a draft at another place, or a freeform
+        or saved location on either side, copies nothing. A copy not within
+        3 km of the new draft's pin is copied switched off (Q12).
+        Published and detached occurrences are never rewritten.
+    - id: FR-016
+      description: >
+        Editor (board sections 3 and 5): Terra Draw with its MapLibre adapter.
+        Tools: Select, Draw a lot, Draw street parking, Undo point. The selected
+        area's form sits beside the map on wide screens; at narrow widths the
+        editor opens full screen with a bottom tool bar (44px targets) and the
+        form as a sheet. OSM parking from the basemap shows faintly as a
+        tracing guide. Outside basemap coverage the editor says it cannot draw
+        there.
+    - id: FR-017
+      description: >
+        Everything ships behind an `arrivalAreas` feature gate with a /platform
+        toggle in the first release (FEATURE_GATE_SLUGS + setting key), off by
+        default.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Caching: the place and event pages declare revalidate = 60, but today
+        they render on every request (the server-side tRPC client awaits
+        headers()), so there is no Next route cache to revalidate. Public
+        EXACT-mode areas may ride the public projection. Holder-only,
+        act-only and staff-only areas come from a per-viewer, uncached read
+        that checks authorization on every request. After a place-area edit
+        the editor calls the existing /api/places/[placeId]/revalidate, so the
+        page stays fresh if it becomes cacheable. Cloudflare holds /events/*
+        and /places/* for s-maxage=120 plus stale-while-revalidate, so
+        per-viewer and restricted areas are fetched per request (no-store)
+        and never baked into the edge-cached document.
+    - id: NFR-002
+      description: >
+        Areas never appear in JSON-LD, page metadata, sitemaps, the embed,
+        search results or the public API in v1. Directions targets count as
+        protected location data and follow FR-008; they are never logged.
+    - id: NFR-003
+      description: >
+        Accessibility: the "Getting there" list is the text twin of the map.
+        Every area is reachable and selectable by keyboard from the list, and
+        kinds differ by pattern as well as colour (dashed outline for load-in,
+        a line for street parking). Map shapes are supplementary.
+    - id: NFR-004
+      description: >
+        Concurrency: update and delete carry the row's updatedAt; a stale
+        write returns a conflict with the current row instead of overwriting.
+    - id: NFR-005
+      description: >
+        Copy: labels and notes are shown as authored, untranslated. All
+        interface text (kinds, costs, legend, editor, errors) goes in en and
+        es. User-facing words: "Getting there", "Parking", "Accessible
+        drop-off", "Load-in", "place" (never "venue").
+    - id: NFR-006
+      description: >
+        The editor is usable at 320px with touch: no horizontal page scroll,
+        and no tool or form field hidden off screen.
+
+# ── Lifecycle (CLAUDE.md Model Lifecycle Convention) ─────────────────────────
+
+lifecycle:
+  ArrivalArea:
+    create: built (place managers, moderators for unowned places, organisers for event-only areas)
+    read_single: built (editor)
+    read_list: built (place page, event page, editors)
+    update: built (fields, geometry, sort order)
+    remove: >
+      built; hard delete with the audit row kept. CASCADE when its place or
+      event is deleted; moved, not deleted, on place merge.
+    platform_page: >
+      none. Areas are managed by place managers, moderators and organisers;
+      platform admins act as moderators through the place page. Abuse goes
+      through reports (FR-011).
+  EventArrivalAreaHide:
+    create: built (hide for this event)
+    read_list: built (event editor, event read projection)
+    update: not built; a hide has no fields to change
+    remove: built (show again); CASCADE with its event and with the place area.
+    platform_page: none (part of the event editor)
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: manage-arrival-areas (create / update / reorder / remove)
+        description: >
+          CRUD for place areas and event-only areas, mirroring
+          use-cases/places/manage-spaces.ts (parseInput, owner access check,
+          re-fetch and parent check inside the transaction). Validates FR-001
+          and FR-005, writes the audit row, revalidates paths.
+        input: parent (placeId | eventId), kind, geometry, label, cost, priceText, note, accessibleSpots, sortOrder, expectedUpdatedAt
+        output: ArrivalAreaRow
+        idempotent: false
+        money: false
+        authorized: managing org of the place; moderator for an unowned place; organiser of the event
+      - name: set-event-arrival-area-hidden
+        description: Hide or show one place area for one event.
+        input: eventId, arrivalAreaId, hidden
+        output: the event's resolved area list
+        idempotent: true
+        money: false
+        authorized: organiser of the event
+      - name: list-arrival-areas-for-viewer
+        description: >
+          The single visibility projection (FR-008, FR-009): resolves the
+          event's live place areas minus hides plus event-only areas, then
+          filters by what this viewer may see. Computes each Directions point.
+        input: placeId | eventId, viewer (optional)
+        output: visible areas with kind, label, cost, note, geometry, directions lat/lng
+        idempotent: true
+        money: false
+        authorized: anyone; the output is filtered
+    modified:
+      - resolve-holder-address.ts (acts on the bill, FR-009)
+      - merge-places.ts / preview-place-merge.ts / place-merge-plan.ts (FR-012)
+      - submit-entity-report.ts (ARRIVAL_AREA subject, FR-011)
+      - get-feature-gates.ts (arrivalAreas)
+      - sync-series-drafts.ts (FR-015)
+      - order confirmation email builder (FR-010)
+
+  ports:
+    new:
+      - ArrivalAreasRepo (packages/ports/src/repos/arrival-areas.ts)
+    existing:
+      - AuditRepo
+      - ClockPort, LoggerPort
+      - EventsRepo, PlacesRepo (pins, location mode, lineup)
+
+  adapters:
+    new:
+      - Prisma ArrivalAreasRepo (packages/adapters/src/db/prisma/arrival-areas.ts)
+    existing:
+      - entity reports adapter (new subject type)
+      - place merge adapter (move rows)
+
+  transport:
+    trpc_procedures:
+      - arrivalAreas.listForPlace (public, filtered)
+      - arrivalAreas.listForEvent (public, filtered, per-viewer)
+      - arrivalAreas.create / update / reorder / remove (protected)
+      - arrivalAreas.setHiddenForEvent (protected)
+    webhooks: []
+
+  ui:
+    pages:
+      - none new; admin/[slug]/places/[placeId]/edit gains a "Getting there" section
+    components:
+      - ArrivalAreasEditor (Terra Draw + maplibre adapter; full-screen mode under ~600px)
+      - ArrivalAreasLayer (MapLibre sources/layers on LocationMapPreview, styled like the search map's areas layer)
+      - GettingThereList (rows + card, keyboard sync with the map)
+      - PlaceLogisticsCard and the event page location block (option A)
+      - Event editor LocationSection (hide list + event-only areas)
+      - Moderator unowned-place editor surface (same ArrivalAreasEditor)
+    dependencies:
+      - terra-draw ^1.37 and terra-draw-maplibre-gl-adapter ^1.5 (peer maplibre-gl >=4; we run ^5.18) [VERIFIED npm view 2026-10-16]
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - name: ArrivalArea
+      fields: >
+        id, placeId? (FK Place, CASCADE), eventId? (FK Event, CASCADE), with a
+        CHECK that exactly one is set; kind ArrivalAreaKind; geometry Json
+        (GeoJSON Polygon | LineString, zod-validated in core); label;
+        cost ArrivalAreaCost; priceText?; note?; accessibleSpots Boolean;
+        sortOrder Int; disabledAt? (FR-014 switch-off); createdByHumanId?
+        (SetNull); createdAt; updatedAt. Indexes on placeId and eventId.
+    - name: EventArrivalAreaHide
+      fields: >
+        eventId (FK Event, CASCADE), arrivalAreaId (FK ArrivalArea, CASCADE),
+        createdAt; unique (eventId, arrivalAreaId).
+    - name: enums
+      fields: >
+        ArrivalAreaKind { PARKING, ACCESSIBLE_DROP_OFF, LOAD_IN };
+        ArrivalAreaCost { FREE, PAID, UNKNOWN };
+        EntityReportSubjectType gains ARRIVAL_AREA.
+  modified_models:
+    - Place, Event (back-relations only)
+  migrations_needed: true
+  storage_note: >
+    No PostGIS: areas are only ever drawn beside their own parent and never
+    searched by location. The precedent is SeatSection.geometry Json.
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      A drawn area leaks a withheld address (an area beside a DIY house, a
+      Directions link, a log line, or several shapes intersecting).
+    severity: HIGH
+    mitigation: >
+      All-or-nothing rule in one projection (FR-008); no clipping to circles;
+      restricted reads uncached (NFR-001); Directions treated as location data
+      (NFR-002). Tests in the place-address-withholding style assert no area
+      reaches a public payload for OBSCURED places.
+  - risk: >
+      Widening resolveHolderAddress to acts (FR-009) releases hidden addresses
+      to anyone who can get themselves listed on an event.
+    severity: HIGH
+    mitigation: >
+      Only humans the organiser lists with a performer role count; listing is
+      an organiser action. Security review of the resolveHolderAddress change
+      before it lands.
+  - risk: >
+      A fake area sends people to the wrong spot.
+    severity: MEDIUM
+    mitigation: 3 km envelope (FR-005), audit rows (FR-013), per-area reports (FR-011).
+  - risk: >
+      OSM licensing (ODbL) if traced outlines count as a derivative database.
+    severity: LOW
+    mitigation: >
+      Nothing copied in code in v1; legal question L15 in
+      docs/legal-and-tax-questions.md. One-tap copy waits on its answer.
+
+open_questions:
+  - L15 (lawyer) — does tracing OSM lots by eye make the area table an ODbL derivative database?
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Mobile app and embed display (later; the mobile app has no map library today)
+  - One-tap copy of OSM lot outlines via Overpass (waits on L15)
+  - Community suggestions of areas (later, with the place-page suggestions work)
+  - Hours, "closed on show nights" and other schedule fields
+  - Booking links, paid-parking partners or affiliate links (enshittification screen: owner first)
+  - Searching or ranking by arrival areas
+  - Scanner app
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - With the gate off, no editor section, layer, list or email line renders anywhere.
+  - A place manager draws a lot and a street line at 320px by touch, saves, and both show on the place page map and in the Getting there list.
+  - An area more than 3 km from the pin, an 11th area, or a 201-point shape is rejected with a message saying which limit it hit.
+  - For an OBSCURED place, the public place page and event page payloads contain no area geometry or Directions point; a ticket holder after reveal sees them.
+  - An act listed on a hidden-address event sees the exact address and load-in before the reveal date; a ticket holder does not see load-in.
+  - An organiser hides a place area for one event; it disappears from that event only, and the place page still shows it.
+  - Directions for an L-shaped lot targets a point inside the lot.
+  - Reporting an area stores a snapshot that survives the area's deletion.
+  - Merging two places whose areas total 11 shows the ARRIVAL_AREA_LIMIT blocker.
+  - Every mutation writes an AuditLog row; deleting an area keeps it.
+  - Keyboard only: tabbing through the Getting there list selects each area on the map.
+  - Zero new console errors on the place page, the event page and both editors; no horizontal scroll at 320px.

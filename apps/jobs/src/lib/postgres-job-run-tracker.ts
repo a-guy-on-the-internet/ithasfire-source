@@ -32,7 +32,7 @@ export class PostgresJobRunTracker implements JobRunTracker {
    *
    * Retention now happens on a schedule (`pruneRuns`, driven by
    * `jobs.prune-run-history`). Between sweeps the table overshoots by at most
-   * one day of runs per job, which for a 15-minute-cron job is ~96 rows.
+   * one day of runs per job, which for a 30-minute-cron job is ~48 rows.
    */
   async record(entry: RunEntry): Promise<void> {
     await this.prisma.jobRun.create({

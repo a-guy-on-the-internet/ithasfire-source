@@ -1,0 +1,678 @@
+# scanner-deployment-tap-to-pay.spec.yaml
+#
+# Operational/deployment companion to scanner-pos-tap-to-pay.spec.yaml.
+# That spec defines WHAT we're building. This one defines HOW we ship it
+# safely given Apple's Tap-to-Pay entitlement gate, the two-stage
+# entitlement review, and our pre-launch / pre-customer reality.
+
+version: "1.0"
+updated: "2026-04-26"
+related:
+  - docs/specs/2026-04-25/scanner-pos-tap-to-pay.spec.yaml
+  - docs/specs/2026-04-24/scanner-foundation.spec.yaml
+
+scope_note: >
+  This spec covers the deployment path for the scanner app, end-to-end:
+  EAS configuration, app.config.ts entitlement strategy, the two-binary
+  release plan that lets us ship before Apple's publishing entitlement
+  clears, the feature-gate + binary-version safety check, and the
+  human-side walkthroughs for Apple Developer / App Store Connect /
+  Stripe Connect onboarding.
+
+  This spec does NOT redefine the product/UX/server contracts — those
+  live in scanner-pos-tap-to-pay.spec.yaml. Read that first.
+
+product_stances:
+  - "Ship the scanner BEFORE Tap to Pay clears Apple. POS code rides along
+     inert; we flip it on per-org once entitlements land."
+  - "One feature gate, two checks: server flag AND minimum binary version.
+     A v1.0 user must never see Tap to Pay UI even if the flag is flipped."
+  - "Apple entitlement requests start at T-0 of this spec — every day of
+     delay there is a day of launch delay later. They're free; file them."
+  - "TestFlight Internal is our daily smoke. App Store + TestFlight
+     External wait on the publishing entitlement."
+
+# ─────────────────────────────────────────────────────────────────────────
+# Two-release strategy
+# ─────────────────────────────────────────────────────────────────────────
+
+release_plan:
+  v1_0:
+    name: "Scanner — Scan Only"
+    contents:
+      - All existing scanner functionality (unified scan, volunteer check-in)
+      - Stripe Terminal SDK installed as a dependency (~3-5MB iOS bundle cost)
+      - POS code scaffolding present but gated OFF and entitlements NOT declared
+      - Server-side pos.* routes present, gated OFF in feature gates
+    why_ship_anyway: >
+      Apple's publishing entitlement review is the long pole (1-4 weeks
+      wall-clock). Shipping v1.0 without the entitlement lets us:
+        - Hit our first event (2-4 weeks out)
+        - Get scan-only feedback from real operators
+        - Have App Store presence + organic growth time
+        - Not block on Apple's queue
+    target: "≤ 2 weeks from spec acceptance"
+
+  v1_1:
+    name: "Scanner — POS Enabled"
+    contents:
+      - Same codebase, native rebuild with Tap to Pay entitlements declared
+      - Feature gate flipped on per-org as Stripe Connect onboarding completes
+      - Server pos.* routes flipped on per-org
+    blocked_on:
+      - Apple Tap to Pay publishing entitlement approval
+      - Stripe Connect Terminal capability enabled per merchant
+      - One real customer with a need to charge at the door
+    target: "Whenever Apple approves + first POS-needing customer onboards"
+
+# ─────────────────────────────────────────────────────────────────────────
+# Code artifacts to create
+# ─────────────────────────────────────────────────────────────────────────
+
+code_artifacts:
+  eas_config:
+    location: apps/scanner/eas.json
+    profiles:
+      development:
+        purpose: Dev clients for `expo run:ios` / on-device debugging
+        distribution: internal
+        ios:
+          simulator: false
+          # Dev entitlement only — apply via env-driven app.config.ts
+          env:
+            EXPO_TAP_TO_PAY_TIER: development
+      preview:
+        purpose: TestFlight Internal + ad-hoc QA builds
+        distribution: internal
+        ios:
+          # Still on dev entitlement — Internal TestFlight accepts it
+          env:
+            EXPO_TAP_TO_PAY_TIER: development
+      production:
+        purpose: App Store + TestFlight External
+        distribution: store
+        ios:
+          # v1.0: tier=none → entitlements NOT declared → signs OK
+          # v1.1: tier=publishing → entitlements declared → requires Apple approval
+          env:
+            EXPO_TAP_TO_PAY_TIER: none  # flip to "publishing" for v1.1
+
+  app_config:
+    location: apps/scanner/app.config.ts
+    notes: >
+      Entitlements must be conditionally added based on EXPO_TAP_TO_PAY_TIER.
+      The Stripe React Native config plugin handles base SDK setup but does
+      NOT add Tap to Pay entitlements automatically — those are manual.
+    contract: |
+      const tier = process.env.EXPO_TAP_TO_PAY_TIER ?? "none";
+      const tapToPayEntitlements =
+        tier === "none"
+          ? {}
+          : {
+              "com.apple.developer.proximity-reader.payment.acceptance": true,
+              "com.apple.developer.proximity-reader.tap-to-pay": true,
+            };
+
+      export default ({ config }) => ({
+        ...config,
+        name: "Ithas Fire Scanner",
+        slug: "ithasfire-scanner",
+        version: "1.0.0",
+        runtimeVersion: { policy: "appVersion" },
+        ios: {
+          bundleIdentifier: "com.ithasfire.scanner",
+          buildNumber: "1",
+          supportsTablet: false,
+          infoPlist: {
+            NSCameraUsageDescription:
+              "Scan ticket and volunteer QR codes at the gate.",
+            // Future: NSLocationWhenInUseUsageDescription if Stripe SDK requires it
+          },
+          entitlements: {
+            ...tapToPayEntitlements,
+          },
+        },
+        android: {
+          package: "com.ithasfire.scanner",
+          permissions: ["CAMERA", "VIBRATE"],
+          // Tap to Pay on Android requires NFC at runtime; permission added later
+        },
+        plugins: [
+          "expo-camera",
+          "expo-secure-store",
+          "expo-sqlite",
+          [
+            "@stripe/stripe-react-native",
+            {
+              merchantIdentifier: "merchant.com.ithasfire.scanner",
+              enableGooglePay: false,
+            },
+          ],
+          "expo-updates",
+        ],
+        updates: {
+          url: "https://u.expo.dev/<project-id>",  // populate from EAS init
+        },
+      });
+
+  feature_gate:
+    location: packages/transport/trpc/src/routers/featureGates.ts (existing)
+    new_keys:
+      - id: "scanner.pos_tap_to_pay"
+        default: false
+        description: >
+          Server-controlled per-org enable for the Sell tab. Gate is checked
+          BOTH server-side (pos.* routers reject if OFF) AND client-side
+          (Sell tab hidden if OFF or if binary doesn't support it).
+
+  binary_capability_check:
+    location: apps/scanner/src/lib/capabilities.ts (new)
+    purpose: >
+      Ensures v1.0 binaries never expose Tap to Pay UI even if the server
+      flag is flipped. The check answers: "does THIS specific binary have
+      the entitlement compiled in?" — not "does the device support it"
+      (the SDK answers that separately).
+    contract: |
+      import Constants from "expo-constants";
+
+      // Bumped to true in v1.1 release where entitlements are declared.
+      // We read from an Expo extra so it's baked into the binary at build
+      // time, not toggleable at runtime.
+      export const binarySupportsTapToPay = (): boolean => {
+        const extra = Constants.expoConfig?.extra ?? {};
+        return extra.tapToPaySupported === true;
+      };
+
+      // Compose with server flag at the call site:
+      //   const sellTabVisible =
+      //     featureGates["scanner.pos_tap_to_pay"] &&
+      //     binarySupportsTapToPay() &&
+      //     terminalSdk.supportsReadersOfType("tapToPayReader");
+    app_config_addition: >
+      In app.config.ts, set:
+        extra: {
+          tapToPaySupported: tier !== "none",
+        }
+
+  permissions_hygiene:
+    rule: >
+      Every iOS permission string must have a one-sentence business
+      justification ready for App Review. Strip permissions the SDK
+      auto-adds if we're not using the feature in v1.0.
+    v1_0_permissions:
+      - NSCameraUsageDescription: "Scan ticket and volunteer QR codes at the gate."
+    v1_1_additions:
+      # Verify exact list when adding entitlements; Stripe SDK has historically
+      # auto-injected a Bluetooth string we must justify or strip.
+      - (TBD by Stripe SDK version — check Info.plist diff after enabling tier)
+
+# ─────────────────────────────────────────────────────────────────────────
+# Apple-side walkthrough — what the human has to do
+# ─────────────────────────────────────────────────────────────────────────
+
+apple_walkthrough:
+  status_2026_05_27:
+    dev_entitlement: GRANTED
+    publishing_entitlement: UNVERIFIED
+    verified_via: >
+      developer.apple.com → Identifiers → com.ithasfire.scanner shows
+      "Tap to Pay on iPhone" capability enabled and toggleable for team
+      5J9DRDR2TB. That toggle becoming available only confirms the
+      DEVELOPMENT entitlement is granted (Internal TestFlight + dev
+      signing). The PUBLISHING entitlement is a separate App Review-
+      adjacent approval; the Identifiers UI does not surface its state.
+      To confirm publishing: search email for messages from
+      `developer@apple.com` / `developerprograms@apple.com` referencing
+      "Tap to Pay" + "publishing", OR attempt a production submit with
+      EXPO_TAP_TO_PAY_TIER=publishing and watch for rejection. Until
+      one of those happens, treat publishing as still in the queue.
+
+  account_prereqs:
+    - Apple Developer Program membership ($99/yr)
+    - Team Agent or Admin role (Member cannot request entitlements)
+    - Tax + banking info filled in App Store Connect → Agreements
+    - Two-Factor Authentication enabled (required for everything)
+
+  step_1_register_app_id:
+    where: developer.apple.com → Certificates, Identifiers & Profiles → Identifiers
+    fields:
+      - Description: "Ithas Fire Scanner"
+      - Bundle ID: explicit, "com.ithasfire.scanner"
+      - Capabilities to enable now (v1.0):
+          - Push Notifications (for future use; cheap to add now)
+          - Sign in with Apple (only if planning to use Better-Auth Apple)
+      - Capabilities to enable later (v1.1):
+          - Tap to Pay on iPhone (only appears AFTER the entitlement is granted)
+
+  step_2_request_dev_entitlement:
+    where: developer.apple.com/contact → "Tap to Pay on iPhone Entitlement"
+    form_fields:
+      - Use case: >
+          "Ithas Fire is a ticketing and event management platform.
+           The scanner app is used by event staff to validate tickets
+           at the door and, with this entitlement, accept day-of card
+           payments via Tap to Pay so attendees can buy tickets at the
+           gate without external hardware."
+      - Expected launch date: "Q3 2026" (be conservative)
+      - Expected user base: "Event organizers and staff (B2B; not
+        consumer-facing). Estimated 100-1000 operators in year 1."
+      - Stripe partnership: "Yes — using Stripe Terminal SDK
+        (stripe-terminal-react-native)."
+      - PCI scope: "Out of scope — all card data handled inside Stripe
+        Terminal certified components. No PAN/track/PIN crosses our app."
+    response_time: "Hours to a few days for dev entitlement."
+    next_step: >
+      Apple's confirmation email contains language about "publishing
+      review." REPLY to that email asking to begin publishing review
+      now. Do NOT wait until you're ready to ship — that wastes
+      weeks. The reply is what kicks off the long pole.
+
+  step_3_request_publishing_entitlement:
+    when: Immediately after dev entitlement is granted (not before)
+    where: Reply to Apple's dev entitlement confirmation email
+    body_template: |
+      "Thank you for granting the development entitlement for [App ID].
+       We would like to begin the publishing review process for App
+       Store distribution. Could you provide the next steps and any
+       additional information required?"
+    expected_questions:
+      - Demo video showing Tap to Pay flow end-to-end
+      - Description of how we handle declined cards / refunds
+      - Confirmation of Stripe Terminal SDK usage and PCI scope
+      - App Store screenshot mockups showing the POS UI
+    response_time: "1-4 weeks wall-clock"
+    blocking: "App Store + TestFlight External + Ad-hoc all blocked
+              until this is granted IF entitlements are declared in
+              the binary. v1.0 ships fine without it."
+
+  step_4_app_store_connect_setup:
+    where: appstoreconnect.apple.com → My Apps → New App
+    fields:
+      - Platform: iOS
+      - Name: "Ithas Fire Scanner" (max 30 chars)
+      - Primary Language: English (U.S.)
+      - Bundle ID: select the one created in step 1
+      - SKU: "ithasfire-scanner-001" (internal only, never shown)
+      - User Access: Full Access
+    after_create:
+      - App Information:
+          - Subtitle: "Tickets at the door" (max 30 chars)
+          - Category: Primary "Business", Secondary "Productivity"
+          - Content Rights: "Does Not Use Third-Party Content"
+          - Age Rating: complete questionnaire (no objectionable content)
+      - Pricing and Availability:
+          - Free
+          - All territories where Ithas Fire operates
+      - App Privacy:
+          - Data collected: Email Address (for sign-in), User ID,
+            Diagnostics (Sentry crash reports). Map each to "Linked
+            to user" + "Used for app functionality".
+          - Tracking: No
+      - App Review Information:
+          - Sign-in required: YES
+          - Demo Account: provide a real test account with
+            SCANNER role on a test event in a test org with
+            Stripe Connect already onboarded
+          - Notes: >
+              "This is the operator-facing scanner companion to
+               Ithas Fire (a ticketing platform). Sign in with the
+               provided account to see the scan UI. Camera permission
+               is required to scan QR codes at events. There is no
+               consumer-facing flow in this app."
+
+  step_5_first_submission:
+    binary: Built via `eas build --profile production`
+    upload: `eas submit --profile production --platform ios`
+    review_time: "24-48 hours typical for first submission"
+    common_first_time_rejections:
+      - "Missing demo video" — record a 30-60s screen recording
+      - "Privacy nutrition label mismatch" — match exactly to actual
+        data collection
+      - "Sign-in required but no demo account" — fix in App Review
+        Information
+      - "Permissions not justified" — see permissions_hygiene above
+
+# ─────────────────────────────────────────────────────────────────────────
+# Stripe-side walkthrough
+# ─────────────────────────────────────────────────────────────────────────
+
+stripe_walkthrough:
+  prereqs:
+    - Stripe account with Connect capability (already exists; this is what
+      the consumer web checkout uses)
+    - Connected accounts (orgs/payees) onboarded with Express or Standard
+
+  enable_terminal:
+    where: dashboard.stripe.com → Settings → Connect → Capabilities
+    action: >
+      Request the "Stripe Terminal" capability for connected accounts.
+      This is per-account — each org's Stripe Connect account needs it
+      enabled before they can accept POS sales. The request is usually
+      auto-approved within minutes for compliant accounts.
+
+  enable_tap_to_pay:
+    where: dashboard.stripe.com → Settings → Payments → Tap to Pay
+    action: >
+      Enable Tap to Pay on iPhone + Tap to Pay on Android for the
+      platform account. This is platform-level — once enabled, all
+      Connect accounts that have the Terminal capability can use it.
+    requirements:
+      - US, UK, AU, CA, and other supported countries (verify list at
+        impl time — Stripe expands this regularly)
+      - Cannot be enabled in test mode without a Connect account
+        also in test mode
+
+  per_org_locations:
+    requirement: >
+      Stripe Terminal requires a Location for every reader/transaction.
+      For Tap to Pay, this is a software construct — not a physical
+      address — but every Connect account needs at least one Location.
+    automation: >
+      When an org's Payee.chargesEnabled flips true, server-side
+      auto-create a Stripe Location named "{orgName} — Default" via
+      `stripe.terminal.locations.create({}, { stripeAccount })` and
+      persist the locationId on the Payee row. This lets the scanner
+      app fetch it via the connectionToken endpoint and never prompt
+      the operator for it.
+
+  test_credentials:
+    test_card_present:
+      number: "4242 4242 4242 4242"
+      simulated: "Use the SDK's simulated reader in dev mode"
+    sandbox: >
+      Stripe Terminal has a test mode reader (`SimulatedReader`) that
+      lets you complete the entire flow without a real card or real
+      device. Wire this for dev/preview profiles and local Vitest
+      coverage of the POS use cases.
+
+# ─────────────────────────────────────────────────────────────────────────
+# Demo video script for App Review (Apple's main ask)
+# ─────────────────────────────────────────────────────────────────────────
+
+demo_video:
+  length: "30-60 seconds"
+  format: "Screen recording on a real iPhone XS+ running the production binary"
+  shots:
+    - "(0-5s) Sign in with the demo account on the launch screen"
+    - "(5-10s) Land on Home, show the event selector with the test event selected"
+    - "(10-15s) Tap 'Sell' tab, show door items list (1 GA $10 ticket type)"
+    - "(15-20s) Tap GA item, quantity stepper appears, total updates"
+    - "(20-30s) Tap 'Charge' — Tap to Pay surface appears, hold a test
+                contactless card to the back of the phone, payment succeeds"
+    - "(30-40s) Sale result screen shows 'ADMIT' card, ticket count, and
+                'Send receipt' CTA. Tap it, enter email, success."
+    - "(40-50s) Tap minted ticket → shows the QR. Switch to Scan tab,
+                hold the QR up, ticket scans as already-admitted."
+    - "(50-60s) End on the home counter showing +1 admitted."
+  audio: None or quiet narration
+  upload: Attach to App Review Information notes
+
+# ─────────────────────────────────────────────────────────────────────────
+# What I (Craft Agent) can do for you vs what you have to do
+# ─────────────────────────────────────────────────────────────────────────
+
+automation_boundaries:
+  i_can_do:
+    - Generate eas.json + app.config.ts wired correctly
+    - Generate the binary capability helper + thread it through the gate
+    - Generate the demo-account seed data (test event, test org, test ticket type)
+    - Generate the App Review notes text + privacy nutrition mapping
+    - Run `eas build --profile development` from the CLI when you're ready
+    - Wire the SDK + Stripe Connect Location auto-create in code
+
+  i_cannot_do:
+    - Log into your Apple Developer or App Store Connect account
+      (2FA + legal attestation requirements)
+    - Submit the entitlement request form (legal attestation by your team)
+    - Fill out App Privacy nutrition label (legal attestation)
+    - Agree to Apple Developer Program License Agreement updates
+    - Configure your Stripe account's banking + tax info
+    - Record the demo video (you need a real device + real test card)
+
+  browser_mcp_note: >
+    chrome-devtools MCP source is currently inactive in this workspace.
+    Even if active, Apple/Stripe/Google Play portals require authenticated
+    sessions with 2FA that I should not have access to, and the forms
+    contain legal attestations a human authorized agent must make.
+
+# ─────────────────────────────────────────────────────────────────────────
+# Sequencing
+# ─────────────────────────────────────────────────────────────────────────
+
+sequencing:
+  this_week:
+    - "[DONE 2026-05-27] (human) File Apple dev entitlement request — start the clock"
+    - "[UNVERIFIED] (human) Reply to Apple confirmation email asking for publishing
+              review immediately after dev entitlement granted —
+              confirm whether this was done; not provable from
+              Identifiers UI alone"
+    - "[DONE] (human) Create App ID + App Store Connect record"
+    - "(agent) Scaffold eas.json + app.config.ts with tier=none"
+    - "(agent) Add binary capability helper + wire feature gate"
+    - "(agent) Seed demo account + test event for App Review"
+  next_week:
+    - "(agent + human) Production build via EAS, smoke on TestFlight Internal"
+    - "(human) Submit v1.0 to App Store (no Tap to Pay declared)"
+    - "(human) Record demo video while we wait on Apple"
+  weeks_3_to_6:
+    - "(wait) Apple publishing entitlement review"
+    - "(human) v1.0 ships, real operators use scan-only at first event"
+    - "(agent) Implement pos.* routers + sell screen behind gate"
+  on_apple_approval:
+    - "(agent) Flip EXPO_TAP_TO_PAY_TIER to 'publishing' on production profile"
+    - "(agent) Bump app version to 1.1.0, native rebuild via EAS"
+    - "(human) Submit v1.1 to App Store with Tap to Pay declared"
+    - "(human + agent) Once approved, flip the gate per-org as orgs onboard"
+
+# ─────────────────────────────────────────────────────────────────────────
+# Risks specific to deployment (product risks live in the other spec)
+# ─────────────────────────────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Apple takes >4 weeks on publishing entitlement review and
+      blocks our first POS-needing customer.
+    severity: MEDIUM
+    mitigation: >
+      File the request today. v1.0 ships scan-only regardless. Worst
+      case: that customer's first event uses self-serve walk-up
+      checkout (signed QR → buyer's phone) — same fallback we'd use
+      if they were on the wrong device anyway.
+
+  - risk: >
+      App Store rejects v1.0 because the binary contains Stripe
+      Terminal SDK code with no exposed UI ("dead code" concern).
+    severity: LOW
+    mitigation: >
+      Have a one-paragraph response ready: "Stripe Terminal SDK is
+      installed in preparation for a forthcoming POS feature. The
+      feature is server-flag-disabled and not exposed in this build.
+      Once Apple grants Tap to Pay publishing entitlement we will
+      submit a follow-up build with the feature enabled." Apple
+      historically accepts this.
+
+  - risk: >
+      OTA update accidentally enables Sell UI on a v1.0 binary,
+      crashing the app at first POS attempt.
+    severity: HIGH
+    mitigation: >
+      The binarySupportsTapToPay() check is the safety net. NEVER
+      gate on the server flag alone. Lint rule (or PR-review checklist
+      item) to ensure Sell-related code paths always check
+      binarySupportsTapToPay() first.
+
+  - risk: >
+      EAS Update channel mis-targeting (preview update lands on
+      production users).
+    severity: MEDIUM
+    mitigation: >
+      Strict channel naming: development | preview | production.
+      Production deploys via tagged release in CI only; no manual
+      `eas update --channel production` from a developer laptop.
+
+mobile_app:
+  scope_note: >
+    The consumer mobile app (apps/mobile/) was rebuilt from scratch on
+    2026-04-26. The pre-rebuild state lives on archive branch
+    `archive/mobile-pre-rebuild-2026-04-26` (local-only at the time of
+    archiving — push blocked by unrelated pre-push hook build errors in
+    stripe-adapter.ts and sweep-orphaned-uploads.ts).
+
+  v1_scope:
+    - Sign-in via better-auth/expo magic link (email-only, no password)
+    - Bottom-tab shell: Discover / Tickets / Profile / Settings
+    - Discover tab: pulls events.discoverPublic via tRPC, renders FlashList
+    - Event detail: placeholder reading events.resolveEventBySlug
+    - Tickets / Profile: placeholders to be filled in v1.1
+    - Settings: sign-out
+
+  v1_explicit_non_goals:
+    - Buy flow / Stripe Payment Sheet (v1.1)
+    - Push notifications (v1.1; APNs cert at first build)
+    - Universal Links runtime handling (entitlement pre-declared; web side
+      needs to serve apple-app-site-association)
+    - Entity-page rendering for places/orgs/humans (v1.1)
+    - Wallet pass / share-to-friends (v1.2+)
+
+  identity:
+    bundle_id: "com.ithasfire" (iOS + Android, intentionally no suffix)
+    apple_team_id: "5J9DRDR2TB"
+    eas_project: "@ithasfire-community/mobile"
+    eas_project_id: "4a946c7a-d87e-476a-8bfa-848be3864a86"
+    sentry_org: "hearth-fire"
+    sentry_project: "hearth-fire-mobile"
+    sentry_project_id: "4511289359335424"
+    sentry_dsn: "https://3ac5479451cb9cfcdac0018d01cad6c7@o4511120392454144.ingest.us.sentry.io/4511289359335424"
+    note: >
+      DSN is intentionally NOT embedded in app.config.ts (unlike scanner).
+      Comes through EXPO_PUBLIC_SENTRY_DSN env var only — set in the
+      EAS profile env or local shell. Means a missing DSN silently
+      disables Sentry rather than every dev-build pinging prod.
+    project_migration_note: >
+      The consumer mobile app now points at the Ithas Fire Community EAS
+      project. Existing binaries built against the old update URL continue
+      polling the old EAS project; publish compatibility updates to the old
+      project until those binaries age out, or ship a forced binary upgrade
+      before relying exclusively on the new update URL. Verify remote build
+      credentials, App Store Connect access, Play credentials, and the
+      assetlinks fingerprint against the Ithas Fire Community project before
+      production submission.
+
+  differences_from_scanner:
+    - "No Tap to Pay tier system in app.config.ts (consumer pays, not accepts)"
+    - "Public App Store listing (NOT Unlisted) — flagship consumer product"
+    - "Universal Links / App Links entitlement pre-declared in iOS
+       associatedDomains and Android intentFilters"
+    - "Bottom-tab + nested-stack navigation; scanner is single-screen-shell"
+    - "Sentry user context auto-synced via useSentryUserSync(humanId) hook
+       in RootNavigator — capability worth backporting to scanner"
+
+  store_distribution:
+    ios: "Public App Store listing"
+    android: "Public Google Play listing"
+    initial_track:
+      ios: "TestFlight Internal → External → App Store"
+      android: "Internal Testing → Open Testing → Production"
+
+  apple_walkthrough_notes: >
+    Same flow as scanner (apple_walkthrough section above) but skip
+    step_2/step_3 entirely (no Tap to Pay request needed). The mobile
+    app DOES need Apple Pay capability (step_1: enable in App ID), but
+    Apple Pay does not have an entitlement-review process — just enable
+    the capability and add merchant ID `merchant.com.ithasfire`.
+
+decisions_made:
+  bundle_id:
+    ios: "com.ithasfire.scanner"
+    android: "com.ithasfire.scanner"
+    decided: "2026-04-26"
+  android_strategy: >
+    Ship Google Play Internal Testing in parallel with iOS TestFlight
+    Internal — same EAS workflow, no extra cost to keeping them in sync.
+    Decided 2026-04-26.
+  sentry:
+    org_slug: "hearth-fire"
+    project_slug: "hearth-fire-scanner"
+    project_id: "4511284791607296"
+    dsn: "https://a334111b8354f829475f8067510ebfc1@o4511120392454144.ingest.us.sentry.io/4511284791607296"
+    note: >
+      DSN is public/safe to embed in client binaries. Sourcemap upload
+      uses SENTRY_AUTH_TOKEN as an EAS Secret — never inlined in app
+      config.
+    decided: "2026-04-26"
+  app_store_distribution:
+    mode: "Unlisted App"
+    rationale: >
+      Scanner is an operator/staff tool, not a consumer app. Unlisted
+      avoids ASO/marketing work, prevents bounce-rate damage from
+      casual downloads hitting the auth gate, and is still a real
+      App Store distribution (full review). Direct link distribution
+      from the Ithas Fire web admin once an org's staff is onboarded.
+      Request via App Store Connect → App Information after first
+      submission is approved.
+    decided: "2026-04-26"
+  brand_assets:
+    status: "deferred until App Store submission week"
+    plan: >
+      Screenshots from real working scanner screens are sufficient for
+      Unlisted App distribution. App icon: square crop of existing
+      Ithas Fire mark (no transparency, 1024x1024). Description: short
+      paragraph. Keywords: irrelevant for Unlisted but field-required;
+      stub with "ithasfire,scanner,tickets,events".
+    decided: "2026-04-26"
+
+open_questions:
+  - "App Store Connect ascAppId + Apple Team ID — both TBD until App
+     Store Connect record is created. Placeholders in eas.json submit
+     config."
+  - "EAS Project ID + Updates URL — both TBD until `eas init` is run
+     in apps/scanner/. Placeholders in app.config.ts.extra.eas and
+     updates.url."
+
+acceptance_criteria:
+  - "EAS development profile builds and runs on a connected iPhone via
+    `eas build --profile development --platform ios`."
+  - "EAS production profile (tier=none) builds, signs, and uploads to
+    App Store Connect successfully WITHOUT requiring Apple Tap to Pay
+    publishing entitlement."
+  - "binarySupportsTapToPay() returns false in v1.0 builds; the Sell
+    tab does not render even if the server flag is forced to true via
+    devtools."
+  - "When EXPO_TAP_TO_PAY_TIER is flipped to 'publishing' (locally,
+    pre-Apple-approval), `eas build --profile production` fails to
+    sign with a clear Apple-side error — proving the gate works."
+  - "App Review Information includes a working demo account, a
+    recorded demo video, and a one-paragraph explanation of the
+    SDK-installed-but-disabled state."
+  - "[DONE 2026-05-27] Apple DEVELOPMENT entitlement granted on App ID
+    com.ithasfire.scanner (team 5J9DRDR2TB). Capability checkbox
+    visible & enabled in Identifiers UI."
+  - "[TODO] Confirm Apple PUBLISHING entitlement status (separate
+    approval, not visible in Identifiers UI). Check email or trial-
+    submit a production build."
+
+follow_ups:
+  android_tap_to_pay:
+    status: post-v1
+    notes: >
+      Same SDK, different entitlement model (Google Play handles it
+      via store-level capability rather than per-app entitlement).
+      Plan: ship v1.0 to Play Store with NFC permission declared but
+      Tap to Pay code-gated. Flip on with v1.1 alongside iOS.
+
+  eas_workflows:
+    status: post-v1.1
+    rationale: >
+      EAS Workflows replaces GitHub Actions for build orchestration.
+      Worth migrating once we have ≥2 EAS-built apps (e.g. add
+      audio-transcoder or a future Ithas Fire consumer mobile app).
+      For one app, GitHub Actions + `eas build --auto-submit` is fine.
+
+  ota_update_strategy:
+    status: post-v1.0
+    rationale: >
+      EAS Update's value scales with iteration speed. Pre-launch we
+      ship infrequently; post-launch with real operators we'll want
+      hotfix capability for JS-only changes (typo fixes, copy tweaks,
+      flow adjustments). Wire `expo-updates` in v1.0 (already in
+      app.config.ts above) so the channel is ready when we need it.

@@ -1,0 +1,13 @@
+-- Venue track record, R11 re-ruled 2026-09-25 (FU-005): the "a ticket at this
+-- place was scanned since lastCalculatedAt" arm of
+-- PlaceStatsRepo.listStalePlaceIds — the only reader this index was built for
+-- (20260924130000_ticket_scanned_at_idx) — now ranges over
+-- `TicketScan.scannedAt` (20260925130000_ticket_scan_scanned_at_idx). No
+-- query filters, ranges or sorts on `Ticket.scannedAt` any more (grepped
+-- 2026-09-25, raw SQL included). A dead index on a hot table costs a write on
+-- every scan.
+--
+-- `CONCURRENTLY` so the drop does not take an ACCESS EXCLUSIVE lock that
+-- would block door scans; it cannot run inside a transaction, so this file is
+-- one statement (precedent: 20260924130000). `IF EXISTS` makes a retry safe.
+DROP INDEX CONCURRENTLY IF EXISTS "Ticket_scannedAt_idx";

@@ -1,0 +1,49 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Post-Event Prompt — SHARED outbox for post-event solicitations, serving BOTH
+// the performer post-gig review prompt (booking-review-data-weave WS3,
+// FR-009/FR-010) and the attendee review prompt (attendee-reviews FR-006).
+// ONE pipeline, discriminated by `audience` — never two prompt outboxes (the
+// two specs' related-specs headers both mandate this).
+//
+// Rows are enqueued by daily sweeps (post-event-prompts.enqueue) and drained
+// by a dispatch job (post-event-prompts.dispatch) through the notify pipeline.
+// ATTENDEE rows are enqueued from day one (history accumulates) but dispatch
+// is gated behind DISPATCH_ENABLED_AUDIENCES in
+// packages/core/src/use-cases/post-event-prompts/constants.ts until the
+// attendee review form ships.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model PostEventPrompt {
+  id      String @id @default(uuid())
+  eventId String
+  humanId String
+
+  /// Denormalized from the gig's booking request at enqueue time — the
+  /// PERFORMER dispatch resolves the place and deep-links to /review-a-place.
+  /// Bare column on purpose (no FK): a deleted place simply makes dispatch
+  /// dead-letter the prompt instead of cascading history away.
+  placeId String?
+
+  /// PERFORMER (post-gig venue review ask) | ATTENDEE (event review ask).
+  /// A human who qualifies for BOTH on one event gets the PERFORMER prompt
+  /// only — audience precedence is enforced in the attendee enqueue sweep.
+  audience PostEventPromptAudience
+
+  /// PENDING = owed; SENT = notify succeeded; FAILED = dead-lettered (send
+  /// exhausted its attempts, or the event/place vanished before dispatch).
+  status   PostEventPromptStatus @default(PENDING)
+  attempts Int                   @default(0)
+  sentAt   DateTime?
+
+  createdAt DateTime @default(now())
+
+  event Event @relation("EventPostEventPrompts", fields: [eventId], references: [id], onDelete: Cascade)
+  human Human @relation("HumanPostEventPrompts", fields: [humanId], references: [id], onDelete: Cascade)
+
+  /// Enqueue idempotency anchor (weave FR-010 / attendee FR-006): one prompt
+  /// per (event, human, audience), sent once, no reminders. Sweeps insert
+  /// with skip-duplicates against this index.
+  @@unique([eventId, humanId, audience])
+  @@index([status, createdAt])
+  @@index([humanId])
+}

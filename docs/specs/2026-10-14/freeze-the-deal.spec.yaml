@@ -1,0 +1,240 @@
+# Confirmed by the owner 2026-10-14 ("yeah that spec is good"). Built 2026-10-14: backend f21d1281c, UI 80c1950ec, help a42cea67e; live run passed.
+# freeze-the-deal.spec.yaml
+#
+# An event's deal freezes when it first goes on sale, or when the organiser
+# freezes it earlier. A change after that is one deliberate edit that every
+# payee is told about, line by line.
+
+version: "1.0"
+updated: "2026-10-14"
+related:
+  - docs/specs/2026-10-12/organiser-resale-share.spec.yaml (FR-003: a change to the clause applies to tickets sold afterwards; this spec does not change that)
+  - docs/specs/2026-09-29/deal-terms-and-settlement.spec.yaml (FR-003, the agreement builder whose writes this fences)
+plan: memory/session_organiser_resale_share_build.plan.md, step 15
+
+# ── Rulings (owner, 2026-10-14; full text in the plan, "Owner rulings 2026-10-14") ──
+# R1  On Q1–Q3: "Booking without terms does just let the organizer set them and change
+#     them in the same way we have resales. We really just need an option to freeze the
+#     terms." No act re-ask, no booking lock.
+# R2  Who freezes: "Organizer and automatic when tickets go on sale".
+# R3  What it locks: "The whole deal" (ticket-sale splits, the resale share, who receives each).
+# R4  Undo: "Yes, everyone is told".
+# R5  Round 1 (F1–F7): "I agree with all your recommendations".
+#     F1 on sale = first publish; unpublish does not unfreeze.
+#     F2 a one-time backfill freezes events already published and upcoming; no notice.
+#     F3 unfreezing is one edit: saving the change re-freezes; one notice per change.
+#     F4 the freeze covers the event's whole deal whatever its source; a booked event's
+#        resale share freezes too; a DRAFT agreement does not freeze.
+#     F5 costs off the top (deductions) and the payout schedule are part of the deal.
+#     F6 freeze roles = today's deal-edit roles; payees still answer their line; no /platform page.
+#     F7 notice = email + in-app to every payee, each line before → after.
+# R6  Design board (canvas K3gh4xtAD7t2HB8441ozYY), owner 2026-10-14: "They don't have that much of
+#     adifference. lets go with a" → option A: a frozen band with "Change the frozen
+#     terms"; edits collect on the page ("Not saved"), one "Save and tell them" sends one
+#     change and one notice.
+# O1  Orchestrator, 2026-10-14, from F3+F4: finalizing a booking onto a frozen event is a
+#     frozen change like any other: refused without frozenChange, recorded and noticed with it.
+# Earlier rulings that still bind: pro-social "Consent is the root"; no enshittification (veto).
+
+summary:
+  problem: >
+    Organisers can change an event's splits, resale share and payees at any
+    time, including after tickets are selling, and nobody on the deal is told.
+    An act who agreed to 30% can find 20% on the settlement sheet. The owner
+    ruled against re-asking or locking (R1); the deal needs to hold still
+    once the night is on sale, and any later change must be visible.
+  solution: >
+    The event carries a freeze. It is set on first publish (F1) or by the
+    organiser before then (R2). While frozen, every deal write is refused
+    unless the caller says it is changing frozen terms; that save applies the
+    change, keeps the freeze, records the change with before and after, and
+    tells every payee on either side of it (F3, F7).
+  users:
+    - organiser (event edit + payout routing, or the agreement's terms editor)
+    - payee (an act, a place, a co-promoter; human or organisation)
+  surfaces:
+    - web (event builder Revenue splits, agreement page The deal, payee views)
+    - email + in-app notices
+    - jobs (none; the backfill is a one-time script)
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Freeze state lives on the Event: `dealFrozenAt` (null = not frozen)
+        and `dealFrozenByHumanId` (null = frozen automatically). It covers
+        every terms row the event points at: PRIMARY and RESALE, with their
+        lines, payees, deductions, payout schedule and the resale clause (R3,
+        F5).
+    - id: FR-002
+      description: >
+        First publish freezes the deal inside the publish transaction, in the
+        same place `publishEvent` activates PENDING terms (F1). A re-publish
+        after an unpublish leaves an existing freeze alone and never unfreezes.
+    - id: FR-003
+      description: >
+        The organiser can freeze an unfrozen event's deal at any time, DRAFT
+        included (R2): `freezeEventDeal`. Freezing an already frozen deal is a
+        no-op that returns the current state.
+    - id: FR-004
+      description: >
+        Every write path that changes an event's deal checks the freeze inside
+        its transaction, under the existing `lockTerms` row lock, and refuses
+        with DEAL_FROZEN unless the input carries `frozenChange: true`. The
+        paths: `updateEventSplits`, `setTermsDeal` (EVENT and
+        BOOKING_AGREEMENT), `setAgreementDeal`, `setResaleClause` (EVENT and
+        BOOKING_AGREEMENT), `finalizeBookingAgreement` (it re-points the
+        event's primary terms), `upsertBookingAgreementLine`,
+        `removeBookingAgreementLine`, `updateBookingAgreementHeader` where it
+        touches money. Org defaults are never frozen (they are not an event);
+        `updatePayoutSchedule` only re-points org and human defaults, so it is
+        not fenced (an event's schedule lives on its terms row and changes only
+        through the deal writes above).
+        A DRAFT agreement whose event is not frozen writes as today (F4).
+    - id: FR-005
+      description: >
+        A save with `frozenChange: true` on a frozen deal applies the change,
+        keeps `dealFrozenAt`, and appends one DealChange row: event, who, when,
+        and the deal before and after as the same normalised shape
+        `deal-fingerprint.ts` hashes. A save that changes nothing appends no
+        row and sends no notice (F3).
+    - id: FR-006
+      description: >
+        After the transaction commits, every payee on the deal before OR after
+        the change gets one notice, email and in-app (F7): a human payee
+        directly; an organisation payee's OWNER, ADMIN and FINANCE members,
+        as `notify-payout-completed.ts` resolves them. The actor is not
+        notified. The notice lists each line before → after (payee, share,
+        who pays the resale share, deductions, schedule), who changed it, and
+        when. Idempotency key `deal-change:${dealChangeId}:${humanId}`.
+        Notice failure never fails the save: the swallow branch calls
+        `deps.reportError` and keeps the log line (CLAUDE.md, Sentry).
+    - id: FR-007
+      description: >
+        Payees and deal editors can read an event's changes, newest first:
+        `listDealChanges`. Readers: anyone allowed to edit the deal, and any
+        payee on any of the event's terms lines, past or present. Nobody else
+        (pro-social 4: money stays private to the people it concerns).
+    - id: FR-008
+      description: >
+        Payees can still confirm or decline their own line while frozen (F6);
+        answering is not a change to the deal and does not append a DealChange.
+    - id: FR-009
+      description: >
+        One-time backfill script: every event with status PUBLISHED, a
+        non-null `publishedAt` and `endsAt` in the future gets `dealFrozenAt =
+        now()`, `dealFrozenByHumanId = null`. No notices (F2). Dry run by
+        default, prints the count; `--apply` writes. Runs after the migration
+        on each environment; prod run is the owner's call.
+    - id: FR-010
+      description: >
+        Web: the three editors show the freeze. Not frozen: a "Freeze the
+        deal" action. Frozen: the deal reads as frozen with the date, and a
+        "Change the frozen terms" action opens the same editor; its save says
+        who will be told before it is sent. The event's change history is
+        visible to editors and payees. Layout per the design board pick.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        The freeze check and the write happen in one transaction under the
+        terms row lock, so a publish and a concurrent split save cannot both
+        win (the save either lands before the freeze or is refused after it).
+    - id: NFR-002
+      description: >
+        Every freeze, frozen change and backfill writes an AuditLog row:
+        `event.deal_frozen` (source MANUAL | PUBLISH | BACKFILL) and
+        `event.deal_frozen_change` (dealChangeId).
+
+# ── Lifecycle (CLAUDE.md "Model Lifecycle Convention") ───────────────────────
+lifecycle:
+  event_freeze_state:
+    create: "built: on first publish (FR-002), by the organiser (FR-003), by the backfill (FR-009)"
+    read: "built: returned with every deal read (getTermsDeal, getAgreementDeal, the event builder query)"
+    update: "built: a frozen change keeps the freeze (FR-005); there is no other update"
+    remove: "not built, by ruling F3: unfreezing is one edit that re-freezes on save, so the state never returns to null"
+    platform_page: "none (F6)"
+  deal_change:
+    create: "built: one row per frozen change that changes something (FR-005)"
+    read: "built: listDealChanges, list only, newest first (FR-007); single-row read not built, the list carries everything"
+    update: "not built: append-only, a record of what happened"
+    remove: "not built: append-only; rows go with their event (FK onDelete CASCADE, like the event's other rows)"
+    platform_page: "none (F6)"
+
+architecture:
+  core:
+    use_cases:
+      - name: freezeEventDeal
+        description: Freeze an unfrozen event's deal (FR-003).
+        input: "{ eventId }"
+        output: "{ dealFrozenAt, dealFrozenByHumanId }"
+        idempotent: true
+        money: true
+      - name: listDealChanges
+        description: The event's frozen changes, newest first (FR-007).
+        input: "{ eventId, cursor? }"
+        output: "DealChange[] with actor display name"
+        idempotent: true
+        money: false
+      - name: "_shared/deal-freeze.ts (assertDealWritable, recordDealChange, notifyDealChange)"
+        description: >
+          One fence for every write path in FR-004 and one record-and-notify
+          path for FR-005/FR-006, so no path carries its own copy.
+        money: true
+    modified:
+      - publish-event.ts (FR-002)
+      - the FR-004 write paths (fence + frozenChange input)
+  ports:
+    new: []
+    existing: [MailerPort, PushPort, ReporterPort, repos.audit, repos.deals]
+  adapters:
+    existing: [prisma events (freeze columns), prisma deals (DealChange create + list)]
+  transport:
+    trpc_procedures:
+      - deals.freezeEventDeal
+      - deals.listDealChanges
+      - "frozenChange?: boolean on deals.setTermsDeal, deals.setResaleClause, events.updateEventSplits, bookingAgreements.finalizeBookingAgreement, bookingAgreements line/header procedures"
+  ui:
+    components:
+      - components/deals/DealEditor.tsx and ResaleClause.tsx (frozen state, change action, who-is-told line)
+      - a DealChanges list (new, components/deals)
+      - SplitsEditor.tsx, AgreementEditor.tsx (mount)
+    notices:
+      - email + in-app variant for a deal change (en + es copy)
+
+data:
+  new_models:
+    - "DealChange { id, eventId → Event (onDelete CASCADE), actorHumanId, createdAt, before Json, after Json }, index (eventId, createdAt desc)"
+  modified_models:
+    - "Event: dealFrozenAt DateTime?, dealFrozenByHumanId String? (→ Human, onDelete SET NULL)"
+  migrations_needed: true
+
+risks:
+  - risk: A write path is missed and changes a frozen deal silently.
+    severity: HIGH
+    mitigation: >
+      One shared fence; a test per FR-004 path that a frozen event refuses
+      without `frozenChange`; a grep check in review for terms writes outside
+      the list.
+  - risk: The publish freeze races a split save in another tab.
+    severity: MEDIUM
+    mitigation: NFR-001 (both under the terms row lock).
+  - risk: Notices go out for a change that rolled back.
+    severity: MEDIUM
+    mitigation: Notify only after commit, keyed by the DealChange id.
+
+open_questions: []
+
+out_of_scope:
+  - Re-asking payees to agree to a change (R1).
+  - Freezing org, place or human default agreements.
+  - Merch terms (no core write path exists today).
+  - Changing which tickets a resale clause applies to (resale spec FR-003 stands).
+
+acceptance_criteria:
+  - Publishing an event for the first time sets dealFrozenAt; unpublish and re-publish leave it set.
+  - On a frozen event, each FR-004 write without frozenChange fails with DEAL_FROZEN and writes nothing.
+  - The same write with frozenChange applies, appends one DealChange, and after commit notifies every payee before and after the change, the actor excepted.
+  - A payee removed by the change gets the notice and can still read the change history.
+  - A payee can confirm their line on a frozen event.
+  - The backfill dry run prints a count and writes nothing; --apply freezes exactly those events.

@@ -1,0 +1,280 @@
+# ai-clerk-and-tool-registry.spec.yaml
+#
+# An in-product, attendee-facing AI "clerk": a natural-language way to find
+# events, see your own tickets/orders, and (with confirmation) buy tickets or
+# take an instant refund — without filling in forms or hunting through pages.
+# The clerk is a server-side agent loop that calls a TOOL REGISTRY of thin
+# wrappers over EXISTING core use-cases, bound to the signed-in attendee's auth
+# context. A /mcp HTTP+SSE transport (phase 2) exposes the same tools to
+# external AI clients. Everything lives inside apps/api — no new app/service.
+
+version: "1.0"
+updated: "2026-06-23"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Attendees who don't want to click through pages or fill in forms have no
+    conversational way to interact with the platform — "where's my ticket for
+    Friday?", "what's on near me this weekend?", "refund my order if I still
+    can". Support volume for these is answerable but currently lands on a human.
+  solution: >
+    A server-side AI clerk (Claude Haiku 4.5 by default) that runs an agent loop
+    over a TOOL REGISTRY — thin wrappers over the core use-cases that already
+    back our tRPC order/search procedures. The clerk acts AS the signed-in
+    attendee through the same Better Auth/RBAC context, so it can only ever touch
+    that attendee's own data. Reads are free; money actions are gated behind
+    explicit UI confirmation and decided server-side, never by the model.
+  users:
+    - signed-in attendee (consumer)
+  surfaces:
+    - api        # tool registry + in-process agent loop (Fastify)
+    - web        # clerk renders inside the support widget (see support-chat-widget.spec.yaml)
+
+# ── Decisions (from scoping conversation) ─────────────────────────────────────
+
+decisions:
+  model: >
+    Claude Haiku 4.5 ($1/$5 per MTok) is the default workhorse — a support turn
+    is structured tool-calling, not deep reasoning, and lands at ~2 cents/
+    conversation with prompt caching. Sonnet 4.6 is an escape hatch for
+    ambiguous turns ONLY if metrics show Haiku fumbling intent; ship single-model
+    on Haiku first. Provider-agnostic in principle; Anthropic SDK to start.
+  model_is_a_router: >
+    The model selects and sequences tool calls and relays results. It does NOT
+    decide business outcomes. Refund eligibility, pricing, and authorization all
+    live in the core use-cases / tRPC layer — the brain and the guard. Removing
+    judgement from the model is WHY a cheap model is safe here.
+  reuse_existing_use_cases: >
+    Tools wrap the SAME core use-cases the tRPC routers call (orders.*,
+    eventsSearch.*), with actorHumanId bound from the authenticated session.
+    Identical authorization to a normal web request, for free — no parallel
+    permission surface.
+  no_new_app: >
+    The agent loop and the /mcp transport are Fastify plugins inside apps/api,
+    siblings to the existing trpc plugin. One process, one Cloud Run service,
+    one scale-to-zero deploy. MCP-over-HTTP is "another transport" in the
+    hexagonal model.
+  not_the_stdio_server: >
+    apps/mcp/ is a SEPARATE stdio MCP server for staff/Copilot admin use (7
+    admin-scoped tools, VS Code transport). It is unrelated to this spec and is
+    left untouched. Do not extend it for attendees.
+  clerk_calls_tools_directly: >
+    The in-process clerk calls the tool registry functions DIRECTLY (no loopback
+    HTTP to /mcp). The /mcp transport is a second CONSUMER of the same registry,
+    for EXTERNAL clients only.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Tool registry: a single module defining each tool once as a typed
+        function over a core use-case, with actorHumanId injected from the
+        authenticated session. Tier-0 (read) tools: searchEvents, autocomplete,
+        listMyOrders, getMyOrder, listMyOrderTickets, getRefundEligibility,
+        quoteFullRefund. Tier-2 (mutating) tools: createCheckout, confirmPayment,
+        refundFullOrder.
+    - id: FR-002
+      description: >
+        In-process agent loop: given a conversation (system prompt + tool defs +
+        message history) it runs Haiku 4.5 with the Tier-0 tools auto-callable,
+        streaming the assistant's text back to the caller (the support widget).
+    - id: FR-003
+      description: >
+        Confirm-before-act: a Tier-2 (mutating) tool call MUST NOT execute
+        directly. The model proposes the action with structured args; the API
+        returns a "pending action" the UI renders as a confirmation card
+        (e.g. "Refund order #1234 — $45 back to •••• 4242?"). The mutation runs
+        only after the user explicitly confirms, then the tool executes and the
+        result is fed back to the loop.
+    - id: FR-004
+      description: >
+        Refund flow: the clerk calls getRefundEligibility / quoteFullRefund to
+        present the server-computed eligibility + amount. If (and only if) the
+        server says eligible, it offers confirmation; on confirm it calls
+        refundFullOrder. The model never asserts eligibility itself.
+    - id: FR-005
+      description: >
+        Buy flow: createCheckout assembles the cart; the UI shows the summary;
+        on confirm, confirmPayment completes. No card is charged without an
+        explicit user confirmation step.
+    - id: FR-006
+      description: >
+        Escalation hook: when the clerk cannot resolve a request (out of scope,
+        repeated failure, user asks for a human), it hands off to the support
+        thread + Discord alert defined in support-chat-widget.spec.yaml.
+    - id: FR-007
+      description: >
+        Phase 2 — /mcp Fastify plugin: exposes the SAME tool registry over MCP
+        Streamable HTTP (POST + SSE) to external AI clients, behind MCP OAuth.
+        No rework of the registry; the registry is the shared substrate.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Authorization parity: a clerk tool call is subject to exactly the same
+        RBAC as the equivalent tRPC request. An attendee can never read or mutate
+        another human's orders. Verified by reusing the core use-cases with the
+        session-bound actorHumanId, not a separate code path.
+    - id: NFR-002
+      description: >
+        Cost: target ~2 cents/conversation on Haiku 4.5. Prompt-cache the system
+        prompt + tool definitions (stable prefix) so multi-turn conversations
+        read cache at ~0.1x input. Deterministic tool ordering; no per-request
+        timestamps/UUIDs in the cached prefix.
+    - id: NFR-003
+      description: >
+        Prompt-injection resilience: the model is treated as untrusted input.
+        Because every mutation is gated by a server-computed decision + explicit
+        user confirmation, a prompt-injected instruction cannot move money or
+        touch another user's data — the tRPC/use-case layer rejects it.
+    - id: NFR-004
+      description: >
+        Latency: run Haiku without extended thinking for snappy turns (the model
+        is a router). Stream tokens to the widget. A tool round-trip should feel
+        like a few seconds, not a spinner.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+# core → ports → adapters → transport → UI
+
+architecture:
+  core:
+    use_cases:
+      # No NEW domain use cases — the clerk reuses these existing ones.
+      - name: (existing) eventsSearch.search / autocomplete
+        description: Find events; power "what's on near me" / title lookups.
+        input: query, filters
+        output: results
+        idempotent: true
+        money: false
+      - name: (existing) orders.listMyOrders / getMyOrder / listMyOrderTickets
+        description: Fetch the attendee's own orders and tickets.
+        input: actorHumanId (from session)
+        output: orders / order / tickets
+        idempotent: true
+        money: false
+      - name: (existing) orders.getRefundEligibility / quoteFullRefund
+        description: Server decides if/how much is refundable. Authoritative.
+        input: actorHumanId, orderId
+        output: eligibility, quote
+        idempotent: true
+        money: false
+      - name: (existing) orders.refundFullOrder
+        description: Execute an instant refund within the eligibility window.
+        input: actorHumanId, orderId
+        output: refund result
+        idempotent: true   # already guarded — must stay so under clerk use
+        money: true
+      - name: (existing) orders.createCheckout / confirmPayment
+        description: Buy tickets — cart assembly then payment confirmation.
+        input: actorHumanId, cart / paymentIntent
+        output: checkout / order
+        idempotent: true
+        money: true
+      - name: run-clerk-turn (NEW, thin orchestration)
+        description: >
+          Drive one agent-loop turn: assemble system prompt + tool defs +
+          history, call the LLM via the agent port, auto-execute Tier-0 tool
+          calls, surface Tier-2 calls as pending confirmations, return assistant
+          text + any pending action. Holds no business logic of its own.
+        input: conversation history, actorHumanId
+        output: assistant message, pending_action?
+        idempotent: false
+        money: false
+
+  ports:
+    new:
+      - AgentPort        # LLM chat-completion + tool-use loop (keeps core LLM-agnostic)
+      - ClerkToolRegistry # maps tool name -> {schema, tier, handler bound to actorHumanId}
+    existing:
+      - (the ports behind orders.* and eventsSearch.* use-cases)
+
+  adapters:
+    new:
+      - AnthropicAgentAdapter   # implements AgentPort via @anthropic-ai/sdk (Haiku 4.5 default)
+    existing:
+      - (order/search/payment adapters — reused unchanged)
+
+  transport:
+    trpc_procedures:
+      - clerk.sendMessage     # append user message, run a turn, return assistant text + pending_action
+      - clerk.confirmAction   # user approves a pending Tier-2 action -> execute the mutation tool
+      # (conversation may live on the support thread from support-chat-widget.spec.yaml)
+    webhooks: []
+    other:
+      - "Phase 2: /mcp Fastify plugin (MCP Streamable HTTP + OAuth) exposing the registry to external clients"
+
+  ui:
+    pages: []   # clerk has no page of its own — it renders inside the support widget
+    components:
+      - ClerkMessage / PendingActionCard   # confirmation UI for Tier-2 actions (in the widget)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []          # conversation reuses SupportThread/SupportMessage (authorType=AI_CLERK)
+  modified_models: []
+  migrations_needed: false
+  notes: >
+    Optional: a ClerkToolCall audit row (thread, tool, args-redacted, result,
+    actorHumanId, ts) for observability/debugging. Money mutations are already
+    audited by the order/refund use-cases, so this is nice-to-have, not required.
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Model executes a money action the user didn't really intend.
+    severity: HIGH
+    mitigation: >
+      Tier-2 tools never auto-execute (FR-003). Explicit per-action UI
+      confirmation; eligibility/amount computed server-side (FR-004). The model
+      cannot complete a charge or refund the tRPC layer would reject.
+  - risk: >
+      Prompt injection via event titles, order notes, or user text steers the
+      clerk toward another user's data or an unwanted action.
+    severity: HIGH
+    mitigation: >
+      actorHumanId is bound server-side from the session, never from model
+      output; tools reuse the same RBAC-guarded use-cases (NFR-001, NFR-003).
+  - risk: >
+      Haiku mis-selects the wrong order or hallucinates a refund amount.
+    severity: MEDIUM
+    mitigation: >
+      Confirmation card shows the concrete server-fetched order + server-quoted
+      amount; user verifies before anything happens. Escalate to Sonnet if
+      intent-resolution metrics warrant.
+  - risk: >
+      Cost runaway from long loops or large context.
+    severity: LOW
+    mitigation: >
+      Cheap model + prompt caching (NFR-002); cap tool-call iterations per turn;
+      give the model a search tool, not the whole catalog.
+
+open_questions:
+  - Does the clerk conversation live on the SupportThread (recommended — one inbox, easy human handoff) or a dedicated ClerkConversation? Spec assumes SupportThread.
+  - Tier-2 confirmation UX — inline card in the chat stream vs a modal? (Defer to ui skill.)
+  - Phase-2 /mcp OAuth: which client(s) first, and do we need dynamic client registration? Defer until a real external consumer exists.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Organizer-facing clerk / Tier-1 natural-language event drafting (future).
+  - The support chat widget UI + thread model itself (see support-chat-widget.spec.yaml).
+  - The existing apps/mcp stdio staff/admin MCP server (untouched).
+  - Anonymous (signed-out) clerk use — clerk requires an authenticated attendee.
+  - Tier-3 autonomous/standing-instruction behavior ("grab a ticket when X drops").
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A signed-in attendee can ask "where's my ticket for <event>?" and the clerk returns their own ticket via listMyOrderTickets, never another user's.
+  - Asking the clerk to refund an INELIGIBLE order yields a clear "not eligible" answer (server decision) and NO refund is attempted.
+  - Refunding an ELIGIBLE order requires an explicit confirmation tap; only then does refundFullOrder run, and the refunded amount matches the server quote.
+  - Buying tickets never charges a card without an explicit confirmation step.
+  - A second request in the same conversation reads prompt cache (cache_read_input_tokens > 0); measured cost is ~2 cents/conversation on Haiku.
+  - The tool registry has exactly one definition per tool, consumed by both the in-process loop and (phase 2) the /mcp plugin.
+  - apps/mcp/ is unchanged.

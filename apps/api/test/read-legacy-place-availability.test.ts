@@ -4,7 +4,7 @@ import {
   legacyPlaceAvailabilityExists,
   readLegacyPlaceAvailability,
   type RawQueryClient,
-} from "../src/scripts/read-legacy-place-availability";
+} from "../src/scripts/backfill/done/read-legacy-place-availability";
 
 /**
  * The backfill's legacy read, after `PlaceAvailability` lost its Prisma model.

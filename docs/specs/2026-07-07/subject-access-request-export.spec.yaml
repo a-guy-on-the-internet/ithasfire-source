@@ -1,0 +1,314 @@
+# subject-access-request-export.spec.yaml
+#
+# Tier1, scoped tiny: let a signed-in human request a bundle of THEIR OWN
+# personal data (GDPR Art.15 / CCPA-style Subject Access Request). No
+# mechanism for this exists anywhere in the repo today (confirmed by grep —
+# the only "export" hit in specs is an unrelated artist-analytics CSV export).
+# Read-only, additive, async-delivered. Does not attempt full legal
+# GDPR/CCPA compliance in one pass — see open_questions for what's
+# deliberately left for a product/legal decision.
+
+version: "1.0"
+updated: "2026-07-07"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    A user who wants to see "everything Ithas Fire has about me" has no
+    self-serve way to get it — support would have to hand-query the DB. This
+    is a real compliance gap (GDPR Art.15 right of access, CCPA right to know)
+    and a trust gap independent of any legal deadline.
+  solution: >
+    Add a self-serve "Request my data" action (Account Settings, near the
+    existing Danger Zone) that enqueues an export request, processed async by
+    an `apps/jobs` scheduled task following the same outbox pattern as
+    `storage.drain-pending-deletions` / `community.dispatch-rsvp-confirmations`:
+    a durable request row, a draining job that assembles a JSON bundle from
+    the human's own rows across the domains listed in `data.export_scope`,
+    writes it to R2 via the existing `FileStoragePort`, and delivers a
+    time-limited download link by email (reusing the existing mailer/notify
+    path). No new bespoke query engine — one use case per domain bucket,
+    read-only, scoped by `authedProcedure`'s actorHumanId (never another
+    human's data).
+  users:
+    - a signed-in human requesting their own data export
+    - platform admin (visibility into pending/failed export requests only —
+      v1 does not add an admin-triggered "export on behalf of" action, see
+      out_of_scope)
+  surfaces:
+    - web    # Account Settings action + "your export is ready" email link
+    - api    # request-my-data-export use case + trpc procedure
+    - jobs   # async assembly + delivery job
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        A signed-in human can request an export of their own data from
+        Account Settings. Requesting enqueues a `DataExportRequest` row
+        (status PENDING) and returns immediately — assembly happens async.
+        Idempotent per human: a second request while one is PENDING/
+        PROCESSING returns the existing request rather than creating a
+        duplicate (mirrors the existing rate-limit/dedup posture on
+        deleteMyAccount, adapted to "one in flight at a time" instead of a
+        time-window rate limit).
+    - id: FR-002
+      description: >
+        A scheduled job (`humans.dispatch-data-export-requests`, cron-driven,
+        scale-to-zero-friendly like the other drain jobs) picks up PENDING
+        requests, assembles the bundle (see FR-003/data.export_scope), writes
+        it as a single JSON file to R2 under a private (non-public) prefix via
+        `FileStoragePort.putObject`, generates a presigned/time-limited
+        download URL via `FileStoragePort.getObjectUrl`, marks the request
+        READY with `deliveredAt`/`expiresAt`, and sends the download link by
+        email via the existing `notify()` path (new notification category,
+        e.g. `dataExportReady`, always-on / not preference-gated — same
+        posture as security-relevant notifications, not marketing).
+    - id: FR-003
+      description: >
+        Bundle format: one JSON file (a small manifest + one array per
+        domain bucket — see `data.export_scope`). CSV/multi-file is explicitly
+        NOT attempted in v1 (see out_of_scope) — JSON is sufficient for a
+        Tier1 scope and avoids building a second serialization path.
+    - id: FR-004
+      description: >
+        The bundle is scoped STRICTLY to rows owned by/authored by the
+        requesting human — the same actorHumanId the tRPC procedure resolves
+        from the session, never a client-supplied id. No cross-human leakage:
+        e.g. TicketTransfer rows include both a fromHumanId and toHumanId —
+        only rows where the requester is a participant are included, and only
+        the requester's own side's identifying fields are the point (the
+        counterparty's identity is already visible to them in-app via existing
+        transfer UI, so no NEW disclosure is introduced by including the
+        transfer's own fields).
+    - id: FR-005
+      description: >
+        The download link expires (e.g. 7 days) and the R2 object is deleted
+        by a retention sweep after expiry — an export bundle sitting in R2
+        indefinitely is itself a PII-retention liability. Mirrors the existing
+        `PendingObjectDeletion` outbox idea conceptually, but v1 can start with
+        a simple `expiresAt`-driven purge job (see FR-002 job or a sibling
+        cleanup job) rather than the full deletion-outbox machinery.
+  non_functional:
+    - id: NFR-001
+      description: >
+        Rate-limited at the tRPC layer (mirrors deleteMyAccount's posture) to
+        prevent abuse/DoS via repeated large-bundle assembly.
+    - id: NFR-002
+      description: >
+        Read-only with respect to every domain table queried — this feature
+        never mutates application data, only the new `DataExportRequest` row.
+    - id: NFR-003
+      description: >
+        Audit-logged (`self.requestDataExport`) so there's a durable record of
+        who requested an export and when — same posture as delete/anonymize.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: request-my-data-export
+        description: >
+          Net-new. authedProcedure-driven. Validates no PENDING/PROCESSING
+          request already exists for this human (idempotent per FR-001),
+          creates the `DataExportRequest` row, audits, returns the request id
+          + status.
+        input: actorHumanId
+        output: requestId, status
+        idempotent: true
+        money: false
+      - name: get-my-data-export-status
+        description: >
+          Net-new, trivial read. Returns the current status/expiresAt/
+          downloadUrl (once READY) for the caller's own request(s), scoped by
+          actorHumanId.
+        input: actorHumanId
+        output: requests[] { id, status, requestedAt, deliveredAt, expiresAt }
+        idempotent: true
+        money: false
+      - name: assemble-data-export  # runs inside the jobs process
+        description: >
+          Net-new. Given a humanId, queries each domain bucket in
+          `data.export_scope` (one read method per bucket, reusing existing
+          repo methods where a suitable "list by humanId" already exists;
+          adding a narrow new one where it doesn't — e.g. `listAllForHuman`
+          reducers per repo, not one giant cross-domain SQL query), assembles
+          the manifest + arrays into one JSON object, writes it via
+          `FileStoragePort.putObject`, and returns the object key
+          + a presigned URL.
+        input: humanId, requestId
+        output: objectKey, downloadUrl, expiresAt
+        idempotent: true
+        money: false
+      - name: purge-expired-data-exports
+        description: >
+          Net-new, scheduled. Deletes R2 objects (via `FileStoragePort.
+          deleteObject`) and marks `DataExportRequest` rows EXPIRED past
+          `expiresAt`. Mirrors the retention-purge shape of
+          `community.purge-dispatched-rsvp-notices`.
+        input: (none / cron-driven, optional retentionOverride like the RSVP purge job)
+        output: purgedCount
+        idempotent: true
+        money: false
+
+  ports:
+    new:
+      - DataExportRequestsRepo   # create, getById, listPendingForDrain, markReady, markFailed, markExpired, findActiveForHuman
+    existing:
+      - FileStoragePort          # putObject / getObjectUrl / deleteObject for the bundle file
+      - NotificationsRepo / notify()  # deliver the "your export is ready" email
+      - AuditPort
+      - Per-domain repos read methods (Orders, Tickets, EventRsvps, EventSaves,
+        EntityFollows, VolunteerSignups, PlaceReviews, SupportThreads,
+        EventEditSuggestions, ConsentRecords/AcceptanceRecords/SmsConsent,
+        PlaceOwnership/PlaceVerificationRequest-as-claimant) — reused, each
+        contributing one bucket; new narrow "list mine" methods added only
+        where missing.
+
+  adapters:
+    new:
+      - prisma DataExportRequests adapter
+    existing:
+      - Whichever per-domain adapters need a new "listByHumanId" read method
+        added (additive, no behavior change to existing methods).
+
+  transport:
+    trpc_procedures:
+      - humans.requestDataExport       # authedProcedure
+      - humans.getMyDataExportStatus   # authedProcedure
+    webhooks: []
+
+  ui:
+    pages: []
+    components:
+      - Account Settings "Request my data" action (near Danger Zone) —
+        shows current request status if one is in flight/ready, download
+        link once READY, disabled state while PENDING/PROCESSING.
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - DataExportRequest   # id, humanId, status (PENDING|PROCESSING|READY|FAILED|EXPIRED), requestedAt, deliveredAt?, expiresAt?, objectKey?, failureReason?
+  export_scope:
+    # Surveyed from the domain model (packages/db/prisma/*.prisma), not guessed.
+    # Grouped into buckets a v1 bundle actually includes:
+    - bucket: account_profile
+      sources: [Human (name/phone/billing*/locale/trustTier), AuthUser (name/email/username/phone), EntityPage (displayName/bio/avatarUrl/bannerUrl/slug)]
+    - bucket: orders_and_tickets
+      sources: [Order (as buyerHumanId), OrderItem, Ticket (as ownerHumanId), TicketScan, TicketTransfer (as either side), PendingTicketTransfer, Claim, ResaleListing, ResaleListingHold, PromoRedemption]
+    - bucket: event_participation
+      sources: [EventRsvp, EventDateRsvp, EventSave, EntityFollow (as follower), EventHuman (lineup attachments referencing this human)]
+    - bucket: community_contributions
+      sources: [EventEditSuggestion (as submitterHumanId), CommunityModeratorApplication (as applicant, if such a model field exists)]
+    - bucket: volunteering
+      sources: [VolunteerSignup, VolunteerRewardGrant, VolunteerWaiverAcceptance]
+    - bucket: reviews_and_venue_claims
+      sources: [PlaceReview (as author), PlaceOwnership (as ownerId/HUMAN), PlaceVerificationRequest (as claimantHumanId)]
+    - bucket: consents_and_acceptances
+      sources: [AcceptanceRecord, ConsentRecord, SmsConsent/SmsConsentEvent, WaiverAcceptance]
+    - bucket: support
+      sources: [SupportThread (as humanId), SupportMessage authored by this human]
+    - bucket: notifications_prefs
+      sources: [NotificationPreference, NotificationDigestSubscription]
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Assembling a bundle across ~9 domain buckets with N+1-shaped queries
+      per human could be slow/expensive if run synchronously.
+    severity: LOW
+    mitigation: Async job (FR-002), not inline in the tRPC request path.
+  - risk: >
+      A leaked/guessable download URL would disclose a full PII bundle.
+    severity: MEDIUM
+    mitigation: >
+      Presigned/time-limited URL (FR-002) with a short expiry (FR-005) and
+      standard R2 presign unguessability; not publicly listable.
+  - risk: >
+      Cross-human leakage via relational rows with two participants
+      (TicketTransfer, disputes) if the query isn't scoped carefully.
+    severity: MEDIUM
+    mitigation: FR-004 — scope every bucket query by actorHumanId, reviewed
+      per-bucket at implementation time, not assumed safe by default.
+  - risk: >
+      The `export_scope` bucket list above is a survey, not a schema-locked
+      inventory — new domains/models added after this spec (e.g. any future
+      PII-bearing table) won't automatically appear in the export.
+    severity: LOW
+    mitigation: >
+      Out of scope to build an automatic schema-driven "every table with a
+      humanId column" scanner in v1 (see out_of_scope) — flagged as a known
+      drift risk for the fixed bucket-list approach.
+
+open_questions:
+  - >
+    Response-time SLA — if this is meant to actually satisfy GDPR Art.15 (1
+    month, extendable) or CCPA (45 days) obligations, does the async job need
+    a guaranteed max-latency SLA/alerting, or is "best effort, typically
+    within minutes" acceptable for v1? Not decided here — this spec assumes
+    best-effort async delivery with no hard SLA enforcement/alerting built.
+  - >
+    Should a request be reviewed by staff before the bundle is released — to
+    guard against an attacker who has taken over a session/account requesting
+    a bundle right before the legitimate owner notices (fraud/abuse angle),
+    or is "any authenticated session can self-serve request their own
+    export, no human review" acceptable given the account is already
+    authenticated? Not decided here; this spec's default (FR-001/FR-002)
+    assumes no staff review gate.
+  - >
+    Retention of the export FILE itself after delivery/download — FR-005
+    proposes a fixed expiry (e.g. 7 days) + purge, but the exact window and
+    whether "already downloaded" should shorten it further is not decided
+    here — flagging for a product/legal call, not silently picking a number
+    as final.
+  - >
+    Should admins be able to trigger an export ON BEHALF OF a human (e.g. to
+    fulfill a request that came in via support instead of self-serve)? Out of
+    scope for v1 (see out_of_scope) but flagged as a likely near-term ask.
+  - >
+    Interaction with the anonymize-buyer-instead-of-block spec
+    (docs/specs/2026-07-07/anonymize-buyer-instead-of-block.spec.yaml) — should
+    a human be required/offered to export their data BEFORE anonymizing
+    (their financial history survives anonymize, so an export requested
+    AFTER anonymizing would still see full order/ticket data — this spec does
+    not require sequencing the two flows, but it's worth a product decision
+    on whether the UI nudges "export first" before delete/anonymize).
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - CSV or multi-file export formats (JSON only, v1).
+  - Admin-triggered "export on behalf of a human" action.
+  - A hard SLA/alerting pipeline for legal response-time compliance.
+  - Staff review/approval gate before bundle release.
+  - An automatic schema-driven scanner that finds every PII-bearing table by
+    introspecting humanId columns (the bucket list in `data.export_scope` is
+    maintained by hand, same as docs/account-deletion.md's inventory).
+  - Any change to the anonymize-buyer-instead-of-block flow's own mechanics
+    (cross-referenced only, see open_questions).
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A signed-in human can request a data export from Account Settings and
+    gets an immediate PENDING acknowledgement.
+  - A second request while one is PENDING/PROCESSING returns the existing
+    request instead of creating a duplicate.
+  - The async job assembles a single JSON bundle covering every bucket in
+    `data.export_scope`, containing ONLY rows where this human is the
+    requester/owner/participant.
+  - The human receives an email with a working, time-limited download link
+    once the bundle is READY.
+  - The download link/object stops working after `expiresAt`, and the R2
+    object is deleted by the purge job.
+  - An audit log entry (`self.requestDataExport`) exists for each request.
+  - No bucket's query can be shown to return another human's data for any
+    tested input (regression test per bucket, esp. TicketTransfer /
+    dispute-shaped two-party rows).

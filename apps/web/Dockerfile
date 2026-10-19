@@ -50,7 +50,9 @@ ARG NEXT_PUBLIC_BUILD_SHA=""
 ARG NEXT_PUBLIC_APP_VERSION=""
 
 # --- Layer 5: build web app (Next) -----------------------------------------
-RUN if [ "$SKIP_BUILD" = "1" ]; then echo "SKIP_BUILD=1: skipping web build"; else pnpm --filter web... build; fi
+# next build --turbopack is memory-hungry; the default Node heap OOMs on CI
+# runners. Give it 8 GB (GitHub ubuntu-latest has 16 GB).
+RUN if [ "$SKIP_BUILD" = "1" ]; then echo "SKIP_BUILD=1: skipping web build"; else NODE_OPTIONS="--max-old-space-size=8192" pnpm --filter web... build; fi
 
 # --- Layer 6: assemble runtime bundle from standalone output ----------------
 # In a monorepo, Next.js standalone output preserves the workspace-relative

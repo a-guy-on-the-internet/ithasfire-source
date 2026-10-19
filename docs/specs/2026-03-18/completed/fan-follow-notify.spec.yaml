@@ -1,0 +1,436 @@
+status: draft
+priority: p1
+
+task: >
+  Add a fan-follow system where users can follow artist profiles and receive
+  automatic notifications when the artist is added to a new event near them.
+  Create a network effect: artists bring their followers, followers discover
+  more shows.
+
+goal: >
+  Solve the cold-start problem for artist events.  When an artist announces a
+  new show, every follower in the region gets notified instantly -- no manual
+  promotion needed.  This makes Ithas Fire the place artists want to list
+  because it comes with a built-in audience delivery mechanism.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Context: What Exists Today
+# ───────────────────────────────────────────────────────────────────────────────
+
+current_state:
+  profile_system: >
+    Humans have a Profile (slug, bio, avatar, banner, visibility) with
+    ProfileModules (about, shows, music, photos, links).  Profiles are
+    PUBLIC or PRIVATE.  No follow/subscribe relationship exists.
+
+  event_human: >
+    EventHuman links a Human to an Event with a role (PERFORMER, HOST, DJ,
+    etc.).  When an artist is added to an event, this row is created.  This
+    is the trigger point for follow notifications.
+
+  notification_infra: >
+    Notification model supports in-app notifications (kind, body, metadata,
+    actionHref, tags, expiry, readAt).  NotificationDigestSubscription handles
+    email digest opt-in/out.  NotificationPreference allows per-scope channel
+    overrides.  Push devices are registered via PushDevice model.
+
+  event_waitlist: >
+    EventWaitlistEntry lets users sign up for notifications about a specific
+    event.  This is event-scoped, not artist-scoped.
+
+  geolocation: >
+    Events have lat/lng coordinates.  listEventsNearCoordinate already queries
+    by proximity.  Humans have no stored "home location" today.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Data Model
+# ───────────────────────────────────────────────────────────────────────────────
+
+schema:
+  new_models:
+    - name: ArtistFollow
+      description: >
+        A fan following an artist.  The core relationship.
+      prisma: |
+        model ArtistFollow {
+          id              String   @id @default(uuid())
+          followerHumanId String   // the fan
+          artistHumanId   String   // the artist being followed
+
+          // Notification preferences for this follow
+          notifyNewEvents Boolean  @default(true)
+          notifyNearby    Boolean  @default(true) // only notify for events near me
+
+          // Fan's location context for proximity filtering
+          // (falls back to their last-known location or profile location)
+          radiusKm        Int      @default(150)  // notify if event is within this radius
+
+          createdAt       DateTime @default(now())
+
+          follower Human @relation("FollowingArtists", fields: [followerHumanId], references: [id], onDelete: Cascade)
+          artist   Human @relation("ArtistFollowers", fields: [artistHumanId], references: [id], onDelete: Cascade)
+
+          @@unique([followerHumanId, artistHumanId])
+          @@index([artistHumanId])
+          @@index([followerHumanId])
+        }
+
+    - name: HumanLocation (optional, v1.1)
+      description: >
+        Stored home/base location for proximity-based notifications.
+        In v1, use the fan's most recent event purchase location as a proxy.
+        Add explicit location storage if notification relevance is poor.
+      prisma: |
+        // Deferred -- use purchase history location for v1.
+        // model HumanLocation {
+        //   humanId   String   @id
+        //   lat       Float
+        //   lng       Float
+        //   city      String?
+        //   region    String?
+        //   country   String?
+        //   updatedAt DateTime @updatedAt
+        //   human     Human    @relation(fields: [humanId], references: [id], onDelete: Cascade)
+        // }
+
+  modified_models:
+    - name: Human
+      changes: >
+        Add relations:
+          artistFollowers  ArtistFollow[] @relation("ArtistFollowers")
+          followingArtists ArtistFollow[] @relation("FollowingArtists")
+
+  new_enums:
+    - name: NotificationDigestType
+      changes: "Add ARTIST_NEW_EVENT to the existing enum"
+
+    - name: NotificationKind
+      changes: "No changes needed -- INFO kind covers follow notifications"
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Use Cases
+# ───────────────────────────────────────────────────────────────────────────────
+
+use_cases:
+  - name: followArtist
+    location: packages/core/src/use-cases/follows/follow-artist.ts
+    input: "{ actorHumanId: string; artistHumanId: string; radiusKm?: number }"
+    output: "{ followId: string }"
+    flow:
+      - Validate artist exists and has a public profile
+      - Prevent self-follow
+      - Upsert ArtistFollow (idempotent -- re-following after unfollow is fine)
+      - Return follow ID
+    authz: Any authenticated user
+
+  - name: unfollowArtist
+    location: packages/core/src/use-cases/follows/unfollow-artist.ts
+    input: "{ actorHumanId: string; artistHumanId: string }"
+    output: "{ success: boolean }"
+    flow:
+      - Delete ArtistFollow row if exists
+      - Idempotent -- unfollowing someone you don't follow returns success
+    authz: Any authenticated user
+
+  - name: listFollowedArtists
+    location: packages/core/src/use-cases/follows/list-followed-artists.ts
+    input: "{ actorHumanId: string; cursor?: string; limit?: number }"
+    output: >
+      { artists: { humanId: string; name: string; slug: string;
+        avatarUrl: string | null; followedAt: Date }[];
+        nextCursor: string | null }
+    flow:
+      - Query ArtistFollow where followerHumanId = actor, join Profile
+      - Cursor pagination by createdAt
+    authz: Actor sees own follows only
+
+  - name: listArtistFollowers
+    location: packages/core/src/use-cases/follows/list-artist-followers.ts
+    input: "{ actorHumanId: string; cursor?: string; limit?: number }"
+    output: "{ totalCount: number; followers: { humanId: string; name: string; followedAt: Date }[]; nextCursor: string | null }"
+    flow:
+      - Query ArtistFollow where artistHumanId = actor, join Human
+      - Return count + paginated list
+    authz: Artist sees own follower list
+    notes: >
+      Follower list is private to the artist.  Public profile shows only
+      the count (see getArtistFollowerCount).
+
+  - name: getArtistFollowerCount
+    location: packages/core/src/use-cases/follows/get-artist-follower-count.ts
+    input: "{ artistHumanId: string }"
+    output: "{ count: number }"
+    flow:
+      - COUNT(*) on ArtistFollow where artistHumanId
+      - Cache in Redis (TTL 5 min) -- hot path on profile pages
+    authz: Public (no auth required)
+
+  - name: notifyFollowersOfNewEvent
+    location: packages/core/src/use-cases/follows/notify-followers-of-new-event.ts
+    input: "{ eventId: string; artistHumanId: string }"
+    output: "{ notifiedCount: number }"
+    flow:
+      - Fetch event location (lat/lng)
+      - Query all ArtistFollow rows where artistHumanId matches and notifyNewEvents = true
+      - For each follower with notifyNearby = true, resolve their location
+        (from most recent order's event, or HumanLocation if it exists)
+      - Filter followers within radiusKm of the event
+      - Batch-create Notification rows (in-app)
+      - Queue email digest entries for followers with email notifications enabled
+      - Return count of notifications created
+    trigger: >
+      Called when an EventHuman row is created with role in (PERFORMER, DJ,
+      HOST) and the event is in PUBLISHED status.  Also triggered when an
+      event transitions to PUBLISHED if it already has EventHuman rows.
+    notes: >
+      This is a potentially high-fan-out operation.  For artists with 10K+
+      followers, batch the notification inserts and email queuing.  Use the
+      existing jobs infrastructure (Cloud Run job) for large fan-outs.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Trigger Integration
+# ───────────────────────────────────────────────────────────────────────────────
+
+triggers:
+  - event: EventHuman created (role = PERFORMER | DJ | HOST)
+    condition: Event.status = PUBLISHED
+    action: Queue notifyFollowersOfNewEvent job
+    notes: >
+      If the event is still DRAFT when the performer is added, don't notify.
+      The publish transition should check for EventHumans and trigger
+      notifications for any that haven't been notified yet.
+
+  - event: Event published (status -> PUBLISHED)
+    condition: Event has EventHuman rows with performer roles
+    action: >
+      For each EventHuman with a performer role, queue
+      notifyFollowersOfNewEvent if not already sent for this event+artist.
+    dedup: >
+      Store a sent flag in metadata or a lightweight ArtistEventNotificationLog
+      to prevent double-sends when an event is unpublished and re-published.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Port Changes
+# ───────────────────────────────────────────────────────────────────────────────
+
+ports:
+  repos:
+    follows:
+      location: packages/ports/src/repos/follows.ts
+      methods:
+        - name: upsert
+          signature: "(data: { followerHumanId: string; artistHumanId: string; radiusKm?: number }) => Promise<ArtistFollowRecord>"
+        - name: delete
+          signature: "(followerHumanId: string, artistHumanId: string) => Promise<void>"
+        - name: getByPair
+          signature: "(followerHumanId: string, artistHumanId: string) => Promise<ArtistFollowRecord | null>"
+        - name: listByFollower
+          signature: "(followerHumanId: string, opts: PaginationOpts) => Promise<Paginated<ArtistFollowRecord>>"
+        - name: listByArtist
+          signature: "(artistHumanId: string, opts: PaginationOpts) => Promise<Paginated<ArtistFollowRecord>>"
+        - name: countByArtist
+          signature: "(artistHumanId: string) => Promise<number>"
+        - name: listFollowersNearLocation
+          signature: >
+            (artistHumanId: string, location: { lat: number; lng: number },
+             opts: { batchSize?: number }) => Promise<ArtistFollowRecord[]>
+          notes: >
+            Returns followers whose radiusKm encompasses the given location.
+            For v1, fetches all followers and filters in-app.  Optimize with
+            PostGIS or a location index if fan-out becomes a bottleneck.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Transport
+# ───────────────────────────────────────────────────────────────────────────────
+
+transport:
+  trpc:
+    router: follows
+    procedures:
+      - name: follow
+        type: mutation
+        auth: required
+
+      - name: unfollow
+        type: mutation
+        auth: required
+
+      - name: listFollowedArtists
+        type: query
+        auth: required
+
+      - name: listFollowers
+        type: query
+        auth: required
+        notes: Artist sees own followers
+
+      - name: getFollowerCount
+        type: query
+        auth: none
+        notes: Public, used on profile pages
+
+      - name: isFollowing
+        type: query
+        auth: required
+        input: "{ artistHumanId: string }"
+        notes: >
+          Returns boolean.  Used to toggle follow/unfollow button state on
+          profile and event pages.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# UI
+# ───────────────────────────────────────────────────────────────────────────────
+
+ui:
+  profile_page:
+    - component: FollowButton
+      description: >
+        Toggleable "Follow" / "Following" button on artist profile pages.
+        Uses isFollowing query for initial state, optimistic update on click.
+        Shows follower count next to the button.
+      placement: >
+        Next to the artist name / avatar area on the public profile page.
+        Also shown on EventHuman cards on the event detail page.
+
+  event_detail_page:
+    - component: PerformerCard (existing, enhanced)
+      description: >
+        The EventHuman cards already show performer names and roles.  Add a
+        small "Follow" button to each performer card.  Show follower count
+        as social proof ("1.2K followers").
+
+  dashboard:
+    - route: /dashboard/followers
+      description: >
+        Artist-side view: total follower count, follower growth chart (weekly),
+        list of followers (name, followed-since date).  No PII beyond name.
+
+  notifications:
+    - in_app: >
+        "DJ Nova is performing at The Hideout on Mar 28"
+        actionHref: /events/{slug}
+        tags: ["follow", "new-event"]
+
+    - email_digest: >
+        Weekly digest: "Artists you follow have {N} upcoming shows."
+        List of events with artist name, date, venue, city.  Unsubscribe link
+        per artist or globally.
+
+    - push: >
+        "[Artist Name] just announced a show near you"
+        Deep link to event page.  Requires PushDevice registration (already
+        exists in the model).
+
+  mobile:
+    - Same follow button on profile and event screens
+    - Push notifications via existing PushDevice infrastructure
+    - Follower list in artist dashboard tab
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Privacy & Abuse
+# ───────────────────────────────────────────────────────────────────────────────
+
+privacy:
+  - Follower list is private to the artist.  Public pages show count only.
+  - Artists can disable follows on their profile (Profile.allowFollows boolean,
+    default true).
+  - Rate limit follow/unfollow to prevent abuse (10 follows/minute per user).
+  - Block list: if the platform adds user blocking, blocked users cannot follow.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Performance Considerations
+# ───────────────────────────────────────────────────────────────────────────────
+
+performance:
+  follower_count_caching: >
+    Cache follower count in Redis (key: artist-followers:{humanId}, TTL 5min).
+    Invalidate on follow/unfollow.  This is a hot read on profile pages.
+
+  notification_fan_out: >
+    For artists with < 1000 followers, inline notification creation is fine.
+    For > 1000, queue a Cloud Run job that batches inserts (100 at a time)
+    and rate-limits email sends.  The existing jobs infrastructure supports
+    this pattern.
+
+  location_resolution: >
+    v1: resolve follower location from their most recent order's event
+    coordinates.  Cache in Redis with 24h TTL.  This avoids adding a new
+    table and works for active users.  Inactive users with no orders won't
+    get proximity-filtered notifications (they'll get all-events notifications
+    instead, which is acceptable).
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Test Matrix
+# ───────────────────────────────────────────────────────────────────────────────
+
+tests:
+  - name: Follow and unfollow round-trip
+    validates: ArtistFollow created and deleted correctly
+
+  - name: Idempotent follow (double-follow)
+    validates: Second follow returns same followId, no duplicate row
+
+  - name: Self-follow blocked
+    validates: Returns error, no row created
+
+  - name: Follow private profile blocked
+    validates: Returns error for non-public profiles
+
+  - name: Notification on event publish with performer
+    validates: >
+      Followers receive in-app notification with correct event link.
+      Non-followers do not.
+
+  - name: Proximity filtering (follower 50km away, radius 100km)
+    validates: Follower receives notification
+
+  - name: Proximity filtering (follower 200km away, radius 100km)
+    validates: Follower does NOT receive notification
+
+  - name: Notification dedup on re-publish
+    validates: >
+      Unpublish then re-publish does not send duplicate notifications
+      for the same event+artist combination
+
+  - name: Artist with 0 followers -- publish event
+    validates: No errors, notifiedCount = 0
+
+  - name: Follower count cache invalidation
+    validates: >
+      Follow -> count returns N+1.  Unfollow -> count returns N.
+
+  - name: listFollowers pagination
+    validates: Correct cursor-based pagination over 50+ followers
+
+  - name: Artist sees own followers, cannot see another artist's
+    validates: Authz enforcement on listFollowers
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Open Questions
+# ───────────────────────────────────────────────────────────────────────────────
+
+open_questions:
+  - question: Should follows be two-way (mutual follow = connection)?
+    context: >
+      For v1, follows are one-way (fan follows artist).  Two-way connections
+      add complexity and change the social dynamic.  Keep it simple.
+
+  - question: Should we show follower count publicly on event pages?
+    context: >
+      "DJ Nova (1.2K followers)" on the event page is social proof that helps
+      sell tickets.  But it could also embarrass artists with low counts.
+      Consider showing only above a threshold (e.g., 10+), or let the artist
+      opt out.
+
+  - question: Email notification frequency?
+    context: >
+      Real-time per-event emails could be spammy for fans following 20 artists.
+      Weekly digest is safer but delays the signal.  Consider: immediate push
+      notification + weekly email digest summary.
+
+  - question: Organization follows in addition to artist follows?
+    context: >
+      Fans might want to follow a venue or promoter, not just a performer.
+      The ArtistFollow model could be generalized to a "Follow" model with
+      subjectType (human | organization | place).  Decide whether to
+      generalize now or keep it artist-only for v1.

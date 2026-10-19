@@ -1,0 +1,148 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Resale — Resale listings, holds, and post-event claims/disputes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ---------------- Claims (post-event resale disputes) ----------------
+/// A Claim represents a buyer dispute on a resale order item.
+/// Only valid for orders with source = RESALE.
+/// While an open claim exists, payout to the reseller is blocked.
+model Claim {
+  id           String @id @default(uuid())
+  orderId      String
+  orderItemId  String
+  eventId      String
+  claimantId   String // buyer (Human)
+  respondentId String // reseller (Human)
+
+  /// Free-text kind validated in app code.
+  /// Expected values: "ticket_invalid" | "entry_denied" | "wrong_seat" | "other"
+  kind String
+
+  /// "open" | "under_review" | "approved" | "denied" | "expired"
+  /// Validated in app code, not an enum.
+  status String @default("open")
+
+  /// Buyer description, screenshots, scan log refs
+  evidence Json @default("{}")
+
+  /// event.endsAt + 3 days — enforced at creation time
+  deadline DateTime
+
+  resolvedAt     DateTime?
+  resolvedById   String? // support staff Human who resolved
+  resolutionNote String?
+  /// "full_refund" | "denied" | "expired" — validated in app code
+  resolution     String?
+
+  /// Seller's response/evidence to the claim. Same shape as `evidence` but from
+  /// the seller's perspective. Support staff see both sides.
+  sellerEvidence    Json      @default("{}")
+  /// When the seller submitted their response. Null if they haven't responded.
+  sellerRespondedAt DateTime?
+
+  order      Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderItem  OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  event      Event     @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  claimant   Human     @relation("ClaimClaimant", fields: [claimantId], references: [id], onDelete: Restrict)
+  respondent Human     @relation("ClaimRespondent", fields: [respondentId], references: [id], onDelete: Restrict)
+  resolvedBy Human?    @relation("ClaimResolver", fields: [resolvedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([orderItemId]) // one claim per order item
+  @@index([orderId])
+  @@index([eventId, status])
+  @@index([claimantId])
+  @@index([respondentId])
+  @@index([status, deadline])
+}
+
+model ResaleListing {
+  id                         String              @id @default(uuid())
+  /// NOT unique: a ticket keeps one row per listing it ever had (cancelled,
+  /// expired and sold listings are the record of what it was offered and sold
+  /// for). Only ONE of them may be live; see the partial index note below.
+  ticketId                   String
+  eventId                    String /// Denormalized for efficient queries
+  sellerHumanId              String
+  askPriceCents              Int
+  faceValueCents             Int?
+  processingPassThroughCents Int                 @default(0)
+  processingFeeConfigRef     String?
+  saleCutoffAt               DateTime?
+  payoutReleaseAt            DateTime?
+  currency                   String              @default("usd") @db.VarChar(3)
+  status                     ResaleListingStatus @default(ACTIVE)
+  expiresAt                  DateTime?
+
+  /// "internal" = TH-minted ticket, "external" = imported from AXS/TM/etc.
+  /// Validated in app code.
+  source String @default("internal")
+
+  /// For external-platform tickets: opaque reference to the upstream system.
+  /// Null for internal listings.
+  externalRef Json?
+
+  /// Snapshot of the resale payout terms ID at listing creation.
+  /// Ensures the seller's listing is governed by the terms in effect when they listed.
+  resalePayoutTermsId String?
+
+  /// The share this listing's sale pays to the event side (organiser-resale-
+  /// share FR-005), priced from the ticket's FR-003 record, and who pays it.
+  /// Both set or both NULL (SQL CHECK "Listing_event_share_shape_check");
+  /// NULL on listings made before the share existed.
+  eventShareCents Int?
+  sharePayer      ResaleSharePayer?
+
+  /// The order that purchased this listing (set on commit).
+  buyerOrderId String? @unique
+
+  ticket     Ticket             @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  event      Event              @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  seller     Human              @relation("SellerResaleListings", fields: [sellerHumanId], references: [id], onDelete: Restrict)
+  hold       ResaleListingHold?
+  buyerOrder Order?             @relation("ResaleListingBuyerOrder", fields: [buyerOrderId], references: [id], onDelete: SetNull)
+  orderItems OrderItem[]        @relation("ResaleListingOrderItems")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sellerHumanId])
+  @@index([eventId, status])
+  @@index([status, expiresAt])
+  // Every lookup by ticket, and the Ticket FK's cascade scan.
+  @@index([ticketId])
+  // NOTE: a partial unique index "Listing_ticketId_live_key" on (ticketId)
+  // WHERE status IN ('ACTIVE','HELD') exists in SQL only (migration
+  // 20261011120000_listing_live_unique_per_ticket) — Prisma can't express
+  // partial indexes. It enforces "one live listing per ticket" while letting
+  // past (CANCELLED / EXPIRED / SOLD) rows stay beside a new one. Who may
+  // list again is the use case's rule: create-resale-listing lets a seller
+  // relist after CANCELLED / EXPIRED, and lets the buyer of a SOLD listing
+  // list the ticket again (a ticket can be resold any number of times). A
+  // refund that unwinds a SOLD listing back to ACTIVE must first close the
+  // buyer's own live listing, or it hits this index
+  // (unwind-resale-order-after-refund).
+  // The adapter maps THIS index's P2002 on create to a
+  // `resale_listing_live_exists` conflict, which create-resale-listing
+  // reports as TICKET_NOT_ELIGIBLE_FOR_RESALE. It tells this index from the
+  // model's other unique constraints by name, then by column (`ticketId`
+  // alone): a new unique constraint that includes ticketId must revisit
+  // `isLiveListingUniqueViolation` in adapters/src/db/prisma/resale-listings.ts.
+  @@map("Listing")
+}
+
+model ResaleListingHold {
+  id           String   @id @default(uuid())
+  listingId    String   @unique
+  buyerHumanId String
+  heldUntil    DateTime
+
+  listing ResaleListing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  buyer   Human         @relation(fields: [buyerHumanId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+
+  @@map("ListingHold")
+}

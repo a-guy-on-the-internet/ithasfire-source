@@ -1,0 +1,30 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Consent — GDPR Article 7(1) audit log of cookie-banner decisions.
+// One row per Accept All / Essential Only / Reset click. Used to demonstrate
+// consent provenance to regulators and to fulfil DSARs.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model ConsentRecord {
+  id                  String        @id @default(uuid())
+  // Stable client-side UUID stored in localStorage (`th-anon-id`). Always
+  // present; lets us stitch pre-signup consents to the eventual account.
+  anonymousId         String        @map("anonymous_id")
+  // Populated from session if user was logged-in at decision time.
+  humanId             String?       @map("human_id")
+  choice              ConsentChoice
+  source              ConsentSource
+  // Snapshot of the legal copy versions in effect at decision time.
+  privacyPolicyVersion String       @map("privacy_policy_version")
+  cookiePolicyVersion  String       @map("cookie_policy_version")
+  // SHA-256(`${ip}:${IP_HASH_SALT}`). Hash, not raw IP, so we can prove
+  // "device fingerprint X gave consent" without retaining the IP itself.
+  ipHash              String?       @map("ip_hash")
+  userAgent           String?       @map("user_agent") @db.VarChar(1024)
+
+  human Human? @relation(fields: [humanId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([humanId, createdAt])
+  @@index([anonymousId, createdAt])
+}

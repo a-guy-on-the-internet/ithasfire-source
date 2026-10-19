@@ -1,0 +1,133 @@
+# Spec: Place Layout Realtime Transport
+meta:
+  owner: transport-trpc
+  status: complete
+  reviewers:
+    - core
+    - adapters
+    - ops
+    - web
+  last_updated: 2025-11-14
+summary: |
+  Define the realtime delivery path for seat status changes, hold expirations,
+  and layout publish events. Establishes contract between transport layer
+  (Fastify + tRPC) and downstream clients (web, mobile, scanner) plus the
+  streaming adapter (Redis Streams/SSE broker).
+
+objectives:
+  - Deliver seat status deltas to subscribed clients within <2s of upstream change.
+  - Support browser-compatible Server-Sent Events (SSE) for MVP with upgrade path
+    to WebSockets when needed.
+  - Reuse hexagonal port contracts (`PlaceLayoutStreamingPort`) and keep payloads
+    aligned with place layout API schema.
+  - Provide replay/backfill hooks for clients reconnecting after brief outages.
+
+protocol:
+  primary: SSE over HTTPS (`text/event-stream`).
+  fallback: short polling via `GET /place-layouts/status?eventId` every 15s when SSE unsupported.
+  future: WebSocket support (phase 2) sharing same payload envelope.
+
+endpoints:
+  - GET /place-layouts/:eventId/stream
+    - Auth: public but requires `placeLayout.feature` enabled; optional JWT for organizer context.
+    - Headers: `Accept: text/event-stream`.
+    - Query params:
+      - `role=buyer|organizer|scanner` (default buyer).
+      - `cursor=<lastEventId>` optional for replay.
+      - `fields=availability,holds,layout` for partial streams.
+    - Response headers: `Cache-Control: no-store`, `Connection: keep-alive`, `X-Place-Layout-Role`.
+
+payload_shape:
+  event_format:
+    - id: string (monotonic increasing, nanosecond timestamp + shard suffix).
+    - event: string (`seat_status_changed`, `seat_hold_expiring`, `layout_version_published`, `heartbeat`).
+    - data: JSON string per event type.
+  seat_status_changed:
+    data:
+      seatId: string
+      status: "AVAILABLE" | "HELD" | "SOLD" | "BLOCKED"
+      holdExpiresAt?: string
+      orderId?: string (organizer only)
+      updatedAt: string (ISO8601)
+      source: "checkout" | "ops" | "import" | "reconcile"
+  seat_hold_expiring:
+    data:
+      seatId: string
+      holdExpiresAt: string
+      secondsRemaining: number
+  layout_version_published:
+    data:
+      layoutVersionId: string
+      checksum: string
+      publishedAt: string
+      trigger: "import" | "rollback"
+  heartbeat:
+    data:
+      ts: string
+      intervalSec: number (default 15)
+
+subscription_flow:
+  1. Client fetches initial payload via `placeLayouts.get` to build baseline.
+  2. Client opens SSE connection with `Last-Event-ID` header if resuming.
+  3. Server attaches to PlaceLayoutStreamingPort to pull events from adapter.
+  4. Adapter ensures at-least-once delivery; server deduplicates using `id`.
+  5. Client merges deltas into local store; on `layout_version_published`, triggers refetch.
+
+backpressure_replay:
+  - SSE endpoint supports `cursor` param which maps to Redis Stream ID.
+  - On reconnect, server reads events since cursor up to max 500 events.
+  - If cursor too old or trimmed, server responds with event `replay_reset` instructing full refetch.
+  - Heartbeats ensure connection liveness; missing heartbeat triggers client reconnect.
+
+adapter_requirements:
+  - Implement `PlaceLayoutStreamingPort.publishStatusChanged` by pushing to Redis Stream `placeLayout:{eventId}` with 24h retention or 10k events (whichever first).
+  - Provide consumer group `transport` with last delivered ID for replay.
+  - Expose `ack` semantics to avoid re-sending after successful SSE flush.
+  - Support cap for simultaneous subscribers (target 5k connections per region).
+
+transport_worker:
+  - Node worker subscribes to Redis Stream using `XREADGROUP` and pushes events to connected SSE clients.
+  - Batch read size 100; flush every 200ms or when queue empty.
+  - Handles backoff with exponential delay on transient errors (max 30s).
+  - Metrics emitted: `placeLayout.stream.events_sent`, `placeLayout.stream.connections`, `placeLayout.stream.replay_resets`, `placeLayout.stream.errors`.
+
+client_guidance:
+  - Use EventSource API on web; for React, wrap in hook `usePlaceLayoutStream(eventId, role)`.
+  - On mobile, use fetch-based polyfill or WebSocket fallback once available.
+  - Maintain queue for out-of-order events by comparing `updatedAt`; apply latest only.
+  - Display in-app toast when stream disconnects >5s and auto-reconnect in background.
+
+security:
+  - Organizer contexts require authenticated JWT; SSE stream attaches `role=organizer` only if token grants `manage_layouts` or `view_layouts`.
+  - Buyer role strips `orderId`, internal section IDs.
+  - Rate limit connection attempts per IP (burst 5/min, sustained 60/min).
+  - Validate eventId belongs to org accessible to token.
+
+observability:
+  logs:
+    - Connection open/close with reason, duration, events sent.
+    - Replay resets triggered.
+    - Errors with redis/transport details.
+  metrics:
+    - Gauges for active connections per role.
+    - Histograms for event delivery latency (event timestamp vs send timestamp).
+    - Counter for connection errors by type.
+  tracing:
+    - Include `traceparent` header from upstream request; propagate to publish logs.
+
+error_handling:
+  - If adapter unreachable → send SSE `event: transient_error` with guidance to retry.
+  - If unauthorized → close connection after sending `event: forbidden`.
+  - If payload exceeds 32 KB → chunk into `event: seat_status_chunk` with `chunkId`, `chunkSeq`.
+
+open_questions:
+  - Should we support per-section subscriptions to reduce payload volume?
+  - Do we need WebSocket MVP for scanner app due to Expo limitations with SSE?
+  - How long should Redis retention stay for compliance vs storage cost?
+  - Should we encrypt organizer SSE payloads with tenant-specific keys?
+
+rollout_plan:
+  - phase_0: Dark-launch endpoint returning heartbeats only; measure connections.
+  - phase_1: Enable seat_status_changed for pilot organizers; monitor latency.
+  - phase_2: Add hold_expiring, layout_published, implement replay.
+  - phase_3: Evaluate WebSocket parity + mobile integration.

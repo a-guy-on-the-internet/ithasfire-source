@@ -1,0 +1,153 @@
+status: complete
+# embed-promo-code-passthrough.spec.yaml
+#
+# Pre-fill promo codes in the embed checkout via URL parameters.
+
+version: "1.0"
+updated: "2026-04-13"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Embed consumers running promotions (email campaigns, social ads, affiliate links)
+    want to deep-link directly to the embed with a promo code pre-applied. Currently
+    the promo code input exists in EmbedCheckout but can only be filled manually by the
+    buyer. Eventbrite supports `promoCode` as a first-class SDK option.
+  solution: >
+    Read an optional `promo` query parameter from the embed URL, pass it through the
+    screen state, and auto-apply it when the checkout screen mounts. The JS SDK
+    accepts a `promoCode` option that appends the param to the iframe src.
+  users:
+    - embed consumer (marketer running campaigns with promo codes)
+    - end user (buyer who clicks a promo link)
+  surfaces:
+    - embed
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        The embed page reads an optional `promo` query parameter from the URL
+        (e.g., `/embed/abc?promo=EARLYBIRD`).
+    - id: FR-002
+      description: >
+        When the checkout screen mounts and a promo code is present, it is
+        auto-filled into the promo code input and validated immediately against
+        the server (using the existing promo code validation logic).
+    - id: FR-003
+      description: >
+        If the promo code is valid, the discount is applied and reflected in the
+        order summary before the user takes any action.
+    - id: FR-004
+      description: >
+        If the promo code is invalid or expired, a subtle inline message is shown
+        ("Promo code not valid") and the checkout proceeds without a discount.
+        The user can still manually enter a different code.
+    - id: FR-005
+      description: >
+        Multiple promo codes are supported via comma separation:
+        `/embed/abc?promo=EARLYBIRD,VIP10`. Each is validated independently.
+    - id: FR-006
+      description: >
+        The JS SDK accepts a `promoCode` option:
+        `HF.createWidget({ ..., promoCode: "EARLYBIRD" })` which appends
+        `?promo=EARLYBIRD` to the iframe src.
+    - id: FR-007
+      description: >
+        The promo param is preserved across screen navigation within the embed
+        (grid → eventDetail → checkout) so the code is available when checkout
+        eventually mounts.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Promo code validation fires within 500ms of checkout screen mount.
+    - id: NFR-002
+      description: >
+        The promo parameter does not leak into analytics or logs (treated as
+        potentially sensitive marketing data).
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases: []
+    # No new use cases. Promo code validation already exists in the checkout flow.
+
+  ports:
+    new: []
+    existing:
+      - name: Promo code validation in checkout use case
+        note: >
+          The existing `createGuestCheckout` and cart calculation logic already
+          handles promo codes. This spec only adds URL-based pre-fill.
+
+  adapters:
+    new: []
+    existing: []
+
+  transport:
+    trpc_procedures: []
+    webhooks: []
+
+  ui:
+    components:
+      - name: EmbedWidgetPage (update)
+        location: apps/web/src/app/embed/[embedId]/page.tsx
+        description: >
+          Read `promo` from `window.location.search` on mount and store in state.
+          Pass the initial promo code(s) to EmbedCheckout as a prop.
+      - name: EmbedCheckout (update)
+        location: apps/web/src/app/embed/[embedId]/_components/EmbedCheckout.tsx
+        description: >
+          Accept an optional `initialPromoCodes` prop. On mount, if present,
+          set the promo code state and trigger validation. Show inline
+          success/error feedback.
+    pages: []
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Promo code enumeration — bots could iterate codes via the embed URL.
+    severity: LOW
+    mitigation: >
+      The existing Turnstile verification on checkout creation mitigates automated
+      abuse. Rate limiting on promo validation (already in place) adds a second layer.
+  - risk: >
+      URL-visible promo codes could be shared beyond the intended audience.
+    severity: LOW
+    mitigation: >
+      This is inherent to any URL-based promo system. Document that
+      high-value codes should use per-user gating, not URL params.
+
+open_questions:
+  - Should the promo code be visible in the URL bar, or should the JS SDK strip it after reading (cleaner UX vs. shareability)?
+  - Should we support a `promoLocked` option that pre-fills the code and hides the input (for exclusive affiliate deals)?
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - New promo code creation or management UI
+  - Server-side promo code validation changes
+  - Affiliate tracking or attribution (separate concern)
+  - Promo codes on the main (non-embed) checkout flow via URL params
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - Loading `/embed/abc?promo=EARLYBIRD` and navigating to checkout shows "EARLYBIRD" pre-filled and validated.
+  - A valid promo code shows the discount applied in the order summary automatically.
+  - An invalid promo code shows an inline error but does not block checkout.
+  - The promo code persists when navigating grid → eventDetail → checkout.
+  - `HF.createWidget({ promoCode: "EARLYBIRD" })` produces the same behavior.

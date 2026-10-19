@@ -1,0 +1,513 @@
+# booking-holds.spec.yaml
+#
+# Holds on booking requests: an ordered line of tentative dates a venue keeps
+# for the acts asking to play, with a challenge/keep/release cycle and a
+# confirm step that mints the event. Un-defers the "DEFERRED PHASE: Holds"
+# section of docs/specs/2026-08-18/completed/venue-hierarchy-and-holds.spec.yaml with
+# one shape change decided here: a hold is its OWN table, not a tentative
+# Event. Also adds two venue-internal workflow fields on the request that the
+# hold notifications depend on — assignee and org tags.
+#
+# Scoped 2026-08-25 (grilling rounds 1-3, owner-locked). N=1 evidence
+# (docs/records/2026-07-30-venue-booking-interview-backlog.md) — holds were
+# the strongest unprompted ask, but that is one room's workflow, not demand.
+#
+# AMENDED 2026-09-25 by docs/specs/2026-09-25/booking-the-night.spec.yaml: a
+# request-linked hold is no longer confirmed on its own and confirm no longer
+# mints (N4). The night is booked when the act agrees the terms (N1, N5) or the
+# venue books without terms on a requested date (N3); both reuse takeLine.
+# Requested dates get one-tap hold buttons (N8). Challenge, keep, release and
+# the line are unchanged.
+
+version: "1.0"
+updated: "2026-08-25"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    A venue fielding several acts for the same night has no way to say
+    "you're first in line" without either committing (creating an event) or
+    faking it (a blackout row). Priority lives in the booker's head, acts
+    don't know where they stand, and the request thread has no record of who
+    was promised what.
+  solution: >
+    A BookingHold row per (request, calendar, date): an ordered line the venue
+    controls, visible to each act only as their own position. Staff can
+    challenge the first hold, which starts a 24-hour keep-or-release clock for
+    that act. Confirming a hold releases every sibling and
+    competitor and then creates the draft event — two commits by design (see
+    FR-008), not one transaction. Every transition is a ledger entry in the
+    thread and a notification to the people it affects.
+  users:
+    - Venue / organizer staff with an edit role (the bookers)
+    - Performer / act (the requester)
+  surfaces:
+    - web (booking inbox Holds tab, thread, sent-request view, admin calendar overlay, org settings → Booking tags)
+    - api (tRPC)
+
+# ── Locked decisions (owner, 2026-08-25) ─────────────────────────────────────
+# - Flag, never block: a hold changes nothing the public sees and stops no
+#   other act from requesting the date. Only a confirmed event blocks.
+# - Venue staff place holds; the act proposes dates in the thread.
+# - Date-level, no time, in the place's timezone, keyed to a named Calendar;
+#   Space optional.
+# - Ordered line per (calendar, date); arrival order, staff may reorder.
+# - Challenge is a real state with a stored deadline: 24 hours by default,
+#   staff may extend before it lapses. Expiry is lazy (computed on read), no
+#   cron. On expiry the hold is released and the line moves up.
+# - Confirm = accept the request if still open + release the request's
+#   sibling holds and every competing hold on that date (one transaction),
+#   THEN create the draft Event on that date in a second commit, idempotent
+#   on the hold id (FR-008 explains why). Money never gates a hold.
+# - Acts see their own date and position only — never who else is in line.
+# - Every hold hangs off a booking request (no request-less holds in v1; a
+#   venue that wants a private pencil-in creates a draft event).
+# - EDITOR is the booking role. No new org role: booking needs to create and
+#   publish events and "it's not supposed to be tedious." Gates stay on
+#   ORG_EDIT_ROLES.
+# - Assignment: BookingRequest.assigneeHumanId; dropdown + "Assign to me";
+#   the first staff reply auto-assigns when unassigned. Assignee is the
+#   notification target for challenges and expiries.
+# - Org-scoped BookingTag, creatable inline from the request (mirror the
+#   event tag input) and managed in org settings → Booking. Venue-internal.
+# - Shape: its own table. Every customer-facing Event read is a PUBLISHED
+#   allowlist, but listByOwner (no default filter), getStatsForPlace (a
+#   denylist) and detectConflicts (status-blind) would all need hand-edits
+#   for a tentative Event status, plus five hand-written EventStatus[]
+#   arrays. A separate table is invisible to all of them by construction.
+# - Naming: "hold" already means POS cart holds, PromoHold and
+#   ResaleListingHold (short-TTL inventory reservations). This is
+#   `BookingHold` in code and `booking_hold.*` in the ledger, always.
+# - Challenge settles priority for the act that asked first: while its clock
+#   is open the venue may not confirm anyone else on that date (2026-08-27).
+# - A hold leaves its line only when the date PASSES, the hold is RELEASED
+#   (act/venue/closure/lapse), or the date is TAKEN: an event on that
+#   calendar+date becomes PUBLISHED (2026-08-27) — and, since venue
+#   confirmation landed (spec 2026-08-27), only a VENUE-OWNED or
+#   VENUE-CONFIRMED event takes a line. An unconfirmed third-party event
+#   blocks nothing (their locked rule); the line is taken when the venue
+#   confirms it (2026-09-07 — gate + confirm-time settle live in
+#   packages/core/src/use-cases/booking-holds/settle-held-dates-for-published-event.ts
+#   and events/confirm-venue-event.ts). Drafts are pencil-ins and
+#   never touch holds; Confirm's own draft mint is the one deliberate
+#   exception. Cancelling an agreement never touches holds.
+# - Own request wins: publishing an event that came from a booking request
+#   whose hold is live on that line CONFIRMS that hold (siblings and
+#   competitors release exactly as on Confirm) — never "you lost the date".
+# - The challenge promise binds publish too: while a challenge clock is open
+#   on the line, publishing a DIFFERENT event on that date is refused
+#   (HOLD_LINE_HAS_OPEN_CHALLENGE) — answer or release the challenge first.
+# - Holds exist only where a Calendar exists (every place has at least one).
+#   An event with no calendar is outside the holds world and never releases
+#   or confirms anything; only an event on the SAME calendar takes the slot.
+# - A community listing on a calendar is placed by venue staff: taking a
+#   line on behalf of an ownerless listing requires an edit role at the
+#   place (no moderator/platform bypass). No-op today — listings carry no
+#   calendar — recorded so nobody adds a bypass to the settle later.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        BookingHold model: bookingRequestId, calendarId, spaceId (nullable),
+        date (DATE, place-local), position (int, 1-based within the active
+        line for that calendar+date), status ACTIVE | CHALLENGED | CONFIRMED |
+        RELEASED, placedByHumanId, respondBy (nullable, set only while
+        CHALLENGED), releasedReason (nullable: manual | expired |
+        confirmed_other | request_closed | sibling_confirmed | past_date), plus
+        the usual timestamps. PARTIAL unique on (bookingRequestId, calendarId,
+        date) over live statuses only (ACTIVE, CHALLENGED) — a released date
+        can be re-held with a fresh row — and a PARTIAL unique on (calendarId,
+        date) WHERE status = CONFIRMED, so the database itself guarantees at
+        most one winner per line (NFR-002). `date` is an ISO YYYY-MM-DD string
+        at the port; the adapter owns the DATE column conversion.
+    - id: FR-002
+      description: >
+        Place hold: staff with ORG_EDIT_ROLES on the owning org (or the direct
+        human owner) pick a date from the request's preferredDates or type
+        one; the hold enters the line for that calendar+date at the last
+        position. Ledger entry booking_hold.placed {date, position}. The act
+        is notified (email + in-app) with the date and position.
+    - id: FR-003
+      description: >
+        Reorder: staff move a hold within its line; positions of the other
+        ACTIVE/CHALLENGED holds renumber. Every act whose position changed is
+        notified; ledger entry booking_hold.reordered {from, to} on each
+        affected request's thread.
+    - id: FR-004
+      description: >
+        Challenge: staff challenge the position-1 hold (only position 1 can
+        be challenged). Status → CHALLENGED, respondBy = now + 24h. Ledger
+        booking_hold.challenged {respondBy}. Notify: the challenged act (email
+        + in-app, with Keep / Release actions); the act at position 2 ("the
+        first hold has been challenged; you'll hear by <respondBy>"); the
+        challenged request's assignee (in-app). Only one open challenge per
+        line at a time.
+    - id: FR-005
+      description: >
+        Extend: while CHALLENGED and before respondBy, staff may push
+        respondBy later. Ledger booking_hold.extended {respondBy}. The
+        challenged act and the position-2 act are notified of the new
+        deadline.
+    - id: FR-006
+      description: >
+        Act answers a challenge from their sent-request view or the thread:
+        Keep → status back to ACTIVE, respondBy cleared, ledger
+        booking_hold.kept; the position-2 act is told the first hold stands.
+        Release → the hold is RELEASED (manual), the line moves up, ledger
+        booking_hold.released {reason: manual}; every act that moved up is
+        notified of their new position; the assignee is notified (email +
+        in-app).
+    - id: FR-007
+      description: >
+        Expiry: a CHALLENGED hold whose respondBy has passed is treated as
+        RELEASED (reason: expired) on every read — list, thread, calendar,
+        and as a precondition check on every mutation. The first mutation or
+        read that observes the lapse persists it (write-on-read, idempotent)
+        and emits the same notifications as a manual release, plus an email
+        to the assignee. No scheduled job.
+    - id: FR-008
+      description: >
+        Confirm: staff confirm any ACTIVE or CHALLENGED hold (position 1 is
+        the norm; confirming a lower position is allowed and logged as such).
+        TWO COMMITS, BY DESIGN — do not "fix" this into one transaction.
+        Commit 1 (one transaction, under the line's advisory lock): if the
+        request is PENDING/VIEWED it is ACCEPTED via the extracted in-tx
+        accept path (agreement drafted as today); the hold → CONFIRMED (CAS);
+        every other hold on that request → RELEASED (sibling_confirmed);
+        every other hold in that calendar+date line → RELEASED
+        (confirmed_other); ledger booking_hold.confirmed on the winner's
+        thread, booking_hold.released on each loser's thread. After commit 1:
+        the draft Event is minted on the hold's date/calendar/space through
+        the existing create-event-from-agreement path (internal-only entry)
+        with startsAt = date + calendar.defaultStartTime. The mint runs its
+        own save internals (quota, media, search) that cannot share commit 1's
+        transaction; if it fails, commit 1 stands — the hold IS confirmed and
+        the line IS settled — and any eligible actor re-runs confirm, which
+        skips commit 1 and only mints. Idempotent on the hold id: a second
+        confirm returns the same event. Notify each released act ("the date
+        went to another act") and the winning act. Refused while another hold
+        in the line has an open challenge (HOLD_LINE_HAS_OPEN_CHALLENGE); the
+        challenged hold itself may be confirmed.
+    - id: FR-009
+      description: >
+        Request closure releases holds: DECLINED, WITHDRAWN, EXPIRED on the
+        request release every ACTIVE/CHALLENGED hold it owns
+        (request_closed) in the same transaction as the status change, with
+        the usual move-up notifications to the other acts in each line.
+    - id: FR-010
+      description: >
+        Past-date death: a hold whose date is before today (place tz) is
+        treated as RELEASED (expired) on read, same write-on-read rule as
+        FR-007, without notifications.
+    - id: FR-011
+      description: >
+        Inbox: fifth tab Holds between Open and Agreement — requests with at
+        least one ACTIVE/CHALLENGED hold. Row shows date(s), position(s), and
+        a countdown when CHALLENGED. The tab classifier in
+        booking-inbox-tabs.ts gains the rule "any live hold → holds" ahead of
+        the agreement rule; the Open count still means Open.
+    - id: FR-012
+      description: >
+        Thread: a "Holds" strip under the stage rail listing this request's
+        live holds with actions (challenge / extend / reorder / release /
+        confirm) for staff; ledger lines render every booking_hold.* kind.
+        The stage rail gains no leg — holds are a state of the request stage.
+    - id: FR-013
+      description: >
+        Act view (account settings → Booking → Booking requests, and the
+        performer thread): each live hold as "Oct 13 — 2nd hold" with Keep /
+        Release when challenged and a deadline. Never the names or count of
+        other acts.
+    - id: FR-014
+      description: >
+        Admin calendar overlay: the place day view and the calendar-events
+        admin read overlay live holds as stacked tentative chips
+        ("2 holds") that never enter conflict detection. Public calendar,
+        embeds, search, stats, availability and sitemap never read the table.
+    - id: FR-015
+      description: >
+        Assignment: BookingRequest.assigneeHumanId, settable by ORG_EDIT_ROLES
+        to any org member holding an edit role; UI is a dropdown of eligible
+        members plus "Assign to me". The first staff message on an unassigned
+        request auto-assigns the author. Ledger booking_request.assigned
+        {assigneeHumanId}. Inbox gains an "Assigned to" column and an
+        Unassigned filter. Human-owned venues: the owner is implicitly the
+        assignee; the field stays null and the UI hides the control.
+    - id: FR-016
+      description: >
+        Notification routing for FR-004/006/007: assignee → else the hold's
+        placedByHumanId (if still an edit-role member) → else every edit-role
+        member. Channels per the locked decision: acts get email + in-app for
+        placed / challenged / extended / released / confirmed; staff get
+        in-app for everything and email only for a challenge answer and a
+        challenge expiry. All routed through the existing notify channel with
+        idempotency keys {holdId}:{transition}:{recipient}.
+    - id: FR-018
+      description: >
+        Date taken by a published event: when an event becomes PUBLISHED on a
+        calendar (publish; a published event moved onto the date; a
+        published recurring listing gaining the date), every date the event
+        occupies on that calendar (its startsAt day plus each SCHEDULED
+        occurrence day, in the place's timezone) is settled as on Confirm:
+        lapsed challenges expire first; if any OTHER hold on the line is
+        CHALLENGED the publish is refused (HOLD_LINE_HAS_OPEN_CHALLENGE);
+        if the event's provenance request has a live hold on the line that
+        hold → CONFIRMED (siblings sibling_confirmed, competitors
+        confirmed_other, ledger and notifications as FR-008); otherwise every
+        live hold → RELEASED (event_scheduled) with ledger
+        booking_hold.released {reason: event_scheduled} and a notification to
+        each act ("the venue scheduled an event on that date") and the
+        request's assignee. All inside the publishing transaction, under the
+        line locks in global order. Draft events never trigger this; events
+        without a calendar never trigger this.
+    - id: FR-019
+      description: >
+        A released hold is terminal. Moving the published event off the date
+        afterwards does not restore the line; the venue places new holds.
+    - id: FR-017
+      description: >
+        Org tags: BookingTag (orgId, name, colour token, sortOrder) and
+        BookingRequestTag join. Creatable inline on the request (type-to-create,
+        mirroring the event tag input) and managed in org settings → Booking
+        (rename, recolour, delete — delete detaches). Inbox filter by tag.
+        Never shown to the act.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        BookingHold is read by exactly the surfaces in FR-011..014. Add a
+        guard test that greps for the repo port outside the allowed use
+        cases, so a future public read can't quietly appear.
+    - id: NFR-002
+      description: >
+        All hold transitions run inside repos.tx() with CAS on (id, status)
+        — two staff confirming different holds in the same line concurrently
+        yield exactly one CONFIRMED hold and one event.
+    - id: NFR-003
+      description: >
+        i18n en/es with argument parity for every new key; keyboard-operable
+        and 320px-clean on every new control; every hold kind renders in the
+        ledger (unknown kinds still render nothing, never crash).
+    - id: NFR-004
+      description: >
+        Lazy expiry must be consistent across surfaces: one pure predicate
+        (isHoldLapsed(hold, now, placeTz)) shared by list, thread, calendar
+        and mutation preconditions.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: place-booking-hold
+        description: Create a hold at the end of the line; ledger + notify the act.
+        input: bookingRequestId, calendarId, spaceId?, date
+        output: hold
+        idempotent: false
+        money: false
+      - name: reorder-booking-hold
+        description: Move a hold within its line; renumber; notify moved acts.
+        input: holdId, toPosition
+        output: line
+        idempotent: true
+        money: false
+      - name: challenge-booking-hold
+        description: Position-1 only; sets CHALLENGED + respondBy; notifies both acts + assignee.
+        input: holdId, respondBy? (default now+24h)
+        output: hold
+        idempotent: false
+        money: false
+      - name: extend-booking-hold-challenge
+        description: Push respondBy later while CHALLENGED and not lapsed.
+        input: holdId, respondBy
+        output: hold
+        idempotent: true
+        money: false
+      - name: answer-booking-hold-challenge
+        description: Act side only — keep or release.
+        input: holdId, answer keep|release
+        output: hold, line
+        idempotent: true
+        money: false
+      - name: release-booking-hold
+        description: Staff manual release; line moves up; notify.
+        input: holdId
+        output: line
+        idempotent: true
+        money: false
+      - name: confirm-booking-hold
+        description: >
+          Accept-if-open + create draft event (existing paths) + release
+          siblings and competitors, one tx; idempotent on holdId.
+        input: holdId
+        output: eventId, releasedHoldIds
+        idempotent: true
+        money: false
+      - name: settle-lapsed-booking-holds (shared helper, not a job)
+        description: >
+          Write-on-read: given holds and now, persist expired/past-date
+          releases and emit their notifications. Called by the reads in
+          FR-011..014 and by every mutation's precondition.
+        input: holds[], now
+        output: settled holds
+        idempotent: true
+        money: false
+      - name: assign-booking-request
+        description: Set/clear assignee; validates edit-role membership; ledger.
+        input: bookingRequestId, assigneeHumanId | null
+        output: request
+        idempotent: true
+        money: false
+      - name: manage-booking-tags / tag-booking-request
+        description: Org tag CRUD + attach/detach on a request.
+        input: orgId, tag fields | bookingRequestId, tagIds
+        output: tags
+        idempotent: true
+        money: false
+      - name: (modified) respond-to-booking-request, withdraw, expire
+        description: Release owned holds on DECLINED/WITHDRAWN/EXPIRED (FR-009).
+      - name: (modified) post-booking-message
+        description: Auto-assign the author on the first staff message when unassigned (FR-015).
+      - name: (modified) list-booking-requests
+        description: Project live holds (date, position, status, respondBy), assignee, tags onto rows.
+
+  ports:
+    new:
+      - BookingHoldsRepo (create, getById, listForRequest, listLine(calendarId, date), listForPlaceRange, updateStatus CAS, renumber)
+      - BookingTagsRepo (org CRUD, attach/detach, listForRequests)
+    existing:
+      - BookingRequestsRepo (+ assigneeHumanId)
+      - AgreementsRepo, EventsRepo (confirm path reuses create-event-from-agreement)
+      - NotifyPort, ReporterPort, AuditLog
+
+  adapters:
+    new:
+      - prisma/booking-holds.ts
+      - prisma/booking-tags.ts
+    existing:
+      - prisma/booking-requests.ts (assignee column, tags include)
+
+  transport:
+    trpc_procedures:
+      - bookingHolds.place / reorder / challenge / extend / answer / release / confirm / listForRequest
+      - bookingRequests.assign
+      - bookingTags.list / create / update / delete / setForRequest
+      - (modified) bookingRequests.list output: holds[], assignee, tags[]
+      - (modified) events.getVenueCalendar / calendars.getEvents admin mode: holds overlay
+    webhooks: []
+
+  ui:
+    pages:
+      - /admin/[slug]/settings → Booking section: tags manager
+    components:
+      - BookingInbox: Holds tab (booking-inbox-tabs.ts rule), Assigned-to column, tag chips + filter, Unassigned filter
+      - BookingThread: HoldsStrip (staff actions) + booking_hold.* ledger rows (BookingSystemEntryRow icons)
+      - SentBookingRequestsList / performer thread: act hold view with Keep / Release
+      - Admin calendar day view + calendar-events admin: stacked hold chips
+      - BookingTagInput (mirrors the event tag input), AssigneePicker
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - BookingHold
+    - BookingTag
+    - BookingRequestTag
+  modified_models:
+    - BookingRequest (+ assigneeHumanId nullable, plain id with NO FK — house
+      style for every human-id column on this model family — plus index)
+  migrations_needed: true
+  ledger_kinds_added (data only, no migration):
+    - booking_hold.placed, reordered, challenged, extended, kept, released, confirmed
+    - booking_request.assigned
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Confirm composes two existing transactional paths (respond-accept and
+      create-event-from-agreement) plus hold releases; they cannot share one
+      tx, so a mint failure leaves a CONFIRMED hold with no event.
+    severity: HIGH
+    mitigation: >
+      RESOLVED in the build (2026-08-26): accept was extracted into an in-tx
+      body (acceptBookingRequestInTx) that confirm calls under its own
+      transaction, never the transport-level Redis wrapper; the event mint
+      runs post-commit and confirm is idempotent on the hold id, so the
+      recovery from a failed mint is "confirm again". FR-008 records the
+      two-commit shape so nobody collapses it.
+  - risk: >
+      Lazy expiry that also sends notifications: a burst of reads could race
+      to "observe" the same lapse and double-notify.
+    severity: MEDIUM
+    mitigation: >
+      The write-on-read is a CAS (status CHALLENGED → RELEASED); only the
+      winner notifies; idempotency keys on the notify channel as backstop.
+  - risk: >
+      Positions drift under concurrent reorder/release.
+    severity: MEDIUM
+    mitigation: >
+      Renumber the whole line inside the tx from a single ordered read; never
+      arithmetic on positions.
+  - risk: >
+      N=1 evidence. One room described this mechanic; other venues may hold
+      differently (e.g. no challenge step).
+    severity: MEDIUM
+    mitigation: >
+      Challenge is optional — a venue that never challenges still gets an
+      ordered line + confirm. Revisit after 2-3 more rooms.
+
+open_questions:
+  - >-
+    Should the act be able to *ask* for a hold as a first-class action
+    (today: they propose in the thread)? Deferred until acts ask for it.
+  - >-
+    Calendar overlay density: per-date "2 holds" chip vs stacked named chips
+    — decide at UI time against the day view.
+  - Does a request-level "Challenge" from position 2's act (rather than
+    staff) ever make sense? Out for v1.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - A new org role (EDITOR is the booking role — owner-locked).
+  - Request-less holds / private pencil-ins (use a draft event).
+  - Time-of-day on holds; multi-day holds.
+  - Any public visibility of holds; any effect on public availability.
+  - A scheduled job for expiry.
+  - Act-initiated holds or act-initiated challenges.
+  - Tags on anything other than booking requests.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - Placing holds for three requests on one calendar+date yields positions
+    1,2,3; each act's sent view shows only its own position.
+  - Challenging position 1 sets respondBy = now+24h; the challenged act, the
+    position-2 act and the assignee each receive exactly one notification
+    with the expected content and channel.
+  - Answering Keep restores ACTIVE and notifies position 2; answering
+    Release renumbers to 1,2 and notifies both remaining acts.
+  - A CHALLENGED hold read 24h+1s later is RELEASED on that read; a second
+    read does not notify again.
+  - Confirming position 1 creates one draft Event on that date, ACCEPTS the
+    request if it was open, releases the request's other-date holds and
+    every competing hold on that date, all visible as ledger lines; a
+    repeated confirm returns the same eventId.
+  - Two concurrent confirms in one line produce one CONFIRMED hold and one
+    event.
+  - Declining a request releases its holds and moves the lines up.
+  - Public place page, embeds, search index, sitemap and
+    get-place-booking-availability are byte-identical with and without holds
+    present (guard test).
+  - Holds tab count equals its rows; Open count unchanged by holds.
+  - First staff message on an unassigned request sets assignee to the author
+    and writes booking_request.assigned.
+  - Inline tag creation from a request appears in org settings → Booking and
+    filters the inbox.
+  - 320px: Holds strip, act Keep/Release, tag input and assignee picker are
+    usable without horizontal scroll; zero console errors.

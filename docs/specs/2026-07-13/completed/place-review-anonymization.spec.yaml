@@ -1,0 +1,275 @@
+# place-review-anonymization.spec.yaml
+#
+# Formalize the "100% anonymous" promise as an enforced policy layer, not UI
+# copy. The original review specs (2026-04-05 place-reviews-and-stats,
+# 2026-04-08 place-review-form-v3) strip anonymousEmail on read and promise
+# anonymity in helper text — nothing more. booking-review-data-weave
+# (2026-07-13) creates real deanonymization vectors: public per-venue
+# aggregates a venue can watch, and platform-sourced reviews carrying
+# humanId + eventId. This spec defines the single anonymization policy every
+# public read surface must pass through.
+#
+# Related specs:
+#   - specs/2026-07-13/completed/booking-review-data-weave.spec.yaml (WS2 venue_stats
+#     block + WS3 booking-form stats consume this policy; its n>=3 gate is
+#     superseded by the thresholds here)
+#   - specs/2026-04-05/completed/place-reviews-and-stats.spec.md (pipeline)
+#   - specs/2026-04-08/completed/place-review-form-v3.spec.md (the promise)
+#   - specs/2026-07-13/deal-terms-transparency-map.spec.yaml (monetary sibling:
+#     H3-cell deal aggregates, opt-in + verified; mirrors this policy-module +
+#     snapshot pattern. Seam: this spec caps per-venue payout display from
+#     anonymous reviews; that spec owns deal-structure data and never displays
+#     per-venue monetary figures)
+
+version: "1.0"
+updated: "2026-07-13"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    We promise reviewers "venues can't see who said what," but anonymity today
+    is only an email strip. Once aggregates go public per-venue, a venue owner
+    can deanonymize by watching: a stats change right after the only gig that
+    month names the band (temporal correlation); showing stats at n=3 then n=4
+    reveals the new review by subtraction; the genre cloud can name a band
+    outright (the one metal act that played a folk room). Platform-sourced
+    reviews (humanId + eventId on the row) raise the stakes from "hard to
+    guess" to "recorded in the database."
+  solution: >
+    One anonymization policy module in core — thresholds, coarsening, and
+    publication cadence — that every public read surface must pass through.
+    Public aggregates come from a periodically recomputed snapshot (not live),
+    values are bucketed/rounded so subtraction attacks are lossy, low-n slices
+    (payout, day-of-week, genre) are withheld at higher thresholds than the
+    headline stats, and reviewer-identifying fields are unreadable outside the
+    audited platform-staff surface.
+  users:
+    - Performers who reviewed a venue (the protected party)
+    - Venue owners (see honest aggregates, can never resolve individuals)
+    - Platform staff (moderation retains full access, audit-logged)
+  surfaces:
+    - web
+    - jobs (snapshot recompute)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        New core policy module (place-reviews/anonymization-policy.ts) holding
+        all constants and pure coarsening helpers. No public surface reads
+        PlaceReview or PlaceStats except through it. Thresholds: headline
+        aggregates (count, would-play-again, scores) require >= 3 visible
+        reviews; payout figures require >= 5 reviews carrying payout data;
+        day-of-week and genre-cloud slices require >= 10. Below threshold the
+        slice is omitted entirely, not zeroed.
+    - id: FR-002
+      description: >
+        Public aggregates are served from a snapshot (PlaceStats.publicSnapshot
+        + publicSnapshotAt), recomputed by a weekly job — never live. A venue
+        watching its page cannot correlate a stats change with a specific
+        recent gig; a fresh review is invisible publicly for up to 7 days and
+        indistinguishable within the weekly batch thereafter.
+    - id: FR-003
+      description: >
+        Value coarsening in the snapshot: payout median/range rounded to $25
+        buckets; percentages rounded to 5%; review counts displayed as bands
+        past 20 ("20+", "50+"). Exact figures never leave the policy module,
+        making n→n+1 subtraction lossy.
+    - id: FR-004
+      description: >
+        Genre protection: the public genre cloud includes only genres with
+        >= 3 reviews at that place; rarer genres fold into an "other" bucket.
+        Genre is never shown alongside any other slice (no "metal bands rate
+        it 2/5").
+    - id: FR-005
+      description: >
+        Platform-sourced reviews (source=PLATFORM, humanId + eventId) are
+        additionally excluded from the public snapshot until 14 days after
+        their event date, and no public surface ever slices aggregates by
+        event. humanId/eventId/anonymousName/anonymousEmail are readable only
+        via the platform-staff moderation procedures; every such read is
+        audit-logged (extend the existing audit pattern in list-platform-reviews).
+    - id: FR-006
+      description: >
+        Individual review text (comment, *Detail fields) stays off all public
+        surfaces, unchanged. If a future spec displays it, it must extend this
+        policy first (date coarsened to month, no genre, randomized publication
+        delay, moderation redaction pass) — recorded here as the precondition.
+    - id: FR-007
+      description: >
+        Moderation guidance: reviewers self-identify in free text ("we, The
+        Foo Band…"). The platform review tooling gains a redact action
+        (edit-with-audit of comment/*Detail) so staff can remove
+        self-identification without hiding the review. Venue responses
+        (respond-to-place-review) are responses to the review text only and
+        must never be able to reveal or request reviewer identity — response
+        UI carries that warning.
+    - id: FR-008
+      description: >
+        The "100% anonymous" form copy is updated to state the mechanism
+        honestly and calmly (per calm-honest-ux): identity is never shown to
+        venues; stats are delayed, batched, and rounded so individual reviews
+        can't be singled out; staff access is logged.
+    - id: FR-009
+      description: >
+        The policy module's pure mechanics live in a shared core primitives
+        module (aggregate-suppression: k-threshold gating, bucket rounding,
+        top-coding, count-band display), consumed here and by
+        deal-terms-transparency-map's suppression-policy. Domain constants
+        (thresholds, bucket sizes, cadences) stay in each domain's policy
+        module; only the math is shared.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        The policy module is pure and unit-tested: given a PlaceStats row and
+        review counts, tests assert exactly which slices appear at n=2,3,4,5,
+        9,10 and that all emitted numbers are bucket-aligned.
+    - id: NFR-002
+      description: >
+        Snapshot recompute failures report via ReporterPort (Sentry
+        convention); a stale snapshot keeps serving rather than falling back
+        to live stats (fail-closed for anonymity, degraded for freshness).
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: anonymization-policy (module, not a use case)
+        description: >
+          Constants + pure helpers: thresholds per slice, bucketing/rounding,
+          snapshot shaping. Consumed by get-place-public-stats,
+          get-review-global-stats, and the weave spec's venue_stats injection.
+        input: PlaceStats row + counts
+        output: public-safe snapshot shape (or per-slice omissions)
+        idempotent: true
+        money: false
+      - name: recompute-public-snapshots
+        description: >
+          Weekly job use case: for each place with visible reviews, build the
+          coarsened snapshot via the policy module and write
+          PlaceStats.publicSnapshot/publicSnapshotAt. Excludes PLATFORM
+          reviews younger than 14 days post-event.
+        input: "now (clock), batch size"
+        output: "recomputed count"
+        idempotent: true
+        money: false
+      - name: redact-place-review (new)
+        description: >
+          Staff-only edit of comment/*Detail fields with audit log entry
+          (pattern: hide/unhide-place-review).
+        input: reviewId, redacted fields, actor
+        output: updated review
+        idempotent: false
+        money: false
+      - name: get-place-public-stats (modified)
+        description: >
+          Serves publicSnapshot only; never computes from live rows.
+        input: placeId
+        output: snapshot or null
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - place-reviews / place-stats repos (snapshot columns)
+      - audit (staff reads + redaction)
+      - reporter (snapshot job swallows)
+
+  adapters:
+    new: []
+    existing:
+      - prisma place-stats (publicSnapshot columns), platform review procedures
+
+  transport:
+    trpc_procedures:
+      - "placeReviews.redact (staff-only, new)"
+      - "placeReviews.getPublicStats (modified: snapshot-only)"
+    webhooks: []
+
+  ui:
+    pages: []
+    components:
+      - "review form TrustLine copy update (FR-008)"
+      - "ReviewDetailPanel: redact action + response-warning copy (FR-007)"
+
+  jobs:
+    - "place-reviews.recompute-public-snapshots (weekly; pattern:
+       recalculate-place-stats scheduling)"
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models:
+    - "PlaceStats: + publicSnapshot Json?, + publicSnapshotAt DateTime?"
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Weekly cadence makes the venue_stats block feel stale on a young
+      platform where every review counts.
+    severity: LOW
+    mitigation: >
+      Staleness is the feature — it's what breaks temporal correlation. Copy
+      says "updated periodically." Cadence is one constant in the policy
+      module if we later tune it.
+  - risk: >
+      Thresholds hide stats for almost all venues early on (few have 5+
+      payout reviews), reducing the visible value of WS2/WS3.
+    severity: MEDIUM
+    mitigation: >
+      Headline stats show at n>=3; only payout and slices need more. The
+      booking-form line degrades gracefully to "N performers have reviewed
+      this venue."
+  - risk: >
+      Existing seed-phase reviews already have anonymousName/Email adjacent to
+      free text; a staff-tooling leak exposes both.
+    severity: MEDIUM
+    mitigation: >
+      Staff reads audit-logged (FR-005); redaction tooling (FR-007); SAR
+      export already handles the reviewer's own data path.
+
+open_questions:
+  - >
+    Should global (non-per-venue) stats on the landing page also move to the
+    snapshot path? Lower risk (no per-venue watcher), but consistency argues
+    yes — decide at implementation.
+  - >
+    Retention: do seed-phase anonymousEmail values get purged once the
+    waitlist purpose lapses? Suggest folding into the existing
+    subject-access-request/deletion work rather than this spec.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Displaying individual review text publicly (precondition recorded in
+    FR-006, not designed here)
+  - Differential-privacy noise injection (bucketing + batching is
+    proportionate at our scale)
+  - Anonymizing the BookingRequest flow (senders are intentionally identified)
+  - Buyer anonymization (covered by anonymize-buyer-instead-of-block spec)
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A place with 4 reviews (3 with payout) shows headline aggregates but no
+    payout figures anywhere public; at 5 payout reviews, payout appears
+    rounded to $25 buckets.
+  - Submitting a new review changes no public number until the weekly
+    snapshot job runs; the job is idempotent on re-run.
+  - A PLATFORM review from an event 3 days ago is absent from the snapshot;
+    after 14 days + next recompute it is included.
+  - No tRPC procedure outside the staff moderation router returns humanId,
+    eventId, anonymousName, or anonymousEmail for any review; staff detail
+    reads and redactions appear in the audit log.
+  - Policy-module unit tests pin every threshold and bucket boundary.
+  - Review-form copy describes the delay/batch/rounding mechanism; the
+    venue response UI warns against identity fishing.

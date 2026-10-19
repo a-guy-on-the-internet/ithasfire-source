@@ -1,0 +1,372 @@
+title: NavigationRail — Design System Alignment
+date: 2026-04-10
+status: implemented
+owner: design-system
+component: packages/ui/src/ui/shell/components/NavigationRail.tsx
+affects:
+  - apps/web/src/app/admin/[slug]/** (all admin pages)
+  - packages/ui/src/ui/shell/NavigationShell.tsx
+  - packages/ui/src/ui/shell/components/NavigationDrawer.tsx (mobile drawer variant)
+references:
+  - docs/design/style-guide.md
+  - docs/design/component-library.md
+  - .github/copilot-instructions.md (Swiss International design spec)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. Problem Statement
+# ──────────────────────────────────────────────────────────────────────────────
+
+problem: |
+  The NavigationRail sidebar items currently feel disconnected from the rest of
+  the design system. Specific issues:
+
+  1. **Background noise.** Items render with `$surface` fill inside an already-
+     `$surfaceRaised` rail frame, creating a card-inside-card look. The visual
+     layering adds noise without conveying meaning.
+
+  2. **Underline/border clutter.** SectionGroup uses `borderTopWidth: 1` dividers
+     that read as HTML-era underlines rather than Swiss structural separators.
+     Combined with `borderLeftWidth: 3` on every item, the rail has too many
+     competing border signals.
+
+  3. **Cramped spacing.** Items at `$1.5` (6px) gap feel tight. The org-chooser
+     dropdown — the closest internal reference — uses `$3` vertical padding per
+     item and zero item-gap (relying on internal padding alone), which feels
+     more spacious and intentional.
+
+  4. **Active state is ambiguous.** The current `$accentSoft` background + `$accent`
+     left-border is subtle to the point of invisibility on some monitors. The
+     org-chooser dropdown has the same problem. Neither surface communicates
+     "you are here" with the confidence the Swiss design system demands.
+
+  5. **Icon container borders feel heavy.** Every icon gets a 2px bordered box,
+     which is appropriate in the dropdown (where items are transient selections)
+     but in persistent navigation it adds visual weight that competes with the
+     section labels.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. Design Principles (from Swiss International spec)
+# ──────────────────────────────────────────────────────────────────────────────
+
+principles:
+  - name: Active negative space
+    application: |
+      The rail frame background IS the breathing room. Items should float
+      on it with transparent backgrounds, not create their own surface layer.
+
+  - name: Typography is the interface
+    application: |
+      The label text and section headings should do the structural work.
+      Borders and fills are supplements, not primaries.
+
+  - name: Bold interaction states
+    application: |
+      "Always indicate interactivity through color, scale, or position changes
+      — never subtle fades." Active state must be unmistakable: a strong
+      left-border accent + bold text weight shift, not a background tint.
+
+  - name: Structural geometric accents
+    application: |
+      "Keep them minimal and functional — they reinforce the grid, not
+      decorate the page." Icon containers should be borderless by default;
+      the icon shape itself is sufficient.
+
+  - name: The grid as law
+    application: |
+      Section dividers should be thin (1px) and use `$borderColor` at reduced
+      opacity or be replaced entirely by generous vertical spacing between
+      section groups. Let whitespace do the separating.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. Target Design
+# ──────────────────────────────────────────────────────────────────────────────
+
+target:
+
+  rail_frame:
+    background: $surfaceRaised          # unchanged — the canvas
+    paddingHorizontal: $4               # increase from $3 for more breathing room
+    paddingVertical: $6                 # unchanged
+    gap: $8                             # increase from $6 — more air between sections
+
+  section_group:
+    borderTopWidth: 0                   # REMOVE divider borders entirely
+    paddingTop: 0                       # whitespace comes from rail_frame gap instead
+    gap: $3                             # increase from $2
+
+  section_heading:
+    paddingHorizontal: $2              # slight inset from items
+    paddingVertical: $1
+    # SectionLabel stays: $brandSecondary, $mono, uppercase, 10px, 1.8 tracking
+    # This is correct Swiss style — numbered-section-label aesthetic
+
+  items_stack:
+    gap: $0.5                           # minimal — items rely on internal padding
+
+  rail_item:
+    # ── Layout ──
+    paddingHorizontal: $4               # generous — match dropdown ListItem
+    paddingVertical: $3.5               # slightly more than current $3
+    gap: $3                             # icon-to-label
+
+    # ── Default state ──
+    backgroundColor: transparent        # KEY CHANGE — no $surface fill
+    borderRadius: 0                     # Swiss: strictly rectangular
+    borderLeftWidth: 3
+    borderLeftColor: transparent
+    borderWidth: 0                      # no other borders
+    color: $color
+    fontWeight: 500
+
+    # ── Hover state ──
+    hover:
+      backgroundColor: $surfaceMuted
+      borderLeftColor: $accent          # steel blue left-border appears on hover
+
+    # ── Active state (current route) ──
+    active:
+      backgroundColor: transparent      # NO fill — let the border speak
+      borderLeftColor: $brandSecondary  # ORANGE left-border — unmistakable
+      borderLeftWidth: 3
+      color: $accent                    # steel blue text
+      fontWeight: 700                   # bold weight shift
+
+    # ── Active + hover ──
+    active_hover:
+      backgroundColor: $surfaceMuted    # subtle fill only on hover
+      borderLeftColor: $brandSecondary  # orange persists
+
+    # ── Press state ──
+    press:
+      opacity: 0.92
+
+    # ── Disabled ──
+    disabled:
+      opacity: 0.4
+      cursor: not-allowed
+
+  icon_slot:
+    width: 24                           # slightly smaller than current 28
+    height: 24
+    borderWidth: 0                      # REMOVE icon box borders
+    borderRadius: 0
+    backgroundColor: transparent        # no icon container fill
+    alignItems: center
+    justifyContent: center
+    note: |
+      Icons render at 18px inside a 24px slot. The slot provides alignment
+      without visual container noise. Active-state icons inherit the $accent
+      color from the parent.
+
+  label_slot:
+    fontSize: 13
+    fontWeight: 600                     # semibold default
+    textAlign: left
+    textTransform: none                 # sentence case — not uppercase
+    letterSpacing: 0                    # no extra tracking on nav labels
+    note: |
+      Labels read as natural text. The section headings (uppercase, mono,
+      orange) provide the Swiss structural contrast. Making item labels
+      also uppercase would flatten the hierarchy.
+
+  badge:
+    # Unchanged — Badge component renders in trailing position
+    tone: neutral | danger | success
+
+  collapsible_item:
+    # ListItem with collapsible=true uses the same visual tokens as rail_item
+    # The chevron indicator (ChevronDown/ChevronRight) replaces the trailing
+    # accessory slot. Child items indent via ChildItemsStack paddingLeft: $6.
+    same_as: rail_item
+    child_indent: $6                    # increase from $4 for clearer hierarchy
+
+  config_controls:
+    # Footer config buttons follow the same transparent-bg pattern
+    same_as: rail_item
+    active:
+      backgroundColor: transparent
+      color: $accent
+      borderLeftColor: $brandSecondary
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. Visual Comparison
+# ──────────────────────────────────────────────────────────────────────────────
+
+comparison:
+  before:
+    description: |
+      Each item is a $surface-filled rectangle with a bordered icon container,
+      sitting inside a $surfaceRaised frame. Active state is $accentSoft fill
+      with $accent left-border. Section groups separated by 1px top borders.
+      Items are uppercase with 0.5px letter-spacing.
+    issues:
+      - Card-in-card layering
+      - Icon borders add visual clutter
+      - Active state too subtle
+      - Section divider borders feel like underlines
+      - Uppercase labels flatten hierarchy with section headings
+
+  after:
+    description: |
+      Items float transparently on the $surfaceRaised canvas. Icons render
+      without containers. Active state uses an orange ($brandSecondary) left-
+      border with steel blue text and bold weight — immediately visible.
+      Sections separate by whitespace alone (gap: $8 on the outer stack).
+      Labels are sentence-case, letting the uppercase mono section headings
+      own the structural typography role.
+    gains:
+      - Cleaner visual hierarchy (section heading → item label)
+      - Active page instantly identifiable via orange accent
+      - Less border noise throughout
+      - Matches Swiss principle of active negative space
+      - Consistent with broader admin UI patterns
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. States Matrix
+# ──────────────────────────────────────────────────────────────────────────────
+
+states:
+  - state: default
+    bg: transparent
+    borderLeft: transparent
+    text: $color
+    weight: 500
+    icon: $colorMuted
+
+  - state: hover
+    bg: $surfaceMuted
+    borderLeft: $accent
+    text: $color
+    weight: 500
+    icon: $color
+
+  - state: active
+    bg: transparent
+    borderLeft: $brandSecondary (3px)
+    text: $accent
+    weight: 700
+    icon: $accent
+
+  - state: active+hover
+    bg: $surfaceMuted
+    borderLeft: $brandSecondary (3px)
+    text: $accent
+    weight: 700
+    icon: $accent
+
+  - state: disabled
+    bg: transparent
+    borderLeft: transparent
+    text: $color (40% opacity)
+    weight: 500
+    icon: $colorMuted (40% opacity)
+
+  - state: focus-visible (keyboard)
+    bg: transparent
+    borderLeft: transparent
+    outline: 2px solid $accent
+    outlineOffset: -2px
+    text: $color
+    weight: 500
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 6. Responsive Behavior
+# ──────────────────────────────────────────────────────────────────────────────
+
+responsive:
+  desktop:
+    rail_width: auto (content-driven, ~220px typical)
+    items: full label + icon
+    sections: heading + items
+    footer: config controls + footer slot
+
+  collapsed:
+    rail_width: 72px
+    items: icon only, centered
+    labels: hidden (Tooltip on hover)
+    section_headings: hidden
+    icon_slot: same dimensions, still borderless
+    active_state: orange left-border still visible
+
+  mobile_drawer:
+    variant: drawer
+    items: same visual treatment as desktop rail
+    full_width: true
+    overlay: true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7. Accessibility
+# ──────────────────────────────────────────────────────────────────────────────
+
+accessibility:
+  - aria-current="page" on active item (web)
+  - role="navigation" on rail frame (web)
+  - role="list" on ItemsStack, role="listitem" on items (web)
+  - Arrow key navigation (up/down) cycles through focusable items
+  - focus-visible outline (2px $accent) for keyboard users
+  - Tooltips on collapsed rail items for label discoverability
+  - prefers-reduced-motion: disable hover transitions, keep state colors
+  - Minimum touch target: 44px height per item (paddingVertical $3.5 ≈ 14px
+    top + 14px bottom + ~18px content = 46px total)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8. Implementation Plan
+# ──────────────────────────────────────────────────────────────────────────────
+
+implementation:
+  files:
+    - path: packages/ui/src/ui/shell/components/NavigationRail.tsx
+      changes:
+        - RailFrame.paddingHorizontal $3 → $4
+        - RailFrame.gap $6 → $8
+        - SectionGroup: remove borderTopWidth and borderTopColor, remove paddingTop
+        - SectionGroup.gap $2 → $3
+        - ItemsStack.gap $1.5 → $0.5
+        - RailButton: backgroundColor transparent, paddingVertical $3.5,
+          remove hoverStyle.borderLeftColor from styled definition (set inline)
+        - IconSlot: remove borderWidth, borderColor, backgroundColor
+        - IconSlot: width/height 28 → 24
+        - LabelSlot: already sentence-case (confirmed), letterSpacing 0
+        - renderItem active state: bg transparent, borderLeftColor $brandSecondary,
+          color $accent, fontWeight 700
+        - renderItem default state: bg transparent, color $color, fontWeight 500
+        - renderMaybeCollapsibleItem: same active-state tokens
+        - renderConfigControl: same active-state tokens
+        - ChildItemsStack.paddingLeft $4 → $6
+
+  testing:
+    - Visual regression: NavigationShell.stories.tsx (expanded + collapsed + drawer)
+    - Keyboard nav: verify ArrowUp/ArrowDown still cycles correctly
+    - Active state: verify aria-current="page" renders on correct item
+    - Collapsed rail: verify tooltip appears and orange border visible
+    - Mobile drawer: verify same visual treatment
+
+  validation_commands:
+    - pnpm -w tsc -p tsconfig.base.json --noEmit
+    - pnpm lint
+    - pnpm -F web build
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 9. Open Questions
+# ──────────────────────────────────────────────────────────────────────────────
+
+open_questions:
+  - question: Should the org-chooser dropdown adopt the same active-state pattern?
+    context: |
+      Currently the dropdown uses $accentSoft fill + $accent left-border for
+      the current workspace. If we shift the rail to orange-border + transparent-bg,
+      the dropdown should probably follow for consistency.
+    recommendation: Yes — update in a follow-up PR to keep this change scoped.
+
+  - question: Should section headings include a numbered prefix (01. 02. 03.)?
+    context: |
+      The Swiss spec calls for numbered section labels on marketing surfaces.
+      Admin nav sections have semantic labels ("Events", "Finance") which may
+      not benefit from numbering.
+    recommendation: No — reserve numbering for content sections, not persistent nav.
+
+  - question: Should hover animation include a slight translateX on the label?
+    context: |
+      The Swiss spec mentions "vertical slide animation" for nav links. A small
+      translateX(2px) on hover could add tactile feedback.
+    recommendation: Try it — add as an optional refinement after the base redesign.

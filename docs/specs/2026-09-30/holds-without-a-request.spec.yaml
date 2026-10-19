@@ -1,0 +1,552 @@
+# holds-without-a-request.spec.yaml
+#
+# Holds that hang off no booking request: an outside booker holding a night
+# for itself, and a place holding a night on its own line. Plus the booking
+# grant that makes someone an outside booker (give, accept, revoke, expire),
+# what an outside booker sees on the place's calendars, and one shared note
+# on every hold, event and booking request.
+#
+# Grilled with the owner 2026-09-29 → 09-30 (rounds 1–6). Decisions are
+# stamped H1–H23. Flow facts were checked against the working tree on
+# 2026-09-30 and re-checked 2026-10-08 after booking-the-night landed
+# (09bec4374, b00e180a9, 1262c82e5); file:line references are the evidence.
+
+version: "1.0"
+updated: "2026-10-08"
+status: confirmed (owner 2026-09-30; canvas picks 2026-10-08; building)
+amends:
+  - "docs/specs/2026-08-25/completed/booking-holds.spec.yaml: FR-001 (a hold may have no request), FR-004 (who may challenge), FR-018 (a place's own hold is confirmed by the place's own publish, not released)."
+  - "docs/specs/2026-08-27/venue-confirmation-and-booking-intents.spec.md: 'Trust for regulars'. The grant goes to an org or a person, carries no capability flags, and is accepted before it counts. The granting UI ships here, not with instant-book."
+related:
+  - "docs/specs/2026-09-25/booking-the-night.spec.yaml: N3 does not apply to request-less holds (H9). N19 / N20 and the owner's 2026-10-01 alignment ruling amend H12 / H13 here (see those decisions)."
+  - "packages/core/src/use-cases/booking-holds/_shared/night-readiness.ts: the one readiness rule both specs call; its holdOwnerKindOf is the seam this spec fills."
+  - docs/decisions/events-have-parties-not-one-owner.md (outside booker; three sides)
+  - "Design canvas: Booking Flow: Bills & Standards (https://claude.ai/artifact/QVdGnAjDwxNyTPa5L5LnMz), row 6"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Every hold hangs off a booking request (BookingHold.bookingRequestId is
+    NOT NULL, cascade-deleted with the request; agreement.prisma:532,549). So
+    an outside booker, who by definition skips the request, cannot pencil a
+    night, and neither can the place for its own programming or for someone it
+    talked to off-platform. The booking grant that defines an outside booker
+    exists only as a model with fixture rows (place.prisma:176): per person
+    only, with no way to give, accept or revoke one.
+  solution: >
+    A hold gets an owner kind: the request (today), an outside booker, or the
+    place. Request-less holds sit in the same lines, with the same positions
+    and challenges, and are resolved by an event existing: the owner books a
+    night by making the event from the hold. The grant becomes a real,
+    accepted, revocable right to make events at a place, held by an org or a
+    person, and it shows the booker which nights are open, held or booked.
+  users:
+    - Place staff (owner, org owners/admins for grants; edit roles for holds)
+    - Outside bookers (grantee person and its delegates, or grantee org's edit-role members)
+    - Named parties on place holds (any person or org on the platform)
+    - Acts with request-backed holds on the same lines (unchanged, but can now be challenged by bookers)
+  surfaces:
+    - web
+    - api
+    - jobs
+
+# ── Decisions (owner, 2026-09-29 → 09-30) ────────────────────────────────────
+
+decisions:
+  - id: H1
+    text: >
+      Three request-less cases are in scope: an outside booker holding for
+      itself; the place holding for someone it spoke to; the place holding for
+      its own event. The last two are one kind, the place hold (H6).
+  - id: H2
+    text: >
+      A booking grant goes to an organisation or a person. For an org, its
+      edit-role members act under it; for a person, the person and their
+      delegates do.
+  - id: H3
+    text: >
+      A booking grant is the right to make events at a place. Holding nights
+      and seeing the place's calendars come with it. One grant means all of it:
+      the canPlaceHolds / canCreateEvents split is dropped.
+  - id: H4
+    text: >
+      Only the place's direct owner, or its owning org's OWNER/ADMIN members,
+      give, edit and revoke grants. A grant does nothing until the grantee
+      accepts it (the person, or an OWNER/ADMIN of the grantee org), the same
+      rule d6d492261 set for org members and delegates.
+  - id: H5
+    text: >
+      Whoever sets a request-less hold owns it and answers challenges on it.
+      A booker hold is owned by the booker; a place hold by the place.
+  - id: H6
+    text: >
+      A place hold is either unassigned or names one person or org on the
+      platform. There are no typed names; people not on the platform are out
+      of scope (creating a Human for them would need its own consent and
+      claim flow).
+  - id: H7
+    text: >
+      A named party is told (email + in-app), sees the hold as an act sees one
+      today (date, place, its position, nobody else's), and may pass: its name
+      comes off and the hold stays with the place, unassigned; staff are told.
+      It is told in-app when the hold is challenged or booked.
+  - id: H8
+    text: >
+      A hold is resolved by an event existing, not by terms. Booking a
+      request-less hold means making the event from it, and that takes the
+      line in the same step.
+  - id: H9
+    text: >
+      booking-the-night N3 (book without terms only on a date the pitch asked
+      for) stands for request-backed holds and does not apply to request-less
+      ones: there is no pitch, and no sender whose consent is missing.
+  - id: H10
+    text: >
+      An outside booker books only when nobody is ahead of it: an empty line,
+      or its own hold at 1st with no open challenge. Otherwise it holds and
+      waits; the place (or anyone with authority, H12) decides by reordering or
+      challenging. The builder refuses a booker's event on a date another
+      party holds.
+  - id: H11
+    text: >
+      New holds join the back of the line. Only the place reorders. The booker
+      releases its own holds; the place may release any hold, the booker is
+      told.
+  - id: H12
+    text: >
+      Anyone who can make events on a calendar (place staff with an edit role,
+      or an outside booker whose grant covers it) may challenge the hold at 1st
+      on any of its dates, in the line or not. The hold's owner answers.
+      AMENDED by booking-the-night N20 and the owner's 2026-10-01 alignment
+      ruling: a challenge needs a live hold BEHIND the 1st that is ready to
+      book (one shared rule, night-readiness.ts findReadyBehind). A booker's
+      or the place's own hold is ready by existing. So a challenger with no
+      hold on the date holds it first (it joins the back) and then
+      challenges; with nobody ready the challenge is refused (NO_ACT_READY).
+  - id: H13
+    text: >
+      A challenge on a request-less hold is answered by booking it (making the
+      event) or releasing it. There is no bare "keep". Deadline 24h, the place
+      may extend it, and a lapsed challenge releases the hold (as today).
+      Request-backed holds answer by booking-the-night N19 (Keep commits to
+      the night: it agrees sent terms, or asks for terms with a 48h clock),
+      which superseded "today's keep/release" on 2026-10-01.
+  - id: H14
+    text: >
+      Request-less holds have no timer and no cap. They end when the date
+      passes, they are released, a challenge lapses, they are booked, or (booker
+      holds) the grant ends.
+  - id: H15
+    text: >
+      Revoking a grant opens a choice: each of the booker's live holds defaults
+      to release, and a kept hold becomes a place hold naming the booker; each
+      upcoming event defaults to staying, the alternative being to withdraw the
+      place's confirmation (the existing path). Never cancel.
+  - id: H16
+    text: >
+      A grant may expire. Booker and staff are warned 7 days ahead. At expiry
+      the booker's holds are released (reason GRANT_ENDED) and its events stay.
+  - id: H17
+    text: >
+      A booker sees, per date on the calendars its grant covers: open; held,
+      with the name of whoever is 1st; or booked, with the organiser's name.
+      Names link to public pages. Its own holds show their position. Nothing
+      else: no counts, no notes, no event details. A place hold that names
+      nobody shows the place's name.
+  - id: H18
+    text: >
+      Notifications per the table in FR-013. A platform-wide notification
+      overview is a separate follow-up.
+  - id: H19
+    text: >
+      Web only. The mobile app is its own endeavour; the scanner needs none of
+      this.
+  - id: H20
+    text: >
+      A request-less hold has no thread. Its history goes to the audit log
+      only; its detail shows who placed it, when, and any open challenge.
+  - id: H21
+    text: >
+      Every hold, event and booking request gets one shared note. Anyone who
+      can open the thing in full can read and edit it. The UI says who can see
+      it. A booker looking at the calendar never sees notes on others' holds.
+  - id: H22
+    text: >
+      No money in this spec. The grant carries no fee; if the place wants a
+      cut, the booker adds it in Splits. Standing deals belong to
+      deal-terms-and-settlement (another session).
+  - id: H23
+    text: >
+      Canvas picks (2026-09-30; canvas republished 2026-10-08 at
+      https://claude.ai/artifact/K5pKC5mDy3gmRrDdywR2d5).
+      Grants live in both places: an "Outside bookers" section in place
+      settings (list, give, revoke) and an "Outside bookers" tab on the place
+      (each booker's holds and events). Revoke is R1, a choice on every row.
+      Holding from the place calendar reuses the existing hold date picker,
+      the one on booking requests; the calendar peek's "Hold this date" opens
+      it on that day. The booker's view is B1, a month grid with a day rail.
+      The booker's nav item appears only for an org or person that has a
+      grant, pending included so it can accept. The note sits inside the real
+      booking request row (under Assigned to / Tags) and the real event
+      builder (N2: the sticky right rail, under "Ready to publish?", so it
+      stays in view while editing; owner 2026-10-08).
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Hold ownership. BookingHold gains ownerKind REQUEST | BOOKER | PLACE.
+        bookingRequestId becomes nullable. New nullable columns: grantId
+        (BOOKER only), holderOrgId / holderHumanId (BOOKER: the grantee;
+        PLACE: the named party or both null), eventId (set when a request-less
+        hold is booked), note / noteUpdatedByHumanId / noteUpdatedAt (FR-012).
+        A CHECK ties columns to kind: REQUEST has a request and no holder or
+        grant; BOOKER has a grant and exactly one holder column; PLACE has no
+        request and no grant and at most one holder column. A new partial
+        unique keeps one live hold per holder per line for BOOKER and named
+        PLACE holds; unassigned place holds are not limited. The request-keyed
+        unique (migration 20260825130000) stays as is. The place of a
+        request-less hold is read through its calendar, never a denormalised
+        column. BookingHoldRecord becomes a discriminated union on ownerKind
+        so every site that reads bookingRequestId has to handle the other two
+        kinds (the 09-30 map found ~40 such sites across core, transport and
+        web).
+    - id: FR-002
+      description: >
+        Booking grant, the record (H2, H3, H4). PlaceBookingGrant: humanId is
+        replaced by granteeOrgId / granteeHumanId (exactly one);
+        canPlaceHolds / canCreateEvents are dropped; new acceptedAt,
+        declinedAt, expiryWarnedAt. Active = accepted, not revoked, not
+        expired. findActiveForHuman resolves an actor through the grantee: the
+        grantee person or its delegates, or an edit-role member of the grantee
+        org. Every caller (place-access.ts:178 inside
+        requirePlaceBookingAuthority, builder-venue-trust.ts:95,
+        create-booking-request-from-event.ts:311, saved-snippet-owner.ts:109)
+        moves to the new lookup. builder-venue-trust stops refusing org
+        owners (its "an org has no grant" rule, :63-66, ends). The
+        capability argument goes with the flags; it is passed today at
+        hold-context.ts:169, place-hold-on-line.ts:95,
+        settle-booking-holds.ts:71, settle-held-dates-for-published-event.ts:371,
+        book-night-without-terms.ts:470, confirm-venue-event.ts:345,
+        venue-confirmation-context.ts:65, agreement-mint-plan.ts:271,
+        cancel-booking.ts:828 and saved-snippet-owner.ts:62.
+        Grant arm of the staff gate (found 2026-10-08, derived from H3, H11,
+        H12, FR-006, FR-007): requirePlaceBookingAuthority (place-access.ts:162)
+        returns via "grant" as if the grantee were staff, so every caller
+        above lets a grantee act on ANY hold or booking at the place: reorder,
+        extend, release others' holds, confirm an act's hold, settle, cancel a
+        booking, mint from an agreement. Harmless while grants exist only in
+        fixtures; a privilege grant the moment FR-003 ships. The grant arm
+        leaves the staff gate. Staff-only actions (reorder, extend, release
+        another's hold, confirm a request hold, settle, cancel booking, the
+        agreement and accept mints, the place's confirmation of someone
+        else's event) require owner or edit-role membership. A grantee passes
+        only the booker gates this spec names: place its own holds (FR-005),
+        challenge (FR-006), release its own (FR-007), book its own (FR-008),
+        and have its own event confirmed by construction (builder-venue-trust).
+    - id: FR-003
+      description: >
+        Give, accept, edit, revoke (H4, H15). Place settings gains "Outside
+        bookers": pick an org or person by their public page (never by email
+        lookup), whole place or one calendar, optional expiry. Giving creates
+        a pending grant and tells the grantee; the grantee accepts or declines
+        from its hub; nothing counts until accepted. Scope and expiry can be
+        edited later. Revoke shows the booker's live holds (default release)
+        and upcoming events (default stay; option: withdraw the place's
+        confirmation via withdrawVenueConfirmation). One transaction releases
+        the unticked holds (GRANT_ENDED) with move-up notices, converts kept
+        holds to PLACE holds naming the booker (FR-005 notice to the booker),
+        and stamps revokedAt; confirmation withdrawals run per event after.
+    - id: FR-004
+      description: >
+        Grant expiry (H16). A daily job warns booker and staff 7 days before
+        expiresAt (once, expiryWarnedAt). At expiry, holds are released as
+        GRANT_ENDED: lazily on read like every other lapse (a new
+        isHoldLapsed branch), and by the same daily job so a line nobody reads
+        still moves up. Events stay. New enum value BookingHoldReleaseReason
+        GRANT_ENDED.
+    - id: FR-005
+      description: >
+        Place a request-less hold. One use case for both kinds, reusing
+        placeHoldOnLine's line lock, settle-before-count, confirmed-winner
+        refusal and position = last. BOOKER: the actor must be covered by an
+        active grant for the calendar; the holder is the grantee. PLACE: the
+        actor needs requirePlaceBookingAuthority staff arm (edit role); an
+        optional named party (org or person picked by public page) and note.
+        Past or invalid dates refused as today (checkHoldDate). The same
+        use case accepts several dates, as placeMany does (limit 12).
+    - id: FR-006
+      description: >
+        Challenge (H12, H13). challengeBookingHold's gate widens from staff to
+        anyone with booking authority on the hold's calendar, and it works on
+        all three kinds. The owner answers: REQUEST as today (keep / release);
+        BOOKER and PLACE by booking (FR-008) or releasing. Extend stays
+        staff-only. Lapse releases as today (EXPIRED). The takeLine guard
+        (an open challenge on another hold refuses the take) applies to every
+        kind. The N20 readiness rule still gates every challenge:
+        holdOwnerKindOf (night-readiness.ts) reads ownerKind, and a BOOKER or
+        PLACE hold behind the 1st counts as ready. REQUEST holds answer per
+        N19.
+    - id: FR-007
+      description: >
+        Release, reorder, pass (H7, H11). The booker releases its own holds;
+        staff release any. Reorder stays staff-only. A named party passes:
+        the holder columns clear, the hold keeps its position, staff are told.
+        Grant revoked or expired: FR-003 / FR-004.
+    - id: FR-008
+      description: >
+        Book a request-less hold (H8, H10). BOOKER: "Book" on a hold at 1st
+        with no open challenge on the line creates the draft event with the
+        booker as owner (organiser), the place confirmed by construction (the
+        grant arm of builder-venue-trust), date and calendar from the hold,
+        startsAt = date + calendar.defaultStartTime; the hold goes CONFIRMED
+        through takeLine (competitors CONFIRMED_OTHER, lost-date notices) and
+        eventId is set. Same shape as booking-the-night FR-001: one
+        transaction for the line, the mint after commit, idempotent on the
+        hold id so a failed mint is retried by booking again. PLACE: "Book"
+        opens the event builder prefilled with date and calendar and a
+        fromHoldId; the save takes the line the same way. A booker's event
+        saved in the builder with no hold takes an empty line (a CONFIRMED
+        hold is written, as booking-the-night N5 does) and is refused with
+        NIGHT_HELD if another party holds the date.
+    - id: FR-009
+      description: >
+        Publish settle (amends 08-25 FR-018). settleHeldDatesForEvent treats a
+        request-less hold that the event already confirmed (eventId matches)
+        as the winner, and a PLACE hold on the line as the winner when the
+        place publishes its own event there with no hold of its own
+        confirmed yet (the top-positioned PLACE hold wins; the others release
+        as CONFIRMED_OTHER). Otherwise unchanged.
+    - id: FR-010
+      description: >
+        Booker's calendar (H17). A read for a grantee over the calendars its
+        grants cover, for a date range: per date open | held { firstName,
+        firstPage } | booked { organiserName, organiserPage }, plus the
+        booker's own holds with position and challenge deadline. Nothing else
+        leaves the server. A PLACE hold that names nobody reports the place as
+        the holder. This read joins the hold-read allowlist
+        (read-scope-guard.test.ts ALLOWED_PREFIXES, :17-68).
+    - id: FR-011
+      description: >
+        Staff calendar. VenueCalendar / HoldDatePicker show request-less holds
+        in their lines, labelled with the holder (booker or named party) or
+        "Place hold", and gain "Hold this date" with no request: pick the
+        calendar, the optional named party, the optional note. The hold's
+        detail shows placed by / when, open challenge and deadline, the note,
+        and actions: challenge, extend, reorder, release, book.
+    - id: FR-012
+      description: >
+        Notes (H21). One note (plain text, 2000 chars) with last-edited-by
+        and when, on BookingHold, Event and BookingRequest. Read and edited by
+        anyone who can open the thing in full: holds, the owner side plus
+        place staff plus a named party; events, anyone with admin access to
+        the event; requests, the sender side and place staff. The field shows
+        who can see it. Saving is last-write-wins with the edited-at stamp as
+        a conflict check ("Changed by X since you opened it").
+    - id: FR-013
+      description: >
+        Notifications (H7, H18). "Booker" = the grantee person, or the grantee
+        org's edit-role members. Routed through the notify channel with
+        idempotency keys {holdId|grantId}:{transition}:{recipient}.
+        | Event                                  | Told                                        |
+        | booker places a hold                   | place staff, in-app                         |
+        | place names a party on a hold          | named party, email + in-app                 |
+        | hold challenged                        | owner, email + in-app; staff, in-app; named party, in-app |
+        | challenge answered or lapsed           | challenger, email + in-app; staff, in-app   |
+        | place releases a booker's hold         | booker, email + in-app                      |
+        | booker releases its own hold           | place staff, in-app                         |
+        | named party passes                     | place staff, in-app                         |
+        | request-less hold booked               | place staff, email + in-app; named party, in-app |
+        | acts on the line lose the date         | existing lost-date notices                  |
+        | grant given / revoked                  | grantee, email + in-app                     |
+        | grant accepted / declined              | place staff who gave it, in-app             |
+        | grant expires in 7 days                | booker and place staff, email + in-app      |
+    - id: FR-014
+      description: >
+        Booker's side of the web app. An org grantee finds its places under
+        its own admin; a person finds them in the hub. Pending grants show
+        there with Accept / Decline. Each place opens the FR-010 calendar with
+        hold, challenge, release and book actions. A named party sees its
+        place holds beside its request holds (ActHoldsPanel) with Pass.
+    - id: FR-015
+      description: >
+        Organizer persona in the dev seed (owner, canvas note 2026-09-30;
+        meaning confirmed 2026-10-08). The
+        seed has no organizer-only org today; every seeded org owns places
+        (apps/api/src/scripts/seed/ids.ts, fixtures.ts). Add one org that owns
+        no place, with a dev login, an accepted grant at a seeded place and a
+        second pending one, a few booker holds and one booked event, so the
+        booker's nav item, calendar and invitation can be driven locally.
+  non_functional:
+    - id: NFR-001
+      description: >
+        Line invariants hold for every kind: one CONFIRMED per line (existing
+        partial unique), one open challenge per line, every mutation under the
+        line's advisory lock with settle-before-count, CAS on status.
+    - id: NFR-002
+      description: >
+        No new way to find people by email. Grant and named-party pickers
+        search public pages (org / person entity pages) only. Grant invites
+        and named-party notices are rate-capped per place (grant invites
+        20/day; named-party notices 50/day).
+    - id: NFR-003
+      description: >
+        Deliberate swallows in the notify paths use ReporterPort (CLAUDE.md
+        convention) with regression tests.
+    - id: NFR-004
+      description: >
+        i18n en + es in apps/web/src/i18n/messages/{en,es}.ts with argument
+        parity; never packages/locale/messages. "Place" in all copy, never
+        "venue". Keyboard-operable, 320px-clean, zero new console errors on
+        every new control, driven in the real app.
+    - id: NFR-005
+      description: >
+        New refusals carry translated messages: NIGHT_HELD { date, holderName },
+        GRANT_NOT_ACCEPTED, GRANT_REQUIRED, HOLD_NOT_FIRST (booking a hold not
+        at 1st), CHALLENGE_ANSWER_NEEDS_BOOK_OR_RELEASE.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: givePlaceBookingGrant / respondToPlaceBookingGrant / updatePlaceBookingGrant
+        description: FR-003. Give (owner/admin), accept or decline (grantee owner/admin or person), edit scope/expiry.
+        idempotent: true
+        money: false
+      - name: previewGrantRevoke / revokePlaceBookingGrant
+        description: FR-003. Preview lists live holds and upcoming events; revoke applies the keep choices in one transaction.
+        idempotent: true
+        money: false
+      - name: settlePlaceBookingGrants (job)
+        description: FR-004. 7-day warning, release at expiry.
+        idempotent: true
+        money: false
+      - name: placeRequestlessHolds
+        description: FR-005. BOOKER or PLACE kind, one or more dates, shares placeHoldOnLine.
+        idempotent: false
+        money: false
+      - name: bookRequestlessHold
+        description: FR-008. Take the line and mint (BOOKER) or return the builder prefill (PLACE).
+        idempotent: true
+        money: false
+      - name: passNamedHold
+        description: FR-007. Named party takes its name off.
+        idempotent: true
+        money: false
+      - name: getBookerCalendar
+        description: FR-010. open / held / booked per date, own holds.
+        idempotent: true
+        money: false
+      - name: setNote
+        description: FR-012. One use case, subject = hold | event | request, gate per subject.
+        idempotent: true
+        money: false
+      - name: (modified) challenge / answer / release / reorder / extend / settle / takeLine / settleHeldDatesForEvent / hold-context
+        description: Handle all three owner kinds; hold-context resolves the place through the calendar when there is no request.
+  ports:
+    new: []
+    existing:
+      - "BookingHoldsRepo (create/listLine/listForHolder/updateHolder/setNote)"
+      - "PlaceBookingGrantsRepo (findActiveForActor, create, accept, decline, update, revoke, listForPlace, listForGrantee, listExpiring)"
+      - "EventsRepo / BookingRequestsRepo (setNote)"
+  adapters:
+    existing:
+      - packages/adapters (Prisma booking-holds, place-booking-grants, events, booking-requests)
+  transport:
+    trpc_procedures:
+      - placeBookingGrants.{give, respond, update, previewRevoke, revoke, listForPlace, listMine}
+      - bookingHolds.{placeRequestless, book, pass, bookerCalendar}
+      - notes.set
+  ui:
+    pages:
+      - "Place settings → Outside bookers (apps/web/src/app/admin/[slug]/places/[placeId]/settings)"
+      - "Booker: places I can book + per-place calendar (org admin and person hub; route chosen on the canvas)"
+    components:
+      - Grant dialog, revoke dialog
+      - VenueCalendar / HoldDatePicker — "Hold this date", request-less hold chips and detail
+      - Booker calendar (open / held / booked)
+      - ActHoldsPanel — named place holds with Pass
+      - NoteField (shared) on hold detail, event builder, booking request thread
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models:
+    - "BookingHold: ownerKind, bookingRequestId nullable, grantId, holderOrgId, holderHumanId, eventId, note, noteUpdatedByHumanId, noteUpdatedAt; CHECK by kind; partial unique per holder per line"
+    - "PlaceBookingGrant: granteeOrgId / granteeHumanId (XOR) replacing humanId; drop canPlaceHolds / canCreateEvents; acceptedAt, declinedAt, expiryWarnedAt"
+    - "Event: note, noteUpdatedByHumanId, noteUpdatedAt"
+    - "BookingRequest: note, noteUpdatedByHumanId, noteUpdatedAt"
+    - "enum BookingHoldOwnerKind (new); BookingHoldReleaseReason + GRANT_ENDED"
+  migrations_needed: true
+  backfill: >
+    Existing holds → ownerKind REQUEST. Grant rows exist only in fixtures and
+    seeds: humanId → granteeHumanId with acceptedAt = createdAt.
+
+# ── Risks ────────────────────────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Blast radius. ~40 sites assume a hold has a request (thread ledger,
+      assignee routing, overlay names, per-request reads, the notifier's
+      resolveHint).
+    severity: HIGH
+    mitigation: >
+      Discriminated-union record type so the compiler finds every site;
+      request-less branches write audit only (H20).
+  - risk: >
+      Other sessions hold uncommitted work in the same files (booking-the-night
+      touches confirm and takeLine; lineup v2 backend; the parties decision).
+    severity: HIGH
+    mitigation: >
+      Re-read each file before writing; temp-index commits of own hunks only;
+      coordinate FR-008 with booking-the-night FR-001 (same take-then-mint shape).
+  - risk: >
+      A booker challenging an act's request hold puts the act on a 24h clock
+      it did not expect from a third party.
+    severity: MEDIUM
+    mitigation: >
+      The place is told of every challenge and can extend the deadline
+      (FR-006, FR-013).
+  - risk: >
+      Shared notes (H21): staff write about an act on a request-backed hold the
+      act can read.
+    severity: MEDIUM
+    mitigation: "The field says who can see it, every time."
+  - risk: Named-party notices used as spam.
+    severity: LOW
+    mitigation: Public-page picker, per-place cap (NFR-002), Pass.
+
+open_questions: []
+# Closed 2026-10-08: the flag to booking-the-night (does H8 apply to
+# request-backed holds?) was answered there before it was sent: N19 makes
+# Keep a commitment to the night, and the owner's 2026-10-01 alignment ruling
+# makes request-less holds count as ready under N20. See H12 / H13.
+
+out_of_scope:
+  - The mobile app (own endeavour) and the scanner.
+  - Money between place and booker (deal-terms-and-settlement).
+  - Creating Humans for people not on the platform.
+  - A thread or ledger for request-less holds (audit log only).
+  - A platform-wide notification overview (follow-up).
+  - Series: a booker's recurring event checks H10 per occurrence date at save; no series-level hold.
+
+# ── Acceptance criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A place admin gives an org a grant on one calendar; nothing works for the org until one of its admins accepts; then its editors see that calendar only, as open / held / booked.
+  - An editor at the place gets no "Outside bookers" controls; the server refuses them too.
+  - The booker holds Fri 17 Oct on an empty line (1st), books it → a DRAFT event owned by the booker exists, confirmed by the place, and the hold is CONFIRMED with eventId set; place staff get email + in-app.
+  - The booker holds Sat 18 Oct behind an act's request hold (2nd); Book is absent and refused (HOLD_NOT_FIRST); the booker challenges the act's hold; the act answers keep; the booker is told; the line is unchanged.
+  - The place challenges the booker's hold at 1st; the booker lets it lapse → released EXPIRED, the next hold moves up with a notice.
+  - The booker saves an event in the builder on a date an act holds → NIGHT_HELD naming the act.
+  - Staff hold a date naming a band on the platform → the band gets email + in-app, sees "1st hold" in its holds, passes → the hold stays, unassigned, staff are told.
+  - A booker viewing that date sees the place's name, not the note, while it is unassigned; the band's name while named.
+  - The place publishes its own event on a date its own hold sits on → that hold is CONFIRMED, other holds on the line lose the date.
+  - Revoke with one hold kept and one event's confirmation withdrawn → the kept hold becomes a place hold naming the booker, the other holds release GRANT_ENDED with move-ups, the event drops to address-only, the booker is told.
+  - A grant that expires in 7 days warns both sides once; at expiry the booker's holds are released and its events remain.
+  - A note written on a booking request by place staff is readable and editable by the sender; the field says who can see it.

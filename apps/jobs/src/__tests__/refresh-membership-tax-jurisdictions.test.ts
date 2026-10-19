@@ -1,5 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 
+// `jobs/memberships` gained an alerting job (`memberships.report-health`), so
+// importing the module now pulls in `../lib/discord-alerts` — which reads
+// `../lib/env` at module scope and throws on a missing DATABASE_URL. Same
+// mock, same reason, as `disputes.test.ts`.
+vi.mock("../lib/discord-alerts", () => ({
+  fireDiscordAlert: vi.fn(async () => undefined),
+  buildCloudLoggingUrl: () => null,
+}));
+
 import { refreshMembershipTaxJurisdictions } from "../jobs/memberships";
 
 /**

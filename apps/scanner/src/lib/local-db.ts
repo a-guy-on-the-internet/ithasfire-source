@@ -2,17 +2,71 @@ import { openDatabaseSync, type SQLiteDatabase } from "expo-sqlite";
 
 import { buildFtsMatch } from "./people-search-tokens";
 import { planQueuedUndo } from "./queued-undo-plan";
+import { reportRetentionIssue } from "./report";
 
 let _db: SQLiteDatabase | null = null;
 let _ftsAvailable = true;
 
+/**
+ * Steps that make deleted attendee data harder to recover from the file, or
+ * that tidy the index. None of them may break opening the database or a wipe,
+ * so each is guarded, and a failure is reported once per step per app run
+ * (some of these run on every wipe or every launch).
+ */
+const reportedBestEffort = new Set<string>();
+function reportOnce(branch: string, err: unknown): void {
+  if (reportedBestEffort.has(branch)) return;
+  reportedBestEffort.add(branch);
+  reportRetentionIssue(err, { branch });
+}
+function bestEffort(branch: string, run: () => void): void {
+  try {
+    run();
+  } catch (err) {
+    reportOnce(branch, err);
+  }
+}
+
 function db(): SQLiteDatabase {
   if (!_db) {
     _db = openDatabaseSync("scanner.db");
-    _db.execSync("PRAGMA journal_mode = WAL;");
-    migrate(_db);
+    const opened = _db;
+    opened.execSync("PRAGMA journal_mode = WAL;");
+    // Overwrite deleted rows with zeroes instead of leaving them on free
+    // pages. Per connection, so it is set on every open.
+    bestEffort("secure_delete_pragma", () =>
+      opened.execSync("PRAGMA secure_delete = ON;"),
+    );
+    migrate(opened);
+    // Once per launch: the index is rebuilt from the people rows. Installs
+    // from before the index could be emptied carry entries for people long
+    // dropped, and a rebuild that failed or was cut off (the rows and the
+    // index are two transactions) is never retried otherwise.
+    bestEffort("launch_index_rebuild", () => rebuildPeopleFts(opened));
   }
   return _db;
+}
+
+/**
+ * Fold the write-ahead log back into the database file and truncate it, so
+ * rows a wipe just deleted do not sit in `scanner.db-wal`.
+ *
+ * A checkpoint that another reader blocks does not throw: SQLite answers
+ * `busy = 1` and leaves the log as it was. That is reported too (once per app
+ * run), as `wal_checkpoint_busy`.
+ */
+function checkpointWal(d: SQLiteDatabase): void {
+  bestEffort("wal_checkpoint", () => {
+    const result = d.getFirstSync<{ busy: number }>(
+      "PRAGMA wal_checkpoint(TRUNCATE);",
+    );
+    if (result?.busy) {
+      reportOnce(
+        "wal_checkpoint_busy",
+        new Error("wal_checkpoint(TRUNCATE) was blocked by a reader"),
+      );
+    }
+  });
 }
 
 /** Probe FTS5 availability at migration time. Expo SQLite ships with FTS5 on
@@ -81,7 +135,12 @@ function migrate(d: SQLiteDatabase) {
       -- FR-006a: the scan_queue row this admit is waiting on, when it never
       -- reached the server. NULL means "server-acknowledged (or never
       -- queued)", which is the online-only undo path.
-      queue_id       TEXT
+      queue_id       TEXT,
+      -- The server answered this admit REJECTED / REPLAY: the shared verdict
+      -- key it was refused with. NULL for an admission that stands. A refused
+      -- row stays VISIBLE (the operator was told to look for it) but is never
+      -- undoable and never counts toward the re-admit guard.
+      refused_key    TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_recent_scans_at ON recent_scans(scanned_at DESC);
@@ -146,6 +205,13 @@ function migrate(d: SQLiteDatabase) {
   // (event_id, ticket_code) match for exactly those rows.
   try {
     d.execSync("ALTER TABLE recent_scans ADD COLUMN queue_id TEXT;");
+  } catch {
+    // column already present
+  }
+
+  // Same precedent, for a refused admit's marker (see the CREATE above).
+  try {
+    d.execSync("ALTER TABLE recent_scans ADD COLUMN refused_key TEXT;");
   } catch {
     // column already present
   }
@@ -489,6 +555,20 @@ export function listDueQueuedScans(nowMs: number): QueuedScan[] {
 }
 
 /**
+ * Whether this admit is still waiting in the queue. A pass over the queue
+ * works from rows it read earlier; by the time one is answered the row may be
+ * gone (the sign-out purge, an undo), and then nothing is written for it.
+ */
+export function isScanQueued(queueId: string): boolean {
+  return (
+    db().getFirstSync<{ present: number }>(
+      "SELECT 1 AS present FROM scan_queue WHERE queue_id = ?",
+      queueId,
+    ) != null
+  );
+}
+
+/**
  * Drop a queue row AND clear every `recent_scans.queue_id` pointing at it, in
  * one transaction.
  *
@@ -733,6 +813,7 @@ export function wasRecentlyAdmittedOnThisDevice(args: {
          AND ticket_code = ? COLLATE NOCASE
          AND kind = 'ticket'
          AND undone = 0
+         AND refused_key IS NULL
          AND scanned_at >= ?`,
     args.eventId,
     args.ticketCode,
@@ -765,6 +846,13 @@ export type RecentScan = {
    * pointer to a queue row that no longer exists.
    */
   queueId: string | null;
+  /**
+   * The shared verdict key the server refused this admit with (REJECTED /
+   * REPLAY), or null when the admission stands. A refused row is shown, marked
+   * NOT ADMITTED, and is never undoable: there is no admission of ours to undo
+   * (on a REPLAY, undoing would revert SOMEONE ELSE's).
+   */
+  refusedKey: string | null;
 };
 
 export function recordRecentScan(args: {
@@ -787,7 +875,14 @@ export function recordRecentScan(args: {
     args.kind,
     scannedAt,
   );
-  return { scanId, ...args, scannedAt, undone: false, queueId: null };
+  return {
+    scanId,
+    ...args,
+    scannedAt,
+    undone: false,
+    queueId: null,
+    refusedKey: null,
+  };
 }
 
 type RecentScanRowSql = {
@@ -800,6 +895,7 @@ type RecentScanRowSql = {
   scanned_at: number;
   undone: number;
   queue_id: string | null;
+  refused_key?: string | null;
 };
 
 const toRecentScan = (r: RecentScanRowSql): RecentScan => ({
@@ -814,6 +910,7 @@ const toRecentScan = (r: RecentScanRowSql): RecentScan => ({
   // Rows written before the queue_id column existed read back as undefined,
   // not null — normalise so callers only ever branch on null.
   queueId: r.queue_id ?? null,
+  refusedKey: r.refused_key ?? null,
 });
 
 export function listRecentScans(limit = 5): RecentScan[] {
@@ -823,6 +920,23 @@ export function listRecentScans(limit = 5): RecentScan[] {
       limit,
     )
     .map(toRecentScan);
+}
+
+/**
+ * The server refused this admit (REJECTED / REPLAY). Keeps the row visible —
+ * the operator may be told to find it — while taking it out of every
+ * "an admission stands" path (undo, re-admit guard).
+ *
+ * Setting `refused_key` on a row that is already `undone` is harmless: the
+ * strip hides undone rows, and both the undo path and the re-admit guard
+ * already skip them, so the extra marker changes nothing anyone reads.
+ */
+export function markRecentScanRefused(scanId: string, verdictKey: string): void {
+  db().runSync(
+    "UPDATE recent_scans SET refused_key = ? WHERE scan_id = ?",
+    verdictKey,
+    scanId,
+  );
 }
 
 export function markRecentScanUndone(scanId: string): void {
@@ -944,26 +1058,86 @@ export function undoQueuedScanLocally(args: {
 // ── Cleanup ────────────────────────────────────────────────────────────────
 
 /**
+ * Tables that hold attendee data or the manifest it came with: names and
+ * emails (`people`), a holder's name (`recent_scans.holder_display`), and the
+ * tickets and events they belong to.
+ */
+const ATTENDEE_TABLES = ["people", "tickets", "events", "recent_scans"] as const;
+
+/**
+ * The offline scan queue and its terminal drops. Ticket codes and client keys
+ * (bearer credentials) plus the last error text; no name or email column.
+ */
+const QUEUE_TABLES = ["scan_queue", "dropped_scans"] as const;
+
+/**
+ * Empty the given tables, and the people search index when `people` is one of
+ * them. Every statement runs even when an earlier one fails, so one bad table
+ * cannot leave the rest on the device; the FIRST failure is then rethrown.
+ *
+ * The index is emptied with FTS5's `'delete-all'` command, not a `DELETE` (see
+ * "The people search index" below): with every people row gone, an empty
+ * index is the right one.
+ */
+function wipeTables(tables: readonly string[]): void {
+  const d = db();
+  const failures: unknown[] = [];
+  const attempt = (run: () => void) => {
+    try {
+      run();
+    } catch (err) {
+      failures.push(err);
+    }
+  };
+  for (const table of tables) {
+    attempt(() => d.execSync(`DELETE FROM ${table};`));
+  }
+  if (_ftsAvailable && tables.includes("people")) {
+    attempt(() =>
+      d.execSync("INSERT INTO people_fts(people_fts) VALUES('delete-all');"),
+    );
+  }
+  checkpointWal(d);
+  if (failures.length > 0) throw failures[0];
+}
+
+/**
  * Sign-out purge (NFR-005). EVERY local artifact goes.
  *
  * `dropped_scans` is in the list deliberately and not by accident: those rows
  * carry ticket codes and client keys — bearer credentials — for an operator who
  * is signing out. Leaving them behind would strand another operator's admits on
  * a shared device, which is the exact class of leak this purge exists to
- * prevent. Anything added to `migrate()` must be added here in the same change.
+ * prevent. Anything added to `migrate()` must be added to
+ * {@link ATTENDEE_TABLES} or {@link QUEUE_TABLES} in the same change.
+ *
+ * Throws the first failure after trying every table and the index. The
+ * caller decides who hears it: `signOut` in
+ * `features/auth/use-scanner-session.ts` catches it and warns in dev only.
  */
 export function clearAll(): void {
-  const d = db();
-  d.execSync(
-    "DELETE FROM tickets; DELETE FROM events; DELETE FROM scan_queue; DELETE FROM recent_scans; DELETE FROM people; DELETE FROM dropped_scans;",
-  );
-  if (_ftsAvailable) {
-    try {
-      d.execSync("DELETE FROM people_fts;");
-    } catch {
-      // FTS table may not exist if probe lied; ignore.
-    }
-  }
+  wipeTables([...ATTENDEE_TABLES, ...QUEUE_TABLES]);
+}
+
+/**
+ * The access-denied wipe: the server answered that the signed-in person holds
+ * no scan role (`use-access-revocation.ts`). The attendee data goes; the
+ * person is still signed in.
+ *
+ * LEFT ON PURPOSE: `scan_queue` and `dropped_scans`. They are admits made at
+ * the door that the server has not recorded yet, and losing the scanner shell
+ * is not losing the right to record them: `tickets.scanTicket` accepts roles
+ * `scanner.getSessionContext` refuses (EDITOR), so a wipe here would erase
+ * admits the server would still take. The queue keeps flushing while someone
+ * is signed in (`scanner-app.tsx`). A queued admit the server does refuse
+ * lands in `dropped_scans` with its Sentry report, as it always has, so rows
+ * appearing there AFTER this wipe are expected. Sign-out removes both tables.
+ *
+ * Throws the first failure after trying every table and the index; the caller
+ * reports it (`access-denied-wipe.ts`).
+ */
+export function clearAttendeeData(): void {
+  wipeTables(ATTENDEE_TABLES);
 }
 
 // ── People (unified search directory) ──────────────────────────────────────
@@ -1013,12 +1187,104 @@ const toLocalPersonRow = (r: PeopleRowSql): LocalPersonRow => ({
   syncedAt: r.synced_at,
 });
 
+/**
+ * ## The people search index
+ *
+ * `people_fts` is a CONTENTLESS FTS5 table (`content=''`), and SQLite refuses
+ * every `DELETE` on one ("cannot DELETE from contentless fts5 table"). So an
+ * index entry is never deleted on its own here:
+ *
+ *   - a NEW person is inserted into the index (`upsertPeople`);
+ *   - everything else that changes what the index should hold (rows dropped, a
+ *     name or email changed) rebuilds it from the rows that remain, with
+ *     {@link rebuildPeopleFts};
+ *   - a wipe empties it with `'delete-all'` (`clearAll`, `clearAttendeeData`);
+ *   - every launch rebuilds it once (`db()`).
+ *
+ * The rebuild lowercases with SQL `LOWER` where `upsertPeople` uses JS. Both
+ * index the same tokens: the `unicode61` tokenizer folds case on its own.
+ *
+ * Covered against a real SQLite in `local-db-people.test.ts`.
+ */
+function rebuildPeopleFts(d: SQLiteDatabase): void {
+  if (!_ftsAvailable) return;
+  d.withTransactionSync(() => {
+    d.execSync("INSERT INTO people_fts(people_fts) VALUES('delete-all');");
+    d.execSync(
+      `INSERT INTO people_fts (rowid, display_name, email_lower)
+       SELECT id, COALESCE(display_name, ''), LOWER(COALESCE(email, ''))
+         FROM people;`,
+    );
+  });
+}
+
+/**
+ * Delete people rows, then bring the index in line. Returns how many rows
+ * went. The rows are committed BEFORE the rebuild, so a failing rebuild cannot
+ * keep them on the device; it throws, and the caller reports it.
+ */
+function dropPeopleRows(deleteRows: (d: SQLiteDatabase) => number): number {
+  const d = db();
+  let removed = 0;
+  d.withTransactionSync(() => {
+    removed = deleteRows(d);
+  });
+  if (removed > 0) rebuildPeopleFts(d);
+  return removed;
+}
+
+/** What the index holds for a person: see the `INSERT` in `upsertPeople`. */
+const indexedText = (displayName: string | null, email: string | null) =>
+  `${displayName ?? ""}\u0000${(email ?? "").toLowerCase()}`;
+
+const personKey = (humanId: string, kind: string) => `${kind}\u0000${humanId}`;
+
+/**
+ * Write one event's manifest people into the cache.
+ *
+ * Runs for every listed event on every sync tick, so it is built to do almost
+ * nothing when nothing changed: the event's rows are read once, only a new or
+ * changed person is written, and `synced_at` is stamped for the whole event in
+ * one statement.
+ *
+ * A cached person who is ABSENT from the manifest is kept. The manifest is not
+ * always the whole list: the server returns the first 10,000 tickets and the
+ * first 10,000 signups of an event (`MANIFEST_PAGE_LIMIT`,
+ * `get-scanner-event-manifest.ts`), so absence does not prove the person left.
+ *
+ * Throws when the index cannot be rebuilt after a name or email changed, with
+ * the rows already written; the caller reports it (`use-local-sync.ts`).
+ */
 export function upsertPeople(eventId: string, people: ManifestPerson[]): void {
   if (people.length === 0) return;
   const d = db();
   const now = Date.now();
+  // A person already indexed whose name or email changed. Their old entry
+  // cannot be deleted (see above), so the index is rebuilt once at the end.
+  let indexStale = false;
 
   d.withTransactionSync(() => {
+    const cached = new Map<
+      string,
+      {
+        display_name: string | null;
+        email: string | null;
+        signup_status: string | null;
+      }
+    >();
+    for (const row of d.getAllSync<{
+      human_id: string;
+      kind: string;
+      display_name: string | null;
+      email: string | null;
+      signup_status: string | null;
+    }>(
+      "SELECT human_id, kind, display_name, email, signup_status FROM people WHERE event_id = ?",
+      eventId,
+    )) {
+      cached.set(personKey(row.human_id, row.kind), row);
+    }
+
     const upsertStmt = d.prepareSync(
       `INSERT INTO people (human_id, event_id, kind, display_name, email, signup_status, synced_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1031,37 +1297,63 @@ export function upsertPeople(eventId: string, people: ManifestPerson[]): void {
 
     try {
       for (const p of people) {
+        const key = personKey(p.humanId, p.kind);
+        const before = cached.get(key);
+        const signupStatus = p.signupStatus ?? null;
+        if (
+          before &&
+          before.display_name === p.displayName &&
+          before.email === p.email &&
+          before.signup_status === signupStatus
+        ) {
+          continue;
+        }
         upsertStmt.executeSync(
           p.humanId,
           eventId,
           p.kind,
           p.displayName,
           p.email,
-          p.signupStatus ?? null,
+          signupStatus,
           now,
         );
-        if (_ftsAvailable) {
-          const idRow = d.getFirstSync<{ id: number }>(
-            "SELECT id FROM people WHERE human_id = ? AND event_id = ? AND kind = ?",
-            p.humanId,
-            eventId,
-            p.kind,
-          );
-          if (idRow) {
-            d.runSync("DELETE FROM people_fts WHERE rowid = ?", idRow.id);
-            d.runSync(
-              "INSERT INTO people_fts (rowid, display_name, email_lower) VALUES (?, ?, ?)",
-              idRow.id,
-              p.displayName ?? "",
-              (p.email ?? "").toLowerCase(),
-            );
+        // So a person listed twice in one manifest is written once.
+        cached.set(key, {
+          display_name: p.displayName,
+          email: p.email,
+          signup_status: signupStatus,
+        });
+        if (!_ftsAvailable) continue;
+        if (before) {
+          if (
+            indexedText(before.display_name, before.email) !==
+            indexedText(p.displayName, p.email)
+          ) {
+            indexStale = true;
           }
+          continue;
+        }
+        const idRow = d.getFirstSync<{ id: number }>(
+          "SELECT id FROM people WHERE human_id = ? AND event_id = ? AND kind = ?",
+          p.humanId,
+          eventId,
+          p.kind,
+        );
+        if (idRow) {
+          d.runSync(
+            "INSERT INTO people_fts (rowid, display_name, email_lower) VALUES (?, ?, ?)",
+            idRow.id,
+            p.displayName ?? "",
+            (p.email ?? "").toLowerCase(),
+          );
         }
       }
     } finally {
       upsertStmt.finalizeSync();
     }
+    d.runSync("UPDATE people SET synced_at = ? WHERE event_id = ?", now, eventId);
   });
+  if (indexStale) rebuildPeopleFts(d);
 }
 
 /**
@@ -1142,80 +1434,84 @@ export function lookupPersonName(
   return row?.display_name?.trim() || null;
 }
 
+/**
+ * The three drops below delete people rows and then rebuild the search index
+ * from what is left (see "The people search index" above). Each THROWS when
+ * the index cannot be brought in line, with the rows already gone.
+ */
 export function dropPeopleForEvent(eventId: string): void {
-  const d = db();
-  d.withTransactionSync(() => {
-    if (_ftsAvailable) {
-      try {
-        d.runSync(
-          "DELETE FROM people_fts WHERE rowid IN (SELECT id FROM people WHERE event_id = ?)",
-          eventId,
-        );
-      } catch {
-        // ignore
-      }
+  dropPeopleRows(
+    (d) => d.runSync("DELETE FROM people WHERE event_id = ?", eventId).changes,
+  );
+}
+
+/**
+ * Drop everything cached for an event that is not in `keepEventIds`: its
+ * people, its tickets, its recent scans (a holder's name is on each) and the
+ * event row. Returns how many people rows went.
+ *
+ * `keepEventIds` is the event list the server just answered with, so an empty
+ * list drops every event. Whether that list is a real answer is the caller's
+ * decision (`use-local-sync.ts`); this function trusts it.
+ *
+ * NOT dropped: `scan_queue` and `dropped_scans`. Those are admits made at the
+ * door, and losing the event from the list does not stop them being sent (see
+ * `clearAttendeeData`).
+ *
+ * The departed events are read from the tables and deleted one event at a
+ * time, instead of one `event_id NOT IN (?, ?, …)`: a platform admin's list
+ * can run to tens of thousands of ids, past SQLite's bound-parameter limit.
+ */
+export function dropEventsNotIn(keepEventIds: readonly string[]): number {
+  const keep = new Set(keepEventIds);
+  return dropPeopleRows((d) => {
+    const cached = d.getAllSync<{ event_id: string }>(
+      `SELECT event_id FROM people
+       UNION SELECT event_id FROM tickets
+       UNION SELECT event_id FROM recent_scans
+       UNION SELECT event_id FROM events`,
+    );
+    let removed = 0;
+    for (const { event_id: eventId } of cached) {
+      if (keep.has(eventId)) continue;
+      removed += d.runSync(
+        "DELETE FROM people WHERE event_id = ?",
+        eventId,
+      ).changes;
+      d.runSync("DELETE FROM tickets WHERE event_id = ?", eventId);
+      d.runSync("DELETE FROM recent_scans WHERE event_id = ?", eventId);
+      d.runSync("DELETE FROM events WHERE event_id = ?", eventId);
     }
-    d.runSync("DELETE FROM people WHERE event_id = ?", eventId);
+    return removed;
   });
 }
 
-export function dropAllPeople(): void {
-  const d = db();
-  d.withTransactionSync(() => {
-    if (_ftsAvailable) {
-      try {
-        d.execSync("DELETE FROM people_fts;");
-      } catch {
-        // ignore
-      }
-    }
-    d.execSync("DELETE FROM people;");
-  });
-}
-
+/**
+ * Drop people rows not synced for `staleAfterMs` whose event is not in
+ * `activeEventIds`. Same one-event-at-a-time delete as {@link dropEventsNotIn},
+ * for the same bound-parameter reason.
+ */
 export function dropStalePeople(opts: {
   staleAfterMs: number;
-  activeEventIds: string[];
+  activeEventIds: readonly string[];
 }): void {
   const cutoff = Date.now() - opts.staleAfterMs;
-  const d = db();
-  d.withTransactionSync(() => {
-    if (opts.activeEventIds.length === 0) {
-      // No active events — drop anything older than the cutoff.
-      if (_ftsAvailable) {
-        try {
-          d.runSync(
-            "DELETE FROM people_fts WHERE rowid IN (SELECT id FROM people WHERE synced_at < ?)",
-            cutoff,
-          );
-        } catch {
-          // ignore
-        }
-      }
-      d.runSync("DELETE FROM people WHERE synced_at < ?", cutoff);
-      return;
-    }
-    const placeholders = opts.activeEventIds.map(() => "?").join(", ");
-    if (_ftsAvailable) {
-      try {
-        d.runSync(
-          `DELETE FROM people_fts WHERE rowid IN (
-             SELECT id FROM people
-              WHERE synced_at < ? AND event_id NOT IN (${placeholders})
-           )`,
-          cutoff,
-          ...opts.activeEventIds,
-        );
-      } catch {
-        // ignore
-      }
-    }
-    d.runSync(
-      `DELETE FROM people
-        WHERE synced_at < ? AND event_id NOT IN (${placeholders})`,
+  const active = new Set(opts.activeEventIds);
+  dropPeopleRows((d) => {
+    const stale = d.getAllSync<{ event_id: string }>(
+      "SELECT DISTINCT event_id FROM people WHERE synced_at < ?",
       cutoff,
-      ...opts.activeEventIds,
     );
+    let removed = 0;
+    for (const { event_id: eventId } of stale) {
+      if (active.has(eventId)) continue;
+      removed += d.runSync(
+        "DELETE FROM people WHERE event_id = ? AND synced_at < ?",
+        eventId,
+        cutoff,
+      ).changes;
+    }
+    return removed;
   });
 }
 

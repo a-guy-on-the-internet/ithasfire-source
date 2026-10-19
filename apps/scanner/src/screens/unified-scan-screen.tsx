@@ -10,7 +10,7 @@ import {
   type LayoutChangeEvent,
 } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
-import { Keyboard as KeyboardIcon, ShieldAlert } from "lucide-react-native";
+import { Keyboard as KeyboardIcon } from "lucide-react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import {
@@ -43,6 +43,7 @@ import {
   lookupPersonName,
   lookupTicketByCode,
   markTicketScannedLocally,
+  markRecentScanRefused,
   markTicketValidLocally,
   recordRecentScan,
   wasRecentlyAdmittedOnThisDevice,
@@ -69,12 +70,32 @@ import {
   railHoldable,
   railTapDismissable,
 } from "../lib/scan-rail-plan";
-import { presentScanResult } from "../lib/scan-result-presentation";
+import {
+  presentScanResult,
+  verdictStampKey,
+  type ScanResultDescriptor,
+} from "../lib/scan-result-presentation";
+import {
+  planAdmitSettlement,
+  planRefusalSurface,
+  type RefusalDescriptor,
+} from "../lib/admit-settlement";
+import type { FeedbackKind } from "../lib/feedback-signatures";
 import { describeScanResult } from "../lib/scan-result-types";
 import { safeTimeString } from "../lib/format";
 import { viewfinderSize } from "../lib/viewfinder";
 import { enqueueScan } from "../lib/use-scan-queue";
 import { trpc } from "../trpc";
+
+/**
+ * What takes the screen INSTEAD of a result: a round trip that threw (lookup or
+ * record), or an admit that settled as something other than ACCEPTED. Both
+ * render through the shared verdict map, so they read the same as on the web.
+ */
+type ScreenFailure = Extract<
+  ScanResultDescriptor,
+  { kind: "failure" } | { kind: "admit_settled" }
+>;
 
 // ── Inline session context shape ────────────────────────────────────────────
 // ScannerSessionContext (RouterOutputs["scanner"]["getSessionContext"]) resolves
@@ -99,7 +120,12 @@ import { LoadingState } from "../ui/loading-state";
 import { ScanFeedbackButton } from "../ui/scan-feedback-button";
 import { TorchButton } from "../ui/torch-button";
 import { RecentScansStrip } from "./recent-scans-strip";
-import { UnifiedResultView, type AnyScanResult } from "./unified-result-view";
+import {
+  SCAN_GLYPH_COMPONENTS,
+  UnifiedResultView,
+  type AnyScanResult,
+} from "./unified-result-view";
+import { LateRefusalNotice } from "./late-refusal-notice";
 import type { SameOrderTicket } from "../lib/scan-result-types";
 import { UnifiedSearchScreen } from "./unified-search-screen";
 
@@ -121,12 +147,28 @@ type AdmitOptions = {
   reResolve?: boolean;
   /** Suppress the success cue when the caller already fired one. */
   silentFeedback?: boolean;
+  /** This admit is express's auto-admit (Sentry tagging only). */
+  express?: boolean;
+  /**
+   * Called whenever the admission is IN and this admit still owns the screen
+   * — server ACCEPTED, or queued (offline / transient error). The search
+   * screen holds its OWN card, which the camera re-resolve never reaches;
+   * without this it kept reading VALID · LET THEM IN with Admit enabled — a
+   * second admission one tap away. It was once called on ACCEPTED only, which
+   * left exactly that on a queued search admit.
+   */
+  onConfirmed?: (scannedAt: Date | string | null) => void;
 };
 
 /** Matches Home's counter cadence; NFR-003 forbids anything faster. */
 const COUNTS_INTERVAL_MS = 5_000;
 /** Matches the queue's own flush cadence. */
 const QUEUE_INTERVAL_MS = 15_000;
+/**
+ * How long a late-refusal notice stays up on its own. Long enough to read a
+ * sentence at a door; it can be tapped away sooner.
+ */
+const LATE_NOTICE_MS = 6_000;
 
 /**
  * Unified scanner Home → Scan flow.
@@ -191,7 +233,45 @@ export const UnifiedScanScreen = ({
   const [mode, setMode] = useState<Mode>("camera");
   const [permission, requestPermission] = useCameraPermissions();
   const [result, setResult] = useState<AnyScanResult | null>(null);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [failure, setFailure] = useState<ScreenFailure | null>(null);
+  /**
+   * Is a verdict (result or failure) on screen RIGHT NOW? Read by the async
+   * admit settler, which must not write a late refusal over another person's
+   * verdict — and a closure over `result` / `failure` would be stale.
+   */
+  const screenOccupiedRef = useRef(false);
+  useEffect(() => {
+    screenOccupiedRef.current = !!result || !!failure;
+  }, [result, failure]);
+  /**
+   * The search screen keeps its OWN result, which the camera's `result` never
+   * sees. It reports it up here so a late refusal never takes over the card of
+   * the person found next.
+   */
+  const searchOccupiedRef = useRef(false);
+  const onSearchResultShown = useCallback((shown: boolean) => {
+    searchOccupiedRef.current = shown;
+  }, []);
+  /**
+   * A refusal that arrived while ANOTHER person's verdict was up. Its own
+   * slot, deliberately NOT cleared by `dismissResult` or `applyResult`: the
+   * next person's 1.2s express dwell used to wipe it before it could be read.
+   * Clears itself after {@link LATE_NOTICE_MS} or on tap. It never extends
+   * anyone's dwell.
+   */
+  const [lateNotice, setLateNotice] = useState<{
+    id: number;
+    message: string;
+  } | null>(null);
+  const showLateNotice = useCallback((message: string) => {
+    setLateNotice({ id: Date.now(), message });
+  }, []);
+  const dismissLateNotice = useCallback(() => setLateNotice(null), []);
+  useEffect(() => {
+    if (!lateNotice) return;
+    const id = setTimeout(() => setLateNotice(null), LATE_NOTICE_MS);
+    return () => clearTimeout(id);
+  }, [lateNotice]);
   const [codeEntry, setCodeEntry] = useState("");
   const [sameOrderTickets, setSameOrderTickets] = useState<SameOrderTicket[]>(
     [],
@@ -227,6 +307,48 @@ export const UnifiedScanScreen = ({
    * green. This is the visible half of it (see `presentScanResult`).
    */
   const [admittedHereRecently, setAdmittedHereRecently] = useState(false);
+  /**
+   * Ticket codes THIS screen admitted since the last dismiss.
+   *
+   * Exists because a successful admit re-resolves the ticket, and the ticket is
+   * now `SCANNED` — so without this the operator was shown the do-not-admit
+   * verdict moments after being told the admission worked. Two very different
+   * situations wear the same status on the wire, and the one that follows an
+   * ADMIT tap must read ADMITTED / DONE.
+   *
+   * A LIST rather than `lastAdmit`, because bulk admit never sets `lastAdmit`
+   * (it has no single undo target) and would otherwise fall into the same trap
+   * for every ticket in the order.
+   */
+  const [justAdmittedCodes, setJustAdmittedCodes] = useState<string[]>([]);
+  /**
+   * Mirror of {@link justAdmittedCodes} for the async / callback paths.
+   *
+   * `applyResult` runs the feedback cue, and it must know whether the result it
+   * is about to announce is the one this operator just admitted. Reading state
+   * there would either capture a stale value (the re-resolve settles in a
+   * different tick from the tap) or force `applyResult` to be rebuilt on every
+   * admit, which re-arms the camera. Same pattern, and the same reason, as
+   * `lastAdmitRef`.
+   */
+  const justAdmittedRef = useRef<string[]>([]);
+  const setJustAdmitted = useCallback((next: string[]) => {
+    justAdmittedRef.current = next;
+    setJustAdmittedCodes(next);
+  }, []);
+  const markJustAdmitted = useCallback(
+    (code: string) => {
+      const current = justAdmittedRef.current;
+      if (!current.includes(code)) setJustAdmitted([...current, code]);
+    },
+    [setJustAdmitted],
+  );
+  const unmarkJustAdmitted = useCallback(
+    (code: string) => {
+      setJustAdmitted(justAdmittedRef.current.filter((c) => c !== code));
+    },
+    [setJustAdmitted],
+  );
   /**
    * Post-check-in lock. `handleCheckIn` neither dismissed nor disabled after a
    * success, so CHECK IN — now the rail's PRIMARY action — was a double-tap
@@ -272,7 +394,7 @@ export const UnifiedScanScreen = ({
    * slips through); the state is what re-renders the UI. Reading the ref
    * during render — which is what shipped — meant nothing scheduled a
    * re-render when it flipped: `resolvePayload` set the ref, called
-   * `setErrorMessage(null)` (a no-op React bails out of on the common path),
+   * `setFailure(null)` (a no-op React bails out of on the common path),
    * then awaited the fetch, and by the time `setResult` flushed the `finally`
    * had already reset the ref. The scrim never appeared during the round trip
    * it exists to cover.
@@ -358,11 +480,21 @@ export const UnifiedScanScreen = ({
             ? {
                 kind: "ticket",
                 status: next.status,
-                // Design §0: colour, glyph, word, haptic and audio say the SAME
-                // one of four. The re-admit guard renders ALREADY IN, so the
-                // signature has to be `already_scanned` — an operator who acts
-                // on the buzz before reading would otherwise hear "admit" on
-                // the one outcome the guard exists to interrupt.
+                /**
+                 * The cue must say what the screen says. A manual admit
+                 * re-resolves the ticket, which comes back `SCANNED` — so
+                 * without this the operator heard the do-not-admit double pulse
+                 * a beat after being told the admission worked. The screen was
+                 * already fixed (the verdict reads ADMITTED / DONE); the audio
+                 * has to agree or the redundancy contract is a lie.
+                 */
+                admitted: justAdmittedRef.current.includes(next.ticketCode),
+                /**
+                 * The re-admit guard renders `admittedHere`, so the signature
+                 * has to be `already_scanned` — an operator who acts on the buzz
+                 * before reading would otherwise hear "admit" on the one outcome
+                 * the guard exists to interrupt.
+                 */
                 admittedHereRecently: admittedHere,
               }
             : { kind: next.kind },
@@ -396,7 +528,7 @@ export const UnifiedScanScreen = ({
 
   const dismissResult = useCallback(() => {
     setResult(null);
-    setErrorMessage(null);
+    setFailure(null);
     setSameOrderTickets([]);
     setExpressPlan(null);
     setConfirmManually(false);
@@ -405,7 +537,8 @@ export const UnifiedScanScreen = ({
     setUndoNotice(null);
     setUndoRefused(false);
     setAdmittedHereRecently(false);
-  }, []);
+    setJustAdmitted([]);
+  }, [setJustAdmitted]);
 
   /**
    * FR-004 — has THIS device already admitted this ticket recently?
@@ -449,7 +582,7 @@ export const UnifiedScanScreen = ({
    * `scanTicket` can outlive the 1.2s dwell and the camera re-arm — on venue
    * LTE that is normal, and NFR-001 only budgets p95 1.5s. A permanent
    * rejection for ticket A arriving after ticket B's state is up used to run
-   * `setLastAdmit(null)` and `setErrorMessage(A's message)` against B: B's UNDO
+   * `setLastAdmit(null)` and `setFailure(A's message)` against B: B's UNDO
    * went disabled, B's dwell stopped, and A's failure text was displayed over
    * B's verdict. Every async settler below checks this before touching
    * screen state.
@@ -459,7 +592,7 @@ export const UnifiedScanScreen = ({
   );
 
   const applyResult = useCallback(
-    (next: AnyScanResult) => {
+    (next: AnyScanResult, applyOpts: { silent?: boolean } = {}) => {
       // ── FR-004 express mode ────────────────────────────────────────────
       // The verdict is taken ONCE, here, by the pure planner. Nothing
       // downstream re-derives "should this auto-admit?" — the rail, the
@@ -485,7 +618,9 @@ export const UnifiedScanScreen = ({
       setUndoRefused(false);
       setUndoNotice(null);
       setAdmittedHereRecently(readmitHalt);
-      triggerForResult(next, readmitHalt);
+      // A post-admit re-resolve is SILENT: the admit already played its cue,
+      // and one admission gets one cue — not a second "valid" a beat later.
+      if (!applyOpts.silent) triggerForResult(next, readmitHalt);
       // A re-admit halt is presented as ALREADY IN (`admittable: false`), so
       // the same-order bulk block would never render anyway — and offering
       // "admit all 4 from this order" under a state that just said "you already
@@ -501,6 +636,7 @@ export const UnifiedScanScreen = ({
           // `result` state has NOT flushed yet — pass the outcome explicitly or
           // the recent-scans row is written with the PREVIOUS holder's name.
           forResult: next,
+          express: true,
           // No re-resolve: the manual path re-resolves to show the operator the
           // now-SCANNED state, which for express would flip the green verdict to
           // amber mid-dwell, fire a second (wrong) audio cue, and spend a round
@@ -537,17 +673,55 @@ export const UnifiedScanScreen = ({
   );
 
   const resolvePayload = useCallback(
-    async (raw: string) => {
+    async (
+      raw: string,
+      /**
+       * `postAdmit`: the background refresh after an admission that is
+       * already in. It is SILENT (no second cue — one admission, one cue), and
+       * it can never take the screen away from the confirmation: a failure is
+       * reported (`post_admit_reresolve_failed`), not shown, and anything other
+       * than this same ticket coming back is ignored. A lookup the operator
+       * starts themselves keeps the full SCAN FAILED behaviour.
+       */
+      resolveOpts: { postAdmit?: boolean } = {},
+    ) => {
       if (inFlightRef.current) return;
+      const postAdmit = resolveOpts.postAdmit === true;
+      const applyOpts = { silent: postAdmit };
+      /**
+       * Post-admit: only the same ticket may replace the confirmation, and
+       * only while that admission is STILL the one on screen. A refresh that
+       * lands after Dismiss (or after the operator moved on) used to restore
+       * the previous person as SCANNED without the "just admitted" mark —
+       * ALREADY USED · STOP while the next person stood at the door.
+       */
+      const apply = (next: AnyScanResult) => {
+        if (
+          postAdmit &&
+          !(
+            next.kind === "ticket" &&
+            next.ticketCode === raw &&
+            justAdmittedRef.current.includes(raw)
+          )
+        ) {
+          reportScanIssue(new Error("post-admit re-resolve: stale or unexpected result"), {
+            branch: "post_admit_reresolve_failed",
+            eventId,
+            tags: { resultKind: next.kind },
+          });
+          return;
+        }
+        applyResult(next, applyOpts);
+      };
       inFlightRef.current = true;
       setInFlight(true);
-      setErrorMessage(null);
+      setFailure(null);
       try {
         // FR-001, branch 1 — the device is offline. Not a failure; the
         // designed behaviour, so no server attempt is made at all.
         const preTrigger = offlineFallbackTrigger({ network });
         if (preTrigger) {
-          applyResult(
+          apply(
             withHolderName(
               resolveScanOffline({ raw, eventId, trigger: preTrigger }),
             ),
@@ -560,8 +734,11 @@ export const UnifiedScanScreen = ({
             eventId,
             raw,
           })) as AnyScanResult;
-          applyResult(next);
+          apply(next);
         } catch (err) {
+          // Post-admit: no offline fallback either — the confirmation already
+          // stands, and an offline "can't verify" must not replace it.
+          if (postAdmit) throw err;
           // FR-001, branch 2 — the resolver failed with a network-classified
           // error. `offline-scan-fallback` captures this to Sentry (NFR-006):
           // an API outage must not look like "the scanner is a bit slow
@@ -580,9 +757,24 @@ export const UnifiedScanScreen = ({
           );
         }
       } catch (err) {
-        setErrorMessage(
-          err instanceof Error ? err.message : "Scan resolve failed.",
-        );
+        if (postAdmit) {
+          // The admission HAPPENED. A SCAN FAILED here invites the operator to
+          // turn away someone who is already in: keep the confirmation, no
+          // haptic, and make it visible where it belongs (CLAUDE.md: a
+          // deliberate swallow reports).
+          reportScanIssue(err, {
+            branch: "post_admit_reresolve_failed",
+            eventId,
+          });
+          return;
+        }
+        // A LOOKUP that threw: `scanFailed`, never `notRecorded` — nothing
+        // was being recorded. Same split as the web.
+        setFailure({
+          kind: "failure",
+          stage: "lookup",
+          detail: err instanceof Error ? err.message : "Scan resolve failed.",
+        });
         AccessibilityInfo.announceForAccessibility("Scan resolve failed.");
         void triggerFeedback("rejected");
       } finally {
@@ -615,6 +807,10 @@ export const UnifiedScanScreen = ({
       // Optimistic local mark — operator gets instant feedback, queue
       // reconciles with the server in the background.
       markTicketScannedLocally(ticketCode);
+      // …and the verdict has to follow it. Recorded BEFORE the round trip;
+      // `presentScanResult` honours it only once the ticket reads SCANNED, and
+      // the `.then` below removes it unless the server ACCEPTED.
+      markJustAdmitted(ticketCode);
       const holderDisplay =
         active && active.kind === "ticket" ? active.holderDisplay : null;
       const ticketId =
@@ -682,26 +878,140 @@ export const UnifiedScanScreen = ({
         );
       };
 
+      /**
+       * The admission is in (server ACCEPTED it, or it is queued): confirm it
+       * on the card NOW, from what we already know, then refresh in the
+       * background. The confirmation never waits on the re-resolve — so a
+       * re-resolve that fails can never leave the card on VALID · LET THEM IN
+       * with Admit enabled, and (see `resolvePayload`'s `postAdmit`) never
+       * replaces it with SCAN FAILED either. The caller's `onConfirmed` runs
+       * on EVERY confirmed path (ACCEPTED, offline, transient) so search can
+       * patch its own card; the camera patch and re-resolve are manual-camera
+       * only (express does not re-resolve; search has its own card).
+       */
+      const confirmAndRefresh = (scannedAt: Date | string | null) => {
+        opts.onConfirmed?.(scannedAt);
+        if (!reResolve) return;
+        const at =
+          scannedAt instanceof Date
+            ? scannedAt
+            : scannedAt
+              ? new Date(scannedAt)
+              : new Date();
+        setResult((prev) =>
+          prev?.kind === "ticket" && prev.ticketCode === ticketCode
+            ? { ...prev, status: "SCANNED", scannedAt: at }
+            : prev,
+        );
+        void resolvePayload(ticketCode, { postAdmit: true });
+      };
+
       if (network === "offline") {
         // No point burning a round trip we know will fail; the queue is the
         // designed path here and REPLAY semantics absorb any double-admit.
         enqueueAndLink();
         cue();
-        if (reResolve) void resolvePayload(ticketCode);
+        confirmAndRefresh(null);
         return;
       }
 
+      /**
+       * One path for every way an admit tap fails to become an admission —
+       * a REJECTED / REPLAY answer AND a thrown permanent rejection — so the
+       * store, the screen, the screen reader and the haptic can never disagree.
+       *
+       *   1. un-mark "just admitted" (in memory, cannot throw);
+       *   2. roll back the store: the local status, and the recent-scans row,
+       *      which stays VISIBLE marked NOT ADMITTED but is no longer undoable
+       *      and no longer counts toward the re-admit guard. A store failure is
+       *      reported and never stops the refusal from being shown;
+       *   3. surface it (`planRefusalSurface`): this admit's screen, a free
+       *      screen marked LATE, or the timed late notice;
+       *   4. buzz, on EVERY path — the resolve already fired ADMIT.
+       */
+      const surfaceRefusal = (args: {
+        descriptor: RefusalDescriptor;
+        verdictKey: string;
+        feedback: FeedbackKind;
+        keepLocalScanned: boolean;
+      }) => {
+        const current = lastAdmitRef.current?.scanId === recent.scanId;
+        unmarkJustAdmitted(ticketCode);
+        try {
+          if (!args.keepLocalScanned) markTicketValidLocally(ticketCode);
+          markRecentScanRefused(recent.scanId, args.verdictKey);
+        } catch (err) {
+          reportScanIssue(err, {
+            branch: "admit_refusal_rollback_failed",
+            eventId,
+            tags: { verdict: args.verdictKey },
+          });
+        }
+
+        const surface = planRefusalSurface({
+          current,
+          screenOccupied:
+            screenOccupiedRef.current || searchOccupiedRef.current,
+          descriptor: args.descriptor,
+          holderName: holderDisplay,
+        });
+
+        if (surface.show) {
+          // Sticky, exactly like any failure: the express dwell is gated on
+          // `!failure`, UNDO is withdrawn, and there is no re-resolve
+          // (`resolvePayload` clears `failure` on entry).
+          if (current) {
+            setLastAdmit(null);
+            lastAdmitRef.current = null;
+          }
+          setFailure(surface.show);
+        } else if (surface.notice) {
+          // Another person's verdict is up: never write over it.
+          showLateNotice(surface.notice);
+        }
+        AccessibilityInfo.announceForAccessibility(surface.announcement);
+        void triggerFeedback(args.feedback);
+      };
+
+      /**
+       * The server ANSWERED (a 200). Passed as `.then`'s FIRST argument, with
+       * the mutation-error handler as its SECOND — never `.then(a).catch(b)`.
+       * Chained, `b` also caught throws from `a`: a SQLITE_BUSY in the rollback
+       * below has no `data.code`, so it was classified "transient" and the
+       * code queued a scan the server had just REFUSED, chimed the admit cue,
+       * and left the screen reading ADMITTED · DONE, with nothing in Sentry.
+       */
+      const onSettled = (response: Parameters<typeof planAdmitSettlement>[0]) => {
+        const current = lastAdmitRef.current?.scanId === recent.scanId;
+        // REJECTED and REPLAY are 200s, not throws — read the outcome. Only
+        // ACCEPTED keeps the optimistic "just admitted" mark (see
+        // `admit-settlement.ts` for the door scenarios this closes).
+        const settlement = planAdmitSettlement(response, {
+          selectedEventName: eventName ?? null,
+          formatTime: safeTimeString,
+        });
+
+        if (settlement.kind === "accepted") {
+          // No store writes here. A late SUCCESS must not chime over someone
+          // else's verdict, and its re-resolve must not replace the result
+          // currently on screen with this ticket's.
+          if (!current) return;
+          cue();
+          confirmAndRefresh(response.scannedAt ?? null);
+          return;
+        }
+
+        surfaceRefusal({
+          descriptor: settlement.descriptor,
+          verdictKey: settlement.key,
+          feedback: settlement.feedback,
+          keepLocalScanned: settlement.keepLocalScanned,
+        });
+      };
+
       void scanTicketMutation
         .mutateAsync({ eventId, ticketCode, clientKey })
-        .then(() => {
-          // Same identity guard as the rejection branch: a late SUCCESS must
-          // not fire a chime over someone else's verdict, and its re-resolve
-          // must not replace the result currently on screen with this ticket's.
-          if (lastAdmitRef.current?.scanId !== recent.scanId) return;
-          cue();
-          if (reResolve) void resolvePayload(ticketCode);
-        })
-        .catch((err: unknown) => {
+        .then(onSettled, (err: unknown) => {
           // Network/transient failures get queued; operator already saw
           // the optimistic confirmation. Permanent errors (TRPC validation,
           // forbidden) surface immediately.
@@ -716,70 +1026,64 @@ export const UnifiedScanScreen = ({
             (err instanceof TypeError && /network/i.test(err.message));
 
           if (isTransient) {
+            // Always queue — the admission still has to reach the server.
             enqueueAndLink();
+            // …but only chime and re-resolve if THIS admit still owns the
+            // screen. Same identity guard as the accepted branch: a late
+            // transient error must not cue over the next person's verdict or
+            // replace it with this ticket's re-resolve.
+            if (lastAdmitRef.current?.scanId !== recent.scanId) return;
             cue();
-            if (reResolve) void resolvePayload(ticketCode);
+            confirmAndRefresh(null);
           } else {
             // Permanent rejection — the server will never accept this admit.
-            // Roll back the optimistic local mark NOW rather than letting the
-            // counter over-report for up to a manifest-sync interval; the
-            // operator is being told "not admitted" in the same frame.
-            markTicketValidLocally(ticketCode);
+            // Same path as a REJECTED answer: roll back the mark, the local
+            // status and the recent-scans row (`notRecorded`), surface it —
+            // marked LATE if this admit no longer owns the screen — and buzz.
             const message =
               err instanceof Error ? err.message : "Ticket admit failed.";
-            const stale = lastAdmitRef.current?.scanId !== recent.scanId;
             reportScanIssue(err, {
               branch: "admit_permanent_rejection",
               eventId,
               tags: {
-                express: opts.forResult ? "true" : "false",
+                express: opts.express ? "true" : "false",
                 // A rejection that lost the race is a different investigation
                 // from one the operator saw.
-                late: stale ? "true" : "false",
+                late:
+                  lastAdmitRef.current?.scanId !== recent.scanId
+                    ? "true"
+                    : "false",
               },
               extra: { errorCode: code || "unknown" },
             });
-
-            /**
-             * Only touch screen state if THIS admit is still the one on screen.
-             *
-             * Without the guard, ticket A's late rejection wrote A's error over
-             * ticket B's live verdict, disabled B's UNDO (`setLastAdmit(null)`)
-             * and stopped B's dwell — while A's operator had already walked
-             * someone through the door two scans ago.
-             */
-            if (stale) {
-              // The admission still has to be un-done and the operator still
-              // has to find out. The local mark is already reverted above; the
-              // recent-scans strip keeps its 30s row, and the Sentry event
-              // above carries the `late` tag. Nothing is written to a state
-              // that belongs to a different person.
-              AccessibilityInfo.announceForAccessibility(
-                "An earlier admission was rejected by the server. Check the recent scans list.",
-              );
-              return;
-            }
-
-            // The error state takes over the screen, and `expressDwellActive`
-            // is gated on `!errorMessage` — so an express auto-admit that the
-            // server rejects becomes STICKY. Auto-dismissing an admit failure
-            // after 1.2s would clear the one message that says the person in
-            // front of the operator was not let in.
-            setLastAdmit(null);
-            lastAdmitRef.current = null;
-            setErrorMessage(message);
-            AccessibilityInfo.announceForAccessibility(message);
-            void triggerFeedback("rejected");
+            surfaceRefusal({
+              descriptor: { kind: "failure", stage: "record", detail: message },
+              verdictKey: "notRecorded",
+              feedback: "rejected",
+              keepLocalScanned: false,
+            });
           }
+        })
+        // Only a throw from one of the two handlers above can land here. It
+        // is reported, never re-classified as a mutation outcome.
+        .catch((err: unknown) => {
+          reportScanIssue(err, {
+            branch: "admit_settlement_handler_failed",
+            eventId,
+          });
         });
     },
     [
       eventId,
+      eventName,
       network,
       resolvePayload,
       scanTicketMutation,
       ctx?.operator.humanId,
       result,
+      markJustAdmitted,
+      unmarkJustAdmitted,
+      showLateNotice,
     ],
   );
 
@@ -816,7 +1120,7 @@ export const UnifiedScanScreen = ({
         .catch((err: unknown) => {
           const message =
             err instanceof Error ? err.message : "Volunteer check-in failed.";
-          setErrorMessage(message);
+          setFailure({ kind: "failure", stage: "record", detail: message });
           AccessibilityInfo.announceForAccessibility(message);
           void triggerFeedback("rejected");
         });
@@ -843,6 +1147,7 @@ export const UnifiedScanScreen = ({
       const promises = tickets.map((ticket) => {
         const code = ticket.ticketCode;
         markTicketScannedLocally(code);
+        markJustAdmitted(code);
         const recent = recordRecentScan({
           eventId,
           ticketCode: code,
@@ -878,6 +1183,7 @@ export const UnifiedScanScreen = ({
             }
             rejected.push(code);
             markTicketValidLocally(code);
+            unmarkJustAdmitted(code);
             reportScanIssue(err, {
               branch: "bulk_admit_permanent_rejection",
               eventId,
@@ -893,14 +1199,16 @@ export const UnifiedScanScreen = ({
           setSameOrderTickets([]);
           if (rejected.length > 0) {
             const message = `${rejected.length} of ${tickets.length} tickets were rejected and NOT admitted. Check them individually.`;
-            setErrorMessage(message);
+            setFailure({ kind: "failure", stage: "record", detail: message });
             AccessibilityInfo.announceForAccessibility(message);
             void triggerFeedback("rejected");
             return;
           }
           void triggerFeedback("valid");
           const first = tickets[0];
-          if (first) void resolvePayload(first.ticketCode);
+          // Same silent, cannot-take-the-screen refresh as a single admit:
+          // the bulk admit already played its one cue.
+          if (first) void resolvePayload(first.ticketCode, { postAdmit: true });
         })
         .finally(() => setBulkAdmitPending(false));
     },
@@ -910,6 +1218,8 @@ export const UnifiedScanScreen = ({
       ctx?.operator.humanId,
       scanTicketMutation,
       resolvePayload,
+      markJustAdmitted,
+      unmarkJustAdmitted,
     ],
   );
 
@@ -921,13 +1231,13 @@ export const UnifiedScanScreen = ({
 
   // ── FR-004 express dwell ──────────────────────────────────────────────────
   /**
-   * `!errorMessage` is load-bearing, not defensive noise: an express admit the
+   * `!failure` is load-bearing, not defensive noise: an express admit the
    * server rejects PERMANENTLY replaces the green verdict with an error state,
    * and a dwell still counting down behind it would clear that error after
    * 1.2s. The one message telling the operator this person was NOT admitted
    * must be the one message that never auto-dismisses.
    */
-  const expressActive = !!expressPlan?.autoAdmit && !!result && !errorMessage;
+  const expressActive = !!expressPlan?.autoAdmit && !!result && !failure;
   const dwell = useExpressDwell({
     active: expressActive,
     /**
@@ -1019,7 +1329,7 @@ export const UnifiedScanScreen = ({
   // (NFR-003). This covers wrong_event the same way it covers scan errors: the
   // operator must explicitly dismiss before the camera resumes, so a QR that
   // moves slightly out of frame and back cannot re-trigger the resolver.
-  const cameraPaused = !!result || !!errorMessage || inFlight;
+  const cameraPaused = !!result || !!failure || inFlight;
 
   /**
    * The verdict, decided ONCE. Both the state and the rail read this object,
@@ -1033,12 +1343,22 @@ export const UnifiedScanScreen = ({
         selectedEventName: eventName ?? null,
         scannedAtLabel:
           result.kind === "ticket" ? safeTimeString(result.scannedAt) : null,
-        // FR-004's re-admit guard, made visible: without this the halt showed
-        // the operator the full-bleed green ADMIT state it was halting.
+        // The post-admit confirmation. Both this and a stale SCANNED are
+        // `SCANNED` on the wire; only the screen knows which one happened here.
+        admitted:
+          result.kind === "ticket" &&
+          justAdmittedCodes.includes(result.ticketCode),
+        // The re-admit guard, made visible: without this the halt showed the
+        // operator the very PASS field it was halting.
         admittedHereRecently,
       }),
     );
-  }, [result, eventName, admittedHereRecently]);
+  }, [result, eventName, admittedHereRecently, justAdmittedCodes]);
+
+  const failurePresentation = useMemo(
+    () => (failure ? presentScanResult(failure) : null),
+    [failure],
+  );
 
   /**
    * What the rail offers, decided by the same pure table the tests assert —
@@ -1104,12 +1424,35 @@ export const UnifiedScanScreen = ({
         eventId={eventId}
         eventName={eventName}
         sessionContext={sessionContext}
-        onBack={() => setMode("camera")}
-        // Explicit arity: express never applies to a search-driven admit (it is
-        // a camera-scan behaviour), and passing `handleAdmit` bare would let a
-        // future prop signature start supplying `AdmitOptions` by accident.
-        onAdmit={(code) => handleAdmit(code)}
+        // Leaving search releases its verdict: a refusal (or the identity of
+        // an admit made there) must not follow the operator to the camera.
+        onBack={() => {
+          dismissResult();
+          setMode("camera");
+        }}
+        // Explicit mapping, never `handleAdmit` bare: express never applies to
+        // a search-driven admit (it is a camera-scan behaviour). `forResult` is the SEARCH card — the camera `result` is
+        // null here, which wrote the recent row with no name and no ticket id
+        // (so it could not be undone). No camera re-resolve: the search card
+        // is patched via `onConfirmed` on every confirmed path.
+        onAdmit={(code, admitOpts) =>
+          handleAdmit(code, {
+            forResult: admitOpts.forResult,
+            reResolve: false,
+            onConfirmed: admitOpts.onConfirmed,
+          })
+        }
         onCheckIn={handleCheckIn}
+        // The admit / check-in round trip runs HERE, so a refusal lands in
+        // `failure` — which only the camera layout rendered. Hand it down.
+        refusal={failurePresentation}
+        // Called whenever search dismisses or resolves someone new: it clears
+        // the refusal AND releases the previous admit's identity, so A's late
+        // refusal counts as late and never takes over B's card.
+        onReleaseVerdict={dismissResult}
+        onResultShown={onSearchResultShown}
+        lateNotice={lateNotice?.message ?? null}
+        onDismissLateNotice={dismissLateNotice}
       />
     );
   }
@@ -1224,17 +1567,25 @@ export const UnifiedScanScreen = ({
           and if the error rendered UNDER the verdict they would never see it.
           `dismissResult` clears both, so there is no half-state.
         */}
-        {errorMessage ? (
-          // A resolve/admit failure is not one of the eleven outcomes, but it
-          // is still a STOP: render it through the same full-bleed state
-          // rather than regressing to a card in a scroll region.
+        {failure && failurePresentation ? (
+          /**
+           * A failed round trip or a refused admit, rendered through the SHARED
+           * verdict map — the same key, word and glyph the web shows for the
+           * same thing: `scanFailed` for a lookup that threw, `notRecorded` for
+           * a write the server did not record, and the reason's own verdict
+           * (HOLD / STOP / ALREADY USED) for an admit that came back REJECTED
+           * or REPLAY. `TRY AGAIN` on the two failure keys, not `STOP`:
+           * nothing there is evidence the holder's ticket is bad.
+           */
           <ToneResultState
-            tone="stop"
-            glyph={ShieldAlert}
-            verdict="SCAN FAILED"
-            badge="ERROR"
-            guidance={errorMessage}
+            tone={failurePresentation.tone}
+            glyph={SCAN_GLYPH_COMPONENTS[failurePresentation.glyph]}
+            state={failurePresentation.state}
+            word={failurePresentation.word}
+            detail={failurePresentation.detail}
             onDismiss={dismissResult}
+            stampKey={verdictStampKey(failurePresentation, null)}
+            reducedMotion={reducedMotion}
             testID="unified-scan-error"
           />
         ) : result && presentation ? (
@@ -1268,6 +1619,7 @@ export const UnifiedScanScreen = ({
             // interactive block) a hint about a countdown that is not running.
             onHoldStart={holdable ? dwell.hold : undefined}
             onHoldEnd={holdable ? dwell.release : undefined}
+            reducedMotion={reducedMotion}
             footer={
               expressActive ? (
                 <ExpressDwellFooter
@@ -1292,7 +1644,7 @@ export const UnifiedScanScreen = ({
           pointerEvents="none" viewfinder and the pointerEvents="none"
           in-flight scrim — FR-007 satisfied literally. */}
       <SafeAreaView edges={["bottom"]} style={localStyles.rail}>
-        {errorMessage ? (
+        {failure ? (
           <SquarePrimaryButton
             label="Dismiss and scan next"
             onPress={dismissResult}
@@ -1541,6 +1893,13 @@ export const UnifiedScanScreen = ({
               {undoNotice}
             </Text>
           </View>
+        ) : null}
+        {lateNotice ? (
+          <LateRefusalNotice
+            message={lateNotice.message}
+            onDismiss={dismissLateNotice}
+            testID="unified-scan-late-refusal"
+          />
         ) : null}
       </SafeAreaView>
     </View>

@@ -1,0 +1,103 @@
+title: use-case | place-layouts.replace-place-layout
+owner: core
+file: packages/core/src/use-cases/place-layouts/replace-place-layout.ts
+goal: >
+  Replace a place's canonical layout by importing a normalized geometry snapshot,
+  regenerating sections and seats, updating stored metadata, and surfacing a diff
+  summary for auditing.
+
+ports:
+  - PlaceLayoutRepo
+  - PlaceLayoutBlobRepo
+  - PlaceLayoutGeometryParserPort
+  - PlaceLayoutStatusRepo
+  - IdempotencyPort
+  - PlaceLayoutStreamingPort
+  - Repos
+  - Clock
+  - Logger
+  - Metrics
+
+invariants:
+  - Feature flag `feature.placeLayout` must be enabled for the organizer's org.
+  - Actor must hold organizer-level authorization for the place's org context.
+  - Replace operation is idempotent: repeated requests with the same idempotency key
+    must yield an identical checksum + diff payload.
+  - Seats and sections are regenerated atomically inside `repos.tx()`. Any failure
+    rolls back to the previous canonical layout.
+  - Imported snapshot must provide geometry for every seat; missing geometry is a
+    hard failure (`invalid_input`).
+  - Existing holds/orders remain associated by seatId; regenerate seats with
+    stable deterministic ids to avoid orphaned records.
+
+input_schema:
+  placeId: uuid # required
+  actorHumanId: uuid # organizer performing the import
+  upload:
+    ref: string # pointer to parser-ready blob (S3, etc.)
+    format: enum[cad,svg,csv]
+    source: enum[admin_wizard,api]
+  options?:
+    dryRun?: boolean # if true, returns diff only, no mutation
+    idempotencyKey?: string # required when dryRun=false
+
+preconditions:
+  - Validate input via zod; missing placeId/upload data yields `invalid_input`.
+  - Ensure actor has org access + `placeLayout.manage` role via AuthzRepo (transport-layer check).
+  - Confirm place layout feature flag enabled. If not, return `forbidden`.
+  - Acquire idempotency key when dryRun=false; fail with `conflict` if in progress.
+
+execution:
+  1. Retrieve current place layout snapshot (if any) via PlaceLayoutRepo.
+  2. Invoke PlaceLayoutGeometryParserPort.parse with upload context to obtain glyphs,
+     sections, stage metadata, and issues.
+  3. Reject parser errors or empty glyph collections with `invalid_input`.
+  4. Enforce deterministic seat + section ids and compute seat index bounds.
+  5. Derive diff summary vs. previous layout and gather warning-level issues.
+  6. If options.dryRun=true, return diff + issues without mutating state.
+  7. Else, within repos.tx():
+     a. Persist glyph snapshot via PlaceLayoutBlobRepo.putForPlace.
+     b. Upsert place layout metadata + sections via PlaceLayoutRepo.replaceWithSnapshot.
+     c. Upsert place layout statuses to ensure availability rows match new seatIds.
+     d. Append audit log entry capturing checksum, counts, actor, diff, and warnings.
+  8. Emit event via PlaceLayoutStreamingPort.publishPlaceLayoutReplaced.
+  9. Commit idempotency record with response payload `{ checksum, diff }`.
+
+output_schema:
+  checksum: string
+  diff:
+    added: number
+    removed: number
+    moved: number
+    sectionsChanged: string[]
+  issues: array<PlaceLayoutParserIssue>
+  seatCount: number
+  sectionCount: number
+  seatIndexBounds: { minX: number; minY: number; maxX: number; maxY: number }
+
+side_effects:
+  - Replaces place layout rows (sections + seats) for the place inside a single tx.
+  - Writes layout glyph snapshot blob keyed by placeId.
+  - Updates place layout status rows so availability references valid seatIds.
+  - Emits streaming event notifying downstream caches of new checksum.
+  - Logs audit + metrics entries for traceability.
+
+errors:
+  - invalid_input(422): invalid uuid, parser errors, missing geometry, duplicate seat ids.
+  - forbidden(403): actor lacks permission or feature flag disabled.
+  - conflict(409): idempotency replay with differing payload or missing key for mutation.
+  - dependency_failed(424): blob storage failure, repo rollback error.
+  - transient(503): upstream timeouts (parser, repos) or idempotency lock contention.
+
+notes:
+  - Preserve customer-facing seatIds by hashing placeId + section label + seat label.
+  - Maintain mapping of legacy seatIds to new ids for analytics; include in diff warnings if seats removed.
+  - Parser warnings should surface but not block import; include them in `issues` output.
+  - Consider batching inserts for >10k seats to avoid transaction timeout (use repo helper).
+
+tests:
+  - happy path import replacing existing place layout with deterministic ids.
+  - dry-run returns diff + issues without persisting changes.
+  - parser error bubbles as invalid_input and does not mutate data.
+  - idempotent retry with same key returns cached checksum/diff.
+  - dependency failure (blob write) triggers rollback and transient error.

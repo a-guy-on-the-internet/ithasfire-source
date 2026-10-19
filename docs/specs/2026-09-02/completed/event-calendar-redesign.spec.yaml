@@ -1,0 +1,668 @@
+# event-calendar-redesign.spec.yaml
+#
+# Retires the hand-rolled calendar engine and replaces it with one DS v3
+# engine mounted in two modes (internal / public), shared across dashboard,
+# place, and embed. DS v3 alignment is the driver; new data (timezone on
+# every payload, EventDate expansion, totalCapacity, requester-side holds)
+# is scoped in because the redesigned chips/peek/toolbar need it to render
+# honestly, not as a separate data project.
+#
+# Scoped 2026-09-02, product-owner interview, all decisions below are
+# locked. Day view is removed. No drag/drop, no resize, no hold actions
+# inside the calendar.
+
+version: "1.0"
+updated: "2026-09-02"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The admin calendar is a hand-rolled engine (EventCalendar.tsx and its
+    Month/Week/Day/Agenda views, event-calendar-*.ts helpers) that predates
+    DS v3: uppercase hand-styled labels, a bespoke primary/ghost Button
+    toggle instead of SegmentedControl, no mono font, none of the AdminPageHeader
+    / DataTable / Card tokens the rest of admin uses. It is also thin on data
+    it already has sitting in Postgres: no calendar payload carries a
+    timezone even though Event.timezone and Place.timezone exist, so the
+    grid silently paints in browser-local time everywhere; community
+    listings collapse every EventDate onto Event.startsAt, hiding the other
+    dates; dashboards drop totalCapacity even though
+    repos.events.getPopularityStats computes it; and there is no way for an
+    org or human to see the holds their own booking requests have placed,
+    because BookingHold is only reachable through BookingRequest.
+  solution: >
+    One calendar engine, DS v3-aligned, mounted in two modes: internal
+    (every status plus holds, dashboard, place) and public (PUBLISHED
+    only, embed today, entity pages later). Month, week, and agenda views;
+    day view is dropped. The engine gets a real toolbar (SegmentedControl,
+    mono range label, overflow menu), a chip design that carries status,
+    repeat, and timezone-mismatch signal without ever showing sold/capacity
+    on month, a Popover/bottom-sheet peek that carries the actions each
+    surface actually needs, and a filter-chip row that replaces the current
+    legend. Underneath, four data gaps close: timezone reaches every
+    payload, EventDate expansion gives community listings one chip per
+    date, events.listMine stops dropping totalCapacity, and a new
+    requester-side holds read lets an org or human dashboard show its own
+    line position without a new table.
+  users:
+    - Organizer / venue staff on the dashboard and place calendars (internal mode)
+    - Visitors on third-party sites embedding an events calendar (public mode)
+    - Acts with an open booking request, seeing their own hold on a dashboard
+  surfaces:
+    - web (admin dashboard, admin place calendar, public embed)
+    - api (tRPC)
+
+motivation: >
+  DS v3 alignment is the driver, not the data work. The calendar is one of
+  the last hand-rolled surfaces in admin and the most visually inconsistent
+  with the rest of the product (docs/specs current DS v3 rollout has moved
+  everything else). The data changes are scoped in only because the
+  redesigned chip and peek cannot render an honest timezone, an honest
+  multi-date listing, or an honest hold line without them, this is not a
+  parallel data-modernization project riding along.
+
+# ── Current State (verified paths) ──────────────────────────────────────────
+
+current_state:
+  - >-
+    > Engine: apps/web/src/app/admin/[slug]/_components/EventCalendar.tsx plus
+    CalendarMonthView / CalendarWeekView / CalendarDayView / CalendarAgendaView,
+    CalendarHoldCluster, and the event-calendar-*.ts helper modules. Hand-rolls uppercase
+    labels and a Button primary/ghost view toggle; no mono font; uses none of AdminPageHeader,
+    SegmentedControl/ViewToggle, DataTable tokens, or Card.
+  - >-
+    > Mount points: dashboard section "01. schedule"
+    (apps/web/src/app/admin/[slug]/dashboard/_components/DashboardContent.tsx); place calendar
+    (apps/web/src/app/admin/[slug]/places/[placeId]/calendar/_components/VenueCalendar.tsx);
+    embed, with EmbedCalendarAgenda.tsx substituted for EmbedCalendarBrowse.tsx below 600px
+    (apps/web/src/app/embed/[embedId]/_components/EmbedCalendarBrowse.tsx,
+    EmbedCalendarAgenda.tsx).
+  - >-
+    > Dashboard data: events.listMine, limit 100, output carries only
+    id/title/status/startsAt/endsAt plus ticketsSold; totalCapacity is computed by
+    repos.events.getPopularityStats and dropped before it reaches the client.
+  - >-
+    > Place data: places.getVenueCalendar returns events plus per-space conflicts plus holds;
+    admin callers see every status, public callers see PUBLISHED only.
+  - >-
+    > Embed data: embeds.getCalendarEvents, limit 200.
+  - >-
+    > Timezone: no calendar payload carries one anywhere. The grid paints in browser-local time
+    unconditionally. Event.timezone and Place.timezone already exist in the Prisma schema and
+    are unused by any calendar read.
+  - >-
+    > Series: EventSeries already produces one Event per occurrence, so the calendar already
+    renders one chip per series date, no expansion work needed there.
+  - >-
+    > Community listings: one Event carries many EventDate rows; the calendar reads only
+    Event.startsAt, so every date after the first is invisible on the grid today.
+  - >-
+    > Holds: BookingHold carries calendarId, spaceId, and bookingRequestId only. The requester
+    (the org or human that placed the underlying booking request) is reachable only by joining
+    through BookingRequest , no requester-side holds query exists. bookingRequests.list already
+    projects a holds summary per request, but that is scoped to a single request thread, not
+    "everything my org/human has a hold on."
+  - >-
+    > Hours: CalendarAvailability (placeId, calendarId nullable = place-wide, dayOfWeek,
+    startTime/endTime as wall-clock strings in Place.timezone, isOpen). The dev database seeds
+    zero rows.
+  - >-
+    > Conflicts: computed per spaceId, events only, holds excluded; the public path returns an
+    empty array.
+  - >-
+    > e2e: apps/web/e2e/venue-calendar.spec.ts, venue-calendar-cell-create.spec.ts,
+    embed-unified-views.spec.ts. Test ids in use: event-calendar, calendar-view-mode-toggle,
+    calendar-view-{month,week,day,agenda}, calendar-month-grid. The route
+    /embed/calendar/[embedId] is a frozen contract
+    (docs/specs/2026-08-04/embed-unified-views.spec.yaml), its URL does not move.
+
+# ── Decisions (owner-locked, 2026-09-02) ─────────────────────────────────────
+
+decisions:
+  scope:
+    - >-
+      Driver order: DS v3 alignment first, functional thinness a distant second.
+    - >-
+      > Data work admitted into scope: timezone on every calendar payload; EventDate expansion
+      for community listings; totalCapacity added to events.listMine output; a new
+      requester-side read listing holds placed by an org's or human's own booking requests.
+    - >
+      One engine, two modes. Internal (dashboard, place) shows every status
+      plus holds. Public (embed) shows PUBLISHED only. Public entity pages
+      are out of scope for this phase but the engine must be mountable
+      there later without a rewrite.
+    - No drag/drop, no resize.
+    - >
+      No hold actions inside the calendar. Confirm / release / challenge
+      stay exactly where they are today, the booking thread
+      (docs/specs/2026-08-25/completed/booking-holds.spec.yaml).
+    - >-
+      > Delivery in four phases, each through code review: (1) data, (2) engine + admin
+      surfaces, (3) embed + mobile, (4) e2e + help articles. This spec first, then a design
+      canvas sign-off, then build.
+  views:
+    - Month, week, agenda. Day view is removed.
+    - >-
+      > Defaults: dashboard opens in agenda; place opens in week; embed offers month and week
+      only and opens in month.
+    - >
+      Dashboard agenda is rolling from today, 30 days per page, "Show more"
+      appends further pages; no month prev/next arrows in agenda mode. Past
+      events are reachable only by switching to month view.
+    - >
+      Below 600px on every surface, month becomes a compact dot-grid with
+      the tapped day's event list rendered beneath it; week is hidden
+      (not adapted, hidden).
+    - >
+      Week's hours window comes from venue hours (CalendarAvailability) for
+      the selected calendar; when the place toolbar's selector is "All",
+      union the hours across every calendar at that place. When no hours
+      exist at all (or there is no venue, dashboards), the window
+      auto-fits to the visible events with a 9:00-24:00 floor. A "Show all
+      hours" link is always present. Events that cross midnight paint a
+      continuation segment into the next day's column.
+    - >
+      The place toolbar gains a calendar selector defaulting to "All",
+      mirroring the existing pattern in the booking inbox.
+  chips_peek_filters:
+    - >-
+      > Chip content: start time, title, a status colour bar on the left edge, a repeat glyph
+      for series occurrences and for multi-date (EventDate-expanded) listings, and a
+      timezone-mismatch glyph when the event's stored timezone differs from the viewer's.
+      Sold/capacity never renders on month chips, only on agenda rows and inside the peek.
+    - >-
+      > Peek: a Popover on desktop, a bottom sheet below 600px. Content: title, a mono
+      date/time range, status, venue, sold/capacity, the series name (linking to the series
+      page) when applicable, and "Date N of M" for multi-date listings. Actions: Edit, View
+      public page, Copy link, plus a per-event ICS download. The place variant additionally
+      shows the owning org and an "Open booking" action. Editing a series occurrence opens the
+      series editor, never a single-occurrence editor. A hold's peek is reduced: the hold line
+      for that date, plus "Open booking", nothing else.
+    - >-
+      > Filters render as chips under the toolbar: status (Cancelled off by default), owner
+      (human dashboards only, org dashboards have exactly one owner), series. Place persists
+      filter state in the URL query string; dashboard persists it in localStorage. The
+      standalone legend is removed; status filter chips carry their own colour swatch.
+    - >-
+      > Hold chips: dashed outline reading "Hold · {Org} · #{position in line}"; solid outline
+      once confirmed; a warning glyph plus the respond-by time while challenged. Org and human
+      dashboards show only the holds their own booking requests have placed.
+  toolbar:
+    - >-
+      > One row. Left: prev, next, Today, a mono range label. Right: a text-label
+      SegmentedControl for view choice, a mono timezone label, and an overflow menu with
+      "Subscribe (webcal)" and "Export month". The legend is removed. On the place calendar the
+      calendar selector takes the timezone label's slot; the label moves to the hours footer
+      under the grid ("Hours · Main Calendar · 5:00 PM – 2:00 AM · America/Chicago") so the
+      toolbar fits the page's 1000px content width without wrapping.
+  timezone:
+    - >
+      Place and embed always paint in the venue's timezone (Place.timezone).
+      Dashboards paint browser-local, with the per-chip mismatch glyph
+      (tooltip gives the venue-local time). No page-level mismatch banner.
+  create:
+    - >
+      Clicking an empty day or slot opens a draft event. On a personal
+      (human) dashboard the draft is owned by that human and the event
+      builder must show the owner prominently. When the dashboard's owner
+      filter is set to exactly one org, the draft belongs to that org.
+  embed:
+    - >-
+      > Reduced relative to internal mode: month and week only, no filter chips, no peek.
+      Clicking an event keeps today's existing checkout behaviour. The host theme bridge is
+      preserved. Sold-out chips render dimmed with a "Sold out" tag. Price shows in week rows
+      only when the event has one to show; month chips never show price.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    # -- Data / core (Phase 1) --
+    - id: FR-001
+      description: >-
+        Every calendar read output carries timezone. events.listMine and
+        embeds.getCalendarEvents add event.timezone (Event.timezone) per row;
+        places.getVenueCalendar adds event.timezone per row plus a payload-level venueTimezone
+        (Place.timezone). No schema change , both columns already exist; this is output-schema
+        widening only, each on its own .strict() Zod schema.
+    - id: FR-002
+      description: >-
+        events.listMine output gains totalCapacity per event, sourced from the same
+        repos.events.getPopularityStats call that already computes ticketsSold, stop dropping
+        the field, do not add a second query.
+    - id: FR-003
+      description: >-
+        EventDate expansion: the calendar reads (dashboard, place, embed) project one
+        occurrence per EventDate row for community-listing events with multiple dates, instead
+        of collapsing onto Event.startsAt. Each occurrence carries an index and total (for the
+        peek's "Date N of M") and the parent event's id, title, status, and timezone. Series
+        events are unaffected, they already produce one Event per occurrence.
+    - id: FR-004
+      description: >-
+        New read use case, requester-side: list BookingHold rows placed by an org's or a
+        human's own booking requests, across all their calendars/dates. Input is the requesting
+        org or human id; output is scoped strictly to holds on requests that org/human owns, no
+        cross-tenant visibility, mirroring the "acts see their own position only" rule from
+        docs/specs/2026-08-25/completed/booking-holds.spec.yaml. Feeds FR-016's hold chips on dashboards.
+    - id: FR-005
+      description: >-
+        Venue-hours union: when the place toolbar's calendar selector is "All" (FR-012), the
+        week view's hours-window computation unions CalendarAvailability across every calendar
+        at that place instead of reading a single calendar's rows. Single-calendar selection is
+        unchanged.
+    # -- Shared engine (Phase 2) --
+    - id: FR-006
+      description: >-
+        One calendar engine replaces EventCalendar.tsx and its Month/Week/ Day/Agenda views,
+        built on DS v3 primitives (SegmentedControl for view choice, AdminPageHeader-style
+        toolbar row, Card/DataTable colour and spacing tokens, mono font for dates and the
+        range label). The engine takes a mode prop, internal (every status plus holds) or
+        public (PUBLISHED only), and is mountable outside dashboard/place/embed (e.g. a future
+        public entity page) without further rework.
+    - id: FR-007
+      description: >-
+        Views are month, week, agenda. Day view is removed: the component, its route/query
+        param handling, and the calendar-view-day test id are deleted, not hidden.
+    - id: FR-008
+      description: >-
+        Per-surface defaults: dashboard opens in agenda; place opens in week; embed opens in
+        month and offers only month and week (no agenda option in its SegmentedControl).
+    - id: FR-009
+      description: >-
+        Dashboard agenda pagination: rolls from today, fetches 30 days per page, and a "Show
+        more" control appends the next 30-day page. No prev/next arrows render in agenda mode.
+        Past events are reached only by switching to month view.
+    - id: FR-010
+      description: >-
+        Responsive collapse at 600px, on every surface: month renders as a compact dot-grid
+        (one indicator per day carrying events) with the tapped day's event list rendered
+        beneath the grid; week is hidden outright below 600px, with no fallback rendering.
+    - id: FR-011
+      description: >-
+        Week hours window: derives from CalendarAvailability for the calendar in scope (FR-005
+        handles the "All" union). When no hours exist for the scope, or there is no venue at
+        all (dashboards), the window auto-fits to the visible events' start/end span with a
+        9:00-24:00 floor. A "Show all hours" link is always rendered and expands to the full
+        day. An event whose end time crosses midnight paints a continuation segment into the
+        next day's column.
+    - id: FR-012
+      description: >-
+        Place toolbar gains a calendar selector defaulting to "All", using the same picker
+        pattern as the booking inbox's calendar selector.
+    - id: FR-013
+      description: >-
+        Chip rendering: start time, title, a left-edge status colour bar, a repeat glyph for
+        series occurrences and FR-003 multi-date occurrences, and a timezone-mismatch glyph
+        (tooltip: venue-local time) when event.timezone differs from the viewer's browser
+        timezone. Sold/capacity numbers are never shown on month chips.
+    - id: FR-014
+      description: >-
+        Peek: Popover on desktop, bottom sheet below 600px. Renders title, a mono date/time
+        range, status, venue, sold/capacity (agenda and peek only, per FR-013), series name
+        linking to the series page when applicable, and "Date N of M" for FR-003 multi-date
+        occurrences. Actions: Edit, View public page, Copy link, and a per-event ICS download.
+        The place variant additionally renders the owning org and an "Open booking" action.
+        Edit on a series occurrence navigates to the series editor. A hold occupies its own
+        reduced peek: the hold line for that date and "Open booking" only, no Edit, ICS, or
+        copy link, and no confirm/release/challenge control (those stay in the booking thread
+        per the locked decision).
+    - id: FR-015
+      description: >-
+        Filter-chip row under the toolbar: status (Cancelled excluded by default), owner
+        (rendered only on human dashboards, since an org dashboard has a single implicit
+        owner), series. Place persists the active filters in the URL query string; dashboard
+        persists them in localStorage. The standalone legend component is deleted; each status
+        filter chip carries its own colour swatch as the legend replacement.
+    - id: FR-016
+      description: >-
+        Hold chips (internal mode only): dashed outline reading "Hold · {Org} · #{position}"
+        while ACTIVE; solid outline once CONFIRMED; a warning glyph plus the respond-by time
+        while CHALLENGED. Org and human dashboards render only holds returned by FR-004's
+        requester-side query, never another org's or human's holds, and never inside the
+        public-mode engine.
+    - id: FR-017
+      description: >-
+        Toolbar is a single row: prev / next / Today plus a mono range label on the left; a
+        text-label SegmentedControl for view choice, a mono timezone label, and an overflow
+        menu with "Subscribe (webcal)" and "Export month" on the right.
+    - id: FR-018
+      description: >-
+        Timezone rendering: place and embed engines always paint in venueTimezone (FR-001).
+        Dashboard engines paint in the browser's local timezone; FR-013's per-chip glyph is the
+        only mismatch signal, no page-level notice banner.
+    - id: FR-019
+      description: >-
+        Create-on-click: clicking an empty day (month, agenda) or slot (week) opens a draft
+        event. On a personal (human) dashboard the draft's owner is that human, and the event
+        builder shows the owner prominently in its header. When the dashboard's owner filter
+        (FR-015) is set to exactly one org, the draft is created under that org instead.
+    # -- Embed (Phase 3) --
+    - id: FR-020
+      description: >-
+        Embed mounts the engine in public mode with month and week only (no agenda), no
+        filter-chip row, and no peek. Clicking an event keeps today's existing checkout-launch
+        behaviour unchanged, this requirement touches rendering only, never the click handler's
+        target.
+    - id: FR-021
+      description: >-
+        The existing host theme bridge (CSS variable overrides from the host page) is preserved
+        end to end through the new DS v3-aligned chip and toolbar markup, a regression test
+        asserts themed colours still apply to the redesigned chips.
+    - id: FR-022
+      description: >-
+        Sold-out events render a dimmed chip carrying a "Sold out" tag, in both month and week,
+        on the embed engine.
+    - id: FR-023
+      description: >-
+        Week rows show price only when the event has a price to show (existing price-display
+        rule, unchanged); month chips never show price, on any surface.
+    - id: FR-024
+      description: >-
+        The route /embed/calendar/[embedId] does not move, it remains the frozen contract from
+        docs/specs/2026-08-04/embed-unified-views.spec.yaml. Only what it renders internally
+        (chips, toolbar, views) changes.
+
+  non_functional:
+    - id: NFR-001
+      description: >-
+        Public mode is allowlist-enforced at the read, not the component: every public-mode
+        read (embeds.getCalendarEvents, and places.getVenueCalendar's public path) returns
+        PUBLISHED events only regardless of what the engine is asked to render. A guard test
+        asserts a non-PUBLISHED event never appears in a public-mode payload.
+    - id: NFR-002
+      description: >-
+        i18n en/es with argument parity for every new copy string (filter labels, "Show more",
+        "Show all hours", "Sold out", "Date N of M", overflow menu items); every new
+        interactive control is keyboard-operable and 320px-clean; zero new console errors on
+        every mounted surface.
+    - id: NFR-003
+      description: >-
+        Any new catch-and-fallback branch introduced by this work (e.g. a degraded hours-window
+        computation if CalendarAvailability read fails) declares reportError?: ReporterPort per
+        the CLAUDE.md convention, never a bare logger.warn.
+    - id: NFR-004
+      description: >-
+        FR-004's requester-side holds read is covered by a tenant-isolation test: an org/human
+        id never receives another org/human's holds, and the public-mode engine never calls
+        this read at all.
+    - id: NFR-005
+      description: >-
+        FR-001/FR-002/FR-003 are additive output-schema widenings only, no existing field is
+        removed or renamed, so callers of these procedures outside the calendar engine (if any)
+        keep working unchanged.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: list-my-events (MODIFIED, events.listMine backing use case)
+        description: Adds timezone (FR-001) and totalCapacity (FR-002) to output.
+        idempotent: true
+        money: false
+      - >-
+        name: get-venue-calendar (MODIFIED, places.getVenueCalendar backing use case)
+        description: > Adds per-event timezone and payload-level venueTimezone (FR-001);
+        expands EventDate occurrences (FR-003); unions hours across calendars when scope is
+        "All" (FR-005). idempotent: true money: false
+      - name: get-embed-calendar-events (MODIFIED)
+        description: Adds per-event timezone (FR-001); expands EventDate occurrences (FR-003).
+        idempotent: true
+        money: false
+        authz: public + assertEmbedOriginAllowed (unchanged)
+      - >-
+        name: list-my-booking-holds (NEW) description: > Requester-side holds read (FR-004):
+        every ACTIVE/CHALLENGED/ CONFIRMED hold placed by booking requests owned by the given
+        org or human. Reuses the lapse-settling predicate from
+        docs/specs/2026-08-25/completed/booking-holds.spec.yaml (isHoldLapsed) rather than re-deriving
+        it. input: orgId | humanId output: hold[] (calendarId, spaceId?, date, position,
+        status, respondBy?) idempotent: true money: false
+    modified:
+      - get-venue-calendar-hours (or equivalent) to accept "union across calendars" (FR-005)
+
+  ports:
+    new: []
+    existing:
+      - EventsRepo (listMine query, output widening only)
+      - PlacesRepo / CalendarsRepo (getVenueCalendar, hours query)
+      - BookingHoldsRepo (new listForRequester(orgId|humanId) method, per
+        docs/specs/2026-08-25/completed/booking-holds.spec.yaml's existing repo shape)
+      - EmbedsRepo (getCalendarEvents, output widening only)
+      - ReporterPort (NFR-003)
+
+  adapters:
+    new: []
+    existing:
+      - prisma/events.ts, prisma/places.ts, prisma/embeds.ts, output field
+        additions only, no column changes
+      - prisma/booking-holds.ts, new listForRequester query joining
+        BookingHold → BookingRequest on requester org/human id
+
+  transport:
+    trpc_procedures:
+      - events.listMine (MODIFIED output, FR-001, FR-002)
+      - places.getVenueCalendar (MODIFIED output, FR-001, FR-003, FR-005)
+      - embeds.getCalendarEvents (MODIFIED output, FR-001, FR-003)
+      - bookingHolds.listForRequester (NEW, FR-004)
+    webhooks: []
+
+  ui:
+    pages:
+      - apps/web/src/app/admin/[slug]/dashboard/_components/DashboardContent.tsx
+        (MODIFIED, mounts the new engine, agenda default, FR-009 pagination)
+      - apps/web/src/app/admin/[slug]/places/[placeId]/calendar/_components/VenueCalendar.tsx
+        (MODIFIED, mounts the new engine, week default, calendar selector FR-012)
+      - apps/web/src/app/embed/[embedId]/_components/EmbedCalendarBrowse.tsx,
+        EmbedCalendarAgenda.tsx (REPLACED by the public-mode engine at month/week;
+        the 600px agenda substitute becomes the FR-010 dot-grid instead)
+    components:
+      - >-
+        NEW (as built): CalendarEngine (mode internal or public),
+        CalendarToolbar, CalendarFilterChips, CalendarFilterMenu,
+        CalendarMonthView, CalendarWeekView, CalendarAgendaView,
+        CalendarDotGrid (FR-010), CalendarDayList, CalendarChip,
+        CalendarPeek, plus helpers.ts, labels.ts, use-calendar-labels.tsx,
+        range.ts, status-colors.ts, view-shared.tsx, Mono.tsx, calendar.css
+      - >-
+        DELETED (phase 2C, after the embed moves in phase 3): EventCalendar.tsx,
+        CalendarDayView, CalendarHoldCluster, the hand-rolled legend component,
+        event-calendar-*.ts helpers not reused by the new engine
+      - >-
+        MODIFIED: event-builder entry (FR-019 owner-prominent header for
+        personal-dashboard drafts)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+  notes: >
+    No schema change. Event.timezone, Place.timezone, EventDate, and
+    BookingHold already exist; this spec is entirely output-schema widening
+    (core/transport) plus one new query (FR-004's listForRequester) against
+    an existing table. The dev database's zero CalendarAvailability rows
+    (current_state) is a seed gap, not a schema gap, tracked as a risk
+    below, not a migration.
+
+# ── Non-Goals ────────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Drag/drop or resize of any chip.
+  - Any hold action inside the calendar (confirm/release/challenge/extend
+    stay in the booking thread, per docs/specs/2026-08-25/completed/booking-holds.spec.yaml).
+  - Day view, in any form, on any surface.
+  - Mounting the engine on a public entity page (must be POSSIBLE later, FR-006, but not wired this phase).
+  - Any change to embed checkout behaviour, host-origin allowlisting, or the CSP frame-ancestors posture.
+  - >-
+    Dark theme (assumption: ships after light-mode sign-off).
+  - Seeding CalendarAvailability data for local dev (flagged as a risk, not fixed here).
+  - Changing how EventSeries produces occurrences (already one Event per date).
+
+# ── Phases ───────────────────────────────────────────────────────────────────
+
+phases:
+  - phase: 0
+    name: Spec and design sign-off
+    work: >-
+      This spec, then a design canvas covering the artboards in "assumptions" below, signed off
+      before any code.
+  - phase: 1
+    name: Data
+    work: >-
+      FR-001, FR-002, FR-003, FR-004, FR-005. Core use case changes, new listForRequester
+      query, transport output widening. Tests: output schema round-trips, EventDate expansion
+      correctness, requester-side tenant isolation (NFR-004), totalCapacity parity with
+      getPopularityStats.
+  - phase: 2
+    name: Engine + admin surfaces
+    work: >-
+      FR-006 through FR-019. Build CalendarEngine on DS v3 primitives, wire dashboard and
+      place. Delete the old engine and its helpers only after both mounts pass review.
+  - phase: 3
+    name: Embed + mobile
+    work: >-
+      FR-020 through FR-024, plus FR-010 (600px dot-grid) verified on every surface including
+      dashboard and place. Host theme bridge regression test (FR-021).
+  - phase: 4
+    name: e2e + help articles
+    work: >-
+      Rewrite venue-calendar.spec.ts, venue-calendar-cell-create.spec.ts,
+      embed-unified-views.spec.ts for the new views/test ids; add coverage for the dot-grid and
+      agenda pagination; sweep help-center articles that describe the old calendar (day view
+      mentions, legend).
+
+# ── Test Plan ────────────────────────────────────────────────────────────────
+
+test_plan:
+  unit:
+    - >-
+      EventDate-expansion projector: one occurrence per date, index/total correct, series
+      events unaffected.
+    - >-
+      Hours-window computation: single-calendar, "All"-union, and no-hours auto-fit-with-floor
+      cases, as a pure function.
+    - >-
+      Timezone-mismatch predicate: pure function, event.timezone vs viewer timezone.
+    - >-
+      Hold chip label/position formatting: ACTIVE/CHALLENGED/CONFIRMED states.
+    - >-
+      Requester-side holds query: tenant isolation (NFR-004).
+  e2e_rewritten:
+    - apps/web/e2e/venue-calendar.spec.ts, week default, calendar selector,
+      hours window, peek actions, hold chips.
+    - apps/web/e2e/venue-calendar-cell-create.spec.ts, create-on-click,
+      personal-dashboard owner prominence (FR-019).
+    - apps/web/e2e/embed-unified-views.spec.ts, month/week only, no peek,
+      sold-out dimming, checkout click unchanged, /embed/calendar/[embedId]
+      still resolves.
+  e2e_new:
+    - >-
+      Dashboard agenda: rolling window, "Show more" pagination, no prev/next arrows, past
+      events unreachable except via month.
+    - >-
+      600px dot-grid on all three surfaces: tap a day, the event list renders
+      beneath, week view absent.
+  manual_run_it:
+    - >-
+      Per CLAUDE.md "Run It": drive dashboard, place, and embed for real , not just green
+      tests. Check zero new console errors and a 320px pass on each. Confirm the timezone glyph
+      and its tooltip against a cross-timezone event. Confirm the "Show all hours" link
+      actually expands a collapsed week.
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - >-
+    risk: > Dev database seeds zero CalendarAvailability rows, so the hours-window auto-fit
+    fallback path is the ONLY path exercised locally; the real venue-hours path (and its
+    union-across-calendars variant, FR-005) may not get meaningful QA until a seeded venue has
+    hours. severity: MEDIUM mitigation: > Seed at least one place with CalendarAvailability
+    rows before phase 2 review; do not treat "looks right on dev" as proof of the hours path.
+  - >-
+    risk: > FR-004 is a brand-new read with no existing analogue, the highest access-control
+    risk in this spec, since a leak would show one org's or human's line position to another.
+    severity: HIGH mitigation: > NFR-004 tenant-isolation test is mandatory before merge; the
+    query scopes on the requester id at the SQL level, never filtered client-side.
+  - >-
+    risk: > EventDate expansion (FR-003) is shared logic reused by three procedures; a bug in
+    the projector regresses dashboard, place, and embed simultaneously instead of one surface
+    at a time. severity: MEDIUM mitigation: > One pure, unit-tested projector function consumed
+    by all three procedures, not three separate implementations.
+  - >-
+    risk: > Removing day view drops the calendar-view-day test id and any URL state that names
+    it; an old bookmarked or saved deep link with a day param has nowhere to land. severity:
+    LOW mitigation: > Confirm no external consumer (embed snippet, saved admin link) depends on
+    a day-view query param before deleting the route handling; fall back to month if an
+    unknown/day view param is ever seen.
+  - >-
+    risk: > DS v3 primitives replacing hand-rolled markup can change class names and DOM
+    structure the embed's host-theme CSS bridge (or a host page's own overrides) may have keyed
+    off informally. severity: MEDIUM mitigation: > FR-021's regression test asserts themed
+    colours apply post-redesign; keep the CSS-variable contract (not class names) as the only
+    thing hosts are told to depend on.
+  - >-
+    risk: > An org or human with events across venues in different timezones could show a
+    timezone-mismatch glyph on nearly every chip, which reads as noise rather than signal.
+    severity: LOW mitigation: > Accepted per the locked decision (no summary banner); revisit
+    only if real usage shows the glyph firing on most chips for a given account.
+
+open_questions:
+  - >-
+    RESOLVED (2026-09-05): the 600px dot-grid ships as calendar-month-dotgrid, with the
+    tapped day's list beneath it. Verified on the dashboard, the place calendar and the
+    public embed at a real 320px and 375px, with no horizontal overflow on any of them.
+  - >-
+    RESOLVED (2026-09-05): FR-022 and FR-023 had no data behind them at spec time.
+    embeds.getCalendarEvents now carries soldOut (boolean) and priceLabel (string or
+    null), derived per page from one batched ticket-availability read that reuses the
+    same remaining-stock basis as the pre-charge gate, never the authored capacity
+    column. The read fails open (available, no price) and reports through ReporterPort,
+    so a failed availability lookup can never falsely retire a live show.
+
+  - >-
+    Export month / Subscribe (webcal) in the overflow menu: this spec
+    assumes both already have a backing implementation elsewhere in the
+    codebase to wire to. If neither exists yet, that is separate scoping,
+    not part of phases 1-4.
+  - >-
+    What test id does the new 600px dot-grid use? Not specified by the
+    product owner, proposed as calendar-month-dotgrid, confirm at build
+    time (see assumptions).
+  - >-
+    Does the requester-side holds read (FR-004) need pagination for an org
+    with a very large number of open booking requests? Deferred, start
+    unpaginated, revisit if a real account's hold count makes it a problem.
+  - >-
+    DEFERRED (phase 2, 2026-09-02): the place peek renders neither the owning
+    organisation nor an "Open booking" action, both of which FR-014 asks for.
+    The place read's calendarEventSchema (get-venue-calendar) carries no owner
+    (ownerName / ownerKey) and no bookingRequestId on an event row, so the
+    engine has nothing to paint. Widening the core read was judged out of
+    scope for a UI fix round; a TODO(FR-014) marks the mapper in
+    VenueCalendar.tsx. Reopen when those two fields are added to the read.
+
+# ── Assumptions ──────────────────────────────────────────────────────────────
+
+assumptions:
+  - >
+    Test ids and the frozen /embed/calendar/[embedId] route are preserved;
+    e2e specs are rewritten only where behaviour actually changed, not
+    wholesale.
+  - >
+    Month view fetches the visible six-week range and prefetches the
+    adjacent month; agenda fetches today plus 30 days per page (FR-009).
+  - Week and agenda views render a "now" line and a "today" tint.
+  - Dark theme support ships after light-mode sign-off, as a follow-up, not in phases 1-4.
+  - >-
+    > Design canvas artboards required before build starts: dashboard agenda, dashboard month
+    with peek open, place week with holds plus a conflict, embed month at desktop width, and
+    the mobile dot-grid plus list at 375px.
+  - >
+    The new 600px dot-grid test id (calendar-month-dotgrid, proposed) is not
+    yet product-owner-confirmed, see open_questions.
+  - >
+    "Export month" and "Subscribe (webcal)" in the overflow menu assume an
+    existing backing capability to wire to; if neither exists, that scoping
+    happens separately before phase 2 ships the toolbar.

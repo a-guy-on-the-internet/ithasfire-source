@@ -16,6 +16,13 @@ export PATH="/opt/homebrew/bin:/Users/somehuman/.nvm/versions/node/v24.8.0/bin:/
 
 cd "$PROJECT_DIR"
 
+LOG_DIR="$PROJECT_DIR/.claude/curation/logs"
+mkdir -p "$LOG_DIR"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+LOG="$LOG_DIR/${TASK}-${STAMP}.log"
+
+HEALTH="$PROJECT_DIR/docs/ops/automation-health.md"
+
 # --- Production DB access (READ-ONLY) -------------------------------------
 # Fetch the prod connection string at runtime (never written to disk) and
 # hand it to the curation commands as CURATION_DB_URL. Two guardrails make
@@ -23,23 +30,22 @@ cd "$PROJECT_DIR"
 #   1. We use the direct URL but force every session read-only via PGOPTIONS,
 #      so even an accidental write errors out at the server.
 #   2. The commands only ever SELECT.
-# If the secret fetch fails (no gcloud auth, offline), we unset the URL so the
-# commands fall back to the local DB rather than silently sweeping nothing.
+# If the secret fetch fails (no gcloud auth, offline), we refuse to run: a
+# sweep of the local DB looks exactly like a real one and already fooled us
+# (2026-10-05). It is reported as a FAILED run below. gcloud's stderr goes to
+# the log (diagnosis; the secret is stdout, so it is not in there).
 export PGOPTIONS='-c default_transaction_read_only=on'
+rc=0
+REASON=""
 if CURATION_DB_URL="$(gcloud secrets versions access latest \
       --secret=hf-prod-direct-database-url \
-      --project=hearthfire-491918 2>/dev/null)"; then
+      --project=hearthfire-491918 2>>"$LOG")" && [ -n "$CURATION_DB_URL" ]; then
   export CURATION_DB_URL
 else
-  unset CURATION_DB_URL
+  rc=3
+  REASON="prod DB secret fetch failed or returned empty (gcloud auth expired or offline); refusing to sweep the local DB"
+  echo "[$(date)] $REASON" >> "$LOG"
 fi
-
-LOG_DIR="$PROJECT_DIR/.claude/curation/logs"
-mkdir -p "$LOG_DIR"
-STAMP="$(date +%Y%m%d-%H%M%S)"
-LOG="$LOG_DIR/${TASK}-${STAMP}.log"
-
-HEALTH="$PROJECT_DIR/docs/ops/automation-health.md"
 
 # Failure has to be LOUD, because nothing reads these logs.
 #
@@ -58,15 +64,16 @@ HEALTH="$PROJECT_DIR/docs/ops/automation-health.md"
 # `launchctl list`.
 #
 # `|| rc=$?` keeps `set -e` from aborting so the reporting below always runs.
-echo "[$(date)] starting /$TASK" >> "$LOG"
-rc=0
-claude -p "/$TASK" --dangerously-skip-permissions >> "$LOG" 2>&1 || rc=$?
+if [ "$rc" -eq 0 ]; then
+  echo "[$(date)] starting /$TASK" >> "$LOG"
+  claude -p "/$TASK" --dangerously-skip-permissions >> "$LOG" 2>&1 || rc=$?
 
-# Capture the reason BEFORE appending the finished line — `claude -p` puts its
-# fatal reason on the last line of output ("You've hit your monthly spend
-# limit", "OAuth access token has expired"), and appending first would make
-# every alert read back its own footer.
-REASON="$(tail -1 "$LOG" 2>/dev/null | cut -c1-200)"
+  # Capture the reason BEFORE appending the finished line — `claude -p` puts its
+  # fatal reason on the last line of output ("You've hit your monthly spend
+  # limit", "OAuth access token has expired"), and appending first would make
+  # every alert read back its own footer.
+  REASON="$(tail -1 "$LOG" 2>/dev/null | cut -c1-200)"
+fi
 
 echo "[$(date)] finished /$TASK (exit $rc)" >> "$LOG"
 

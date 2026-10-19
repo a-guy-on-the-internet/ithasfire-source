@@ -1,0 +1,227 @@
+/* ProseEditor styles */
+/* These styles apply to the TipTap editor content area */
+
+.tiptap {
+  outline: none;
+  width: 100%;
+}
+
+.tiptap:focus {
+  outline: none;
+}
+
+/* Placeholder */
+.tiptap p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  float: left;
+  color: var(--colorMuted, #5C544A);
+  pointer-events: none;
+  height: 0;
+}
+
+/* Typography: none here on purpose. The ProseMirror root carries
+   `.event-content-body` (ProseEditor.tsx, editorProps.attributes), so headings,
+   paragraphs, lists, blockquote, rule and links come from the same rules the
+   public event page and the builder's Preview use:
+   src/components/events/event-body-typography.css. A `.tiptap h2` rule here
+   would tie with `.event-content-body h2` on specificity and the editor would
+   drift from the page again, which is the bug this replaced (22px/600 H2 in
+   the editor, 24px/700 on the page). */
+
+/* Selection */
+.tiptap ::selection {
+  background: var(--accentSoft, rgba(226, 72, 29, 0.10));
+}
+
+/* Image float / text-wrap */
+.tiptap figure[data-type="image-block"][data-float="left"] {
+  float: left;
+  margin: 0 16px 8px 0;
+  clear: right;
+}
+
+.tiptap figure[data-type="image-block"][data-float="right"] {
+  float: right;
+  margin: 0 0 8px 16px;
+  clear: left;
+}
+
+/* Clearfix: ensure content after floated images doesn't collapse */
+.tiptap::after {
+  content: "";
+  display: table;
+  clear: both;
+}
+
+/* Prevent resize cursor from leaking during drag */
+.tiptap.is-resizing,
+.tiptap.is-resizing * {
+  cursor: ew-resize !important;
+  user-select: none !important;
+}
+
+/* ============================================================
+   Audio block — editor rail + processing skeleton
+   ============================================================
+   The rail's two icon buttons are real <button> elements (keyboard reachable,
+   correct semantics) so their hover / active / focus / touch-target states live
+   here rather than in Tamagui: `styled()` cannot express `@media (pointer:
+   coarse)`, and Tamagui's hover colour does not reach the lucide <svg>. */
+
+.th-audio-rail-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  color: var(--colorMuted, #5C544A);
+  cursor: pointer;
+  transition:
+    background-color 150ms ease-out,
+    border-color 150ms ease-out,
+    color 150ms ease-out;
+}
+
+.th-audio-rail-btn:hover {
+  border-color: var(--borderColor, #211C16);
+  color: var(--color, #211C16);
+}
+
+.th-audio-rail-btn:focus-visible {
+  outline: 2px solid var(--accent, #E2481D);
+  outline-offset: 1px;
+}
+
+/* Destructive hover inverts: a danger glyph on a danger fill vanishes. */
+.th-audio-rail-delete:hover {
+  background-color: var(--danger, #B91C1C);
+  border-color: var(--danger, #B91C1C);
+  color: var(--colorInverted, #FDFAF3);
+}
+
+/* "Downloads allowed" is an ON state, not a hover — it stays filled.
+   `accentHard` is dark in every theme, so the glyph rides `onStructure`. */
+.th-audio-rail-toggle[aria-checked="true"],
+.th-audio-rail-toggle[aria-checked="true"]:hover {
+  background-color: var(--accentHard, #B93312);
+  border-color: var(--accentHard, #B93312);
+  color: var(--onStructure, #FDFAF3);
+}
+
+/* Touch: a 44px hit box without touching the 24px visual. The rail grows to
+   44px too — `min-height` beats the inline `height: 30px` per CSS, no
+   `!important` needed — so the overlay stays inside the rail instead of
+   reaching down over the player's own info bar and stealing its taps.
+   -9px, not -10: 24 + 9x2 = 42 fits a 44px rail with a pixel to spare on each
+   side, where -10 would overhang onto the player's top border. */
+@media (pointer: coarse) {
+  .th-audio-rail {
+    min-height: 44px;
+  }
+
+  .th-audio-rail-btn::after {
+    content: "";
+    position: absolute;
+    inset: -9px;
+  }
+
+  /* The two rail buttons sit 4px apart ($1), so their 9px overlays overlapped
+     by 14px and the later one (Delete) painted on top: measured at 320px with
+     touch emulation, taps on the right 4px of the visible Download toggle
+     removed the audio. 4 + 14 = 18 = 9 + 9, so the overlays now meet at the
+     midpoint and each visible button owns its own taps. Coarse pointers only;
+     the desktop rail keeps its 4px gap. */
+  .th-audio-rail-btn + .th-audio-rail-btn {
+    margin-left: 14px;
+  }
+}
+
+/* Coarse-pointer hit box for the small square controls inside the editor's
+   media blocks, where the VISUAL size is load-bearing and must not grow: the
+   player's download button is sized to the info bar's 44px budget, so a bigger
+   tap target has to come from an overlay rather than from height. 26 + 9x2 =
+   44, and 9 < the $3 gap to its neighbour, so it never steals an adjacent tap.
+   (`AudioPlayer` renders only inside this editor, so this stylesheet reaches
+   it — see AUDIO_PLAYER_METRICS.downloadButtonSize.) */
+@media (pointer: coarse) {
+  .th-audio-hit-44 {
+    position: relative;
+  }
+
+  .th-audio-hit-44::after {
+    content: "";
+    position: absolute;
+    inset: -9px;
+  }
+}
+
+/* Silhouette waveform. Bar heights are fixed in the component (never random —
+   the editor re-renders on a 10s poll and a reshuffling skeleton reads as new
+   data arriving); only the sweep moves. */
+.th-audio-skel-wave {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  width: 100%;
+  height: 34px;
+}
+
+.th-audio-skel-bar {
+  flex: 1 1 0;
+  min-width: 1px;
+  background: color-mix(in srgb, var(--color, #211C16) 16%, transparent);
+}
+
+/* One slow sweep, staggered per bar by an inline animation-delay. Off entirely
+   past the 5 minute timeout (`data-motion="off"`) — motion that keeps implying
+   "almost there" once the job has stalled is misinformation. */
+.th-audio-skel-wave[data-motion="on"] .th-audio-skel-bar {
+  animation: th-audio-skel-sweep 2400ms ease-in-out infinite;
+}
+
+@keyframes th-audio-skel-sweep {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .th-audio-skel-wave[data-motion="on"] .th-audio-skel-bar {
+    animation: none;
+    opacity: 1;
+  }
+
+  .th-audio-rail-btn {
+    transition: none;
+  }
+}
+
+/* ============================================================
+   Toolbar buttons (main toolbar, More panel, selection menu)
+   ============================================================
+   The system focus ring from globals.css ("FOCUS: one treatment,
+   everywhere"), restated at class specificity so no Tamagui atomic
+   outline can win over the zero-specificity floor. On an accent
+   fill (a pressed toggle, an open insert bar) the ring flips to
+   ink, or it disappears into the button it outlines. Raised so the
+   neighbouring button, painted later, cannot cover the ring. */
+.th-pe-btn:focus-visible {
+  outline: var(--focus-width) solid var(--focus-color);
+  outline-offset: var(--focus-offset);
+  position: relative;
+  z-index: 1;
+}
+
+.th-pe-btn[data-active="true"] {
+  --focus-color: var(--focus-color-on-accent);
+}

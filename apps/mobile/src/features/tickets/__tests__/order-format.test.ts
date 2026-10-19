@@ -1,112 +1,80 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  computeOrderCharges,
-  shouldShowChargeRow,
-} from "../order-format";
+import { buyerChargeLines, type BuyerCharges } from "../order-format";
 
-describe("computeOrderCharges", () => {
-  it("splits a taxed order so the rows sum to the total", () => {
-    const charges = computeOrderCharges({
-      amountGrossCents: 5000,
-      feesPlatformCents: 250,
-      taxAmountCents: 440,
-      buyerTotalCents: 5900,
-    });
+const sum = (charges: BuyerCharges) =>
+  buyerChargeLines(charges).reduce((acc, line) => acc + line.cents, 0);
 
-    expect(charges).toEqual({
-      subtotalCents: 5000,
-      platformFeeCents: 250,
-      taxCents: 440,
-      processingFeeCents: 210,
-      totalCents: 5900,
-    });
+describe("buyerChargeLines", () => {
+  it("PASS_THROUGH: shows every fee, and the lines add to the total", () => {
+    const charges: BuyerCharges = {
+      subtotalCents: 1000,
+      platformFeeCents: 33,
+      processingFeeCents: 64,
+      taxCents: 89,
+      creditCents: 0,
+      totalCents: 1186,
+    };
 
-    const summed =
-      charges.subtotalCents +
-      charges.platformFeeCents +
-      charges.taxCents +
-      charges.processingFeeCents;
-    expect(summed).toBe(charges.totalCents);
+    expect(buyerChargeLines(charges).map((l) => l.id)).toEqual([
+      "subtotal",
+      "platformFee",
+      "tax",
+      "processingFee",
+    ]);
+    expect(sum(charges)).toBe(charges.totalCents);
   });
 
-  it("does NOT let the processing fee absorb tax", () => {
-    // The regression this guards: omitting tax from the subtraction inflates
-    // the processing fee by exactly the tax amount, which is the number a
-    // buyer is most likely to dispute.
-    const taxed = computeOrderCharges({
-      amountGrossCents: 10_000,
-      feesPlatformCents: 500,
-      taxAmountCents: 875,
-      buyerTotalCents: 11_800,
-    });
+  it("ABSORB: no platform or processing line; $10.00 + $0.89 = $10.89", () => {
+    // The bug this replaces: the client recomputed processing as
+    // total − gross − feesPlatformCents − tax, so an ABSORB order showed a
+    // 33¢ platform fee the buyer never paid and a −33¢ processing line.
+    const charges: BuyerCharges = {
+      subtotalCents: 1000,
+      platformFeeCents: 0,
+      processingFeeCents: 0,
+      taxCents: 89,
+      creditCents: 0,
+      totalCents: 1089,
+    };
 
-    expect(taxed.processingFeeCents).toBe(425);
-    expect(taxed.processingFeeCents).not.toBe(425 + 875);
+    const lines = buyerChargeLines(charges);
+    expect(lines.map((l) => l.id)).toEqual(["subtotal", "tax"]);
+    expect(lines.some((l) => l.cents < 0)).toBe(false);
+    expect(sum(charges)).toBe(1089);
   });
 
-  it("treats a null tax as zero", () => {
-    const charges = computeOrderCharges({
-      amountGrossCents: 2000,
-      feesPlatformCents: 100,
-      taxAmountCents: null,
-      buyerTotalCents: 2190,
-    });
-
-    expect(charges.taxCents).toBe(0);
-    expect(charges.processingFeeCents).toBe(90);
-  });
-
-  it("treats an undefined tax as zero", () => {
-    const charges = computeOrderCharges({
-      amountGrossCents: 2000,
-      feesPlatformCents: 100,
-      taxAmountCents: undefined,
-      buyerTotalCents: 2190,
-    });
-
-    expect(charges.taxCents).toBe(0);
-    expect(charges.processingFeeCents).toBe(90);
-  });
-
-  it("handles a fully free order without inventing fees", () => {
-    const charges = computeOrderCharges({
-      amountGrossCents: 0,
-      feesPlatformCents: 0,
-      taxAmountCents: 0,
-      buyerTotalCents: 0,
-    });
-
-    expect(charges).toEqual({
+  it("free order: only the subtotal line, at zero", () => {
+    const charges: BuyerCharges = {
       subtotalCents: 0,
       platformFeeCents: 0,
-      taxCents: 0,
       processingFeeCents: 0,
+      taxCents: 0,
+      creditCents: 0,
       totalCents: 0,
+    };
+
+    expect(buyerChargeLines(charges)).toEqual([
+      { id: "subtotal", label: "Subtotal", cents: 0 },
+    ]);
+    expect(sum(charges)).toBe(0);
+  });
+
+  it("a platform credit shows as its own negative line", () => {
+    const charges: BuyerCharges = {
+      subtotalCents: 1000,
+      platformFeeCents: 33,
+      processingFeeCents: 64,
+      taxCents: 89,
+      creditCents: -500,
+      totalCents: 686,
+    };
+
+    expect(buyerChargeLines(charges).at(-1)).toEqual({
+      id: "credit",
+      label: "Credit applied",
+      cents: -500,
     });
-  });
-
-  it("surfaces a negative processing fee rather than clamping it", () => {
-    // Inconsistent stored amounts must stay visible — silently clamping to 0
-    // would make the rows stop summing to the total with no signal.
-    const charges = computeOrderCharges({
-      amountGrossCents: 5000,
-      feesPlatformCents: 500,
-      taxAmountCents: 0,
-      buyerTotalCents: 5200,
-    });
-
-    expect(charges.processingFeeCents).toBe(-300);
-  });
-});
-
-describe("shouldShowChargeRow", () => {
-  it("hides zero rows", () => {
-    expect(shouldShowChargeRow(0)).toBe(false);
-  });
-
-  it("shows non-zero rows, including negatives", () => {
-    expect(shouldShowChargeRow(1)).toBe(true);
-    expect(shouldShowChargeRow(-1)).toBe(true);
+    expect(sum(charges)).toBe(686);
   });
 });

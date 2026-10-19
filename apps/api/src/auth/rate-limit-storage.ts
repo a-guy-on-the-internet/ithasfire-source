@@ -2,6 +2,7 @@ import Redis from "ioredis";
 import type { RateLimit } from "better-auth";
 
 import { createPinoLoggerAdapter } from "@th/adapters/infra/logger";
+import { resolveRedisConnection } from "@th/adapters/redis/connection-config";
 import type { ReporterPort } from "@th/ports/reporter";
 import { createThrottledReporter } from "@th/core/lib/throttled-reporter";
 
@@ -209,22 +210,44 @@ export function createRedisRateLimitStorage(opts: {
  * commands reject fast — bounded by `commandTimeout`/`maxRetriesPerRequest`,
  * same settings as the `dep.ts` client — and the storage wrapper above
  * fails open, so auth keeps working without rate limiting rather than
- * crashing. Production boot still hard-requires `REDIS_URL` via
- * `buildDeps()`; the localhost fallback here matches `dep.ts` dev behavior.
+ * crashing.
+ *
+ * Config comes from the SAME `resolveRedisConnection` the other two clients
+ * use (`lib/dep.ts`, and jobs' `lib/container.ts`), so this client picks up
+ * `REDIS_NAMESPACE` too. Without that, `bauth:rl:*` — the sign-in limiter —
+ * would be the one keyspace still shared between dev and prod, which is
+ * exactly the "a dev load test rate-limits real production users" failure
+ * the namespace exists to prevent.
+ *
+ * `resolveRedisConnection` THROWS in production on a missing or loopback
+ * `REDIS_URL`. That throw is deliberately left to land in the existing
+ * fail-open envelope in `createBetterAuthRateLimitStorage` (no-op storage +
+ * a throttled Sentry report on the `init` branch) rather than escaping into
+ * Better Auth's `onRequestRateLimit`, which has no try/catch and would 500
+ * every auth request. The loud signal for that misconfiguration is
+ * `buildDeps()` in `lib/dep.ts`, which runs the same resolver and hard-fails
+ * boot — so a real production process never reaches this path with a bad
+ * URL. Crashing here as well would only convert a boot failure into a
+ * harder-to-read auth outage.
  */
 let lazyClient: Redis | null = null;
 
-function getAuthRateLimitRedis(): Redis {
+export function getAuthRateLimitRedis(): Redis {
   if (!lazyClient) {
     // Publish to `lazyClient` only after the error listener is attached: if
     // any construction step throws, the retry path must rebuild from scratch
     // rather than cache a listener-less client whose later 'error' events
     // would crash the process unhandled.
     const logger = createPinoLoggerAdapter();
-    const redisUrl = env.REDIS_URL ?? "redis://localhost:6379";
-    const client = new Redis(redisUrl, {
-      commandTimeout: 500,
-      maxRetriesPerRequest: 2,
+    const connection = resolveRedisConnection({
+      url: env.REDIS_URL,
+      namespace: env.REDIS_NAMESPACE,
+      nodeEnv: process.env.NODE_ENV,
+    });
+    const client = new Redis(connection.url, {
+      ...(connection.keyPrefix ? { keyPrefix: connection.keyPrefix } : {}),
+      commandTimeout: connection.commandTimeout,
+      maxRetriesPerRequest: connection.maxRetriesPerRequest,
       lazyConnect: true,
     });
     // Without a listener ioredis emits unhandled 'error' events when the

@@ -201,3 +201,154 @@ describe("instrument volunteering feed-token scrub", () => {
     );
   });
 });
+
+// L1: `includeLocalVariables` + `sendDefaultPii` ship frame locals and the
+// request body. A frame holding a Place row carries the true address of a
+// venue that withholds it — the hooks must run the location scrub
+// (`scrubLocationFromErrorEvent`, unit-tested in @th/errors). These pin the
+// WIRING: remove the call and they fail.
+describe("instrument location scrub", () => {
+  const prevDsn = process.env.SENTRY_DSN;
+  const PLACE = {
+    id: "place-1",
+    name: "Hidden House",
+    address: "1412 Holly St",
+    postcode: "37206",
+    city: "Nashville",
+    lat: 36.1771,
+    lng: -86.7389,
+    phone: "+1 615 555 0199",
+  };
+  const TRUTH = ["1412 Holly", "37206", "36.1771", "-86.7389", "555 0199"];
+
+  function expectNoTruth(value: unknown) {
+    const text = JSON.stringify(value);
+    for (const needle of TRUTH) expect(text).not.toContain(needle);
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    if (prevDsn === undefined) delete process.env.SENTRY_DSN;
+    else process.env.SENTRY_DSN = prevDsn;
+  });
+
+  it("beforeSend scrubs frame locals, extra, breadcrumbs and a JSON request body", async () => {
+    const { beforeSend } = await loadSentryHooks();
+    const event = {
+      exception: {
+        values: [
+          {
+            type: "Error",
+            value: "boom",
+            stacktrace: {
+              frames: [{ function: "upsertPlace", vars: { place: PLACE, lat: 36.1771 } }],
+            },
+          },
+        ],
+      },
+      extra: { place: PLACE },
+      breadcrumbs: [{ category: "db", data: { row: PLACE } }],
+      request: {
+        url: "https://api.ithasfire.com/api/trpc/places.upsertPlace",
+        data: JSON.stringify({ 0: { json: PLACE } }),
+      },
+    } as unknown as SentryEvent;
+
+    const sent = beforeSend(event) as Record<string, any> | null;
+
+    expect(sent).not.toBeNull();
+    expectNoTruth(sent);
+    // Triage fields survive.
+    expect(sent!.extra.place).toMatchObject({ id: "place-1", city: "Nashville" });
+    expect(sent!.request.url).toBe(
+      "https://api.ithasfire.com/api/trpc/places.upsertPlace",
+    );
+  });
+
+  it("beforeSendTransaction scrubs the request body too", async () => {
+    const { beforeSendTransaction } = await loadSentryHooks();
+    const event = {
+      transaction: "POST /api/trpc/places.upsertPlace",
+      request: { data: { 0: { json: PLACE } } },
+    } as unknown as SentryEvent;
+
+    const sent = beforeSendTransaction(event);
+
+    expectNoTruth(sent);
+    expect(sent?.transaction).toBe("POST /api/trpc/places.upsertPlace");
+  });
+});
+
+describe("Sentry — user.ip_address pinned to the resolved client_ip tag", () => {
+  // Sentry's requestDataIntegration fills user.ip_address from the
+  // client-writable X-Client-IP / leftmost X-Forwarded-For. `beforeSend` must
+  // overwrite it with the `client_ip` tag (cf-connecting-ip precedence).
+  it("beforeSend overwrites a spoofed ip_address with the client_ip tag", async () => {
+    const beforeSend = await loadBeforeSend();
+    const event = {
+      exception: { values: [{ type: "Error", value: "boom" }] },
+      tags: { client_ip: "203.0.113.7" },
+      user: { ip_address: "6.6.6.6", id: "u1" },
+    } as unknown as SentryEvent;
+
+    const sent = beforeSend(event) as Record<string, any> | null;
+
+    expect(sent?.user).toEqual({ ip_address: "203.0.113.7", id: "u1" });
+  });
+
+  it("beforeSend leaves user alone when no client_ip tag is present", async () => {
+    const beforeSend = await loadBeforeSend();
+    const event = {
+      exception: { values: [{ type: "Error", value: "boom" }] },
+      user: { ip_address: "198.51.100.1" },
+    } as unknown as SentryEvent;
+
+    const sent = beforeSend(event) as Record<string, any> | null;
+
+    expect(sent?.user).toEqual({ ip_address: "198.51.100.1" });
+  });
+
+  it("beforeSendTransaction pins it too", async () => {
+    const { beforeSendTransaction } = await loadSentryHooks();
+    const sent = beforeSendTransaction({
+      transaction: "GET /health",
+      tags: { client_ip: "203.0.113.7" },
+    } as unknown as SentryEvent) as Record<string, any> | null;
+
+    expect(sent?.user).toEqual({ ip_address: "203.0.113.7" });
+  });
+});
+
+describe("instrument location scrub of the request query (tRPC GET input)", () => {
+  const prevDsn = process.env.SENTRY_DSN;
+  const input = encodeURIComponent(
+    JSON.stringify({ json: { near: { lat: 36.161234, lng: -86.781234 } } }),
+  );
+  const URL_WITH_NEAR = `https://api.ithasfire.com/api/trpc/search.events?input=${input}`;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    if (prevDsn === undefined) delete process.env.SENTRY_DSN;
+    else process.env.SENTRY_DSN = prevDsn;
+  });
+
+  it("beforeSend and beforeSendTransaction replace a query carrying near lat/lng, keeping the path", async () => {
+    const { beforeSend, beforeSendTransaction } = await loadSentryHooks();
+    for (const hook of [beforeSend, beforeSendTransaction]) {
+      const sent = hook({
+        request: { url: URL_WITH_NEAR, query_string: `input=${input}` },
+      });
+      expect(sent?.request?.url).toBe(
+        "https://api.ithasfire.com/api/trpc/search.events?[scrubbed]",
+      );
+      expect(sent?.request?.query_string).toBe("[scrubbed]");
+      expect(JSON.stringify(sent)).not.toMatch(/36\.16|86\.78/);
+    }
+  });
+});

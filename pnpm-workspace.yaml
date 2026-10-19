@@ -1,0 +1,20 @@
+packages:
+  - apps/*
+  - packages/adapters
+  - packages/config/*
+  - packages/core
+  - packages/types
+  - packages/errors
+  - packages/ports
+  - packages/test-utils
+  - packages/db
+  - packages/schema
+  - packages/locale
+  - packages/ui
+  - packages/ui-email
+  - packages/ui-native
+  - packages/web-rn-shims
+  - packages/service/*
+  - packages/transport/*
+
+nodeLinker: hoisted

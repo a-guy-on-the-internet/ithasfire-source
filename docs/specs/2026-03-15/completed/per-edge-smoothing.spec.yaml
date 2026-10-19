@@ -1,0 +1,446 @@
+# Spec: Per-Edge Smoothing for Place Layout Designer
+meta:
+  owner: apps-web
+  status: complete
+  reviewers:
+    - product
+    - core
+    - design
+  last_updated: 2026-03-11
+summary: |
+  Replace the current per-section Catmull-Rom smoothing model with a per-edge
+  smoothing model in the place layout designer. The current approach applies a
+  single smoothing factor (0-1) uniformly to every edge of a section's polygon.
+  This breaks down for amphitheater-style venues (e.g. Red Rocks, Hollywood Bowl)
+  where sections share edges with neighbours: adjacent sections smooth their shared
+  boundary independently, creating visual gaps or overlaps, and there is no way to
+  keep some edges sharp (aisles, straight walls) while curving others (arcs facing
+  the stage).
+
+  Per-edge smoothing lets each polygon edge independently be smooth or sharp. When
+  two sections share a boundary (identical vertex pairs), their shared edge
+  tessellates identically, guaranteeing seamless rendering. The designer UX allows
+  selecting individual edges and toggling or adjusting their smoothing factor.
+
+motivation:
+  - Amphitheater-style layouts have concentric curved arcs with straight radial
+    aisles. Per-section smoothing curves everything or nothing.
+  - Shared boundaries between adjacent sections must curve identically to avoid
+    rendering artifacts (gaps, overlaps, z-fighting).
+  - Organizers need fine-grained control: curve the stage-facing arc, keep the
+    aisle edges ruler-straight.
+  - The current per-section slider is unintuitive for complex layouts and often
+    produces unexpected shapes when applied uniformly.
+
+scope:
+  in_scope:
+    - New `edgeSmoothing` data model on DesignerSection.
+    - Edge selection interaction in the designer canvas (click an edge to select it).
+    - Per-edge smoothing slider/toggle in the toolbar (appears when an edge is selected).
+    - Updated Catmull-Rom tessellation that respects per-edge flags.
+    - Shared-boundary detection: automatically link smoothing across sections that
+      share an edge (same vertex pair within tolerance).
+    - Draw-time rendering changes for smooth/sharp edges.
+    - CSV bridge serialization/deserialization of per-edge smoothing.
+    - Undo/redo support for all per-edge smoothing mutations.
+    - Migration path from the existing per-section `smoothing` field.
+  out_of_scope:
+    - Buyer-facing seat picker rendering (consumes the tessellated polygon; no change).
+    - Bezier/cubic curve handles per edge (future enhancement; this spec covers
+      Catmull-Rom interpolation only).
+    - Section merge/split tools.
+    - Mobile/scanner layout rendering.
+
+# ─── Data Model ──────────────────────────────────────────────────────────────
+
+data_model:
+  DesignerSection_changes:
+    deprecate:
+      - field: smoothing
+        type: "number | undefined"
+        note: |
+          Kept as a read-only migration compat field. On load, if `smoothing > 0`
+          and `edgeSmoothing` is absent, convert to per-edge: set every edge to
+          that smoothing value. After migration, `smoothing` is ignored by
+          rendering code.
+    add:
+      - field: edgeSmoothing
+        type: "EdgeSmoothingFlag[]"
+        default: "[]"
+        note: |
+          Sparse array indexed by edge index (edge i connects vertex i to
+          vertex (i+1) % n). Absent entries = sharp (0). Present entries carry
+          a smoothing factor 0-1.
+
+  EdgeSmoothingFlag:
+    definition: |
+      type EdgeSmoothingFlag = {
+        /** Edge index (0-based, connects polygon[i] to polygon[(i+1) % n]). */
+        edgeIndex: number;
+        /** Smoothing factor for this edge. 0 = sharp, 1 = full Catmull-Rom. */
+        smoothing: number;
+      };
+
+  types_ts_additions:
+    - "export type EdgeSmoothingFlag"
+    - "edgeSmoothing?: EdgeSmoothingFlag[] added to DesignerSection"
+
+  UndoSnapshot:
+    note: |
+      No changes needed. UndoSnapshot already deep-copies sections including
+      all their fields. The existing `snapshot()` spread of section objects will
+      capture `edgeSmoothing` automatically.
+
+# ─── State & Actions ────────────────────────────────────────────────────────
+
+state:
+  new_fields:
+    - field: selectedEdge
+      type: "{ sectionId: string; edgeIndex: number } | null"
+      default: "null"
+      note: |
+        Tracks which polygon edge is currently selected for smoothing adjustment.
+        Cleared on tool change, section change, or Escape.
+
+  new_actions:
+    - type: SELECT_EDGE
+      payload: "{ sectionId: string; edgeIndex: number }"
+      behavior: |
+        Set `selectedEdge`. If the edge belongs to a different section, also
+        update `activeSectionId`.
+
+    - type: CLEAR_EDGE_SELECTION
+      payload: "(none)"
+      behavior: "Set selectedEdge to null."
+
+    - type: SET_EDGE_SMOOTHING
+      payload: "{ sectionId: string; edgeIndex: number; smoothing: number }"
+      behavior: |
+        Upsert an EdgeSmoothingFlag for the given edge. Clamp smoothing to [0, 1].
+        If smoothing === 0, remove the entry (sparse representation).
+        If the edge is a shared boundary (see shared_boundary_detection), apply
+        the same smoothing to the matching edge on the adjacent section.
+        Push an undo entry.
+
+    - type: SET_EDGE_SMOOTHING_BATCH
+      payload: "{ entries: Array<{ sectionId: string; edgeIndex: number; smoothing: number }> }"
+      behavior: |
+        Batch-apply smoothing to multiple edges in one undo step. Useful for
+        "smooth all edges" or "sharpen all edges" bulk actions.
+
+    - type: MIGRATE_SECTION_SMOOTHING
+      payload: "(none — triggered on LOAD_STATE)"
+      behavior: |
+        For each section with `smoothing > 0` and no `edgeSmoothing`, generate
+        an EdgeSmoothingFlag for every edge with that section's smoothing value.
+        Clear the legacy `smoothing` field.
+
+  modified_actions:
+    - type: SET_TOOL
+      change: "Clear selectedEdge when switching away from select tool."
+
+    - type: DELETE_SELECTED
+      change: |
+        When a section is deleted, also remove any selectedEdge that references it.
+
+    - type: MOVE_POLYGON_VERTEX
+      change: |
+        After moving a vertex, shared-boundary detection should be re-evaluated
+        for the two edges adjacent to the moved vertex.
+
+# ─── Shared Boundary Detection ──────────────────────────────────────────────
+
+shared_boundary_detection:
+  algorithm: |
+    Two edges are "shared" when:
+      1. Section A has edge (vA_i, vA_j) and Section B has edge (vB_k, vB_l).
+      2. distance(vA_i, vB_l) < SNAP_THRESHOLD_WORLD AND
+         distance(vA_j, vB_k) < SNAP_THRESHOLD_WORLD
+         (note: reversed vertex order because adjacent sections traverse their
+         shared boundary in opposite directions).
+    This check runs lazily: only when SET_EDGE_SMOOTHING is dispatched, and only
+    for the affected edge's endpoints against all other sections.
+
+  data_structure: |
+    No persistent adjacency graph. The check is O(E) where E is total edge
+    count across all sections — fast enough for the expected scale (< 200
+    sections, < 2000 edges). If performance becomes an issue, build a spatial
+    hash of vertex positions.
+
+  propagation: |
+    When edge smoothing is set on a shared boundary:
+      1. Find the matching edge on the adjacent section.
+      2. Apply the same smoothing value to that edge.
+      3. Both mutations are captured in a single undo entry (use
+         SET_EDGE_SMOOTHING_BATCH internally).
+    The user sees both edges update simultaneously. A subtle visual indicator
+    (e.g., a small chain-link icon at the edge midpoint) signals the linkage.
+
+# ─── Tessellation Changes ───────────────────────────────────────────────────
+
+tessellation:
+  current_behavior: |
+    `catmullRomTessellate(polygon, smoothing)` applies a uniform smoothing
+    factor to every edge, blending between linear interpolation and the
+    Catmull-Rom spline point using `smoothing` as the blend weight.
+
+  new_behavior: |
+    `catmullRomTessellatePerEdge(polygon, edgeSmoothing)`:
+      - For each edge i (p1 → p2), look up the smoothing factor from the sparse
+        edgeSmoothing array. Absent = 0 (sharp, linear).
+      - If smoothing > 0: subdivide using Catmull-Rom with p0, p1, p2, p3 as
+        control points, blending linear ↔ spline by the per-edge factor.
+      - If smoothing === 0: emit a single linear segment (p1 → p2), no
+        subdivision. This keeps sharp edges cheap.
+      - Transition smoothness: where a smooth edge meets a sharp edge, the
+        Catmull-Rom curve naturally converges to the control point at the
+        vertex, so no special handling is needed at the boundary between
+        smooth and sharp edges.
+
+  function_signature: |
+    export function catmullRomTessellatePerEdge(
+      polygon: Point[],
+      edgeSmoothing: EdgeSmoothingFlag[],
+      closed?: boolean,
+    ): Point[]
+
+  backward_compat: |
+    The existing `catmullRomTessellate(polygon, smoothing)` function is
+    retained for test compatibility but its internal callers
+    (`tessellatedPolygon`) switch to the per-edge version.
+
+  tessellatedPolygon_update: |
+    export function tessellatedPolygon(section: DesignerSection): Point[] {
+      if (section.edgeSmoothing && section.edgeSmoothing.length > 0) {
+        return catmullRomTessellatePerEdge(section.polygon, section.edgeSmoothing);
+      }
+      // Legacy fallback
+      if (section.smoothing && section.smoothing > 0) {
+        return catmullRomTessellate(section.polygon, section.smoothing);
+      }
+      return section.polygon;
+    }
+
+# ─── Canvas Interaction ─────────────────────────────────────────────────────
+
+canvas_interaction:
+  edge_selection:
+    tool: select
+    trigger: |
+      Click within HIT_DISTANCE (8 screen-px) of a polygon edge midpoint or
+      anywhere along the edge line. The hit-test finds the nearest edge by
+      computing point-to-segment distance for each edge of each section.
+    visual_feedback: |
+      Selected edge is rendered with a thicker highlight stroke (3px, accent
+      color) and small circular handles at both endpoints.
+      If the edge is a shared boundary, the matched edge on the adjacent
+      section also gets a subtle highlight (dashed, same accent color).
+    deselection: |
+      Clicking empty canvas, pressing Escape, switching tools, or selecting a
+      different edge all clear the selection.
+
+  edge_hover: |
+    When hovering near an edge in select mode, show a subtle highlight
+    (1.5px accent outline) to indicate it is clickable. Change cursor to
+    a crosshair or custom "edge" cursor.
+
+  keyboard_shortcuts:
+    - key: "S"
+      action: "Toggle smoothing on the selected edge (0 → 0.6, >0 → 0)."
+    - key: "Shift+S"
+      action: "Open a smoothing value input for the selected edge."
+
+# ─── Toolbar UI ─────────────────────────────────────────────────────────────
+
+toolbar:
+  edge_smoothing_panel:
+    visibility: "Shown when `selectedEdge` is non-null."
+    location: |
+      Replaces the current per-section smoothing slider contextually. When an
+      edge is selected, the panel header reads "Edge Smoothing" instead of
+      "Smoothing". When no edge is selected, fall back to bulk controls.
+    controls:
+      - label: "Edge Smoothing"
+        type: slider
+        range: "0-100%"
+        step: 1
+        binding: "SET_EDGE_SMOOTHING for selectedEdge"
+      - label: "Linked"
+        type: indicator
+        note: |
+          Shows a chain-link icon when the selected edge is a shared boundary.
+          Tooltip explains: "This edge is shared with [adjacent section label].
+          Smoothing changes apply to both."
+
+  bulk_actions:
+    visibility: "Shown when a section is active but no edge is selected."
+    controls:
+      - label: "Smooth All Edges"
+        type: button
+        action: "SET_EDGE_SMOOTHING_BATCH with smoothing=0.6 for every edge of the active section."
+      - label: "Sharpen All Edges"
+        type: button
+        action: "SET_EDGE_SMOOTHING_BATCH with smoothing=0 for every edge of the active section."
+      - label: "Legacy slider (deprecated)"
+        type: slider
+        note: |
+          Keep the existing per-section slider visible but labelled "(legacy)"
+          during the transition period. It dispatches SET_EDGE_SMOOTHING_BATCH
+          with a uniform value, effectively replicating old behavior. Remove
+          after one release cycle.
+
+# ─── Draw / Rendering ───────────────────────────────────────────────────────
+
+rendering:
+  section_fill: |
+    No change. `drawSections` already calls `tessellatedPolygon(section)` to
+    get the render polygon. The updated `tessellatedPolygon` function handles
+    the per-edge logic transparently.
+
+  edge_smoothing_indicators: |
+    When the select tool is active and a section is highlighted, draw small
+    colored dots at the midpoint of each smooth edge (smoothing > 0):
+      - Dot color: section accent or a fixed teal (#2dd4bf).
+      - Dot size: 4px screen-space (scales with zoom).
+    This gives an at-a-glance view of which edges are smooth without selecting
+    each one.
+
+  shared_boundary_indicator: |
+    When an edge is selected and is a shared boundary, draw a thin dashed line
+    along the matched edge on the adjacent section using the same accent color.
+    Optionally render a small link icon at the shared edge midpoint.
+
+  selected_edge_highlight: |
+    Render the selected edge with:
+      - 3px stroke in accent color (on top of the section fill).
+      - Small circular handles (6px radius) at both endpoint vertices.
+      - A ghost curve preview showing what the edge looks like at the current
+        smoothing value (if smoothing is being adjusted via drag).
+
+# ─── CSV Bridge ─────────────────────────────────────────────────────────────
+
+csv_bridge:
+  serialization: |
+    Add an `edgeSmoothing` column to the section row in the CSV export.
+    Format: pipe-delimited list of `edgeIndex:smoothing` pairs.
+    Example: "0:0.75|2:0.5|5:1.0"
+    Empty string or absent column = all edges sharp.
+
+  deserialization: |
+    Parse the `edgeSmoothing` column back into EdgeSmoothingFlag[].
+    Clamp smoothing values to [0, 1]. Ignore edge indices that exceed the
+    polygon vertex count.
+
+  backward_compat: |
+    If a CSV has the legacy `smoothing` column but no `edgeSmoothing` column,
+    apply the migration (uniform smoothing → all edges get that value).
+    If both columns are present, `edgeSmoothing` takes precedence.
+
+# ─── Testing ────────────────────────────────────────────────────────────────
+
+testing:
+  reducer_tests:
+    - SELECT_EDGE sets selectedEdge and activeSectionId.
+    - CLEAR_EDGE_SELECTION resets selectedEdge to null.
+    - SET_EDGE_SMOOTHING upserts flag, supports undo/redo.
+    - SET_EDGE_SMOOTHING with smoothing=0 removes the entry.
+    - SET_EDGE_SMOOTHING on a shared boundary propagates to adjacent section.
+    - SET_EDGE_SMOOTHING_BATCH applies multiple entries in one undo step.
+    - MIGRATE_SECTION_SMOOTHING converts legacy smoothing to per-edge flags.
+    - SET_TOOL clears selectedEdge.
+    - DELETE_SELECTED clears selectedEdge when section is deleted.
+    - Edge smoothing survives full undo/redo cycle.
+
+  tessellation_tests:
+    - catmullRomTessellatePerEdge with empty edgeSmoothing returns raw polygon.
+    - catmullRomTessellatePerEdge with one smooth edge subdivides only that edge.
+    - catmullRomTessellatePerEdge with all edges smooth matches legacy catmullRomTessellate output.
+    - Sharp edges produce exactly 1 segment (start → end) with no subdivision.
+    - Output points have finite coordinates for all edge combinations.
+    - Shared boundary edges produce identical tessellation points.
+
+  csv_bridge_tests:
+    - Round-trip serialize/deserialize preserves edgeSmoothing.
+    - Legacy smoothing column migrates to edgeSmoothing on import.
+    - Both columns present: edgeSmoothing wins.
+    - Malformed edgeSmoothing column degrades gracefully (empty array).
+    - Out-of-range edge indices are filtered out.
+
+  integration_tests:
+    - Draw a 4-vertex section, select one edge, set smoothing to 0.8, verify
+      tessellatedPolygon produces subdivided points only on that edge.
+    - Draw two adjacent sections sharing a boundary, set smoothing on the
+      shared edge, verify both sections update.
+    - Undo the shared-boundary smoothing, verify both sections revert.
+
+# ─── Migration ──────────────────────────────────────────────────────────────
+
+migration:
+  strategy: |
+    Non-breaking additive change. The new `edgeSmoothing` field is optional.
+    Existing layouts with `smoothing` continue to work via the legacy fallback
+    in `tessellatedPolygon`. On the next save (CSV export or API persist), the
+    migration runs and writes `edgeSmoothing` into the data.
+
+  steps:
+    1. Ship types + reducer changes with the legacy fallback active.
+    2. Update the toolbar to show per-edge controls alongside the legacy slider.
+    3. After one release cycle, remove the legacy slider and the `smoothing`
+       field from new sections (keep read support for old data).
+    4. Run a one-time backfill on persisted layouts to convert `smoothing` to
+       `edgeSmoothing` (trivial: iterate sections, expand uniform value).
+
+  risks:
+    - Existing layouts with smoothing > 0 will look identical after migration
+      (uniform per-edge = same visual result). No visual regression.
+    - CSV files exported by the old version can be imported by the new version
+      (forward compat via legacy column fallback).
+    - CSV files exported by the new version have both columns, so older versions
+      of the code ignore `edgeSmoothing` and use the `smoothing` column (backward
+      compat).
+
+# ─── Performance ────────────────────────────────────────────────────────────
+
+performance:
+  tessellation: |
+    Per-edge tessellation is actually cheaper than uniform smoothing for most
+    real layouts because sharp edges skip subdivision entirely. Only curved
+    edges pay the Catmull-Rom cost. Expected performance improvement for
+    amphitheater layouts where ~60% of edges are straight aisles.
+
+  shared_boundary_detection: |
+    O(S * E_avg) per SET_EDGE_SMOOTHING dispatch, where S = section count and
+    E_avg = average edges per section. For 100 sections * 6 edges = 600
+    comparisons. Each comparison is 2 distance checks. Well under 1ms.
+
+  memory: |
+    EdgeSmoothingFlag[] is sparse; typical sections will have 1-3 smooth edges
+    out of 4-8 total. Negligible memory impact.
+
+# ─── Resolved Decisions ──────────────────────────────────────────────────────
+
+decisions:
+  smoothing_control: |
+    Always a slider (0-100%), never a binary toggle. Maximum flexibility for
+    organizers to fine-tune curvature per edge.
+  shared_boundary_propagation: |
+    Automatic propagation is the default. When two sections share an edge,
+    smoothing changes always propagate to both sides. No opt-in/opt-out UI.
+    This prevents gaps and is the expected behavior for amphitheater layouts.
+  edge_selection_tool: |
+    Edge selection is a sub-interaction within the existing select tool. No
+    separate "edge mode" tool — keeps the tool palette simple.
+  bulk_action_scope: |
+    "Smooth All Edges" and "Sharpen All Edges" apply only to the active
+    section, not the entire layout. Consistent with the section-scoped
+    mental model of the toolbar.
+
+next_steps:
+  - Review spec with product/design for UX validation.
+  - Implement EdgeSmoothingFlag type and migration logic (low risk, additive).
+  - Build catmullRomTessellatePerEdge and its test suite.
+  - Wire up SELECT_EDGE interaction in useDesignerCanvas.
+  - Add toolbar per-edge controls.
+  - Implement shared-boundary detection and propagation.
+  - Update CSV bridge serialization.
+  - Deprecate and eventually remove legacy per-section smoothing slider.

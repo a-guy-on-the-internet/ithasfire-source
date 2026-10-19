@@ -1,0 +1,28 @@
+{
+  "name": "@th/ports",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "dependencies": {
+    "@th/schema": "workspace:^",
+    "@th/types": "workspace:^",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@th/tsconfig": "workspace:^",
+    "vitest": "^2.1.3"
+  },
+  "scripts": {
+    "test": "vitest --run"
+  }
+}

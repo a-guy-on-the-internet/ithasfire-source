@@ -3,7 +3,7 @@ import { createHmac } from "node:crypto";
 import type { RateLimitPort, RateLimitResult } from "@th/ports/rate-limit";
 import type { ReporterPort } from "@th/ports/reporter";
 import { createThrottledReporter } from "@th/core/lib/throttled-reporter";
-import { resolveClientIp } from "@th/trpc/client-ip";
+import { resolveTrustedClientIp } from "@th/trpc/client-ip";
 
 import { resolveAuthLimits, resolveGuessSpaceRule } from "./rate-limit-rules";
 
@@ -122,7 +122,11 @@ export type AuthRateLimitLogger = {
 };
 
 export type AtomicAuthRateLimitDeps = {
-  rateLimit: RateLimitPort;
+  /**
+   * Only `consume`: the account bucket is charged only after the IP bucket
+   * allows, which `consumeMany` (charges every bucket) can't express.
+   */
+  rateLimit: Pick<RateLimitPort, "consume">;
   logger: AuthRateLimitLogger;
   /**
    * Secret keying the account-identifier HMAC (see
@@ -336,8 +340,17 @@ export function normalizeAuthPath(url: string): string | null {
  *   /sign-in/email-otp                { email, otp, ... }
  *   /email-otp/verify-email           { email, otp }
  *   /email-otp/send-verification-otp  { email, type }
+ *   /email-otp/change-email           { newEmail, otp } — keyed on the NEW
+ *       address (the code was mailed there).
  *   /phone-number/verify              { phoneNumber, code, ... }
  *   /phone-number/send-otp            { phoneNumber }
+ *   /sign-in/magic-link               { email, name?, callbackURL?, ... }
+ *   /request-password-reset           { email, redirectTo? }
+ *   /email-otp/request-password-reset { email }
+ *   /forget-password/email-otp        { email }
+ *   /phone-number/request-password-reset { phoneNumber }
+ *   /change-email                     { newEmail, callbackURL? } — keyed on
+ *       the NEW address (the recipient), not the signed-in account.
  *
  * The remaining guess-space paths carry NO account identifier at all and are
  * therefore IP-limited only (documented rather than guessed at):
@@ -356,8 +369,15 @@ const ACCOUNT_IDENTIFIER_FIELD: Readonly<Record<string, string>> = {
   "/sign-in/email-otp": "email",
   "/email-otp/verify-email": "email",
   "/email-otp/send-verification-otp": "email",
+  "/email-otp/change-email": "newEmail",
   "/phone-number/verify": "phoneNumber",
   "/phone-number/send-otp": "phoneNumber",
+  "/sign-in/magic-link": "email",
+  "/request-password-reset": "email",
+  "/email-otp/request-password-reset": "email",
+  "/forget-password/email-otp": "email",
+  "/phone-number/request-password-reset": "phoneNumber",
+  "/change-email": "newEmail",
 };
 
 /**
@@ -556,7 +576,10 @@ export function resolveLimiterIp(
   headers: HeadersLike,
   socketAddress?: unknown,
 ): string | null {
-  const ip = resolveClientIp(headers, socketAddress);
+  // `resolveTrustedClientIp`: a verified web → API forward stamped by
+  // plugins/verified-client-ip.ts (an `onRequest` hook, so it has run before
+  // this `preHandler`) wins; otherwise exactly `resolveClientIp`.
+  const ip = resolveTrustedClientIp(headers, socketAddress);
   if (!ip) return null;
   return ip.slice(0, MAX_IP_KEY_LENGTH);
 }

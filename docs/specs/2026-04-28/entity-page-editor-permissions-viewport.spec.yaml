@@ -1,0 +1,96 @@
+# Not built yet (2026-10-08 docs consolidation): editor-permissions prop model, tablet/fluid widths
+# entity-page-editor-permissions-viewport.spec.yaml
+# Add editor permissions, block palette categories, and viewport preview controls.
+
+version: "1.0"
+updated: "2026-04-28"
+
+summary:
+  problem: >
+    The entity-page editor exposes editing controls without a clear UI-level permission model and
+    previews pages only at the current admin-shell width. The add-block surface is also a flat list,
+    which becomes harder to scan as block kinds grow.
+  solution: >
+    Add a lightweight editor permissions model, categorize the block palette from the shared block
+    config, and introduce a viewport switcher so editors can preview phone, tablet, and desktop
+    widths without leaving the editor.
+  users:
+    - Page editors on web
+    - Admins reviewing entity pages
+  surfaces:
+    - web
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Editor UI accepts explicit permissions for adding, deleting, duplicating, reordering, and
+        editing blocks; hidden/disabled controls match the current user's authority.
+    - id: FR-002
+      description: >
+        Add-block controls group block kinds by category from the shared block config.
+    - id: FR-003
+      description: >
+        Viewport controls switch the preview canvas between mobile, tablet, desktop, and fluid modes.
+    - id: FR-004
+      description: >
+        The viewport preview uses existing Tamagui tokens and EventBuilder-style sticky header chrome.
+    - id: FR-005
+      description: >
+        Primary save/publish actions stay in the existing contextual action bar when already present.
+  non_functional:
+    - id: NFR-001
+      description: >
+        Permissions are a UX gate only; server-side RBAC remains authoritative in use cases.
+    - id: NFR-002
+      description: >
+        Viewport switching must not require iframes or new dependencies.
+
+architecture:
+  core:
+    use_cases: []
+  ports:
+    new: []
+    existing: []
+  adapters:
+    new: []
+    existing: []
+  transport:
+    trpc_procedures: []
+    webhooks: []
+  ui:
+    pages:
+      - apps/web/src/components/entity-pages/PageEditorView.tsx
+    components:
+      - apps/web/src/components/entity-pages/EditorHeader.tsx
+      - apps/web/src/components/entity-pages/PageBlocksEditor.tsx
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+
+risks:
+  - risk: >
+      UI permissions could drift from server RBAC and appear to grant authority.
+    severity: MEDIUM
+    mitigation: >
+      Document permissions as affordance-only and keep existing tRPC/use-case authorization checks.
+  - risk: >
+      Fixed-width preview could create horizontal overflow inside admin shell.
+    severity: LOW
+    mitigation: >
+      Wrap canvas in a horizontally scrollable preview stage with clear bounds.
+
+open_questions:
+  - Should viewport preference persist per user, per page, or remain session-local?
+
+out_of_scope:
+  - Mobile native editor.
+  - Puck iframe preview.
+  - New RBAC use cases.
+
+acceptance_criteria:
+  - Editors can filter/add blocks by category without losing ownerType restrictions.
+  - Viewport buttons produce stable preview widths and are keyboard-accessible.
+  - Controls hidden by permissions cannot be triggered from the UI, while server checks remain unchanged.

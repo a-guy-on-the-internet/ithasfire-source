@@ -80,6 +80,6 @@ Comp tickets are **not refundable through the normal flow** — there's nothing 
 ## Common uses
 
 - **Press and VIPs** — guest list for media and featured attendees
-- **Comp swaps** — reciprocal guest lists between organisers at shared venues
+- **Comp swaps** — reciprocal guest lists between organisers at shared places
 - **Crew** — band members, sound tech, door staff
 - **Giveaways** — when a contest winner needs tickets issued outside the buyer flow

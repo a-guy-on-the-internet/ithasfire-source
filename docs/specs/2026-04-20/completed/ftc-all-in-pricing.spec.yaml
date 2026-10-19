@@ -1,0 +1,231 @@
+# ftc-all-in-pricing.spec.yaml
+#
+# Buyer-facing FTC all-in pricing compliance across event discovery, detail, checkout,
+# embeds, reserved-seat overrides, and SEO/search price surfaces.
+
+version: "1.0"
+updated: "2026-04-20"
+
+summary:
+  problem: >
+    Ithas Fire now computes buyer-facing totals in several places, but the compliance intent
+    is not captured in a standalone spec. Without a dedicated FTC all-in pricing spec, buyer
+    surfaces can drift back toward face-value-first presentation, unresolved totals can behave
+    inconsistently, and reserved-seat override prices can diverge from the totals shown for
+    general admission tickets.
+  solution: >
+    Treat buyer total as the primary public price everywhere a buyer shops: event detail,
+    ticket lists, checkout, mobile CTA, embeds, SEO metadata, and search indexing. Reuse the
+    existing buyer-display helpers plus backend fee estimation so every buyer-facing surface
+    renders the same all-in amount, keeps fee breakdown secondary, explicitly handles the
+    temporary "Calculating total..." state, and respects reserved-seat override buyer totals.
+  users:
+    - buyers on web event pages
+    - buyers in checkout
+    - buyers in embedded checkout flows
+    - buyers discovering events via search cards or SEO-fed previews
+  surfaces:
+    - web
+    - embed
+    - seo
+    - search
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        On buyer-facing event detail surfaces, the primary displayed ticket price must be the
+        buyer total, not face value. This applies to EventContent and TicketsSection, including
+        "from" or per-ticket pricing states.
+    - id: FR-002
+      description: >
+        On buyer-facing checkout surfaces, the primary displayed price must be the buyer total
+        for both unit and line-item views. This applies to the ticket grid, order summary,
+        mobile CTA bar, seat-picker tooltip/selection state, and confirmation views.
+    - id: FR-003
+      description: >
+        On embed buyer flows, the primary displayed price must be the buyer total across embed
+        event detail, ticket-type list, seat picker, order summary sidebar, mobile CTA, checkout,
+        and confirmation views.
+    - id: FR-004
+      description: >
+        Fee breakdown remains allowed, but it must stay secondary to the buyer total on every
+        buyer-facing surface. Breakdown may appear behind hover, tap, tooltip, expandable tray,
+        or summary rows; it must never visually outrank the total.
+    - id: FR-005
+      description: >
+        The canonical per-ticket buyer total estimate comes from
+        `estimateBuyerTicketPricingForEvent`. Web and embed helpers may format or multiply the
+        value, but they must not invent a separate fee formula for buyer-facing display.
+    - id: FR-006
+      description: >
+        Reserved-seat price overrides must display override-specific buyer totals when a seat has
+        `priceOverride.priceCents`. `list-event-seat-availability` and
+        `list-embed-available-seats` must continue to provide `priceOverride.buyerTotalCents`,
+        and seat pickers must prefer that override total over the default ticket-type total.
+    - id: FR-007
+      description: >
+        Unresolved totals are an explicit supported state. For paid tickets whose buyer total is
+        not yet known, buyer-facing UI must show "Calculating total..." instead of presenting
+        face value as though it were the final FTC-compliant price. Free tickets may still render
+        as "Free" immediately.
+    - id: FR-008
+      description: >
+        Search, discovery, and SEO surfaces must use buyer-total-aware fields when available.
+        `build-event-seo`, `get-event-seo`, `build-search-index`, event formatting helpers, and
+        web search result rendering must prefer `minBuyerTotalCents`, `maxBuyerTotalCents`, or
+        `lowestBuyerTotalCents` over face-value fields.
+    - id: FR-009
+      description: >
+        Buyer-total support must cover range displays as well as single-price displays. If an
+        event or section spans multiple ticket prices, the rendered range must be based on all-in
+        buyer totals rather than face-value minima/maxima.
+    - id: FR-010
+      description: >
+        All buyer-facing price labels used for pre-purchase merchandising must remain within this
+        scope only. Organizer/admin fee preview, settlement math, and back-office buyer-total
+        columns may continue to exist unchanged and are not part of FTC compliance acceptance for
+        this spec.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Buyer-facing price formatting must stay consistent between web and embed surfaces by
+        reusing the existing `buyer-display` helper family for unit totals, line totals, and
+        ranges.
+    - id: NFR-002
+      description: >
+        Buyer-facing price rendering must avoid misleading flicker. A paid ticket may transition
+        from "Calculating total..." to a final all-in amount, but it must not briefly show face
+        value as the primary final-looking price and then replace it with a higher total.
+    - id: NFR-003
+      description: >
+        SEO/search total fields and buyer-facing UI totals must stay numerically aligned for the
+        same published event so price cards, search sorting/filtering, and event detail pages do
+        not disagree.
+
+architecture:
+  core:
+    use_cases:
+      - name: estimateBuyerTicketPricingForEvent (reuse)
+        description: >
+          Canonical fee-estimation path for buyer totals, including fee mode, tax estimate, and
+          min/max buyer totals for published events.
+        input: event record, ticket types
+        output: perTicketEstimates, minBuyerUnitTotalCents, maxBuyerUnitTotalCents
+        idempotent: true
+        money: true
+      - name: listEventSeatAvailability (reuse)
+        description: >
+          Enriches reserved seats with `priceOverride.buyerTotalCents` so seat-level pricing uses
+          all-in override totals.
+        input: eventId
+        output: seats with seat status and override buyer total
+        idempotent: true
+        money: false
+      - name: listEmbedAvailableSeats (reuse)
+        description: >
+          Mirror of event seat availability for embed consumers, including override buyer totals.
+        input: embedId, eventId, seatSectionId
+        output: section plus seats with override buyer total
+        idempotent: true
+        money: false
+      - name: getEventSeo / buildEventSeo (reuse)
+        description: >
+          Publishes buyer-total-aware min/max pricing into the SEO payload used by web metadata and
+          page formatting.
+        input: event, ticket types, buyer pricing estimates
+        output: seo pricing with minBuyerTotalCents / maxBuyerTotalCents
+        idempotent: true
+        money: false
+      - name: buildSearchIndex (reuse)
+        description: >
+          Stores `lowestBuyerTotalCents` on event search documents so discovery surfaces can sort,
+          filter, and label events by all-in buyer pricing.
+        input: published events and ticket tiers
+        output: search documents
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - Repos.events
+      - Repos.embeds
+      - Repos.payoutTerms
+      - Repos.feePolicies
+      - Repos.seats
+      - MultiSearchPort
+
+  adapters:
+    new: []
+    existing:
+      - existing repo adapters that resolve fee policy, payout terms, seats, and search indexing
+
+  transport:
+    trpc_procedures:
+      - event and embed detail procedures continue to return base ticket data used for buyer-facing merchandising
+      - `events.getCheckoutFeeRates` provides `perTicketEstimates`, including `buyerUnitTotalCents`, which web and embed checkout surfaces join onto base ticket data for display
+      - seat-availability procedures provide `priceOverride.buyerTotalCents` for reserved-seat override pricing
+    webhooks: []
+
+  ui:
+    pages: []
+    components:
+      - EventContent.tsx and TicketsSection.tsx
+      - checkout TicketTypeGrid.tsx, SeatMapPicker.tsx, OrderSummary.tsx, MobileCTABar.tsx,
+        Checkout.tsx, OrderConfirmation.tsx
+      - embed EmbedEventDetail.tsx, EmbedTicketTypeList.tsx, EmbedSeatPicker.tsx,
+        EmbedOrderSummarySidebar.tsx, EmbedMobileCTABar.tsx, EmbedCheckout.tsx,
+        EmbedConfirmation.tsx
+      - search UniversalSearchPage.tsx and event-format.ts helpers
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+
+risks:
+  - risk: >
+      Buyer totals can be absent temporarily during fee-estimate loading, especially on checkout
+      and embed seat selection. If a surface falls back to face value instead of the explicit
+      pending state, it creates a compliance regression.
+    severity: HIGH
+    mitigation: >
+      Treat "Calculating total..." as the only allowed paid-ticket fallback until the buyer total
+      is known.
+  - risk: >
+      Reserved-seat override pricing can drift from general-admission pricing if the override path
+      stops flowing through the same estimate logic.
+    severity: HIGH
+    mitigation: >
+      Keep override totals sourced from the backend seat-availability use cases and require seat
+      pickers to prefer override buyer totals whenever present.
+  - risk: >
+      SEO/search buyer totals may lag behind visible event detail totals if search-index fields or
+      SEO payload builders regress to face-value fields.
+    severity: MEDIUM
+    mitigation: >
+      Acceptance covers buyer-total preference in both SEO payload generation and search document
+      construction.
+
+open_questions:
+  - Should compact list/search/card surfaces add explicit copy such as "includes fees" or "all-in"
+    next to the displayed amount, or is showing only the buyer total sufficient if the amount is
+    already the final payable total?
+  - When admission tax is still an estimate pre-checkout, should condensed buyer-facing surfaces
+    expose an explicit "estimated tax" qualifier, or reserve that qualifier for expanded fee
+    breakdown UI only?
+
+out_of_scope:
+  - organizer/admin ticket fee preview and pricing editor copy
+  - settlement, payout, refund, or resale pricing rules beyond their effect on buyer-facing totals
+  - schema changes, fee-policy redesign, or new runtime pricing algorithms
+
+acceptance_criteria:
+  - Event detail pages render buyer totals as the primary ticket price wherever pricing is shown
+  - Checkout and embed flows render buyer-total unit and line-item amounts consistently
+  - Paid tickets with unresolved estimates show "Calculating total..." instead of a face-value-first price
+  - Reserved seats with price overrides show override-specific buyer totals in seat pickers/tooltips
+  - Search results and SEO-derived pricing labels prefer buyer-total fields over face-value fields
+  - Fee breakdown remains available but secondary to the displayed total on buyer-facing surfaces

@@ -1,5 +1,7 @@
 import type Redis from "ioredis";
 
+import { execOrThrow } from "@th/adapters/redis/exec-or-throw";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Job Run Tracker — Redis-backed run history for every job execution.
 //
@@ -42,7 +44,7 @@ export interface JobRunTracker {
    *
    * Exists so `record()` does NOT have to prune on every write. Trimming
    * per-write is O(writes); trimming on a schedule is O(1/day), and the table
-   * only ever overshoots by one day of runs (~96 rows for a 15-minute-cron job) in
+   * only ever overshoots by one day of runs (~48 rows for a 30-minute-cron job) in
    * between — trivial.
    *
    * Measured 2026-08-25, production, 7d: prune-on-write made `record()` cost
@@ -71,12 +73,17 @@ export function createJobRunTracker(redis: Redis): JobRunTracker {
       const score = new Date(entry.startedAt).getTime();
       const member = JSON.stringify(entry);
 
-      await redis
-        .multi()
-        .zadd(key, score, member)
-        // Keep only the most recent MAX_PER_JOB entries
-        .zremrangebyrank(key, 0, -(MAX_PER_JOB + 1))
-        .exec();
+      // execOrThrow, not a bare exec(): ioredis resolves exec() even when a
+      // queued command failed, which made the callers' catch dead code.
+      await execOrThrow(
+        redis
+          .multi()
+          .zadd(key, score, member)
+          // Keep only the most recent MAX_PER_JOB entries
+          .zremrangebyrank(key, 0, -(MAX_PER_JOB + 1)),
+        "job run record",
+        key,
+      );
     },
 
     async runs(jobName, limit = 25) {
@@ -87,7 +94,19 @@ export function createJobRunTracker(redis: Redis): JobRunTracker {
     },
 
     async latestAll() {
-      const pattern = `${KEY_PREFIX}*`;
+      // SCAN is the one place ioredis's `keyPrefix` does NOT do the right
+      // thing, in BOTH directions:
+      //   1. The MATCH pattern is not a key argument, so ioredis leaves it
+      //      alone — an un-prefixed pattern matches nothing once a namespace
+      //      is configured.
+      //   2. The keys SCAN returns come back fully qualified (prefix
+      //      included) and are NOT stripped, so feeding one straight into
+      //      `zrevrange` — which DOES get prefixed — would double it up.
+      // So we prepend the prefix here by hand and strip it right back off.
+      // Do not "simplify" this to `${KEY_PREFIX}*`; it silently returns an
+      // empty map in every deployed environment.
+      const activePrefix = redis.options.keyPrefix ?? "";
+      const pattern = `${activePrefix}${KEY_PREFIX}*`;
       const result = new Map<string, RunEntry>();
       let cursor = "0";
 
@@ -101,7 +120,10 @@ export function createJobRunTracker(redis: Redis): JobRunTracker {
         );
         cursor = next;
 
-        for (const key of keys) {
+        for (const qualifiedKey of keys) {
+          const key = qualifiedKey.startsWith(activePrefix)
+            ? qualifiedKey.slice(activePrefix.length)
+            : qualifiedKey;
           const [latest] = await redis.zrevrange(key, 0, 0);
           if (latest) {
             const entry = JSON.parse(latest) as RunEntry;

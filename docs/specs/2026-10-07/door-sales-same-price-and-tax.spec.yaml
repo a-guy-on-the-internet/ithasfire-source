@@ -1,0 +1,237 @@
+# door-sales-same-price-and-tax.spec.yaml
+#
+# Door sales (POS card, cash, comp; web Sell screen and scanner app) charge
+# what online checkout charges for the same ticket: same price, same fees,
+# same tax, from the same shared code.
+
+version: "1.0"
+updated: "2026-10-08"
+
+# ── Rulings (owner, 2026-10-07; full text in memory
+#    project_pos_box_office_must_charge_tax.md) ─────────────────────────────
+# R0  "BOX OFFICE AND POS SALE SHOULD CHARGE TAX. THAT MECHANISM NEEDS TO BE
+#     CONSISTENT." / "box office and pos should be pulling the same ticket
+#     information we get on checkout and events". States: MN + TN.
+# R1  Door price is REMOVED: delete the ticket-pack editor field and drop the
+#     column. The door charges the price the event page shows.
+# R2  Card at the door = online: buyer pays platform fee + processing fee on
+#     top, exactly as online.
+# R3  REVISED by the owner 2026-10-08: cash = ticket + tax. NO platform fee
+#     and NO processing fee ("If they pay cash I don't want OUR platform fee
+#     to be applied, but I do want THEIR fees to be applied if they added
+#     any"; organiser-added fees don't exist yet, and would apply to cash if
+#     they ever do). The tax is owed to the platform and comes out of the
+#     organiser's next payout. Was: ticket + platform fee + tax.
+# R4  The system computes the cash total; the typed amount only works out
+#     change. Comps stay $0: no fees, no tax.
+# R5  Tax lookup fails at the door → refuse (as online, 10-06 "never 0%
+#     because a lookup failed"), BUT an EDITOR-or-above may enter the rate
+#     by hand. It applies for the rest of the event, is marked manual with
+#     who entered it, and alerts the platform. A later successful lookup
+#     replaces it (second alert if the rates differ).
+# R6  Cash debt is carried into the next payout. A platform admin page lists
+#     balances still unpaid after 30 days; collected by hand for now. Payout
+#     setup is NOT required to sell cash.
+# R7  Sell screen (web + scanner) shows ticket, fees, tax, total before the
+#     charge. Till report splits the tax owed (no platform fee on cash
+#     since 2026-10-08) from what the organiser keeps. Door buyers may give an optional email: used for a
+#     receipt that itemises tax and to attach the ticket to that email. No
+#     marketing, no account created.
+# Earlier rulings that still bind: TN taxes the buyer total
+# (project_tax_base_is_jurisdictional); MN state = buyer total, Minneapolis
+# 3% entertainment tax on face (session_minneapolis_entertainment_tax.plan);
+# PASS_THROUGH fee basis is settled.
+
+summary:
+  problem: >
+    A door sale charges no tax, no platform fee, and can use a hidden door
+    price, so the same ticket costs a different amount at the door than on
+    the event page. In TN and MN the platform is the party that collects
+    the tax, so every taxable door sale under-collects.
+  solution: >
+    Extract checkout's pricing pipeline (price, platform fee, tax lines,
+    processor fee) into one shared function that checkout, the door paths
+    and the Sell screen quote all call. Cash runs the same function with
+    the platform and processor fees off. Cash tax becomes a ledger debit on the
+    organiser's payee. Door price is deleted.
+  users:
+    - door staff (Scanner role) selling on the web Sell screen or scanner app
+    - organiser Editor/Admin (manual tax rate, refunds, till report)
+    - walk-up buyer
+    - platform admin (unpaid cash balances, manual-rate alerts)
+  surfaces: [web, scanner, api, jobs]
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        One shared pricing function returns, per line and in total, the face
+        price (STANDARD mode, scheduled prices and pay-what-you-want rules
+        included), platform fee (with cap and waiver), tax lines, processor
+        fee and charge total. Online checkout, POS card, POS cash and the
+        Sell screen quote all call it. The pipeline itself lives nowhere
+        else; the door code computes no price, fee or tax of its own.
+    - id: FR-002
+      description: >
+        Card at the door: order records feesPlatformCents, taxAmountCents,
+        tax situs fields, OrderTaxLine rows, feePolicySnapshot and per-item
+        buyerTotalCents exactly as online checkout does for the same cart;
+        the PaymentIntent amount equals the online charge total.
+    - id: FR-003
+      description: >
+        Cash at the door: same as FR-002 with platform fee = 0 and
+        processor fee = 0 (tax is solved on that base; R3 as revised
+        2026-10-08). A cash sale reserves no fee waiver. The order's amounts come from the shared
+        function, never from the typed amount. Typed amount < total is
+        refused; above it returns change.
+    - id: FR-004
+      description: >
+        Cash sale writes a payee ledger debit (new entry type) of the tax
+        (no debit when the tax is 0) in the same transaction as the order. Payable math, liability
+        SQL and the ledger conservation checks include it. A cash refund
+        writes the matching reversal.
+    - id: FR-005
+      description: >
+        Comp (cash, $0 collected, explicit comp action) records $0 ticket,
+        no fee, no tax lines, no ledger debit.
+    - id: FR-006
+      description: >
+        Door tax uses prepareCheckoutTax / resolveCheckoutTax with the same
+        retry-then-refuse rule. Door sales are not skipped by the
+        event-ended shortcut in prepareCheckoutTax (door sales happen after
+        start; an event with no endsAt counts as ended once it starts).
+    - id: FR-007
+      description: >
+        Manual rate: on TAX_RATE_UNAVAILABLE the Sell screen offers an
+        Editor-or-above "Enter tax rate" action. It stamps the event with
+        the rate, taxRateSource "manual", who and when, then retries the
+        sale. reportError fires on entry. A later successful lookup
+        replaces a manual stamp and reports again if the rates differ.
+        Scanner-role staff see the refusal and that an Editor is needed.
+    - id: FR-008
+      description: >
+        Card refund at the door returns tax through the existing
+        refundFullOrder tax-share path. Cash refund returns ticket + fee +
+        tax to the buyer and reverses the ledger debit.
+    - id: FR-009
+      description: >
+        Cash till report shows, per event: cash collected, tax owed,
+        organiser keeps; comps and refunds as today.
+    - id: FR-010
+      description: >
+        Sell screen (web admin Sell, scanner sell screen) shows ticket, fees,
+        tax and total before the card tap or cash entry, from the shared
+        quote, with the line labels online checkout uses.
+    - id: FR-011
+      description: >
+        Optional buyer email at the door. When given: the receipt itemises
+        tax lines and the ticket is attached to that email (shows up if
+        they sign up later). No marketing consent, no account created.
+    - id: FR-012
+      description: >
+        doorPriceCents is removed from the schema (migration drops the
+        column), ticket-pack editor, template apply, door-pricing.ts DOOR
+        mode, preview-promos DOOR mode and every reader.
+    - id: FR-013
+      description: >
+        Platform admin page lists payees whose cash-sale debit has stayed
+        unrecovered for more than 30 days: org, amount, oldest date.
+  non_functional:
+    - id: NFR-001
+      description: >
+        Parity test: for a fixed cart in TN, MN (Minneapolis and not) and a
+        no-tax state, online checkout and POS card produce identical
+        amounts, fees, tax lines and charge totals; POS cash is the same
+        cart with no platform fee and no processor fee, tax re-solved.
+    - id: NFR-002
+      description: >
+        No network tax lookup inside a DB transaction on any door path.
+    - id: NFR-003
+      description: >
+        Every catch-and-fallback on the new paths calls reportError
+        (CLAUDE.md Sentry convention).
+
+architecture:
+  core:
+    use_cases:
+      - name: price-cart (shared, extracted from create-checkout + checkout-helpers)
+        description: Pure pricing pipeline; channel ONLINE | DOOR_CARD | DOOR_CASH.
+        money: true
+        idempotent: true
+      - name: startPosSale / recordCashSale (edit)
+        description: Call price-cart; write fees, tax, tax lines; cash writes ledger debit.
+        money: true
+        idempotent: true
+      - name: quotePosCart (new, replaces client unit×qty totals)
+        description: Sell screen quote from price-cart.
+        money: true
+        idempotent: true
+      - name: setManualEventTaxRate (new)
+        description: EDITOR+ stamps a manual rate on an event; reportError.
+        money: true
+        idempotent: true
+      - name: refundCashSale / getCashTillReport (edit)
+        money: true
+        idempotent: true
+      - name: listUnrecoveredCashDebts (new, platform admin)
+        money: false
+        idempotent: true
+  ports:
+    existing: [OrdersRepo, PayeeLedgerRepo, TaxRateLookupPort, ReporterPort, EmailPort]
+    new: []
+  adapters:
+    existing:
+      - packages/adapters/src/db/prisma/orders.ts (till summary split)
+      - payee-ledger adapter (new entry type in payable/liability SQL)
+  transport:
+    trpc_procedures:
+      - pos.quoteCart (new)
+      - pos.startSale / pos.recordCashSale (pass taxRateLookup, buyer email)
+      - events.setManualTaxRate (new, EDITOR+)
+      - platform.cashDebts (new)
+  ui:
+    pages:
+      - /platform/cash-debts (new)
+    components:
+      - apps/web admin Sell: SellView, sell-cart, SellCatalogue, CashTillPanel
+      - apps/scanner pos: sell-screen, sale-state, tap-to-pay-surface
+      - platform TicketPackEditorView (remove door price)
+
+data:
+  new_models: []
+  modified_models:
+    - TicketType / ticket-pack template: drop doorPriceCents
+    - LedgerEntryType enum: add CASH_SALE_DEBIT and CASH_SALE_DEBIT_REVERSAL
+    - Event: who/when entered a manual tax rate (or an audit row)
+  migrations_needed: true
+
+risks:
+  - risk: Peer WIP in resolve-checkout-tax-rate.ts (sale param) and tax-impositions.ts (Minneapolis row) is uncommitted.
+    severity: HIGH
+    mitigation: Build on HEAD's API, never commit their hunks; door inherits the Minneapolis line when their step 6 lands.
+  - risk: Finalize webhook AMOUNT_MISMATCH once a processor fee is charged without per-item buyerTotalCents.
+    severity: HIGH
+    mitigation: price-cart writes buyerTotalCents for every channel; parity test covers finalize.
+  - risk: Card-present Stripe cost differs from the online processor rate the buyer is charged.
+    severity: LOW
+    mitigation: R2 rules the buyer pays the online amount; note the spread in the release notes.
+  - risk: Extracting the checkout pipeline moves an online cent.
+    severity: HIGH
+    mitigation: Existing checkout suites stay byte-identical; frozen fixtures before the extraction.
+  - risk: A mistyped manual rate charges a whole event wrong.
+    severity: MEDIUM
+    mitigation: EDITOR+ only, confirm step showing the rate as a percent, platform alert.
+
+open_questions: []
+
+out_of_scope:
+  - Automated collection of unpaid cash debts (invoicing, Stripe debit).
+  - Door prices as a visible feature (may return later as "advance / door").
+  - States other than MN and TN in the taxability table.
+
+acceptance_criteria:
+  - The same ticket bought online and by card at the door charges the same total, fees and tax lines (driven live on dev).
+  - A cash sale records its tax (no platform fee), the till report shows it owed, and the next payout for that payee is reduced by it.
+  - A failed lookup at the door refuses; an Editor enters a rate, the sale goes through at that rate, and Sentry gets the report.
+  - doorPriceCents appears nowhere in schema or code (grep).
+  - A door buyer who gives an email gets a receipt itemising tax.

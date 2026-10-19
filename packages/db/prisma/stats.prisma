@@ -1,0 +1,62 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Human & Organization Stats — aggregated performance surfaces.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model HumanStats {
+  id                     String   @id @default(uuid())
+  humanId                String   @unique
+
+  totalEventsPerformed   Int      @default(0)
+  totalTicketsAttributed Int      @default(0)
+  avgDrawPerEvent        Float?
+  topCities              Json?    // { city, state?, country, tickets }[]
+  topPlaceIds            Json?    // placeId[] top 5
+  topGenres              Json?    // genre[] top 5
+
+  channelBreakdown       Json?    // { source, tickets }[]
+
+  totalConsentedFans     Int      @default(0)
+  repeatFanCount         Int      @default(0)
+
+  followerCount          Int      @default(0)
+
+  last90DayTickets       Int      @default(0)
+  last90DayEvents        Int      @default(0)
+
+  computedAt             DateTime @default(now())
+
+  human                  Human    @relation(fields: [humanId], references: [id], onDelete: Cascade)
+
+  @@index([humanId])
+  @@map("human_stats")
+}
+
+model OrgStats {
+  id                     String       @id @default(uuid())
+  orgId                  String       @unique
+
+  totalEventsOrganized   Int          @default(0)
+  totalTicketsSold       Int          @default(0)
+  totalVenues            Int          @default(0)
+  avgTicketsPerEvent     Float?
+  topPlaceIds            Json?        // placeId[] top 5
+  topArtistHumanIds      Json?        // humanId[] top 5
+
+  uniqueAttendees        Int          @default(0)
+  repeatAttendees        Int          @default(0)
+
+  attributionSummary     Json?        // { eventId, attributed, walkIn }[]
+  topGenres              Json?        // genre[] top 5
+
+  followerCount          Int          @default(0)
+
+  last90DayTickets       Int          @default(0)
+  last90DayEvents        Int          @default(0)
+
+  computedAt             DateTime     @default(now())
+
+  org                    Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@map("org_stats")
+}

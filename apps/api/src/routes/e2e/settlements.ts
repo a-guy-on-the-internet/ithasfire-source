@@ -20,6 +20,7 @@ import { runPayoutBatch } from "@th/core/use-cases/settlements/run-batch";
 import { getSettlement } from "@th/core/use-cases/settlements/get-settlement";
 import { quoteFullRefund } from "@th/core/use-cases/orders/quote-full-refund";
 import { refundFullOrder } from "@th/core/use-cases/orders/refund-full-order";
+import { stripeRefundReasonSchema } from "@th/schema";
 import {
   assertE2eAuthorized,
   formatError,
@@ -403,15 +404,18 @@ const settlements: FastifyPluginAsync = async (app) => {
         .send({ ok: false, error: "missing_actor_human_id" });
     }
 
+    const parsedReason = stripeRefundReasonSchema
+      .optional()
+      .safeParse(body.reason);
+    if (!parsedReason.success) {
+      return reply.status(400).send({ ok: false, error: "invalid_reason" });
+    }
+
     try {
       const result = await refundFullOrder(app.deps.trpc, {
         actorHumanId: body.actorHumanId,
         orderId,
-        reason: body.reason as
-          | "requested_by_customer"
-          | "fraudulent"
-          | "other"
-          | undefined,
+        reason: parsedReason.data,
       });
       return reply.send({
         ok: true,

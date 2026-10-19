@@ -128,6 +128,10 @@ async function exportOrgOrders(
     { header: "Platform Fee (cents)", value: (r) => r.feesPlatformCents },
     { header: "Currency", value: (r) => r.currency },
     { header: "Status", value: (r) => r.status },
+    // Mirror of the order's Dispute row (OPEN / UNDER_REVIEW / WON / LOST /
+    // WARNING_*); blank when the charge was never disputed. `Status` alone
+    // never says "disputed" — see resolveOrderStatusFilter in core.
+    { header: "Dispute", value: (r) => r.disputeStatus ?? "" },
     { header: "Source", value: (r) => r.source },
     { header: "Stripe PI", value: (r) => r.stripePaymentIntentId },
   ];

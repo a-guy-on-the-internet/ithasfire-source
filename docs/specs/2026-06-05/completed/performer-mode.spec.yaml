@@ -1,0 +1,165 @@
+# performer-mode.spec.yaml
+#
+# An explicit opt-in "performer mode" that gates performer-facing surfaces,
+# instead of inferring intent from the incidental Human.jobs[] tags.
+# "Performer" deliberately covers musicians, comedians, DJs, speakers, drag,
+# spoken-word, magicians — anyone who gets booked for a slot. User-facing copy
+# may favour activity verbs ("get booked") so nobody has to self-label.
+
+version: "1.0"
+updated: "2026-06-10"
+status: in-progress
+# 2026-06-10: Core gate SHIPPED — PerformerProfile model (ownerType human|org),
+# isPerformerEnabled predicate, set-performer-mode/get-performer-status use
+# cases, performers.setMode/getMyStatus tRPC, account + org settings toggles.
+# REMAINING: profile-content fields (EPK slug, rider, default availability,
+# default payout terms) and the completion-nudge flow (FR-003).
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Today the only signal that a Human is a performer is Human.jobs[] +
+    Human.genreTags[] (added by human-jobs-and-genre-identity, 2026-04-14),
+    which are set incidentally — often via the PlaceReview form — and were
+    never meant as a feature gate. Surfacing performer features (booking
+    requests, EPK / "Book Me", agreement editor, default payout terms) off
+    "does jobs[] contain a performer role?" is leaky and assumes intent that was
+    never given. No entity should be treated as a potential performer by default.
+  solution: >
+    Add an explicit, intentional opt-in. An entity (Human, and later Org) turns
+    on performer mode via a deliberate "Set up your performer profile" action,
+    which creates a PerformerProfile row. All performer surfaces gate on that
+    profile, not on jobs[]. The existing jobs[]/genreTags[] become *contents* of
+    the performer profile rather than the trigger. Turning it off hides the
+    surfaces without deleting data.
+  users:
+    - Any authenticated Human who wants to be discoverable/bookable as a performer
+    - Organizations (bands, troupes, DJ collectives) — same opt-in, org-role scoped
+  surfaces:
+    - web (account/org settings — "Performer profile" / get-booked entry)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        An entity can enable performer mode. Enabling creates a PerformerProfile
+        (stamping enabledAt). The act is intentional and reversible (disable
+        stamps disabledAt and hides surfaces, but retains the row + data).
+    - id: FR-002
+      description: >
+        A shared `isPerformer(entity)` predicate in packages/core is the SINGLE
+        source of truth (an enabled PerformerProfile exists). No surface may
+        infer performer status from jobs[] / genreTags[] directly — those become
+        profile fields. GENRE_JOBS and the jobs picker continue to work as
+        profile content.
+    - id: FR-003
+      description: >
+        Enabling performer mode optionally prompts to complete the profile
+        (jobs, genre tags, public EPK slug, default availability, default payout
+        terms). Completion is not required to be "on", but the booking CTA (spec
+        (a)/(c)) only renders for performer-mode entities.
+    - id: FR-004
+      description: >
+        Scope: a Human may only toggle their own performer mode; an Org's
+        performer mode requires an org admin role (mirror repos.authz org-role
+        checks). Audit-log performer_mode_enabled / _disabled.
+  non_functional:
+    - id: NFR-001
+      description: >
+        Additive and default-off for all existing entities. No backfill — nobody
+        is auto-enrolled, even if they already have jobs[] set.
+    - id: NFR-002
+      description: >
+        Idempotent: enabling an already-enabled profile is a no-op that returns
+        the same profile.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: set-performer-mode
+        description: >
+          Enable/disable performer mode for the target entity. Creates the
+          PerformerProfile (or stamps enabledAt/disabledAt). Reuses
+          update-human-jobs for profile content rather than re-implementing it.
+        input: "{ ownerType: 'human'|'org', ownerId, enabled: boolean, actorHumanId }"
+        output: "{ performerProfileId, enabledAt: Date | null }"
+        idempotent: true
+        money: false
+    constants:
+      - name: isPerformer
+        file: packages/core/src/lib/performer-mode.ts
+        description: Predicate over an entity (enabled PerformerProfile present); the only gate the rest of the app may use.
+  ports:
+    new:
+      - PerformerProfilesRepo
+    existing:
+      - HumansRepo, OrgsRepo (read for ownership/authz)
+  adapters:
+    new:
+      - packages/adapters/src/db/prisma/performer-profiles.ts
+    existing: []
+  transport:
+    trpc_procedures:
+      - performers.setMode (entity-scoped; self for Human, org-admin for Org)
+  ui:
+    pages:
+      - apps/web/src/app/account/settings (add a "Performer profile" section / get-booked entry)
+      - org settings (same entry, org-role gated)
+    components:
+      - reuse <HumanJobsPicker>; add an enable/disable switch + profile completion nudge
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - >
+      PerformerProfile (entity-scoped: ownerType human|org + ownerId, enabledAt,
+      disabledAt?, plus EPK slug, rider, default availability ref, default
+      payout terms ref). The gate lives here (enabled = enabledAt set &&
+      disabledAt null). Chosen over a bare flag because the EPK / book-me spec
+      (2026-03-18) and tour-routing want a home for this data, and it must apply
+      to Orgs as well as Humans.
+  modified_models: []
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Existing code that gates on jobs[] would silently keep working and bypass
+      the new gate. Mitigation: grep for jobs-based gating and route everything
+      through isPerformer; add a test asserting the booking CTA ignores jobs[].
+    severity: MEDIUM
+    mitigation: Centralize on isPerformer; lint/review for direct jobs[] gating.
+
+open_questions: []
+
+decisions:
+  - >
+    Profile row (PerformerProfile), NOT a bare flag — it houses the EPK slug,
+    rider, default availability, and default payout terms, and is entity-scoped
+    so Orgs get it too.
+  - >
+    Do NOT auto-create the public EntityPage on enable. Showing an entity page
+    on the settings page is itself flag-gated; instead nudge the user with a
+    small notification to set one up after enabling performer mode.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - The booking-request / agreement flow (spec (c)).
+  - The venue toggle + block (spec (a)).
+  - Full EPK / "Book Me" build (tracked in 2026-03-18/artist-epk-book-me.spec.yaml).
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - An entity can explicitly enable and disable performer mode from settings; default is off for everyone.
+  - isPerformer is the only gate; a Human with jobs[] set but performer mode off is NOT treated as a performer.
+  - Disabling retains jobs[]/genreTags[]/profile data; re-enabling restores the surfaces.
+  - set-performer-mode is idempotent; Human self-scoped, Org org-admin scoped; audit log entries emitted.

@@ -1,0 +1,178 @@
+# event-detail-subnav.spec.yaml
+#
+# Event-scoped sub-navigation for the admin event detail pages.
+
+version: "1.0"
+updated: "2026-04-24"
+related:
+  - docs/specs/2026-03-23/volunteering.spec.md
+  - docs/specs/2026-04-24/volunteer-shift-composer.spec.yaml
+
+scope_note: >
+  This spec introduces a persistent event-scoped sub-navigation on the admin
+  event detail surface. It does not change the data model, business logic,
+  APIs, or permissions. It is a pure UX/navigation improvement that unifies
+  how organizers move between surfaces that already exist under
+  /admin/{slug}/events/{id}/*.
+
+summary:
+  problem: >
+    Today there is no event-level hub. The only page rooted at
+    /admin/{slug}/events/{id} is `edit/`, which mounts EventBuilder with its
+    own Edit/Preview/Seating tabs. Event-scoped siblings
+    (volunteers, applications, attendees, comp-tickets) each live on separate
+    routes and are reached through inconsistent side doors:
+      - Volunteers: buried inside EventBuilder → Advanced Settings →
+        Volunteering → "Manage roles".
+      - Applications: buried inside EventBuilder → Advanced Settings → Gate,
+        only visible when the gate is APPLICATION.
+      - Attendees: only reachable from the events list row action.
+      - Comp tickets: only reachable from the events list row action.
+    Organizers cannot see the full surface of a single event in one place, and
+    volunteer/applications paths feel like easter eggs.
+  solution: >
+    Introduce a shared layout at apps/web/src/app/admin/[slug]/events/[id]/
+    that renders an `EventTabNav` above every child route. The tab bar lists
+    the event-scoped surfaces (Overview, Volunteers, Applications, Attendees,
+    Comp tickets) and highlights the active segment. No page bodies are moved
+    or rewritten; existing routes continue to own their content. The Edit
+    page becomes "Overview" conceptually — EventBuilder's internal
+    Edit/Preview/Seating tabs remain as a second-level within Overview.
+  users:
+    - Org admins editing and operating events
+    - Org editors managing attendees, applications, and volunteers
+  surfaces:
+    - web-admin
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        A shared Next.js layout at
+        apps/web/src/app/admin/[slug]/events/[id]/layout.tsx must wrap all
+        child routes (edit, volunteers, applications, attendees, comp-tickets)
+        with a persistent event header and tab bar.
+    - id: FR-002
+      description: >
+        The tab bar must expose, in order:
+          1. Overview  → edit/
+          2. Volunteers → volunteers/
+          3. Applications → applications/
+          4. Attendees → attendees/
+          5. Comp tickets → comp-tickets/
+        The active tab must be derived from the current path segment.
+    - id: FR-003
+      description: >
+        The event header above the tab bar must display the event title, a
+        back link to /admin/{slug}/events, and (when available) the event
+        date/time and status. The header must not duplicate EventBuilder's
+        internal Save/Publish controls.
+    - id: FR-004
+      description: >
+        The layout must fetch a lightweight event summary
+        (title, startAt, status, gateType, volunteeringEnabled) via the
+        existing events.getForEdit (or a minimal equivalent) tRPC query.
+        No new port or use case is introduced.
+    - id: FR-005
+      description: >
+        Conditional visibility:
+          - Applications tab: show always, but render a muted/disabled tab
+            with a tooltip "Enable application gate in event settings" when
+            gateType !== "APPLICATION".
+          - Volunteers tab: show always; when volunteeringEnabled is false,
+            link still works (user can enable on the volunteers page or in
+            settings) and the tab shows no count.
+      note: >
+        "Always visible" is intentional — predictable IA beats hiding. The
+        disabled state for Applications is a soft cue, not a hard block.
+    - id: FR-006
+      description: >
+        Each tab may optionally show a badge count in a follow-up. For v1,
+        render tabs without counts. Structure the `EventTabNav` component so
+        badges can be added without API changes to the layout contract.
+    - id: FR-007
+      description: >
+        The Overview tab must continue to render EventBuilder unchanged,
+        including its internal Edit/Preview/Seating sub-tabs. EventBuilder is
+        not refactored as part of this spec.
+    - id: FR-008
+      description: >
+        The existing in-EventBuilder "Manage roles" and "Review applications"
+        shortcut buttons remain functional; they now navigate to the same
+        routes the new tab bar links to. They may be removed in a future pass
+        but are out of scope here.
+    - id: FR-009
+      description: >
+        The events list page row actions (View attendees, Comp tickets, Edit)
+        must still work. They land on the corresponding tab with the shared
+        header/tab bar now visible.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Layout must not block first paint waiting on the event summary query.
+        Render the tab bar with the event title set to a skeleton and hydrate
+        when the query resolves.
+    - id: NFR-002
+      description: >
+        Tabs must be keyboard-navigable (left/right arrow moves focus, Enter
+        activates) and expose role="tablist" semantics appropriate for a
+        nav-as-tabs pattern (tablist with link children is acceptable).
+    - id: NFR-003
+      description: >
+        No new warnings introduced in focused ESLint
+        (no-misused-promises, no-floating-promises, exhaustive-deps).
+
+  out_of_scope:
+    - Adding Orders, Waitlist, Lineup, Waiver, Finance, Payouts, or Check-in
+      tabs. Those may be added in follow-up specs once their pages exist.
+    - Moving content out of EventBuilder's Advanced Settings accordion.
+    - Adding badge counts to the tabs.
+    - RBAC changes. Tabs must inherit existing per-page gating.
+    - Mobile app surfaces.
+
+implementation_notes:
+  files_added:
+    - apps/web/src/app/admin/[slug]/events/[id]/layout.tsx
+    - apps/web/src/app/admin/[slug]/events/[id]/_components/EventTabNav.tsx
+    - apps/web/src/app/admin/[slug]/events/[id]/_components/EventDetailHeader.tsx
+  files_touched:
+    - apps/web/src/app/admin/[slug]/events/[id]/page.tsx (formerly
+      `edit/page.tsx`; the `/edit` route is now a back-compat redirect.
+      May drop its own wrapper if the layout already provides
+      padding/back link).
+    - apps/web/src/app/admin/[slug]/events/[id]/volunteers/_components/VolunteersView.tsx
+      may drop its own AdminPageHeader slug/back hint now that the layout
+      provides one — optional follow-up.
+  data:
+    - Reuse trpc.events.getForEdit (or getForDetail if present) via a
+      client-side query in the layout's client wrapper. If the layout must
+      stay server-only, add a thin client component for the header/tab bar
+      and render children as-is.
+  accessibility:
+    - role="navigation" on the outer wrapper, aria-label="Event sections".
+    - Active tab uses aria-current="page".
+  styling:
+    - Match existing admin tab styling (see EventBuilder's top tab row).
+    - Sticky below the admin top bar on desktop; horizontally scrollable on
+      narrow viewports.
+
+validation:
+  - Focused ESLint passes on new and touched files.
+  - get_errors clean on new and touched files.
+  - Manual check: navigating between Overview/Volunteers/Applications/
+    Attendees/Comp tickets keeps the header+tab bar stable and highlights
+    the active tab.
+  - Manual check: landing directly on any tab route via URL renders the
+    layout correctly (no layout-vs-page race).
+
+risks:
+  - Double headers: VolunteersView and applications/page currently render
+    their own `AdminPageHeader`. v1 accepts the visual duplication; follow-up
+    cleanup is listed in implementation_notes.
+  - Mobile layout: the tab bar is horizontally scrollable, so we will not
+    crowd the small viewport; verify on the web-mobile viewport.
+  - EventBuilder's internal tabs could be confused with the outer tabs.
+    Visual hierarchy (outer = section nav, inner = Edit/Preview/Seating
+    inside Overview) must be obvious; use label "Overview" for the outer
+    tab to avoid the word "Edit" appearing twice.

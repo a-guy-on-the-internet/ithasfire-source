@@ -1,0 +1,87 @@
+/* ── HUMAN (musician / artist) standard layout ───────────────────────────────
+   Single-column, mobile-first, shows-first performer template. The root reuses
+   place-entity.module.css `.placeRoot` for the shared Swiss skin tokens
+   (--place-data / --place-rule / --place-accent) + font handling and the hero
+   reuses the shared hero classes, so this module only owns the single-column
+   body rhythm, the demoted past-shows zone, and the low-emphasis footer.      */
+
+/* Constrained editorial reading column under the full-bleed hero. */
+.humanBody {
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 1.75rem 1.5rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+/* Each stacked zone. Blocks carry no margin of their own (see
+   block-primitives.module.css), so the zone's gap owns the rhythm between
+   blocks inside it; the parent `.humanBody` gap spaces the zones. */
+.zone {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+/* Photos strip sits a touch tighter to read as a gallery band, not a card. */
+.photoZone {
+  margin-top: 0.25rem;
+}
+
+/* Past shows: demoted + visually dimmed so history never competes with the
+   live calendar above it. Still fully legible + keyboard reachable. */
+.pastShowsZone {
+  opacity: 0.72;
+  transition: opacity 0.15s ease;
+}
+
+.pastShowsZone:hover,
+.pastShowsZone:focus-within {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pastShowsZone {
+    transition: none;
+  }
+}
+
+/* Connect & booking footer — the page's low-emphasis "how to reach me" band.
+   A thick top rule separates it from the content above; the socials (`links`)
+   and booking contact (`booking_info`) blocks render inside it. */
+.footerZone {
+  margin-top: 1rem;
+  padding-top: 1.5rem;
+  border-top: 2px solid var(--place-rule);
+  display: flex;
+  flex-direction: column;
+  /* Owns the spacing between the label and its blocks (blocks are marginless). */
+  gap: 0.75rem;
+  /* Hero "Booking" CTA scroll target — clear the fixed chrome (matches the
+     org sidebar anchor's offset). */
+  scroll-margin-top: 5rem;
+}
+
+/* The zone takes programmatic focus (tabIndex=-1) after the hero Booking jump;
+   suppress the mouse/programmatic outline but keep it for keyboard focus. */
+.footerZone:focus:not(:focus-visible) {
+  outline: none;
+}
+
+.footerLabel {
+  /* The footerZone gap spaces the label from the first block. */
+  margin: 0;
+  font-size: 0.75rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  opacity: 0.7;
+}
+
+@media (max-width: 640px) {
+  .humanBody {
+    padding: 1.5rem 1.125rem 0;
+  }
+}

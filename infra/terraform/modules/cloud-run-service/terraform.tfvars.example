@@ -1,0 +1,6 @@
+project_id   = "ithasfire-dev"
+region       = "us-central1"
+environment  = "dev"
+service_name = "api"
+image        = "gcr.io/example/api:latest"
+port         = 3001

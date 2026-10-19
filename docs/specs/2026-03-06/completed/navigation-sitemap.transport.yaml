@@ -1,0 +1,92 @@
+# Spec: Navigation Sitemap Transport
+meta:
+  owner: transport
+  status: draft
+  reviewers:
+    - platform
+    - apps-web
+    - apps-mobile
+  last_updated: 2025-11-26
+summary: |
+  Define the transport layer responsible for delivering navigation payloads (sections, badges, alerts,
+  shortcuts) to UI shells across web and mobile. Ensures consistent caching, RBAC filtering, and context
+  propagation for admin, organizer, and consumer personas. This spec covers *app navigation payloads*, not
+  SEO XML sitemaps (see `docs/specs/platform/sitemaps-architecture.spec.yaml`).
+goals:
+  - Provide a single endpoint (tRPC + REST) that returns the active nav sitemap for personal/org contexts.
+  - Include derived metadata such as badge counts, alert severity, feature flag gating, and hub shortcuts.
+  - Support cache-friendly semantics (ETags/stale-while-revalidate) so shells stay snappy.
+  - Emit analytics hooks for nav impressions + assignment IDs for A/B tests.
+scope:
+  in_scope:
+    - API contracts for `navigation.getSections`, `navigation.getShortcuts`, and mobile overlay summary.
+    - Transport-level middleware handling context detection + RBAC filtering.
+    - Caching, pagination (if needed), and error codes.
+  out_of_scope:
+    - Underlying data fetchers (repos/use cases) which live in `@th/core`.
+    - Consumer discovery content (handled by event search transports).
+request_flow:
+  - Client includes Better Auth session token in `Authorization` header (JWT) and optional `x-th-context-id`.
+  - Fastify plugin resolves context (per context-routing spec) before handler executes.
+  - Handler calls `core.navigation.getSitemap({ context })` returning nav sections + metadata.
+  - Response includes `ETag` so clients can `If-None-Match`.
+endpoints:
+  - tRPC: `navigation.getSitemap`
+    input: `{ locale?: string, layout?: "desktop" | "mobile" }`
+    output:
+      - shellVariant: "admin" | "discovery" # tells client whether to mount NavigationShell vs discovery shell
+      - sections: NavigationSection[] (same shape as UI spec; empty when shellVariant === "discovery")
+      - shortcuts: QuickAction[]
+      - badges: { alerts: number, payouts: number }
+      - experiments: { assignmentId: string, variants: Record<string,string> }
+      - expiresAt: ISO timestamp for cache guidance
+  - REST fallback: `GET /v1/navigation`
+    headers:
+      - `If-None-Match`
+      - `X-TH-Context-ID` (optional)
+    responses:
+      - 200 with JSON body, `ETag`, `Cache-Control: private, max-age=30, stale-while-revalidate=60`
+      - 304 when unchanged
+  - Mobile summary: `GET /v1/navigation/mobile-summary`
+    - Lightweight payload for overlay badges + admin shortcuts (IDs only).
+rbac_rules:
+  - Sections/items annotated with required roles; transport filters before returning to client.
+  - When all items filtered out or `context.type === consumer`, return `shellVariant: "discovery"` so UI mounts consumer-only shell.
+  - Super-admin contexts receive additional section `HQ Tools`; only available when `context.type === "super_admin"`.
+data_shape:
+  NavigationSection:
+    - id, label, icon, order, items[], featureFlag, rbacRoles
+  NavigationItem:
+    - id, label, route, badgeCount, tone, children[], analyticsId
+  QuickAction:
+    - id, label, icon, actionType (client-side, deeplink, mutation), confirm?
+errors:
+  - 401 `unauthenticated`
+  - 403 `forbidden_context` (context not allowed for navigation route)
+  - 409 `context_stale` (context not recognized anymore)
+  - 500 `internal`
+caching:
+  - Primary TTL 30s for organizer contexts; consumer contexts can cache 5 minutes.
+  - Revalidate on context switch events (clients should drop caches when `context.switch` mutation resolves).
+  - Use Redis to store rendered sitemap keyed by `{contextId}:{featureHash}`; invalidated when alerts/payout badges change.
+telemetry:
+  - Log `navigation.payload.generated` (contextId, latencyMs, sectionCount).
+  - Audit when sitemap includes admin sections to detect unexpected exposure.
+  - Emit metrics for cache hit/miss ratio.
+implementation_notes:
+  - Provide TypeScript types in `packages/transport/types/navigation.ts` consumed by web/mobile packages.
+  - Compose data from `adminHub.getSummary`, alerts service, payouts queue, feature flag service.
+  - Ensure translation keys provided for labels; UI resolves copy via `@th/locale`.
+  - Order/structure of sections is defined centrally in transport/core config; no drag/drop customization exposed to clients.
+dependencies:
+  - Context routing platform spec (for header/cookie resolution and Better Auth session expectations).
+  - Navigation shell component + Admin Hub flow specs (consumers of this payload).
+  - SEO Sitemap architecture doc (only to avoid naming collisions; that spec covers public XML sitemaps).
+open_questions:
+  - Do we need delta/diff payloads for large nav trees or is full payload fine?
+  - Should REST endpoint support `fields` query to trim response for mobile overlay?
+  - How do we handle consumer contexts that still have saved admin bookmarks (redirect?).
+next_steps:
+  - Build `navigation` router in `packages/transport/trpc`.
+  - Implement caching helper + Redis keying strategy.
+  - Update UI shell + overlay to fetch from new endpoint.

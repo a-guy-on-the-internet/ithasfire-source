@@ -1,0 +1,216 @@
+# Not built yet (2026-10-18): code a563a4b42 + legal copy landed, not pushed; not driven on an SMS-on stack
+# volunteer-ask-reminders.spec.yaml
+#
+# Reminders (email, in-app, SMS) for volunteers on a one-time ask with a start
+# time and on event roles without shifts, and the text-reminder offer put back.
+
+version: "1.0"
+updated: "2026-10-17"
+
+# ── Rulings (owner, 2026-10-17; "Go with your recommended." to round 1) ──────
+# Full round in memory session_ask_text_reminders.plan.md.
+# R1  Anchor: a ONE_TIME ask's startsAt. An ONGOING/RECURRING ask's start is
+#     when it opens, not when a volunteer is expected, so it gets none.
+# R2  An ask with no anchor sends no reminder and offers no texts.
+# R3  Channels: email + in-app + SMS, same as shift reminders.
+# R4  Timing: 24h and 1h before, same jobs and bands as shifts. Approved
+#     inside a band = that reminder is missed; a moved start sends no
+#     correction. Both match shifts.
+# R5  The organiser switch `ask.smsOptInEnabled` no longer gates anything:
+#     the volunteer chooses, as on event shifts. Column stays, unused.
+# R6  Ask status: OPEN, PAUSED, CLOSED remind; DRAFT, ARCHIVED do not;
+#     a withheld (banned) owner does not.
+# R7  Event roles without shifts: remind before the EVENT start, copy says
+#     "the event starts", never "your shift". The event box returns for them.
+# R8  Dated ask slots (occurrence claims): NOT in this build. They need a
+#     claim-keyed ledger; built with the slot screens (occurrences spec FR-009).
+# R9  Terms §12 and help put back with wording scoped to what is built; the
+#     owner reads the Terms diff before it is committed.
+# R11 Owner 2026-10-18: "Ok." to the Terms §12 + Privacy wording (R9 read done).
+# R10 Ask signups that already have smsOptIn = true are honoured (STOP still
+#     blocks).
+# R12 Owner 2026-10-18: "Yea. If we could group them that'd be ideal and less
+#     spammy." One reminder per person per start time, on every channel: signups
+#     of one person on the same event or ask with the same anchor time share one
+#     text / email / in-app notice naming every role. Channels: all three (the
+#     orchestrator's recommendation; owner did not narrow it).
+# Earlier rulings that still bind: switching texts ON re-consents only the
+# actor's own verified phone, others get the static `smsMayNeedStart` hint
+# (owner 2026-10-17, `_shared/record-volunteer-sms-consent.ts`).
+
+summary:
+  problem: >
+    Volunteers on standing asks and on shiftless event roles were offered text
+    reminders that were never sent, and get no reminder on any channel: the
+    only reminder jobs select by shift start. The offer was taken down
+    (9d118cd01, c3cde1900, 5e28128ab).
+  solution: >
+    Teach the existing volunteer reminder jobs a second and third anchor (the
+    ask's start, the event's start), reusing the VolunteerShiftNotification
+    ledger, then put the opt-in back wherever a reminder will really be sent.
+  users:
+    - volunteer (account or guest)
+    - organiser (ask and event owner)
+  surfaces: [jobs, web]
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        A signup is "remindable" by exactly one anchor: its shift's start
+        (existing), else for an event signup without a shift the event's
+        start when the ROLE has no shifts at all (a role-level pick on a role
+        that has shifts gets nothing), else for a non-EVENT ask signup the ask's startsAt when the
+        ask is ONE_TIME. One shared core helper decides it; the submit path,
+        the contact-prefs toggle, the public ask payload and the jobs all
+        call it.
+    - id: FR-002
+      description: >
+        The 24h and 1h jobs send ask-start and event-start reminders to
+        APPROVED signups in the same bands as shifts, on email (always),
+        in-app (humanId set) and SMS (phone + smsOptIn, US, not opted out),
+        with the same ledger claim, rollback, redacted reporting and GSM-7
+        title trimming as shift reminders.
+    - id: FR-003
+      description: >
+        Ask-start reminders skip asks in DRAFT or ARCHIVED and asks whose
+        owner is withheld, re-checked just before any claim (as the
+        still-on event re-check does). Event-start reminders use the
+        existing still-on event gate.
+    - id: FR-004
+      description: >
+        Ask reminder copy names the ask and its start in the ask's timezone
+        (subject place's zone, then the platform default via resolveTimeZone, when the ask has none; the zone is always named), shows the
+        end only when set, never shows an event address, and links to
+        /v/<askId>. Event-start copy says the event starts at <time>.
+    - id: FR-005
+      description: >
+        Submit stores smsOptIn = true only when the signup is remindable (FR-001),
+        has a phone and the volunteer ticked the box; the organiser switch
+        no longer takes part. Reapply follows the same rule.
+        `updateVolunteerContactPrefs` refuses ON (`sms_reminders_unavailable`)
+        only for signups that are not remindable.
+    - id: FR-006
+      description: >
+        Web: the public ask page offers the text opt-in when the ask is
+        remindable, the SMS gate is on and a phone is entered (as before the
+        take-down, minus the organiser condition). The event box offers it
+        for a shiftless role. The ask form drops nothing further and gains
+        no switch.
+    - id: FR-006b
+      description: >
+        A signed-in volunteer can turn an ask signup's texts on and off from
+        its row on /my-volunteering (Q9 "manage toggle"; ask signups have no
+        other manage surface). Needed because STOP clears every signup's
+        smsOptIn and START deliberately does not restore them
+        (record-sms-opt-in.ts:53). Same control and consent rules as the
+        event page's sign-up row toggle.
+    - id: FR-007
+      description: >
+        Terms §12 and help (volunteer-at-an-event.md, recruit-standing-volunteers.md,
+        manage-volunteers.md, notification-settings.md) say texts come for event shifts, event roles and
+        one-time asks with a set start time. Terms diff to the owner before
+        commit.
+
+    - id: FR-008
+      description: >
+        Grouping (R12). Per channel, candidates sharing a destination (phone
+        for SMS, email address for email, humanId for in-app), the same
+        subject (event or ask) and the same start instant are sent as ONE
+        message naming every role still unsent (on an event, a shift that
+        starts at the event start joins the shiftless roles, and any
+        event-start member makes it the start form). The
+        ledger stays per signup: every grouped signup's (signup, kind,
+        channel) row is claimed before the send and all claimed rows roll
+        back together if it fails. A signup whose row was already sent is
+        left out of the message. Two shifts at different times stay separate.
+        SMS stays one segment: past two roles it reads "<role> and N more".
+        A role added after a reminder for that start went out gets its own
+        reminder, so the copy promises timing (about 24h and 1h before each
+        start time), not a hard count.
+        Consent copy changes from "for each shift or role" to per start time;
+        the Terms change goes to the owner before commit.
+  non_functional:
+    - id: NFR-001
+      description: >
+        One ledger row per (signup, kind, channel): a signup has one anchor,
+        so overlapping ticks and the three anchors can never double-send.
+    - id: NFR-002
+      description: >
+        Every swallow branch reports through `reportError` with phone numbers
+        redacted (CLAUDE.md error convention; 0f8103f28 precedent).
+
+architecture:
+  core:
+    use_cases:
+      - name: sendVolunteerShiftReminders (extended) or a sibling sendVolunteerAskReminders
+        description: >
+          Builder's call, stated in the plan: one dispatcher over a candidate
+          union, or a sibling sharing the channel fan-out. Either way the
+          same jobs run it.
+        idempotent: true
+        money: false
+      - name: _shared/signup-reminder-anchor (new helper)
+        description: FR-001 rule, pure.
+  ports:
+    existing: [repos.volunteering, MailerPort, SMSPort, ReporterPort, ClockPort]
+    new: >
+      repo methods: find ask-start and event-start reminder candidates; ask
+      still-remindable re-check.
+  adapters:
+    existing: [packages/adapters/src/db/prisma/volunteering.ts]
+  transport:
+    trpc_procedures: [] # public ask payload gains `textRemindersOffered`
+  ui:
+    components:
+      - PublicAskView (opt-in back)
+      - VolunteerSection (box back for shiftless roles)
+  email:
+    templates: >
+      volunteer.shift_reminder gains an optional ask/event-start variant or a
+      sibling template; endsAt optional.
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+  lifecycle: >
+    No new model. VolunteerShiftNotification rows for ask and event-start
+    reminders follow the existing ledger lifecycle (append-only, cascade
+    with the signup).
+
+risks:
+  - risk: An ask start edited after reminders went out leaves a stale reminder.
+    severity: LOW
+    mitigation: Matches shifts (R4); a correction notice is a separate feature.
+  - risk: Old asks with null timezone render a wrong local time.
+    severity: MEDIUM
+    mitigation: Place zone fallback, then the platform default, zone named.
+  - risk: >
+      A role whose ONLY shift is deleted becomes shiftless, so its signups get
+      event-start reminders (nothing records the old shift). Accepted by the
+      orchestrator 2026-10-17; pinned by the "PINNED EDGE" test.
+    severity: LOW
+    mitigation: The organiser removed every shift; the event start is the only time left.
+  - risk: Recurring listings move Event.startsAt to the next date.
+    severity: LOW
+    mitigation: >
+      Unreachable: recurring listings are community listings with no org,
+      and event roles require an org (manage-event-volunteer-roles.ts:43-56).
+  - risk: A dated slot on a ONE_TIME ask is reminded by the ask start, not the slot.
+    severity: LOW
+    mitigation: Slots have no screen yet (R8); the claim-keyed reminders replace this when built.
+
+open_questions: []
+
+out_of_scope:
+  - Occurrence-claim reminders (R8).
+  - Correction notices for moved starts.
+  - Removing the `smsOptInEnabled` column.
+
+acceptance_criteria:
+  - An APPROVED signup on a ONE_TIME ask starting in 24h gets email, in-app (with account) and SMS (opted in) once each across overlapping ticks.
+  - The same signup on an ONGOING ask, a DRAFT/ARCHIVED ask, or a withheld owner's ask gets nothing.
+  - A shiftless event-role signup gets reminders before the event start; none for a cancelled event.
+  - Submitting with the box ticked on a remindable ask stores smsOptIn true without the organiser switch; on a non-remindable ask it stores false.
+  - The public ask page shows the opt-in only on a remindable ask with the SMS gate on; zero new console errors; no overflow at 320.

@@ -19,7 +19,9 @@ export const snsEnvelopeSchema = z
     TopicArn: z.string().min(1).max(2048),
     Message: z.string().max(512 * 1024),
     Timestamp: z.string().min(1),
-    SignatureVersion: z.enum(["1", "2"]),
+    // SHA256 only: the inbound topic is set to signature_version = 2, and
+    // accepting "1" would keep SHA1 signatures verifiable.
+    SignatureVersion: z.literal("2"),
     Signature: z.string().min(1),
     SigningCertURL: z.string().url(),
     Subject: z.string().optional(),
@@ -131,9 +133,18 @@ const CERT_MAX_BYTES = 64 * 1024;
 export const defaultFetchCertPem: FetchCertPem = async (certUrl) => {
   const cached = certCache.get(certUrl);
   if (cached) return cached;
-  const response = await fetch(certUrl);
+  // No redirects: the host+path were validated on THIS URL, and a redirect
+  // would fetch the "cert" from somewhere that check never saw.
+  const response = await fetch(certUrl, { redirect: "error" });
   if (!response.ok) {
     throw new Error(`sns_cert_fetch_failed_${response.status}`);
+  }
+  // Refuse a declared oversize body before reading any of it; the byte check
+  // below still covers a missing or lying content-length.
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > CERT_MAX_BYTES) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error("sns_cert_too_large");
   }
   const pem = await response.text();
   if (Buffer.byteLength(pem, "utf8") > CERT_MAX_BYTES) {
@@ -147,8 +158,8 @@ export const defaultFetchCertPem: FetchCertPem = async (certUrl) => {
 };
 
 /**
- * Verify an SNS envelope's signature (NFR-002). SignatureVersion "1" is
- * SHA1withRSA, "2" is SHA256withRSA. Returns false (never throws) for a
+ * Verify an SNS envelope's signature (NFR-002). Only SignatureVersion "2"
+ * (SHA256withRSA) passes the envelope schema. Returns false (never throws) for a
  * signature that simply doesn't match; throws for structural problems
  * (untrusted cert URL, cert fetch failure) so callers can distinguish
  * "forged" from "broken".
@@ -159,9 +170,9 @@ export async function verifySnsSignature(
 ): Promise<boolean> {
   assertAmazonSnsCertUrl(envelope.SigningCertURL);
   const pem = await fetchCertPem(envelope.SigningCertURL);
-  const algorithm =
-    envelope.SignatureVersion === "2" ? "RSA-SHA256" : "RSA-SHA1";
-  const verifier = createVerify(algorithm);
+  // Belt for callers that skip the schema: never verify with SHA1.
+  if (envelope.SignatureVersion !== "2") return false;
+  const verifier = createVerify("RSA-SHA256");
   verifier.update(buildSnsStringToSign(envelope), "utf8");
   return verifier.verify(pem, envelope.Signature, "base64");
 }

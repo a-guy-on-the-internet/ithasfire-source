@@ -1,0 +1,179 @@
+# membership-entity-page-block.spec.yaml
+#
+# In-page membership block for HUMAN/ORGANIZATION entity pages, replacing the
+# link-out-only "tab" experience with tier cards + inline join, reusing the
+# already-shipped memberships money loop end to end.
+
+version: "1.0"
+updated: "2026-08-18"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The full memberships money loop (Stripe Billing subscriptions, tiers,
+    join flow) is already built and live in dev, but on an entity's own page
+    it's only reachable via a separate "Memberships" TAB
+    (EntityPageShell → MembershipsPanel) — not part of the normal page body a
+    visitor scrolls through, and outside the block-editor system every other
+    piece of page content goes through.
+  solution: >
+    A new `memberships` PageBlock kind, rendered inline in the normal page
+    flow (not a separate tab), showing tier cards with pricing/benefits and a
+    Join CTA that opens the EXISTING inline subscribe flow
+    (MembershipPaymentStep) — first-party, so nothing about the deliberate
+    embed link-out restriction applies here. Reuses the already-public-safe
+    `memberships.listPublic` procedure and the existing MembershipTierCard /
+    MembershipPaymentStep components; the join-flow state machine currently
+    living inside MembershipsPanel gets extracted into a shared hook so the
+    block and the (retained, for now) tab don't duplicate logic.
+  users:
+    - Musicians / organizations with active membership tiers
+    - Public visitors browsing an entity page who want to join
+  surfaces:
+    - web
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Add a new PageBlock kind `memberships`, registered in
+        block-config.ts's HUMAN_BLOCK_KINDS and ORG_BLOCK_KINDS (not PLACE —
+        see Out of Scope) and in BLOCK_REGISTRY / BlockRenderer's kind→
+        component dispatch.
+    - id: FR-002
+      description: >
+        The block's own component fetches tiers via
+        `trpc.memberships.listPublic({ ownerType, ownerId })` directly
+        (not shell-level prop drilling as MembershipsPanel does today),
+        so the block is self-contained and independently placeable.
+    - id: FR-003
+      description: >
+        Renders MembershipTierCard for each returned tier (name,
+        price/interval, benefits) exactly as MembershipsPanel does today —
+        no new card design.
+    - id: FR-004
+      description: >
+        Join CTA opens the extracted join-flow (postal-code collection →
+        memberships.start → MembershipPaymentStep) inline on the entity page
+        (e.g. within an overlay/sheet consistent with how other entity-page
+        interactive flows open, such as booking requests) — never a
+        navigation away from the page.
+    - id: FR-005
+      description: >
+        The join-flow state machine (pitch → postal code → payment →
+        success/member view) is extracted from MembershipsPanel into a
+        shared hook/component consumed by BOTH the new block and the
+        existing MembershipsPanel tab, so there is exactly one
+        implementation of "how joining works."
+    - id: FR-006
+      description: >
+        A signed-in active/trialing member viewing the block sees their
+        member status (mirroring MembershipsPanel's existing member view)
+        rather than tier cards + Join.
+    - id: FR-007
+      description: >
+        If an owner has zero tiers, the block does not render at all
+        (matches the existing `showMembershipTab` gate's zero-tiers hide
+        behavior) — never an empty-state block on a page that never
+        configured memberships.
+    - id: FR-008
+      description: >
+        The existing memberships TAB (EntityPageShell/MembershipsPanel)
+        is retained unchanged in this phase — the block is additive, not a
+        replacement, so entities relying on the tab today see no regression
+        while the block rolls out. Deprecating the tab is a follow-up
+        decision, not part of this spec.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Block placement/ordering follows the same drag-and-drop mechanism as
+        every other block (no special-cased position).
+    - id: NFR-002
+      description: >
+        No Stripe IDs, tax internals, or any non-public data leave the
+        existing listPublic contract — the block consumes it as-is.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: list-public-tiers (existing, reused verbatim)
+        description: Already public-safe; no changes needed.
+        input: "ownerType (HUMAN|ORGANIZATION), ownerId"
+        output: "tiers[] (id, name, description, priceCents, currency, interval, sortOrder)"
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing: []
+
+  adapters:
+    new: []
+    existing: []
+
+  transport:
+    trpc_procedures: []  # memberships.listPublic and memberships.start already exist
+    webhooks: []
+
+  ui:
+    pages: []
+    components:
+      - "New: MembershipBlock (block-registry.ts entry, kind=\"memberships\")"
+      - "New/extracted: useMembershipJoinFlow (shared hook pulling join-flow state out of MembershipsPanel)"
+      - "Modified: block-config.ts (register kind), BLOCK_REGISTRY"
+      - "Reused unchanged: MembershipTierCard.tsx, MembershipPaymentStep.tsx"
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Extracting MembershipsPanel's join-flow into a shared hook (FR-005)
+      touches a live, shipped money-flow component — regression risk on the
+      subscribe path if the extraction changes behavior subtly.
+    severity: MEDIUM
+    mitigation: >
+      Extract with the existing MembershipsPanel's own behavior as the
+      ground truth; add/extend tests pinning the pitch→payment→success
+      transitions before and after extraction; live-QA the join flow (not
+      just unit tests) per the project's money-flow validation convention.
+  - risk: >
+      Two entry points to the same join flow (tab + block) could drift if
+      the extraction (FR-005) is incomplete and one path is patched without
+      the other.
+    severity: LOW
+    mitigation: >
+      Single shared hook, not two implementations — enforced by FR-005.
+
+open_questions:
+  - "Should the block have a distinct visual treatment (e.g. accent border) to signal 'this costs money' the way pricing/checkout surfaces typically get more visual weight than a bio block? Recommend deferring to the ui skill's design-review pass rather than deciding upfront."
+  - "Long-term: should the tab be deprecated once the block ships, or do both stay indefinitely (e.g. tab for a full/detailed view, block for a page-flow teaser)? Explicitly deferred per FR-008 — not blocking this spec."
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - "PLACE (venue) entity pages — MembershipTier has no ownerPlaceId today; adding one is schema + core work the user explicitly deferred (2026-08-17: 'need input from a real venue/org/group... just do human + org for now')."
+  - "Deprecating or redesigning the existing Memberships tab."
+  - "Any change to Stripe Billing, pricing, tax, settlement, or the join-flow's money mechanics — this spec is purely a new presentation surface for already-correct, already-shipped logic."
+  - "Embed widget changes (getMembershipWidget stays link-out-only by design — that constraint is about third-party iframe origins and doesn't apply to this first-party block)."
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - "An org/human owner can add a Memberships block to their entity page via the same block-editor drag-and-drop UI as any other block."
+  - "A visitor sees tier cards inline in the page body (no tab click required) and can complete a Join without ever leaving the entity page."
+  - "A signed-in active member sees their member status in the block, not tier cards."
+  - "An owner with zero configured tiers sees no Memberships block (not an empty one)."
+  - "The existing /p/{slug}?tab=memberships experience is unchanged and still works."

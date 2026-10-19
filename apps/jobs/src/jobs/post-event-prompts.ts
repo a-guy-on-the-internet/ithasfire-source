@@ -110,6 +110,7 @@ export const dispatchPostEventPromptsJob = defineScheduledTask({
           sms: ctx.sms ?? undefined,
           push: ctx.push ?? undefined,
           logger: ctx.logger,
+          reportError: ctx.reportError,
         },
         payload,
       );
@@ -120,6 +121,7 @@ export const dispatchPostEventPromptsJob = defineScheduledTask({
           postEventPrompts: ctx.repos.postEventPrompts,
           events: ctx.repos.events,
           places: ctx.repos.places,
+          humans: ctx.repos.humans,
         },
         notify,
         clock: ctx.clock,

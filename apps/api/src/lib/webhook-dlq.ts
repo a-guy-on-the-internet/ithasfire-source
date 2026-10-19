@@ -8,6 +8,9 @@
  */
 import type Redis from "ioredis";
 
+import { execOrThrow } from "@th/adapters/redis/exec-or-throw";
+import type { ReporterPort } from "@th/ports/reporter";
+
 const DLQ_INDEX_KEY = "webhook_dlq:index";
 const DLQ_EVENT_PREFIX = "webhook_dlq:event:";
 const TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
@@ -22,26 +25,57 @@ export interface WebhookDlqItem {
 }
 
 export class WebhookDlq {
-  constructor(private redis: Redis) {}
+  /**
+   * `reportError` is optional: only the push path (the webhook route) passes
+   * it, to report a failed post-push trim without failing the push.
+   */
+  constructor(
+    private redis: Redis,
+    private reportError?: ReporterPort,
+  ) {}
 
   async push(item: WebhookDlqItem): Promise<void> {
     const key = `${DLQ_EVENT_PREFIX}${item.stripeEventId}`;
     const score = Date.now();
 
-    await this.redis
-      .multi()
-      .hset(key, {
-        stripeEventId: item.stripeEventId,
-        eventType: item.eventType,
-        payload: item.payload,
-        error: item.error,
-        receivedAt: item.receivedAt,
-      })
-      .expire(key, TTL_SECONDS)
-      .zadd(DLQ_INDEX_KEY, score, item.stripeEventId)
-      .exec();
+    // execOrThrow, not a bare exec(): ioredis resolves exec() even when a
+    // queued command failed, so a lost event would look stored.
+    await execOrThrow(
+      this.redis
+        .multi()
+        .hset(key, {
+          stripeEventId: item.stripeEventId,
+          eventType: item.eventType,
+          payload: item.payload,
+          error: item.error,
+          receivedAt: item.receivedAt,
+        })
+        .expire(key, TTL_SECONDS)
+        .zadd(DLQ_INDEX_KEY, score, item.stripeEventId),
+      "webhook dlq push",
+      key,
+    );
 
-    // Trim oldest entries beyond MAX_ITEMS
+    // The event is stored at this point. A trim failure must NOT reject
+    // push(): the caller logs `stripe_webhook_dlq_store_failed` (a paging
+    // alert: "event lost") on rejection, and this event was not lost. Report
+    // it under its own step instead. Do not log the alert strings here.
+    try {
+      await this.trim();
+    } catch (err) {
+      try {
+        this.reportError?.(err, {
+          tags: { area: "webhook_dlq", step: "dlq_trim" },
+          extra: { step: "dlq_trim", eventId: item.stripeEventId },
+        });
+      } catch {
+        // A throwing reporter never changes behaviour.
+      }
+    }
+  }
+
+  /** Trim oldest entries beyond MAX_ITEMS. */
+  private async trim(): Promise<void> {
     const count = await this.redis.zcard(DLQ_INDEX_KEY);
     if (count > MAX_ITEMS) {
       const toRemove = await this.redis.zrange(
@@ -55,7 +89,7 @@ export class WebhookDlq {
         for (const id of toRemove) {
           pipeline.del(`${DLQ_EVENT_PREFIX}${id}`);
         }
-        await pipeline.exec();
+        await execOrThrow(pipeline, "webhook dlq trim", DLQ_INDEX_KEY);
       }
     }
   }
@@ -90,11 +124,12 @@ export class WebhookDlq {
   }
 
   async remove(stripeEventId: string): Promise<void> {
-    await this.redis
-      .multi()
-      .del(`${DLQ_EVENT_PREFIX}${stripeEventId}`)
-      .zrem(DLQ_INDEX_KEY, stripeEventId)
-      .exec();
+    const key = `${DLQ_EVENT_PREFIX}${stripeEventId}`;
+    await execOrThrow(
+      this.redis.multi().del(key).zrem(DLQ_INDEX_KEY, stripeEventId),
+      "webhook dlq remove",
+      key,
+    );
   }
 
   async count(): Promise<number> {

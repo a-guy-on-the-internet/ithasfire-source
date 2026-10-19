@@ -61,7 +61,6 @@ const seedPlatformTables: FastifyPluginAsync = async (app) => {
       const placePending = await prisma.place.create({
         data: {
           name: "E2E Pending Venue",
-          slug: `e2e-pending-venue-${Date.now()}`,
           address: "100 Pending Ave, Testville, TS 00010",
           addrLine1: "100 Pending Ave",
           city: "Testville",
@@ -79,7 +78,6 @@ const seedPlatformTables: FastifyPluginAsync = async (app) => {
       const placeVerified = await prisma.place.create({
         data: {
           name: "E2E Verified Hall",
-          slug: `e2e-verified-hall-${Date.now()}`,
           address: "200 Verified Blvd, Testville, TS 00020",
           addrLine1: "200 Verified Blvd",
           city: "Testville",

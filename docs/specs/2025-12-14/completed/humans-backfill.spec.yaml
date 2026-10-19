@@ -1,0 +1,56 @@
+# Spec: Humans Dataset Backfill Job
+meta:
+  owner: data-platform
+  status: draft
+  reviewers:
+    - platform-eng
+    - seo
+summary: |
+  One-off and periodic job that normalizes human/talent records to ensure only fully
+  qualified public profiles are eligible for sitemap emission and downstream search exposure.
+scope:
+  included:
+    - Hydrating missing slugs and canonical URLs.
+    - Classifying `visibility` into `PUBLIC` or `PRIVATE` only; flagging anomalies.
+    - Setting `seo_index` when required profile attributes are present.
+    - Writing audit logs for all mutations.
+  excluded:
+    - Generating sitemap shards (handled by sitemap generator).
+    - Editing profile content (owner must update via app).
+execution:
+  orchestration: keda-cronjob (ad-hoc triggerable)
+  image: ghcr.io/ithasfire/jobs:backfills-latest
+  command: ["node", "dist/sitemaps/backfill-humans.js"]
+  schedule:
+    cron: "0 6 * * *"  # daily at 06:00 UTC
+  manual: pnpm -C apps/jobs run backfill:humans -- --dry-run
+inputs:
+  postgres:
+    tables:
+      - humans
+      - human_organizer_links
+      - humans_profiles
+  config:
+    guardrail_thresholds: seo.sitemaps.humans.guardrails
+outputs:
+  mutations:
+    - updates to humans.visibility / humans.seo_index
+    - audit_log entries (entity: human, action: backfillVisibility)
+  metrics:
+    - humans.backfill.public_total
+    - humans.backfill.private_total
+    - humans.backfill.anomalies_detected
+  reports:
+    - CSV of anomalous records saved to R2 `sitemaps/backfill/humans/{date}.csv`
+failure_modes:
+  - name: missing_required_fields
+    resolution: set seo_index=false; add to anomaly report.
+  - name: foreign_key_violation
+    resolution: skip record, log error, raise ticket to data team.
+acceptance_criteria:
+  - 100% of humans records end with valid visibility enum (PUBLIC/PRIVATE).
+  - All sitemap-eligible humans have seo_index=true and required metadata populated.
+  - Anomaly rate < 2%; anything higher creates Jira ticket automatically.
+rollout_notes:
+  - Run dry-run on staging and review anomaly CSV before first prod execution.
+  - Coordinate with product ops before flipping visibility for high-profile talent.

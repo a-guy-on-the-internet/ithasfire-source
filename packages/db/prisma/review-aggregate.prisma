@@ -1,0 +1,42 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Review Aggregate — generic snapshot-not-live publication table for attendee
+// reviews (attendee-reviews spec, 2026-07-14, FR-004). ONE attendee review
+// rolls up to FOUR subject types (the event, the venue, the organizer/owner,
+// the series); a weekly job (recompute-review-aggregates) materializes the
+// suppressed, coarsened public snapshot for each subject into a row here.
+//
+// Public reads (getReviewAggregate, the audience_stats PLACE block) serve these
+// snapshots VERBATIM and NEVER compute from live AttendeeReview rows — the
+// snapshot delay is the anonymity mechanism (same defense as place reviews'
+// PlaceStats.publicSnapshot). `snapshot` is the AttendeeReviewSnapshot shape
+// from packages/core/src/use-cases/attendee-reviews/aggregation-policy.ts;
+// below-threshold subjects store `{ version: 1 }` (nothing publishable).
+//
+// `subjectId` is a bare column (no FK) on purpose — one table spans EVENT /
+// PLACE / OWNER / SERIES ids, and a deleted subject just leaves a stale row the
+// next recompute overwrites or a public read fails closed on.
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum ReviewAggregateSubjectType {
+  EVENT
+  PLACE
+  OWNER
+  SERIES
+}
+
+model ReviewAggregate {
+  id          String                     @id @default(uuid())
+  subjectType ReviewAggregateSubjectType
+  subjectId   String
+
+  /// Coarsened, suppression-gated public snapshot (AttendeeReviewSnapshot).
+  snapshot   Json
+  computedAt DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// One aggregate per (subjectType, subjectId) — the recompute upsert anchor
+  /// and the getReviewAggregate lookup key.
+  @@unique([subjectType, subjectId])
+}

@@ -6,6 +6,10 @@ import {
 } from "./helpers/mailpit";
 import { confirmStripePaymentIntent } from "./helpers/stripe-webhook";
 import { createE2eTrpcClient, signInAndGetToken } from "./helpers/trpc";
+import {
+  signInWithPasswordIfPrompted,
+  signUpWithPassword,
+} from "./helpers/sign-in";
 
 /**
  * E2E test for automatic settlement creation during order finalization.
@@ -92,30 +96,14 @@ test.describe.serial("Automatic Settlement Creation", () => {
     const username = `buyerautosettlement${uniqueId}`;
 
     // Sign up via UI
-    await page.goto("/sign-up");
-    const signUpForm = page.getByTestId("auth-sign-up-form");
-    if (!(await signUpForm.isVisible())) {
-      const signInForm = page.getByTestId("auth-sign-in-form");
-      if (!(await signInForm.isVisible())) {
-        await page.getByTestId("navbar-account").click();
-        await expect(signInForm).toBeVisible({ timeout: 10_000 });
-      }
-      await page.getByTestId("auth-sign-in-create-account").click();
-    }
-    await expect(signUpForm).toBeVisible({ timeout: 10_000 });
-
-    await signUpForm.getByPlaceholder("Jane Doe").fill("Auto Settlement Buyer");
-    await signUpForm.getByPlaceholder("janedoe").fill(username);
-    await signUpForm.getByPlaceholder("you@example.com").fill(email);
-    await signUpForm.getByPlaceholder("••••••••").first().fill(password);
-    await signUpForm.getByPlaceholder("••••••••").nth(1).fill(password);
-    await page.getByTestId("auth-sign-up-submit").click();
-
-    await expect(page.getByTestId("auth-sign-up-form")).not.toBeVisible({
-      timeout: 15_000,
-    });
-    await page.waitForURL((url) => !url.pathname.startsWith("/sign-up"), {
-      timeout: 30_000,
+    // Create the account through the UI. The ritual — including the
+    // `auth-sign-up-expand-form` disclosure the email form lives behind —
+    // is in `helpers/sign-in.ts`.
+    await signUpWithPassword(page, {
+      displayName: "Auto Settlement Buyer",
+      username,
+      email,
+      password,
     });
 
     // Verify email via Mailpit
@@ -127,17 +115,12 @@ test.describe.serial("Automatic Settlement Creation", () => {
     await mailpit.clear();
 
     // Sign in and get JWT
-    await page.goto("/sign-in");
-    await page.waitForLoadState("networkidle");
-    const signInForm = page.getByTestId("auth-sign-in-form");
-    if (await signInForm.isVisible({ timeout: 5_000 }).catch(() => false)) {
-      await signInForm.getByTestId("auth-sign-in-email").fill(email);
-      await signInForm.getByTestId("auth-sign-in-password").fill(password);
-      await signInForm.getByTestId("auth-sign-in-submit").click();
-      await page.waitForURL((url) => !url.pathname.startsWith("/sign-in"), {
-        timeout: 30_000,
-      });
-    }
+    // Already authenticated by the sign-up above in most runs, so this is
+    // "sign in IF the card asks". The two-step flow lives in the helper.
+    await signInWithPasswordIfPrompted(page, {
+      email,
+      password,
+    });
 
     const { token } = await signInAndGetToken(request, apiBaseUrl, {
       email,

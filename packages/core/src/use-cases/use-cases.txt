@@ -1,0 +1,8 @@
+	•	createFeePolicyDraft(scope, knobs) -> {policyId, version}
+	•	approveFeePolicy(policyId, approver) -> {activeAt}
+
+	
+	•	publishAgreement({agreementId, feePolicyId?}) -> {agreementId} // resolves and pins policy
+		•	Agreement.feePolicyId nullable in draft, required on publish.
+	•	computePriceForAgreement({agreementId, qty, unitPriceCents}) -> totals // uses pinned policy
+	•	checkout({agreementId,...}) // computes, writes snapshot into order

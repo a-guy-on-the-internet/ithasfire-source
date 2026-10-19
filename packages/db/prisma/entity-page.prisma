@@ -1,0 +1,220 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// EntityPage — Generic public pages for Humans, Organizations, and Places.
+// Replaces the old human-only Profile / ProfileTheme / ProfileModule system.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model EntityPage {
+  id                String         @id @default(uuid())
+  ownerType         PageOwnerType
+  ownerId           String         // humanId | orgId | placeId
+  slug              String         @unique
+  displayName       String?
+  bio               String?
+  avatarUrl         String?
+  bannerUrl         String?
+  visibility        PageVisibility @default(PUBLIC)
+  allowFollows      Boolean        @default(true)
+  showFollowerCount Boolean        @default(false)
+
+  // Content classification (free-form, same convention as PageBlock.kind /
+  // PageTheme.layoutKey — deliberately NOT a DB enum). `category` is the
+  // page's CURRENT classification; `templateAppliedCategories` records every
+  // (category, template revision) that has ever been template-seeded — a bare
+  // category string means revision 1, a `"<category>@<N>"` marker means
+  // revision N — so re-entering a category (or re-loading at the same
+  // revision) never reseeds, while a template-revision bump seeds its newly
+  // introduced kinds exactly once. See page-templates.ts +
+  // seed-page-template-blocks.ts.
+  category                  String?
+  templateAppliedCategories String[] @default([])
+
+  theme       PageTheme?
+  blocks      PageBlock[]
+  draft       PageDraft?
+  slugHistory PageSlugHistory[]
+  followers   EntityFollow[] @relation("PageFollowers")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([ownerType, ownerId])
+  @@index([slug])
+  @@index([ownerType, ownerId])
+}
+
+model PageTheme {
+  id           String @id @default(uuid())
+  pageId       String @unique
+  colorPrimary String?
+  colorBg      String?
+  colorText    String?
+  fontKey      String?
+  layoutKey    String?
+
+  page EntityPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
+}
+
+model PageBlock {
+  id         String  @id @default(uuid())
+  pageId     String
+  kind       String  // free-form, validated per ownerType in core
+  orderIndex Int     @default(0)
+  data       Json    @default("{}")
+  visible    Boolean @default(true)
+  // Which page surface the block belongs to: "main" (the default page body)
+  // or "memberships" (the member-gated Membership tab). Free-form String,
+  // validated in core exactly like `kind` — deliberately NOT a DB enum.
+  section    String  @default("main")
+
+  page EntityPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
+
+  @@index([pageId, orderIndex])
+  // PARTIAL UNIQUE INDEX, raw SQL only (Prisma cannot express a `WHERE` on an
+  // index): migration 20260924140000_page_block_pinned_unique creates
+  //   "PageBlock_pinned_kind_per_page_key" UNIQUE ("pageId", "kind")
+  //     WHERE "kind" = 'track_record'
+  // A PINNED kind (core block-config `pinned`; venue-track-record R6) lives
+  // at most ONCE per page — the owner can never delete it, so two copies
+  // would be two undeletable blocks. Core's check-then-create in
+  // managePageBlocks `add` is racy without this; the adapter maps the P2002
+  // to BLOCK_PINNED. To pin another kind, EXTEND that predicate in a NEW
+  // migration; do not widen the index to every kind.
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PageDraft — the unpublished edits to one EntityPage (page editor, spec
+// docs/specs/2026-10-08/entity-page-wysiwyg-editor.spec.yaml).
+//
+// ONE shared draft per page (R14): every editor's autosave merges field-level
+// patch ops `{path, value}` into this row, last write wins per path. Public
+// reads NEVER touch this table; visitors see EntityPage / PageTheme /
+// PageBlock / Place exactly as before (R2).
+//
+// LIFETIME: the row is created on first lock (lockDraftForUpdate) and is
+// NEVER deleted by Publish or Discard; it goes only when its EntityPage is deleted
+// (cascade). Publish applies the overlays to those tables and Place in one
+// transaction, then CLEARS the row in that same transaction; Discard clears
+// it. Clearing resets data, placePatch, placeBase and fieldEditors to '{}'
+// and KEEPS revision (still increasing) and appliedBatchIds. Both are
+// idempotency keys, so they must never repeat across publishes: a deleted
+// and recreated row would restart revision at 0, and a lost-response Publish
+// retry carrying an old draftRevision could match a new draft and push
+// another editor's unpublished edits live (R2).
+// "Has unpublished changes" is DERIVED from non-empty overlays, never a
+// stored flag; the derivation ignores `data.v`. A missing row and an empty
+// revision-0 row (left by a lock with no write) both mean nothing pending;
+// core must not tell them apart.
+//
+// PUBLISH RULE (publishPageDraft, input draftRevision), checked under the
+// row lock, exactly three branches:
+//   (a) draftRevision == revision AND the overlays are non-empty: apply,
+//       clear (revision becomes draftRevision + 1), set
+//       lastPublishedRevision = that new revision.
+//   (b) lastPublishedRevision == draftRevision + 1: this caller's own
+//       Publish already happened (lost-response retry). Revisions never
+//       repeat, so this alone proves it, even if newer edits have been saved
+//       since. Return the published result; write nothing; newer edits stay
+//       in the draft.
+//   (c) anything else is STALE or DISCARDED (e.g. another editor discarded,
+//       or saved newer edits): write nothing, return that outcome with
+//       updatedByHumanId so the UI can say who. Never "succeed" silently
+//       (R13), and NEVER publish a non-empty draft whose revision is greater
+//       than draftRevision: the check is equality, not >=.
+// Discard clears (revision + 1) and leaves lastPublishedRevision alone.
+// Save/get responses tell the client when the draft was cleared since its
+// clientRevision, so it drops its local overlay instead of re-sending it.
+//
+// `data` is an OPEN JSON overlay (page fields, theme, blocks), keyed by op
+// path, deliberately NOT typed columns: later phases add layout and styling
+// freedom ("geo cities/tumblr creativity", owner R19), and a new draftable
+// field is a core change with no migration. Core validates every op.
+// RESERVED key `data.v`: the overlay's format version (absent = 1). A later
+// phase that changes what paths mean (freeform layouts, per-block styles)
+// bumps it and core upgrades older overlays on read, again without a
+// migration. Ops never write it: core rejects any op whose path is `v` or
+// starts with `v.`.
+//
+//   placePatch     Place fields edited on the canvas (venue facts, R9).
+//   placeBase      each patched Place field's LIVE value when the draft
+//                  first touched it. Publish compares it with Place now; a
+//                  difference means Settings changed the field meanwhile and
+//                  the editor picks a value (R9 conflict).
+//   fieldEditors   path → { humanId, at, rev }: who edited each path last
+//                  and in which revision (R14). Reserved keys `$base` → { rev }
+//                  (revision of the last clear) and `$pruned` → { rev }; shape
+//                  owned by core page-draft-ops.ts.
+//   revision       +1 per saved op batch, and +1 on each Publish or Discard
+//                  clear; it never goes down and never resets for the life
+//                  of the page. Optimistic sync for clients, and Publish's
+//                  idempotency key (draftRevision).
+//   lastPublishedRevision  the revision the last Publish cleared to; null
+//                  until the first Publish. Lets branch (b) tell a retried
+//                  Publish from a Discard that won the race.
+//   appliedBatchIds  ids of the most recent op batches, newest last, capped
+//                  at 100 (core trims; the adapter refuses a longer list;
+//                  SQL CHECK backstops). A retried
+//                  batch whose id is listed is a no-op. Checked and written
+//                  under the same row lock as the merge, so "applied" and
+//                  "recorded" can never disagree. Survives a clear, so a
+//                  batch retried after Publish is still recognised.
+//
+// Human ids (updatedByHumanId, fieldEditors) are plain ids, no FK (precedent:
+// Order.compIssuedByHumanId, SettlementSheet.settledByHumanId): fieldEditors
+// lives in JSON and cannot carry an FK, so the column follows suit. Readers
+// MUST handle a human id that no longer resolves (deleted account): show the
+// edit without a name, never fail the read.
+//
+// SQL CHECKs, raw SQL only (migration 20261008230000_page_draft):
+//   PageDraft_json_objects_check   the four Json columns are JSON objects
+//   PageDraft_revision_check       revision >= 0
+//   PageDraft_applied_batch_ids_check  cardinality(appliedBatchIds) <= 100
+//   PageDraft_last_published_revision_check
+//                  lastPublishedRevision is null, or 1 <= it <= revision
+// ─────────────────────────────────────────────────────────────────────────────
+
+model PageDraft {
+  id                    String   @id @default(uuid())
+  pageId                String   @unique
+  data                  Json     @default("{}")
+  placePatch            Json     @default("{}")
+  placeBase             Json     @default("{}")
+  fieldEditors          Json     @default("{}")
+  appliedBatchIds       String[] @default([])
+  revision              Int      @default(0)
+  lastPublishedRevision Int?
+  updatedByHumanId      String?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  page EntityPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
+}
+
+model PageSlugHistory {
+  id         String   @id @default(uuid())
+  pageId     String
+  slug       String   @unique
+  recordedAt DateTime @default(now())
+
+  page EntityPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([pageId, recordedAt])
+}
+
+model EntityFollow {
+  id              String   @id @default(uuid())
+  followerHumanId String
+  entityPageId    String
+  notifyNewEvents Boolean  @default(true)
+  notifyNearby    Boolean  @default(false)
+  radiusKm        Int?
+  createdAt       DateTime @default(now())
+
+  follower   Human      @relation("HumanFollowing", fields: [followerHumanId], references: [id], onDelete: Cascade)
+  entityPage EntityPage @relation("PageFollowers", fields: [entityPageId], references: [id], onDelete: Cascade)
+
+  @@unique([followerHumanId, entityPageId])
+  @@index([entityPageId])
+  @@index([followerHumanId])
+}

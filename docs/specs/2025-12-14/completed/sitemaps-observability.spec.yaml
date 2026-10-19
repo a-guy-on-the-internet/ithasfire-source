@@ -1,0 +1,193 @@
+# Spec: Sitemap Observability & Operations
+meta:
+  owner: platform-ops
+  status: draft
+  reviewers:
+    - data-platform
+    - seo
+  last_updated: 2025-11-09
+summary: |
+  Define the telemetry, alerting, and operational playbooks needed to keep sitemap
+  generation and delivery healthy at scale. Pairs with the sitemap architecture spec.
+objectives:
+  - Detect generation failures or oversize shards within 5 minutes.
+  - Provide dashboards for SEO/marketing to verify freshness, coverage, and guardrail compliance across events, organizers, venues, and humans.
+  - Automate cleanup of stale shards and surface anomalies.
+  - Supply runbooks for on-call engineers and SEO partners.
+scope:
+  in_scope:
+    - Metrics emitted by generator jobs and transport layer.
+    - Logs, traces, and sampling rules for long-running jobs.
+    - Alert thresholds, paging policies, and escalation paths.
+    - Health checks and validation scripts (manual + automated).
+    - Operational runbooks and dashboards.
+  out_of_scope:
+    - Business KPIs (click-through, conversions) — tracked elsewhere.
+    - Manual QA of content (covered by SEO workflows).
+    - Search Console integration beyond notification steps.
+telemetry:
+  metrics:
+    counters:
+      - name: sitemap.generator.runs_total
+        tags: [env, shard_type, status]
+        notes: Increment per shard generation attempt.
+      - name: sitemap.transport.requests_total
+        tags: [env, route, status]
+        notes: Count Fastify responses for index and shard routes.
+    gauges:
+      - name: sitemap.generator.urls_emitted
+        tags: [env, shard_name]
+        notes: Number of URLs produced per shard; used for coverage trends across each dataset.
+      - name: sitemap.generator.urls_filtered
+        tags: [env, shard_name, filter_reason]
+        notes: Count of URLs excluded due to guardrails (e.g., private, seo_index=false, stale_completed, humans_private).
+      - name: sitemap.generator.size_bytes
+        tags: [env, shard_name]
+        notes: Raw XML size; scrape gzip size from storage metadata.
+      - name: sitemap.index.child_count
+        tags: [env]
+        notes: Number of child sitemaps referenced in index.
+    histograms:
+      - name: sitemap.generator.duration_ms
+        tags: [env, shard_type]
+        buckets: [1000, 5000, 10000, 30000, 60000, 120000]
+      - name: sitemap.generator.latency_to_publish_ms
+        tags: [env, shard_type]
+        notes: Time from job trigger to shard promotion.
+    derived:
+      - name: sitemap.generator.coverage_ratio
+        expression: |
+          urls_emitted / expected_count_dataset
+        notes: Compare against materialized expected counts (see data validation section).
+      - name: sitemap.generator.guardrail_ratio
+        expression: |
+          urls_filtered / (urls_emitted + urls_filtered)
+        notes: Guardrail exclusions should remain within expected thresholds (<5% for events, <2% for organizers/venues, <1% for humans since only `PUBLIC` entries should emit).
+  traces:
+    sampling: head 20% of shard jobs, tail sample on error.
+    attributes:
+      - shard_name
+      - shard_type
+      - trigger_reason ("nightly" | "event_update" | "organizer_update" | "manual")
+      - attempt_number
+logging:
+  format: jsonl
+  fields:
+    - ts
+    - level
+    - shard
+    - shard_type
+    - trigger_reason
+    - urls_emitted
+    - size_bytes
+    - lastmod_min
+    - lastmod_max
+    - duration_ms
+    - error_code (if failure)
+  storage:
+    - primary: GCP Cloud Logging (existing sink)
+    - retention: 30 days critical, 7 days info
+alerts:
+  generator_failures:
+    condition: sitemap.generator.runs_total{status="failure"} > 0 over 15m
+    severity: pager
+    responders: platform-oncall
+    annotations:
+      summary: "Sitemap generator failing"
+      details: "Shard {{shard_name}} failed {{value}} time(s). See trace: {{trace_url}}"
+  shard_size_near_limit:
+    condition: sitemap.generator.size_bytes > 45_000_000
+    severity: warn
+    responders: seo-tech
+    action: review sharding strategy or data anomalies.
+  coverage_drop:
+    condition: sitemap.generator.coverage_ratio < 0.95 for 3 consecutive runs
+    severity: ticket
+    responders: platform-ops
+    action: Investigate data pipeline or filter logic.
+  guardrail_regression:
+    condition: sitemap.generator.guardrail_ratio > 0.1 for 2 consecutive runs OR urls_filtered{filter_reason=~"seo_index=false|humans_private"} spikes > 100
+    severity: warn
+    responders: seo-tech
+    action: Audit incoming datasets for incorrect flags or regressions in guardrail logic.
+  transport_errors:
+    condition: sitemap.transport.requests_total{status=~"5.."} > 10 over 10m
+    severity: pager
+    responders: platform-oncall
+health_checks:
+  automated:
+    - name: sitemap-index-probe
+      schedule: every 10 minutes
+      behavior: fetch /sitemap.xml via public CDN, validate HTTP 200, parseable XML, child URLs reachable.
+    - name: shard-spot-check
+      schedule: hourly
+      behavior: random shard fetch, ensure URL count matches metric gauge and `lastmod` within SLA (24h events, 72h others).
+  manual:
+    - name: search-console-verify
+      frequency: weekly
+      steps:
+        - SEO logs into Google Search Console
+        - Validate no errors/warnings on sitemap index
+        - Record in shared doc.
+data_validation:
+  expected_counts:
+    source: materialized views in Postgres (`seo_expected_event_urls`, `seo_expected_org_urls`, `seo_expected_venue_urls`, `seo_expected_human_urls`).
+    SLA:
+      events: ratio >= 0.98 within 24h of publish; allow drop to 0.9 for archived months.
+      organizers: ratio >= 0.99.
+      venues: ratio >= 0.99.
+      humans: ratio >= 0.995 (public humans should emit unless explicitly suppressed).
+  tooling: apps/jobs/src/sitemaps/validate.ts compares dataset vs generated counts.
+  guardrail_checks:
+    source: daily job comparing filtered URLs vs guardrail thresholds, stored in `seo_sitemap_guardrail_audit` table.
+    SLA:
+      - Private/invite-only events filtered count should equal upstream dataset flag count ±1%.
+      - Organizers/venues with `seo_index=false` should never appear in generated shards.
+      - Humans with `visibility = PRIVATE` should be fully filtered; any other visibility state should raise a data quality incident.
+  tooling: apps/jobs/src/sitemaps/validate-guardrails.ts publishes report + Slack digest.
+runbooks:
+  incident_response:
+    - Failure to generate shard
+    - Transport 5xx
+    - Coverage anomaly (drop or spike)
+  contents:
+    sections: [Symptoms, Immediate Actions, Validation, Escalation, Postmortem]
+    location: docs/runbooks/sitemaps/<topic>.md (to create in later task).
+dashboards:
+  grafana:
+    panels:
+      - Run status heatmap by shard
+      - Coverage ratio over time for events vs organizers
+      - Top shard sizes (bar chart)
+      - Transport latency percentiles
+      - Alert summary table
+      - Guardrail ratio by shard type (line)
+      - Humans coverage & guardrail panel (dual axis: emitted vs filtered)
+    owner: seo-tech
+    refresh: 5m
+  looker:
+    explores:
+      - join metrics with search impressions when available
+    note: optional stretch goal once telemetry stable.
+permissions:
+  - Metrics/logs accessible to platform eng, SEO, and product ops via existing RBAC groups.
+  - Alert ack/resolution restricted to on-call roles.
+slo:
+  freshness:
+    target: 99% of event URLs refreshed within 12h of data change.
+    measurement: generator.latency_to_publish_ms
+  availability:
+    target: sitemap routes 99.9% success over rolling 30 days.
+    measurement: transport request metrics via uptime checks.
+open_questions:
+  - Should we integrate with Datadog instead of Grafana for pager alerts?
+  - Do we need to log per-URL diffs when coverage ratio dips, or is aggregate enough?
+  - How to version runbooks for non-engineering stakeholders?
+acceptance_criteria:
+  - [ ] Metrics emitted in staging and visible in Grafana prototype.
+  - [ ] Alert rules deployed in non-prod and verified via synthetic failure.
+  - [ ] Health checks wired into uptime job with success/failure history.
+  - [ ] Runbook templates drafted and linked from dashboard.
+notes:
+  - Reuse existing logging helpers (`@th/observability`) to avoid bespoke tooling.
+  - Keep alert fatigue low; warn-level notifications should route to Slack channel, not pager.

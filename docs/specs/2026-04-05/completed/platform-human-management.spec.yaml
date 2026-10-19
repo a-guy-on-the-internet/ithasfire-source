@@ -1,0 +1,436 @@
+spec: platform-human-management
+title: "Platform Human Management Actions"
+status: complete
+created: 2026-03-27
+area: platform/admin
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Summary
+# ─────────────────────────────────────────────────────────────────────────────
+summary: |
+  Add mutation capabilities to the platform humans admin page
+  (/platform/humans). Currently the page is read-only — staff can
+  search and view humans but cannot take any action. This spec adds:
+  suspend, ban, reactivate, force-verify email, unlink OAuth provider,
+  and delete human. All actions are ADMIN-only, audited, and require
+  confirmation dialogs.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Current State
+# ─────────────────────────────────────────────────────────────────────────────
+current_state:
+  prisma_schema:
+    - "Human model in auth.prisma — status field uses HumanStatus enum"
+    - "HumanStatus enum: INVITED | ACTIVE | SUSPENDED | BANNED"
+    - "AuthAccount model — providerId, accountId, userId (FK to AuthUser), OAuth tokens"
+    - "AuthUser model — humanId (unique FK to Human), email, emailVerified, username, etc."
+    - "AuthSession model — userId FK, token, expiresAt"
+    - "Cascade deletes: AuthUser → Human cascades; AuthAccount/AuthSession → AuthUser cascades"
+  types:
+    - "HumanRecord (packages/types/src/repos/humans.ts) includes status: HumanStatus"
+    - "UpdateHumanInput is Partial<Pick<HumanRecord, 'name' | 'status' | 'locale' | ... >>"
+    - "status IS included in UpdateHumanInput — so setStatus is already possible via update()"
+  ports:
+    - "HumansRepo (packages/ports/src/repos/humans.ts):"
+    - "  - update(id, updates) — accepts UpdateHumanInput (includes status)"
+    - "  - getByIdWithIdentity(id) — returns HumanWithIdentity"
+    - "  - listAllWithMemberships(input) — paginated listing for platform table"
+    - "  NO dedicated setStatus(), delete(), or auth-account operations"
+    - "No AuthAccountsRepo port exists — auth accounts managed by Better Auth / raw Prisma"
+  transport:
+    - "platformRouter (packages/transport/trpc/src/routers/platform.ts):"
+    - "  - checkStaffAccess — enforces staff roles: ADMIN, REVIEWER, SUPPORT, DEVELOPER"
+    - "  - listHumans query — paginated search with status/verified filters"
+    - "  NO mutation procedures for human management"
+  ui:
+    - "apps/web/src/app/platform/humans/page.tsx (530 lines):"
+    - "  - Read-only DataTable with search, filter chips, sort, pagination"
+    - "  - Columns: ID, name, email, username, status badge, verified, orgs, createdAt"
+    - "  - NO action buttons, row menus, or mutation hooks"
+  better_auth:
+    - "Account linking config (apps/api/src/auth/better-auth.ts line ~121):"
+    - "  accountLinking: { enabled: true, updateUserInfoOnLink: true, trustedProviders: ['google', 'apple'] }"
+    - "  allowUnlinkingAll is NOT set (defaults to false)"
+    - "Better Auth client API: authClient.unlinkAccount({ providerId }) — works when allowUnlinkingAll is true"
+    - "Better Auth admin API: may support server-side account deletion — needs verification"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Architecture Decisions
+# ─────────────────────────────────────────────────────────────────────────────
+decisions:
+  - title: "Use existing update() for status changes, no new port method"
+    detail: |
+      UpdateHumanInput already includes `status`. The use cases will
+      call `repos.humans.update(id, { status })` directly. No need
+      for a separate setStatus() method on the repo.
+
+  - title: "New port methods needed: unlinkAuthAccount, deleteHuman, invalidateSessions, forceVerifyEmail"
+    detail: |
+      These operations touch AuthAccount, AuthSession, and AuthUser
+      tables directly. They need explicit port methods because:
+      - unlinkAuthAccount: deletes an AuthAccount row by providerId + userId
+      - deleteHuman: cascading delete of Human + AuthUser + all related data
+      - invalidateSessions: delete all AuthSessions for an authUserId
+      - forceVerifyEmail: update AuthUser.emailVerified to true
+
+  - title: "Raw Prisma in adapter, not Better Auth client API"
+    detail: |
+      For admin operations (unlink, delete, force-verify), use direct
+      Prisma queries in the adapter rather than the Better Auth client
+      API. Reasons:
+      - Better Auth's client API is designed for self-service, not admin ops
+      - allowUnlinkingAll would affect ALL users, not just admin actions
+      - Direct Prisma gives us transaction control and audit logging
+
+  - title: "ADMIN-only RBAC"
+    detail: |
+      All human management mutations restricted to staff with ADMIN role.
+      REVIEWER, SUPPORT, and DEVELOPER can view but not mutate.
+
+  - title: "Soft operations first, hard delete as separate action"
+    detail: |
+      Suspend/ban are reversible status changes. Delete is a
+      destructive cascade. The UI should make delete significantly
+      harder to reach (separate confirmation with typed input).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Work Items
+# ─────────────────────────────────────────────────────────────────────────────
+work_items:
+
+  # ── 1. HumansRepo: add admin-focused methods ───────────────────────────
+  - id: repo-admin-methods
+    title: "Add admin methods to HumansRepo port + Prisma adapter"
+    layer: ports + adapters
+    effort: M
+    description: |
+      Add the following methods to the HumansRepo interface
+      (packages/ports/src/repos/humans.ts):
+
+      ```ts
+      /**
+       * List OAuth/credential accounts linked to a human's AuthUser.
+       * Returns providerId + accountId pairs for display in admin UI.
+       */
+      listAuthAccounts(humanId: string): Promise<{
+        providerId: string;
+        accountId: string;
+        createdAt: Date;
+      }[]>;
+
+      /**
+       * Unlink a specific OAuth provider from a human's AuthUser.
+       * Deletes the AuthAccount row. Throws if it's the only account
+       * (credential) and the user has no password — they'd be locked out.
+       */
+      unlinkAuthAccount(input: {
+        humanId: string;
+        providerId: string;
+      }): Promise<void>;
+
+      /**
+       * Force-set emailVerified on the human's AuthUser.
+       */
+      forceVerifyEmail(humanId: string): Promise<void>;
+
+      /**
+       * Invalidate all active sessions for a human's AuthUser.
+       * Used after suspend/ban to force logout.
+       */
+      invalidateAllSessions(humanId: string): Promise<{ count: number }>;
+
+      /**
+       * Hard-delete a human and all associated data.
+       * Cascades through AuthUser → AuthAccount, AuthSession.
+       * Also deletes: OrgMember rows, push devices, API keys,
+       * notification preferences, entity pages.
+       * Orders, tickets, and financial records are NOT deleted
+       * (orphaned with humanId preserved for audit).
+       */
+      deleteHuman(humanId: string): Promise<void>;
+      ```
+
+      Prisma adapter implementation in
+      packages/adapters/src/db/prisma/humans.ts:
+      - listAuthAccounts: query AuthAccount via AuthUser.humanId join
+      - unlinkAuthAccount: find AuthUser by humanId, delete AuthAccount
+        by providerId + userId. Guard: count remaining accounts, throw
+        if would leave user with zero auth methods.
+      - forceVerifyEmail: update AuthUser.emailVerified = true
+      - invalidateAllSessions: deleteMany AuthSession where userId =
+        authUser.id
+      - deleteHuman: delete Human by id (Prisma cascades handle the rest
+        via onDelete: Cascade on AuthUser → Human FK)
+    files:
+      - packages/types/src/repos/humans.ts
+      - packages/ports/src/repos/humans.ts
+      - packages/adapters/src/db/prisma/humans.ts
+    acceptance:
+      - "All 5 methods exist on HumansRepo interface"
+      - "Prisma adapter implements all 5 with proper error handling"
+      - "unlinkAuthAccount throws if removing last auth method"
+      - "deleteHuman cascades correctly (verify with integration test)"
+
+  # ── 2. Use Cases ───────────────────────────────────────────────────────
+  - id: admin-use-cases
+    title: "Create admin human management use cases"
+    layer: packages/core
+    effort: M
+    description: |
+      Create the following use cases in
+      packages/core/src/use-cases/platform/:
+
+      ### admin-set-human-status.ts
+      - Input: `{ humanId: string; status: "ACTIVE" | "SUSPENDED" | "BANNED"; reason?: string }`
+      - Validates input via Zod
+      - Calls `repos.humans.getByIdWithIdentity()` to verify human exists
+      - Prevents self-suspension (actor.humanId !== humanId)
+      - Prevents status change on other ADMIN-role humans (optional guard)
+      - Calls `repos.humans.update(humanId, { status })` inside repos.tx()
+      - If status is SUSPENDED or BANNED: also calls
+        `repos.humans.invalidateAllSessions(humanId)` to force logout
+      - Logs audit entry within the transaction
+      - Returns updated human record
+
+      ### admin-force-verify-email.ts
+      - Input: `{ humanId: string }`
+      - Calls `repos.humans.forceVerifyEmail(humanId)` inside repos.tx()
+      - Audit log
+
+      ### admin-unlink-auth-account.ts
+      - Input: `{ humanId: string; providerId: string }`
+      - Calls `repos.humans.unlinkAuthAccount(input)` inside repos.tx()
+      - After unlink: `repos.humans.invalidateAllSessions(humanId)` (force re-auth)
+      - Audit log
+
+      ### admin-delete-human.ts
+      - Input: `{ humanId: string; confirmationPhrase: string }`
+      - confirmationPhrase must exactly match the human's email
+      - Calls `repos.humans.deleteHuman(humanId)` inside repos.tx()
+      - Audit log
+      - Returns `{ deleted: true }`
+
+      All use cases must:
+      - Accept `{ actor, repos }` context per standard pattern
+      - Enforce `actor.roles.includes("ADMIN")` or delegate to
+        `repos.authz.ensureStaffRole(actor, "ADMIN")`
+      - Be exported from packages/core/src/index.ts
+    files:
+      - packages/core/src/use-cases/platform/admin-set-human-status.ts
+      - packages/core/src/use-cases/platform/admin-set-human-status.test.ts
+      - packages/core/src/use-cases/platform/admin-force-verify-email.ts
+      - packages/core/src/use-cases/platform/admin-force-verify-email.test.ts
+      - packages/core/src/use-cases/platform/admin-unlink-auth-account.ts
+      - packages/core/src/use-cases/platform/admin-unlink-auth-account.test.ts
+      - packages/core/src/use-cases/platform/admin-delete-human.ts
+      - packages/core/src/use-cases/platform/admin-delete-human.test.ts
+      - packages/core/src/index.ts (add exports)
+    acceptance:
+      - "4 use cases with Zod input validation"
+      - "ADMIN-only RBAC enforced"
+      - "Self-action prevention on suspend/ban/delete"
+      - "Session invalidation on status change + unlink"
+      - "Audit logs for every mutation"
+      - "Tests cover: happy path, RBAC denial, self-action prevention, not-found, last-account guard"
+
+  # ── 3. tRPC Mutations ──────────────────────────────────────────────────
+  - id: trpc-mutations
+    title: "Add platform human management mutations to tRPC router"
+    layer: packages/transport
+    effort: S
+    description: |
+      In `packages/transport/trpc/src/routers/platform.ts`, add:
+
+      ```ts
+      setHumanStatus: staffProcedure("ADMIN")
+        .input(z.object({
+          humanId: z.string().uuid(),
+          status: z.enum(["ACTIVE", "SUSPENDED", "BANNED"]),
+          reason: z.string().optional(),
+        }))
+        .mutation(async ({ ctx, input }) => {
+          return adminSetHumanStatus({ actor: ctx.actor, repos: ctx.repos, input });
+        }),
+
+      forceVerifyEmail: staffProcedure("ADMIN")
+        .input(z.object({ humanId: z.string().uuid() }))
+        .mutation(/* ... */),
+
+      unlinkAuthAccount: staffProcedure("ADMIN")
+        .input(z.object({
+          humanId: z.string().uuid(),
+          providerId: z.string(),
+        }))
+        .mutation(/* ... */),
+
+      deleteHuman: staffProcedure("ADMIN")
+        .input(z.object({
+          humanId: z.string().uuid(),
+          confirmationPhrase: z.string(),
+        }))
+        .mutation(/* ... */),
+
+      // Query: list a human's linked auth accounts for the detail panel
+      listHumanAuthAccounts: staffProcedure("ADMIN")
+        .input(z.object({ humanId: z.string().uuid() }))
+        .query(/* ... */),
+      ```
+
+      If `staffProcedure("ADMIN")` doesn't exist as a helper, create
+      it or inline the role check. The existing `checkStaffAccess`
+      accepts a roles array — use `["ADMIN"]` for these mutations.
+    files:
+      - packages/transport/trpc/src/routers/platform.ts
+    depends_on: [admin-use-cases]
+    acceptance:
+      - "5 new procedures (4 mutations + 1 query) on the platform router"
+      - "All restricted to ADMIN role"
+      - "Input schemas match use case Zod schemas"
+
+  # ── 4. Humans Table: Row Actions ────────────────────────────────────────
+  - id: ui-row-actions
+    title: "Add action dropdown to humans table rows"
+    layer: apps/web
+    effort: M
+    description: |
+      Modify `apps/web/src/app/platform/humans/page.tsx` to add a
+      row-level actions menu (three-dot / ellipsis button in the last
+      column). Actions vary by current status:
+
+      | Current Status | Available Actions |
+      | --- | --- |
+      | ACTIVE | Suspend, Ban, Force Verify (if !emailVerified) |
+      | INVITED | Suspend, Ban, Force Verify |
+      | SUSPENDED | Reactivate (→ ACTIVE), Ban |
+      | BANNED | Reactivate (→ ACTIVE) |
+
+      Additional actions (always available for ADMIN):
+      - **Manage Accounts** → opens a dialog showing linked providers
+        with "Unlink" buttons (calls listHumanAuthAccounts query)
+      - **Delete** → only in the Manage Accounts dialog or as a
+        separate danger-zone action
+
+      UI components:
+      - `DropdownMenu` (from @th/ui or radix) for the row action trigger
+      - `AlertDialog` for confirmation on Suspend/Ban/Reactivate
+      - `Dialog` for Manage Accounts (lists providers, unlink buttons)
+      - `AlertDialog` with typed confirmation for Delete
+        (user must type the human's email to confirm)
+
+      Use `trpc.platform.setHumanStatus.useMutation()` etc. with
+      `onSuccess` → invalidate `listHumans` query.
+
+      Toast notifications on success/failure.
+    files:
+      - apps/web/src/app/platform/humans/page.tsx
+      - apps/web/src/app/platform/humans/_components/HumanActions.tsx (new)
+      - apps/web/src/app/platform/humans/_components/ManageAccountsDialog.tsx (new)
+      - apps/web/src/app/platform/humans/_components/DeleteHumanDialog.tsx (new)
+    depends_on: [trpc-mutations]
+    acceptance:
+      - "Three-dot menu renders on every row (ADMIN only, hidden for other staff roles)"
+      - "Suspend/Ban show confirmation dialog with reason field"
+      - "Reactivate shows simple confirmation"
+      - "Force Verify only appears when email is not verified"
+      - "Manage Accounts dialog lists providers with unlink buttons"
+      - "Delete requires typed email confirmation"
+      - "Table refreshes after successful mutation"
+      - "Error toasts for failed mutations"
+
+  # ── 5. Tests ────────────────────────────────────────────────────────────
+  - id: tests
+    title: "Unit + integration tests for all use cases"
+    layer: packages/core + packages/adapters
+    effort: M
+    description: |
+      Use case tests (Vitest, in-memory repo mocks):
+      - admin-set-human-status: happy path × 3 statuses, RBAC denial,
+        self-suspension prevention, session invalidation side effect,
+        not-found error
+      - admin-force-verify-email: happy path, already-verified idempotency,
+        not-found
+      - admin-unlink-auth-account: happy path, last-account guard,
+        session invalidation, not-found
+      - admin-delete-human: happy path, wrong confirmation phrase,
+        self-delete prevention, not-found
+
+      Adapter integration tests (if feasible with test DB):
+      - unlinkAuthAccount leaves other accounts intact
+      - deleteHuman cascades correctly
+      - invalidateAllSessions clears all sessions
+    depends_on: [admin-use-cases, repo-admin-methods]
+    acceptance:
+      - "All use case test files pass with `pnpm -C packages/core vitest --run`"
+      - "Edge cases covered: RBAC, self-action, not-found, last-account"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data Model Notes
+# ─────────────────────────────────────────────────────────────────────────────
+data_model_notes:
+  cascade_behavior: |
+    The existing Prisma schema has:
+    - AuthUser.humanId → Human.id with onDelete: Cascade
+      (deleting Human cascades to AuthUser)
+    - AuthAccount.userId → AuthUser.id with onDelete: Cascade
+    - AuthSession.userId → AuthUser.id with onDelete: Cascade
+    So `prisma.human.delete({ where: { id } })` will cascade through
+    AuthUser → AuthAccount + AuthSession automatically.
+
+  financial_records: |
+    Orders, tickets, settlements, and payout items reference humanId
+    but do NOT have onDelete: Cascade. After human deletion these
+    records become orphaned (humanId points to a deleted row). This is
+    intentional for financial audit integrity. The UI should handle
+    null human lookups gracefully in order/settlement views.
+
+  human_status_semantics:
+    ACTIVE: "Normal user, full access"
+    INVITED: "Created via invitation, not yet onboarded"
+    SUSPENDED: "Temporarily restricted — cannot log in, existing sessions invalidated. Reversible."
+    BANNED: "Permanently restricted — same as suspended but signals policy violation. Reversible by ADMIN."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rollout Plan
+# ─────────────────────────────────────────────────────────────────────────────
+rollout:
+  phase_1: "Repo methods + use cases + tests (items 1, 2, 5)"
+  phase_2: "tRPC mutations (item 3)"
+  phase_3: "UI row actions (item 4)"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Risks & Edge Cases
+# ─────────────────────────────────────────────────────────────────────────────
+risks:
+  - title: "Deleting a human with active orders"
+    detail: |
+      Orders reference humanId. After deletion, order views will show
+      a missing buyer. The adapter should NOT prevent deletion — the
+      use case confirms via typed email. But the UI should warn: "This
+      human has N active orders that will lose their buyer reference."
+      Query order count before showing the delete dialog.
+
+  - title: "Unlinking the last credential account"
+    detail: |
+      If a human has only email/password (providerId='credential') and
+      no OAuth accounts, unlinking 'credential' would lock them out
+      permanently. The repo method must throw an error if the unlink
+      would leave zero accounts.
+
+  - title: "Suspending a human mid-checkout"
+    detail: |
+      If a human is in the middle of a Stripe checkout session when
+      suspended, the webhook will still process the payment. The order
+      will succeed but the human won't be able to access their tickets
+      until reactivated. This is acceptable — no financial loss.
+
+  - title: "Self-deletion by the acting admin"
+    detail: |
+      The use case must prevent an admin from deleting their own
+      account. Check actor.humanId !== input.humanId.
+
+  - title: "Race condition: concurrent status changes"
+    detail: |
+      Two admins could try to suspend and ban the same human
+      simultaneously. Since update() is a single Prisma call inside a
+      transaction, last-write-wins is acceptable. The audit log will
+      show both actions.

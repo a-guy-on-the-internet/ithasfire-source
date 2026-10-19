@@ -1,0 +1,219 @@
+version: "1.0"
+updated: "2026-05-25"
+status: "complete"
+title: "Human-level Stripe Connect & payouts"
+
+summary:
+  problem: >
+    The admin Payments screen blocks individual users from connecting Stripe
+    with the copy "Payments are managed at the organisation level. Join or
+    create an organisation to get started." This contradicts the rest of the
+    platform — events, payee ledger, and payout-summary use cases already
+    treat humans as first-class owners — so individuals can list events but
+    cannot receive payouts.
+  solution: >
+    Extend Stripe Connect onboarding and status read paths to accept a human
+    owner (the acting user themselves). The data layer is already polymorphic
+    (Payee.subjectType ∈ {HUMAN, ORGANIZATION}); only the input contracts and
+    the orgId-bound branches in the two stripe-connect use cases need to grow
+    a human path. Remove the org-only empty state from the admin UI.
+  users:
+    - "Individual organiser (human owner of events)"
+    - "Org admin (unchanged; current flow continues to work)"
+  surfaces: ["web"]
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        A human user with no org membership can initiate Stripe Connect
+        onboarding from /admin/<human-slug>/payments and complete it without
+        ever creating or joining an org.
+    - id: FR-002
+      description: >
+        After onboarding, the same screen displays the human's Connect
+        status, requirements, and payout summary, identical in shape to the
+        org view.
+    - id: FR-003
+      description: >
+        Orders whose event is owned by a human are paid out to that human's
+        Stripe account via the existing payout pipeline. No new payout-resolution
+        code path beyond the Payee subjectType branch that already exists in
+        getOwnerPayoutSummary.
+    - id: FR-004
+      description: >
+        An actor may only initiate / read Connect status for themselves
+        (when humanId is supplied) — they cannot pass an arbitrary humanId to
+        onboard another user.
+    - id: FR-005
+      description: >
+        The existing org-scoped behaviour is unchanged. Same inputs
+        (`{orgId}`), same authorisation (requireOrgMembership), same output
+        shape.
+    - id: FR-006
+      description: >
+        UI removes the "paymentsOrgOnly" empty state on /admin/<human-slug>/payments
+        and the "showingOrgPayments" banner. The PaymentsView resolves the
+        current owner as either {kind: "org", id} or {kind: "human", id} and
+        wires queries accordingly.
+  non_functional:
+    - id: NFR-001
+      description: >
+        No regression in onboarding time-to-first-payout for org owners.
+        The new branch must not add a query to the org path.
+    - id: NFR-002
+      description: >
+        Inputs are validated as a discriminated union so a caller cannot
+        smuggle both orgId and humanId and trip an ambiguous branch.
+    - id: NFR-003
+      description: >
+        Tests cover both owner kinds for every touched use case. No use
+        case ships with org-only test coverage.
+
+architecture:
+  core:
+    use_cases:
+      - name: initiate-stripe-connect-onboarding
+        file: packages/core/src/use-cases/stripe-connect/initiate-onboarding.ts
+        change: >
+          Input schema: z.union([{orgId, actorHumanId}, {humanId, actorHumanId}])
+          with refine() requiring humanId === actorHumanId when present.
+          Branch on shape:
+            • orgId path: existing requireOrgMembership + Payee upsert with
+              subjectType=ORGANIZATION, subjectId=orgId (unchanged).
+            • humanId path: skip membership check, Payee upsert with
+              subjectType=HUMAN, subjectId=humanId.
+          Stripe account creation parameters: pass `business_type=individual`
+          (vs. `company` for orgs) and pre-fill `individual.email` from the
+          human's primary email.
+        idempotent: true
+        money: true
+      - name: get-stripe-connect-status
+        file: packages/core/src/use-cases/stripe-connect/get-connect-status.ts
+        change: >
+          Same input-shape change as above. Branch the Payee lookup to use
+          subjectType + subjectId from the resolved owner.
+        idempotent: true
+        money: false
+  ports:
+    new: []
+    existing:
+      - PayeeRepository.upsertForSubject (already polymorphic)
+      - PayeeRepository.findBySubject (already polymorphic)
+      - StripeConnectAdapter.createAccount (accepts business_type)
+      - StripeConnectAdapter.createAccountLink
+  adapters:
+    new: []
+    existing:
+      - packages/adapters/src/payment-processors/stripe (no changes)
+  transport:
+    trpc_procedures:
+      - router: stripeConnect
+        procedure: initiateOnboarding
+        change: >
+          Input grows `humanId?: string`. Procedure derives actorHumanId from
+          ctx and passes the discriminated union into the core use case. If
+          neither orgId nor humanId is supplied, default to humanId =
+          actorHumanId (self-serve).
+      - router: stripeConnect
+        procedure: getStatus
+        change: same shape as initiateOnboarding
+    webhooks: []
+  ui:
+    pages:
+      - apps/web/src/app/admin/[slug]/payments/page.tsx (no structural change)
+    components:
+      - path: apps/web/src/app/admin/[slug]/payments/_components/PaymentsView.tsx
+        change: >
+          Replace useCurrentOrgId() with a useCurrentOwner() returning
+          {kind, id}. Remove the !orgId early-return (lines 186-201).
+          Remove the isHumanFallback banner. Pass humanId or orgId to the
+          two tRPC queries based on owner kind. Onboarding handler routes
+          the same way.
+      - path: apps/web/src/i18n/messages/en.ts
+        change: >
+          Delete `paymentsOrgOnly` and `showingOrgPayments` keys (and their
+          es.ts counterparts and the keys in packages/locale/messages/*).
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+  notes: >
+    Finance schema already supports the HUMAN subjectType
+    (packages/db/prisma/finance.prisma:10-38). No DDL required.
+
+risks:
+  - risk: >
+      Half-onboarded human: Stripe account is created but the Payee row is
+      keyed with the wrong subjectType, so payouts never flow.
+    severity: HIGH
+    mitigation: >
+      Wrap account creation + Payee upsert in a single core transaction with
+      Stripe-account-id idempotency. Add a unit test in
+      packages/core/src/use-cases/stripe-connect/__tests__/ that asserts the
+      Payee row's subjectType matches the input shape.
+  - risk: >
+      Actor escalation — caller passes another user's humanId to onboard a
+      Stripe account on their behalf.
+    severity: HIGH
+    mitigation: >
+      Input schema .refine() enforces humanId === actorHumanId. Add a
+      transport-level test that submitting a different humanId returns
+      FORBIDDEN.
+  - risk: >
+      business_type mismatch — a human onboards with `business_type=company`
+      because the parameter wasn't branched. Stripe later asks for an EIN
+      they don't have.
+    severity: MEDIUM
+    mitigation: >
+      Branch business_type in the adapter call site, not in the adapter.
+      Unit test covers both branches.
+  - risk: >
+      A human owner later joins an org and is unsure which Payments view
+      they're looking at.
+    severity: LOW
+    mitigation: >
+      Owner kind already shows in the admin chrome (slug, owner switcher).
+      Keep the page header subtitle referencing the resolved owner name.
+
+open_questions:
+  - >
+    Should an individual who later forms an org be able to migrate their
+    historical payouts to the org's Stripe account? (Out of scope for v1,
+    but flag for product.)
+  - >
+    Tax — do we need to surface 1099 thresholds differently for individuals
+    vs. orgs? Stripe handles 1099-K generation; we likely don't.
+  - >
+    Should we require email verification before allowing humans to start
+    Stripe onboarding? (Recommend yes — `verifyEmail` is already in the
+    auth flow.)
+
+out_of_scope:
+  - Migrating an individual's Connect account to an org account.
+  - Backfilling Payee rows for events historically owned by humans without
+    Connect accounts (those events already gate Buy CTA via sellability).
+  - Mobile app surfacing (web admin only for v1).
+  - Multi-account support (a human with multiple Stripe accounts).
+
+acceptance_criteria:
+  - >
+    A new human user with no org can navigate to /admin/<their-slug>/payments,
+    click "Set up Stripe Connect", complete Stripe's hosted onboarding, return
+    to the page, and see status = connected, charges enabled, payouts enabled.
+  - >
+    The same human creates a free-then-paid event, a buyer purchases a
+    ticket, the order completes, and the pending-payout figure on the
+    Payments screen reflects the sale (net of platform + processor fees).
+  - >
+    On the next payout run, the human receives a Stripe payout to their
+    bank account.
+  - >
+    An existing org admin sees no change in behaviour, copy, or latency on
+    /admin/<org-slug>/payments. All existing tests in
+    `packages/core/src/use-cases/stripe-connect/__tests__/` pass unchanged
+    and the new human-path tests are added alongside.
+  - >
+    A POST to stripeConnect.initiateOnboarding with `humanId` ≠ actor's
+    humanId returns FORBIDDEN, not 200.

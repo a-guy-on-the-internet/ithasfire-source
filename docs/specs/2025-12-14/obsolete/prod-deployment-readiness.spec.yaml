@@ -1,0 +1,137 @@
+# Spec: Production Deployment Readiness
+meta:
+  owner: platform-core
+  status: draft
+  reviewers:
+    - infra
+    - security
+    - observability
+    - qa
+  last_updated: 2024-05-07
+summary: |
+  Codifies the minimum checklist required before green-lighting Ithas Fire's first full production
+  deployment. Consolidates infrastructure hardening, secret management, observability, reliability,
+  and release operations so every team can reason about what "production ready" means.
+objectives:
+  - Stand up a reproducible production cluster (GKE + supporting services) with Terraform + Argo CD.
+  - Ensure secrets, credentials, and environment configuration flow through GSM + CSI, never static files.
+  - Provide defense-in-depth (network policies, PodDisruptionBudgets, autoscaling, backups).
+  - Establish telemetry parity (OTel, Datadog, logs) with clear SLOs, alerts, and on-call playbooks.
+  - Document cutover + rollback procedures with QA exit criteria.
+
+scope:
+  in_scope:
+    - `infra/terraform/main.tf` Cloud Run services, Neon, Upstash Redis, Cloudflare DNS.
+    - Argo CD app-of-apps manifest and per-surface Helm releases (api, web, jobs, scanner, cron).
+    - Observability stack: OTEL collector, Datadog agent, Loki/S3 archive, structured logging.
+    - Secret delivery via Google Secret Manager CSI driver and workload identity bindings.
+    - Release operations: canary, manual judgment, rollback, and approval workflows.
+  out_of_scope:
+    - Feature-specific QA (owned by individual product specs).
+    - Mobile store submission or legal sign-off.
+
+milestones:
+  - name: "Provision prod foundation"
+    owners: [infra]
+    checklist:
+      - Terraform `infra/terraform/main.tf` applied in prod workspace w/ remote state locked.
+      - Cloud Run services deployed for API, Web, Jobs.
+      - `infra/argo/overlays/prod` synced in Argo CD; health green.
+  - name: "Hardening + access"
+    owners: [security, infra]
+    checklist:
+      - NetworkPolicies restrict namespace egress to required services only.
+      - PodDisruptionBudgets for api, jobs, transports ensure >=1 replica during maintenance.
+      - Workload Identity + IAM conditions enforced; no long-lived JSON keys.
+      - Bastion + VPN documented for break-glass.
+  - name: "Observability + SLOs"
+    owners: [observability, platform-core]
+    checklist:
+      - OTEL collector DaemonSet deployed; Fastify, jobs, workers exporting traces + metrics.
+      - Datadog monitors for API latency, error rate, queue depth, and DB saturation linked to PagerDuty.
+      - Runbooks stored in `docs/runbooks/*.md` and referenced from spec.
+  - name: "Secrets + env config"
+    owners: [platform-core]
+    checklist:
+      - GSM secrets map completed; CSI driver mounted for all workloads.
+      - Rotations scripted via `infra/scripts/verify.sh` + Datadog audit hooks.
+      - `.env` files removed from containers; rely on ConfigMaps + secrets only.
+  - name: "Release rehearsal"
+    owners: [platform-core, qa]
+    checklist:
+      - Staging cutover drill with simulated traffic using `pnpm stack:dev` recorded.
+      - Canary release config validated (Argo Rollouts or Helm hooks) with abort + rollback tested.
+      - QA exit report filed and linked.
+
+infra_requirements:
+  terraform:
+    - Ensure `backend.tfbackend` points at prod bucket/project; state locked via GCS + DynamoDB (if AWS path used).
+    - Use `terraform plan -var-file=envs/prod/terraform.tfvars` inside CI before apply.
+    - Tag every resource with `env=prod`, `service`, `owner` for cost + incident routing.
+  kubernetes:
+    - Namespaces: `prod-api`, `prod-web`, `prod-support`, `prod-shared`.
+    - Enforce namespace ResourceQuotas + LimitRanges.
+    - Set HorizontalPodAutoscalers for API (p95 < 300ms) and Jobs (queue depth < 5k).
+    - Configure PodSecurityAdmission baseline; privileged workloads go through security review.
+  data:
+    - Neon Primary + read replica configured; PITR >= 7 days.
+    - Redis Upstash plan sized for 3x projected peak TTL objects; eviction policy documented.
+    - Storage buckets (logs, uploads) have object versioning + lifecycle rules.
+
+security_controls:
+  secrets:
+    - Google Secret Manager holds Stripe, Better Auth, Datadog, and internal API keys.
+    - CSI driver with `rotationPollPeriod: 1h`; apps reload via SIGHUP or sidecar watcher.
+    - Dual control for production secret updates (PR + approval).
+  networking:
+    - Cloud Armor WAF with basic OWASP + bot rules.
+    - Cloudflare proxied DNS entries; origin restricts to Cloudflare IP ranges.
+    - Private Service Connect for Neon/Postgres; no public DB endpoints.
+  compliance:
+    - Audit log sink -> BigQuery for IAM + GKE events.
+    - Access review cadence recorded in `docs/secrets-manager-map.md`.
+
+observability_stack:
+  telemetry:
+    traces:
+      - OTEL collector receives from Fastify, jobs, adapters; exports to Datadog + GCP Trace.
+      - Trace sampling default 20%; feature flag `telemetry.forceSample` for incidents.
+    metrics:
+      - Prometheus remote-write to Datadog; include custom metrics for queue depth, payouts, scanner scans.
+      - SLIs stored in Looker dashboards: API availability, payout settlement lag, scanner scan success.
+    logs:
+      - Loki (tempo) for short-term query; Cloud Storage for 30-day retention; PII scrubber middleware enabled.
+  alerting:
+    - PagerDuty services: `api`, `jobs`, `payments`, `scanner`.
+    - Slack channels: `#ops-alerts`, `#deployments`, `#observability-lab`.
+    - Alert runbooks referenced by slug (e.g., `RUNBOOK: api-latency`, `RUNBOOK: payout-delay`).
+
+release_management:
+  process:
+    - Feature freeze begins T-7 days; only bug fixes merged after freeze.
+    - Use Argo Rollouts canary (20% -> 50% -> 100%) with manual approval gate.
+    - Record every deploy in Deploy Tracker (Notion + `deploy-history` repo).
+  rollback:
+    - Helm chart versions pinned; `helm rollback <release> <revision>` documented.
+    - Database migrations gated via `prisma migrate deploy --dry-run`; require confirmation before apply.
+    - Fallback toggles for feature flags stored in LaunchDarkly (`ld-production` env).
+  comms:
+    - Deployment lead posts agenda + status in `#deployments` (start, canary, full traffic, done).
+    - Incident bridge auto-started if any SLO breached during rollout.
+
+qa_exit_criteria:
+  - End-to-end checklists for buyer checkout, organizer dashboard, payout pipeline, scanner flows executed in prod-like env.
+  - Synthetic transactions via k6 or Playwright hitting prod endpoints with feature flags matching launch state.
+  - Load test demonstrates 2x expected launch concurrency; metrics recorded.
+  - Security review signed off (threat model, dependency scan, container scan).
+  - Incident response dry run for payments + scanner teams completed.
+
+risks:
+  - Delay in OTEL onboarding leaves blind spots; mitigation: fallback to Datadog APM agent temporarily.
+  - Neon read replica lag causing stale reads; mitigation: force primary reads for payout-critical queries until tuned.
+  - GSM quota limits if secrets proliferate; mitigation: batch secrets and prune unused versions quarterly.
+
+open_questions:
+  - Do we need regional failover (multi-cluster) before GA, or is single-region + backup acceptable?
+  - Who owns ongoing cloud cost anomaly monitoring once prod is live?
+  - Should canary cover scanner mobile builds or rely on Expo release channels separately?

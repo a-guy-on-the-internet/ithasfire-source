@@ -1,0 +1,60 @@
+/*
+ * Stamp C — the door verdict's entry (owner, 2026-10-06; DS DECISIONS.md D-150,
+ * overriding D-125's "no transition at all"). See `ToneResultState`'s
+ * `## Motion` section for the reasoning.
+ *
+ * Only the hero glyph and the word move. The tone fill, the state line and the
+ * holder/detail lines are untouched by this file and paint on frame 1.
+ *
+ * Keyframe names are local to this module (CSS Modules hash them), so they
+ * cannot collide with anything in globals.css.
+ */
+
+/* The glyph drops onto the fill like a rubber stamp: oversize and invisible,
+ * a slight overshoot under its resting size, then home. Origin sits below
+ * centre so it lands rather than pulses. */
+@keyframes drop {
+	0% {
+		transform: scale(1.9);
+		opacity: 0;
+	}
+	70% {
+		transform: scale(0.94);
+		opacity: 1;
+	}
+	100% {
+		transform: scale(1);
+	}
+}
+
+@keyframes fadein {
+	from {
+		opacity: 0;
+	}
+	to {
+		opacity: 1;
+	}
+}
+
+/* Durations are literals on purpose: the owner pinned 180ms and 120ms, and the
+ * native twin (`@th/ui-native` use-verdict-stamp.ts) mirrors them. Don't swap
+ * in --motion-* tokens; if a token moved, the two surfaces would drift. */
+.glyph {
+	transform-origin: 50% 60%;
+	animation: drop 180ms cubic-bezier(0.3, 0, 0.2, 1) both;
+}
+
+/* 120ms long, 120ms in: the word arrives as the glyph lands. `both` holds it
+ * at opacity 0 through the delay, so it never flashes in and back out. */
+.word {
+	animation: fadein 120ms 120ms linear both;
+}
+
+/* Reduced motion: the static final frame, identical to the pre-stamp render
+ * (scale 1, opacity 1). No JS branch, so SSR and hydration cannot disagree. */
+@media (prefers-reduced-motion: reduce) {
+	.glyph,
+	.word {
+		animation: none;
+	}
+}

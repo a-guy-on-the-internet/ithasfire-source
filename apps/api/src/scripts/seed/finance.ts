@@ -192,12 +192,18 @@ export const ensureAgreement = async (
 
 // ── Default agreements (primary + resale) ────────────────��───────────────
 
+// Relies on `seed:dev` wiping the database first: an org whose pointer already
+// names a RESALE row keeps it, even one another org also points at.
 export const ensureDefaultAgreements = async (
   prisma: PrismaClient,
   orgId: string,
   payeeId: string = DEMO_IDS.payee,
   agreementId: string = DEMO_IDS.agreement,
 ): Promise<{ primaryId: string; resaleId: string }> => {
+  const org = await prisma.organization.findUnique({
+    where: { id: orgId },
+    select: { defaultResalePayoutTermsId: true },
+  });
   const [primaryExisting, resaleExisting] = await Promise.all([
     prisma.payoutTerms.findFirst({
       where: {
@@ -208,14 +214,20 @@ export const ensureDefaultAgreements = async (
       },
       select: { id: true },
     }),
-    prisma.payoutTerms.findFirst({
-      where: {
-        kind: "RESALE",
-        status: { in: ["ACTIVE", "PENDING"] },
-        isDefault: true,
-      },
-      select: { id: true },
-    }),
+    // Each org owns its RESALE default: look it up through the org's own
+    // pointer. An org-less findFirst made every org adopt one shared row,
+    // which the resale read treats as `terms_shared` (read-only).
+    org?.defaultResalePayoutTermsId
+      ? prisma.payoutTerms.findFirst({
+          where: {
+            id: org.defaultResalePayoutTermsId,
+            kind: "RESALE",
+            status: { in: ["ACTIVE", "PENDING"] },
+            isDefault: true,
+          },
+          select: { id: true },
+        })
+      : null,
   ]);
 
   let primaryId = primaryExisting?.id ?? agreementId;
@@ -326,7 +338,7 @@ export const ensureFeePolicy = async (prisma: PrismaClient) => {
       // `scopeType: "GLOBAL"` / `scopeId: null` as well as the economics.
       //
       // Spread from the SAME code constant the deploy-time reconciler
-      // (`apps/api/src/scripts/seed-platform-fee-policy.ts`) materializes, so a
+      // (`apps/api/src/scripts/reference-data/seed-platform-fee-policy.ts`) materializes, so a
       // FRESHLY seeded dev DB and a deployed one cannot start out with
       // different economics (see the create-if-absent caveat above). Do NOT
       // inline numbers here — change

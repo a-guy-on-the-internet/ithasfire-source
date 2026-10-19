@@ -92,6 +92,97 @@ function createError(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Segment upload concurrency
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * How many HLS segments we upload to R2 at once.
+ *
+ * A 4-minute track at `hls_time 6` is ~40 segments, and uploading them one at
+ * a time serialises ~40 `readFile` + network round trips — the single largest
+ * chunk of wall-clock time in this use case.
+ *
+ * The bound matters as much as the parallelism. A bare `Promise.all` over the
+ * whole array would, for a long podcast (hundreds of segments), open hundreds
+ * of concurrent sockets against R2 in one go — which invites rate limiting and
+ * connection churn — while buffering every segment's contents in memory at the
+ * same time. This service is a 2 vCPU / 2Gi Cloud Run instance handling one
+ * request at a time (see infra/terraform/envs/*: audio_transcoder_cpu
+ * = "2", audio_transcoder_memory = "2Gi", module concurrency default 1), so
+ * that headroom is finite and scales with the length of the uploaded file.
+ *
+ * 8 keeps the network pipe busy — uploads are I/O bound, so this is not
+ * competing for the CPU the encode wants — with at most 8 segments (~1MB)
+ * resident.
+ */
+const SEGMENT_UPLOAD_CONCURRENCY = 8;
+
+/**
+ * Runs `task` over `items` with at most `concurrency` in flight.
+ *
+ * Failure semantics are deliberately strict, because a partially-uploaded HLS
+ * render that reports success would produce a playlist referencing segments
+ * that 404:
+ * - the first rejection is captured and rethrown once the pool has fully
+ *   drained (so no in-flight rejection can be swallowed by a later resolve);
+ * - no NEW work starts after a failure.
+ *
+ * Hand-rolled rather than pulling in `p-limit` — the transcoder image stays
+ * dependency-light.
+ *
+ * Exported for unit tests; the only production call site is the segment upload
+ * below.
+ */
+export async function runWithConcurrency<T>(
+  items: readonly T[],
+  concurrency: number,
+  task: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  // A bound below 1 would make `Math.min` spawn ZERO workers: `Promise.all([])`
+  // resolves, `failed` stays false, and the caller is told every item
+  // succeeded having uploaded none of them — the exact catastrophic outcome
+  // this helper exists to prevent. Unreachable from the single call site
+  // today, but too sharp an edge to leave in a helper whose contract is
+  // strictness.
+  if (concurrency < 1) {
+    throw new Error(
+      `runWithConcurrency requires concurrency >= 1, got ${concurrency}`,
+    );
+  }
+
+  let nextIndex = 0;
+  let firstError: unknown;
+  let failed = false;
+
+  const worker = async (): Promise<void> => {
+    // Workers never reject: a failure is recorded and the worker returns, so
+    // `Promise.all` below always resolves and always means "pool drained".
+    while (!failed) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+
+      try {
+        await task(items[index]!, index);
+      } catch (err) {
+        if (!failed) {
+          failed = true;
+          firstError = err;
+        }
+        return;
+      }
+    }
+  };
+
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+  if (failed) {
+    throw firstError;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Use Case
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -218,22 +309,60 @@ export async function transcodeAudio(
 
     const playlistKey = `${outputPrefix}/audio.m3u8`;
 
-    // Upload segments first
-    for (const segment of transcodeResult.segments) {
-      const segmentKey = `${outputPrefix}/${segment.filename}`;
-      const segmentContent = await readFile(segment.path);
+    // Upload segments first, in a bounded-concurrency pool. This `await`
+    // resolves only once EVERY segment has landed, and rethrows the first
+    // failure once the pool has drained — which is what keeps the playlist
+    // upload below strictly ordered after them. A playlist visible before its
+    // segments is a broken player, so a partial upload must fail the whole
+    // step rather than report success.
+    //
+    // Not logged here: the failure propagates out of the use case and the
+    // route already logs it with the full error (`transcode_job_failed`,
+    // app.ts) and captures it to Sentry, so a log at this site would duplicate
+    // both.
+    //
+    // Retry semantics change slightly and deliberately. `upload_failed` is
+    // absent from app.ts's `permanentErrors` list, so a failed upload is
+    // RETRYABLE and Pub/Sub redelivers, which is what we want for an R2
+    // hiccup. It also reclassifies one case that used to be permanent: the
+    // S3 adapter throws `invalid_input`/`public_base_url_not_configured` when
+    // `public: true` is requested without a configured public base URL
+    // (s3-adapter.ts), and every segment put sets `public: true`. That is
+    // reachable by MISCONFIGURATION, not just by a malformed key —
+    // `S3_PUBLIC_BASE_URL` is optional in env.ts and Terraform materialises
+    // the unset case as "", which is falsy. Previously that ack'd the message
+    // after one attempt and left the upload stuck in TRANSCODING forever;
+    // now it retries and lands in the DLQ, which is louder and easier to
+    // diagnose. The cost is 5 redeliveries that each re-download and
+    // re-transcode before failing at the first put.
+    await runWithConcurrency(
+      transcodeResult.segments,
+      SEGMENT_UPLOAD_CONCURRENCY,
+      async (segment) => {
+        const segmentKey = `${outputPrefix}/${segment.filename}`;
 
-      await fileStorage.putObject({
-        key: segmentKey,
-        content: segmentContent,
-        options: {
-          contentType: "video/mp2t", // MPEG-2 Transport Stream
-          public: true, // HLS files need to be publicly accessible
-        },
-      });
-    }
+        try {
+          const segmentContent = await readFile(segment.path);
 
-    // Upload playlist
+          await fileStorage.putObject({
+            key: segmentKey,
+            content: segmentContent,
+            options: {
+              contentType: "video/mp2t", // MPEG-2 Transport Stream
+              public: true, // HLS files need to be publicly accessible
+            },
+          });
+        } catch (err) {
+          throw createError(
+            "upload_failed",
+            `Failed to upload HLS segment ${segmentKey}`,
+            err,
+          );
+        }
+      },
+    );
+
+    // Upload playlist — strictly after every segment above.
     const playlistContent = await readFile(transcodeResult.playlistPath);
     const { url: playlistUrl } = await fileStorage.putObject({
       key: playlistKey,

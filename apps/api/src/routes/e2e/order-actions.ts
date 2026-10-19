@@ -148,7 +148,7 @@ const orderActions: FastifyPluginAsync = async (app) => {
     // help section of their own order page, mirroring sendTicketIssuedEmail.
     const supportUrl = `${publicAppUrl.replace(/\/+$/, "")}/my-tickets/${order.id}#get-help`;
     const venueName =
-      orderEvent.place?.name ?? orderEvent.addressText ?? "Venue TBA";
+      orderEvent.place?.name ?? orderEvent.addressText ?? "Place TBA";
     const qrBaseUrl = `${publicAppUrl.replace(/\/+$/, "")}/tickets/qr`;
     const ticketAssets = tickets.map((t) => ({
       code: t.code,
@@ -386,6 +386,9 @@ const orderActions: FastifyPluginAsync = async (app) => {
             // No prior reversals: with unbounded capacity above, the
             // recovery path in reverseTransfersForItems is never entered.
             listTransferReversals: async () => [],
+            // The stub processor moves no money, so no prior refund can
+            // exist for the retry pre-flight to reuse.
+            listRefundsForPaymentIntent: async () => [],
             createTerminalConnectionToken: async () => ({
               secret: `pst_e2e_${Date.now()}`,
             }),
@@ -411,6 +414,22 @@ const orderActions: FastifyPluginAsync = async (app) => {
             },
             cancelReaderAction: async () => {
               throw new Error("e2e stub: terminal readers unsupported");
+            },
+            // Dispute ops are out of scope for the e2e checkout stub.
+            retrieveDispute: async () => {
+              throw new Error("e2e stub: disputes unsupported");
+            },
+            updateDisputeEvidence: async () => {
+              throw new Error("e2e stub: disputes unsupported");
+            },
+            uploadDisputeEvidenceFile: async () => {
+              throw new Error("e2e stub: disputes unsupported");
+            },
+            // Reporting-only on the port (never a payout gate), so an e2e
+            // checkout never reads it; the composition root's unconfigured
+            // processor fails it the same way.
+            getPlatformBalance: async () => {
+              throw new Error("e2e stub: platform balance unsupported");
             },
           }
         : app.deps.trpc.payments;

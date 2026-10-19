@@ -26,7 +26,13 @@ import { logAndAlert } from "@th/adapters/infra/discord-alerts";
 import { createPinoLoggerAdapter } from "@th/adapters/infra/logger";
 import { createPrismaRepos } from "@th/adapters/db/prisma-repos";
 import { withGuardedRepos } from "@th/adapters/decorators/with-dependency-guard";
-import { CLIENT_IP_HEADER_PRECEDENCE } from "@th/trpc/client-ip";
+import { withSearchReindexDrainScheduling } from "@th/adapters/decorators/with-search-reindex-drain-scheduling";
+import { createSearchReindexDrainTrigger } from "@th/adapters/queue/cloud-tasks-scheduler";
+import type { Repos } from "@th/ports/repos";
+import type { VerificationCodePurpose } from "@th/types/verification-code-purpose";
+import { TRUSTED_CLIENT_IP_HEADER_PRECEDENCE } from "@th/trpc/client-ip";
+import { isUsSmsNumber } from "@th/ports/comms/sms";
+import { RedisRateLimitAdapter } from "@th/adapters/rate-limit/redis-rate-limit-adapter";
 
 import { env } from "../lib/env";
 import { fireDiscordAlert } from "../lib/dep";
@@ -38,14 +44,38 @@ import {
   logAuthUserSignedUp,
   logAuthVerificationEmailSent,
 } from "./observability";
-import { createPhoneOtpSender, createTwoFactorOtpSender } from "./otp-senders";
+import {
+  createPhoneOtpSender,
+  createTwoFactorOtpSender,
+  createTwoFactorSendOtpGuardHook,
+} from "./otp-senders";
+import { createPhoneVerificationOptInHook } from "./phone-verification-opt-in";
+import {
+  dropUnverifiedImageOnCreate,
+  hookPath,
+  refuseUnverifiedImageUpdate,
+  syncProviderAvatarToPage,
+} from "./profile-image-sync";
+import {
+  prismaUnprovenEmailMoveLookup,
+  refuseUnprovenEmailMove,
+} from "./unproven-email-move";
+import { safeReporter } from "@th/ports/reporter";
 import {
   deleteUnprovisionedAuthUserWhere,
   handleProvisioningWithRollback,
   provisionGuardConfig,
   resolveHumanIdWithSelfHeal,
 } from "./provision-recovery";
-import { createBetterAuthRateLimitStorage } from "./rate-limit-storage";
+import {
+  createBetterAuthRateLimitStorage,
+  getAuthRateLimitRedis,
+} from "./rate-limit-storage";
+import {
+  createOtpSmsBudget,
+  createOtpSmsPerUserCap,
+  createOtpSmsPerUserGate,
+} from "./otp-sms-budget";
 import {
   AUTH_RATE_LIMIT_CUSTOM_RULES,
   AUTH_RATE_LIMIT_GLOBAL,
@@ -56,6 +86,82 @@ import {
   hostOnlySessionCookiesToClearForResponse,
 } from "./host-only-session-cookie";
 import { handleShadowUpgrade } from "./shadow-upgrade";
+import {
+  refuseSecondFactorBypassSession,
+  refuseUnverifiedPasskeyForTwoFactor,
+  sessionUserIdOf,
+  skipsProviderLinkForTwoFactor,
+  twoFactorPrerequisites,
+} from "./second-factor-bypass";
+import {
+  stampFirstSignInFromHook,
+  type FirstSignInStampDeps,
+} from "./first-sign-in";
+import {
+  isInboxProvingProvider,
+  isOwnInboxVerification,
+  isSessionAllowed,
+  resolveEmailProofTrigger,
+  accountNotActiveRedirect,
+  passwordResetProofFromUrl,
+  refusedAuthEndpoint,
+  RESET_SWEEP_OPTIONS,
+  sweepAuthUserPatch,
+  revokeUnprovenCredentials,
+  sweptAnything,
+  UNPROVEN_ACCOUNT_SWEPT_ACTION,
+  secureAccountAfterPasswordReset,
+  type EmailProofTrigger,
+  type UnprovenCredentialDeps,
+  type UnprovenSweepResult,
+} from "./account-security";
+import { makeApiKeysRepo } from "@th/adapters/db/prisma/api-keys";
+import { makeAuditRepo } from "@th/adapters/db/prisma/audit";
+import { makeBansRepo } from "@th/adapters/db/prisma/bans";
+import { makeHumansRepo } from "@th/adapters/db/prisma/humans";
+import {
+  createNetworkIdentityHasher,
+  isUsableNetworkIdentitySecret,
+} from "@th/core/lib/security/network-identity";
+import { makeNetworkSightingsRepo } from "@th/adapters/db/prisma/network-sightings";
+import {
+  ACCOUNT_NOT_ACTIVE_ERROR,
+  emailBeingSet,
+  isEmailAllowedForAccount,
+  recordSightingFromHook,
+  type SightingHookDeps,
+} from "./ban-gate";
+
+/**
+ * Search reindex drain scheduling for the provisioning repos below, built the
+ * way `dep.ts` builds it. `provisionHumanForAuthUser` MARKS the new human in
+ * its transaction; without this decorator nothing would schedule the drain
+ * that refreshes it. Built once for this module — but it is a SECOND trigger
+ * object in the API process (dep.ts builds its own), so the two keep separate
+ * in-process slot memos: at worst one extra scheduler call per slot, which
+ * Cloud Tasks answers `duplicate` (same slot name). Null (repos returned
+ * as-is) without a Cloud Tasks queue.
+ */
+const authSearchReindexDrain = createSearchReindexDrainTrigger({
+  CLOUD_TASKS_QUEUE: env.CLOUD_TASKS_QUEUE,
+  CLOUD_TASKS_INVOKER_SA: env.CLOUD_TASKS_INVOKER_SA,
+  JOBS_SERVICE_URL: env.JOBS_SERVICE_URL,
+  SEARCH_REINDEX_DRAIN_DELAY_S: env.SEARCH_REINDEX_DRAIN_DELAY_S,
+  SEARCH_REINDEX_DRAIN_WINDOW_S: env.SEARCH_REINDEX_DRAIN_WINDOW_S,
+});
+function withAuthSearchReindexDrain(
+  repos: Repos,
+  logger: ReturnType<typeof createPinoLoggerAdapter>,
+): Repos {
+  return authSearchReindexDrain
+    ? withSearchReindexDrainScheduling(repos, {
+        trigger: authSearchReindexDrain,
+        clock: createSystemClock(),
+        logger,
+        reportError: safeReporter(Sentry.captureException),
+      })
+    : repos;
+}
 
 function parseTrustedOrigins(value: string | undefined): string[] {
   if (!value) return [];
@@ -268,6 +374,327 @@ const verifyAppleIdToken = async (idToken: string): Promise<boolean> => {
   return true;
 };
 
+// ── Account-security hook deps (see ./account-security.ts) ────────────────
+// Thin Prisma wiring for the F5/F6 rules from the 2026-09-29 security review.
+// Every read here runs OUTSIDE Better Auth's own transaction on purpose: the
+// decisions must see committed state.
+
+const loadHumanStatusForAuthUser = async (authUserId: string) => {
+  const row = await prisma.authUser.findUnique({
+    where: { id: authUserId },
+    select: { human: { select: { status: true } } },
+  });
+  return row?.human?.status ?? null;
+};
+
+const revokeApiKeysForAuthUser = async (authUserId: string) => {
+  const row = await prisma.authUser.findUnique({
+    where: { id: authUserId },
+    select: { humanId: true },
+  });
+  if (!row?.humanId) return 0;
+  const { count, closedRequestCount } = await makeApiKeysRepo(
+    prisma,
+  ).revokeAllForHuman({ humanId: row.humanId });
+  // Scoped API keys R31: the reset also closed the holder's open key requests.
+  if (closedRequestCount > 0) {
+    createPinoLoggerAdapter().info(
+      "auth_password_reset_api_key_requests_closed",
+      { authUserId, closedRequestCount },
+    );
+  }
+  return count;
+};
+
+/**
+ * Remove everything that could have been attached to this AuthUser before
+ * its email was proven, in ONE transaction: password credential and every
+ * session (unless `keepCredentialAndSessions`), passkeys, TOTP enrolment, the
+ * phone number, the Human's API keys, delegate grants it made and pending
+ * org invitations it sent. Org grants that cannot be attributed safely are
+ * collected for review instead. Deleting ALL sessions is safe for the prover
+ * because every sweep runs before Better Auth creates the prover's session.
+ */
+const sweepUnprovenAccountInDb = async (
+  authUserId: string,
+  opts: {
+    keepCredentialAndSessions: boolean;
+    markEmailVerified: boolean;
+    trigger: string;
+    auditOnlyIfSomethingRemoved: boolean;
+  },
+): Promise<UnprovenSweepResult> =>
+  prisma.$transaction(async (tx) => {
+    const user = await tx.authUser.findUnique({
+      where: { id: authUserId },
+      select: { humanId: true, phoneNumber: true },
+    });
+    const credentialAccounts = opts.keepCredentialAndSessions
+      ? { count: 0 }
+      : await tx.authAccount.deleteMany({
+          where: { userId: authUserId, providerId: "credential" },
+        });
+    const sessions = opts.keepCredentialAndSessions
+      ? { count: 0 }
+      : await tx.authSession.deleteMany({ where: { userId: authUserId } });
+    const passkeys = await tx.passkey.deleteMany({
+      where: { userId: authUserId },
+    });
+    const twoFactor = await tx.authTwoFactor.deleteMany({
+      where: { userId: authUserId },
+    });
+    // Phone, 2FA and (when sessions go) the first-sign-in stamp: see
+    // `sweepAuthUserPatch` for why, including the orchestrator's reading of
+    // the owner ruling "A new account is new the moment it gets created"
+    // (2026-10-07) and its side effect.
+    await tx.authUser.update({
+      where: { id: authUserId },
+      data: sweepAuthUserPatch(opts),
+    });
+    const humanId = user?.humanId ?? null;
+    const apiKeys = humanId
+      ? await makeApiKeysRepo(tx).revokeAllForHuman({ humanId })
+      : { count: 0, closedRequestCount: 0 };
+    const delegateGrants = humanId
+      ? await tx.humanDelegate.deleteMany({ where: { principalId: humanId } })
+      : { count: 0 };
+    // B2: the squatter's push devices go with their sessions (see
+    // `UnprovenCredentialCounts.pushDevices`).
+    const pushDevices =
+      humanId && !opts.keepCredentialAndSessions
+        ? await tx.pushDevice.deleteMany({ where: { humanId } })
+        : { count: 0 };
+    const pendingInvites = humanId
+      ? await tx.orgInvitation.updateMany({
+          where: { invitedByHumanId: humanId, status: "PENDING" },
+          data: { status: "REVOKED" },
+        })
+      : { count: 0 };
+    const privilegedMemberships = humanId
+      ? await tx.orgMember.findMany({
+          where: { humanId, role: { in: ["OWNER", "ADMIN"] } },
+          select: { orgId: true, role: true },
+        })
+      : [];
+    const acceptedPrivilegedInvites = humanId
+      ? await tx.orgInvitation.findMany({
+          where: {
+            invitedByHumanId: humanId,
+            status: "ACCEPTED",
+            role: { in: ["OWNER", "ADMIN"] },
+          },
+          select: { orgId: true, role: true, acceptedByHumanId: true },
+        })
+      : [];
+    const counts = {
+      credentialAccounts: credentialAccounts.count,
+      sessions: sessions.count,
+      passkeys: passkeys.count,
+      twoFactor: twoFactor.count,
+      apiKeys: apiKeys.count,
+      apiKeyRequestsClosed: apiKeys.closedRequestCount,
+      phoneNumbers: user?.phoneNumber ? 1 : 0,
+      delegateGrants: delegateGrants.count,
+      pendingInvitesRevoked: pendingInvites.count,
+      pushDevices: pushDevices.count,
+    };
+    const grantsToReview = { privilegedMemberships, acceptedPrivilegedInvites };
+    // Same transaction: the audit row exists iff the sweep committed.
+    if (!opts.auditOnlyIfSomethingRemoved || sweptAnything(counts)) {
+      await makeAuditRepo(tx).log({
+        // An AuthUser not yet linked to a Human is audited under its own id.
+        entity: humanId ? "Human" : "AuthUser",
+        entityId: humanId ?? authUserId,
+        action: UNPROVEN_ACCOUNT_SWEPT_ACTION,
+        data: { authUserId, trigger: opts.trigger, ...counts, grantsToReview },
+      });
+    }
+    return { counts, grantsToReview };
+  });
+
+const unprovenCredentialDeps = (): UnprovenCredentialDeps => ({
+  logger: createPinoLoggerAdapter(),
+  reportError: safeReporter(Sentry.captureException),
+  loadAuthUser: (authUserId) =>
+    prisma.authUser.findUnique({
+      where: { id: authUserId },
+      select: { id: true, emailVerified: true },
+    }),
+  revokeAll: (authUserId, trigger) =>
+    sweepUnprovenAccountInDb(authUserId, {
+      keepCredentialAndSessions: false,
+      markEmailVerified: false,
+      trigger,
+      auditOnlyIfSomethingRemoved: false,
+    }),
+});
+
+/**
+ * Which existing AuthUser an email-proof sign-in is about to flip to
+ * verified. `user.update.before` receives only the patch, not the row, so it
+ * is recovered from the request: the email-OTP sign-in and verify-email
+ * bodies carry `email`;
+ * the magic-link verify query carries the token, whose verification row
+ * (default `storeToken: "plain"`, so identifier = token) holds the email and
+ * is still present at this point (the handler only bumps its attempt count).
+ */
+const resolveEmailProofAuthUserId = async (
+  ctx: unknown,
+  trigger: EmailProofTrigger,
+): Promise<string | null> => {
+  const c = ctx as {
+    body?: { email?: unknown };
+    query?: { token?: unknown };
+    context?: {
+      internalAdapter?: {
+        findVerificationValue(
+          identifier: string,
+        ): Promise<{ value: string } | null>;
+      };
+    };
+  } | null;
+  let email: string | null = null;
+  if (trigger === "email_otp_sign_in" || trigger === "email_otp_verify_email") {
+    email = typeof c?.body?.email === "string" ? c.body.email : null;
+  } else if (
+    trigger === "magic_link_sign_in" &&
+    typeof c?.query?.token === "string" &&
+    c.context?.internalAdapter
+  ) {
+    const verification =
+      await c.context.internalAdapter.findVerificationValue(c.query.token);
+    if (verification) {
+      const parsed = JSON.parse(verification.value) as { email?: unknown };
+      email = typeof parsed.email === "string" ? parsed.email : null;
+    }
+  }
+  if (!email) return null;
+  const row = await prisma.authUser.findUnique({
+    where: { email: email.toLowerCase() },
+    select: { id: true },
+  });
+  return row?.id ?? null;
+};
+
+// ── Ban that sticks (2026-09-29; see ./ban-gate.ts) ─────────────────────────
+// Both key their hashes off BETTER_AUTH_SECRET — the same root the tRPC ctx
+// hands `adminSetHumanStatus` (`identityHashSecret` in lib/dep.ts), so a ban
+// recorded there matches what these hooks compute.
+
+// Built ONCE per process: deriving the HKDF keys on every sign-up/sign-in
+// was pure waste. Null without a usable secret (the use cases then report it).
+const identityHasher = isUsableNetworkIdentitySecret(env.BETTER_AUTH_SECRET)
+  ? createNetworkIdentityHasher(env.BETTER_AUTH_SECRET)
+  : null;
+
+const banGateDeps = () => ({
+  repos: { bans: makeBansRepo(prisma) },
+  clock: createSystemClock(),
+  identitySecret: env.BETTER_AUTH_SECRET ?? null,
+  hasher: identityHasher,
+  logger: createPinoLoggerAdapter(),
+  reportError: safeReporter(Sentry.captureException),
+});
+
+const sightingHookDeps = (): SightingHookDeps => ({
+  repos: { networkSightings: makeNetworkSightingsRepo(prisma) },
+  identitySecret: env.BETTER_AUTH_SECRET ?? null,
+  hasher: identityHasher,
+  logger: createPinoLoggerAdapter(),
+  reportError: safeReporter(Sentry.captureException),
+  loadHumanIdForAuthUser: async (authUserId) => {
+    const row = await prisma.authUser.findUnique({
+      where: { id: authUserId },
+      select: { humanId: true },
+    });
+    return row?.humanId ?? null;
+  },
+});
+
+/**
+ * The roles on the Human behind an auth user, for the second-factor gate
+ * (`StaffRolesOf` in ./second-factor-bypass.ts). Which of them are staff is
+ * `SECOND_FACTOR_STAFF_ROLES` (`@th/ports/authz`), shared with hasStaffRole.
+ */
+const staffRolesOfAuthUser = async (
+  authUserId: string,
+): Promise<readonly string[]> => {
+  const row = await prisma.authUser.findUnique({
+    where: { id: authUserId },
+    select: { human: { select: { roles: true } } },
+  });
+  return row?.human?.roles ?? [];
+};
+
+const firstSignInStampDeps = (): FirstSignInStampDeps => ({
+  // One UPDATE guarded on NULL: writes once per account, a no-op after.
+  stampIfUnset: (authUserId, at) =>
+    makeHumansRepo(prisma).stampFirstSignInIfUnset(authUserId, at),
+  logger: createPinoLoggerAdapter(),
+  reportError: safeReporter(Sentry.captureException),
+  now: () => new Date(),
+});
+
+/**
+ * The ACCOUNT_NOT_ACTIVE refusal, shared by the session gate and the
+ * email-proof sign-in check. On the OAuth callback and magic-link verify the
+ * browser is NAVIGATING to the API origin, so a JSON 403 would be the page the
+ * user sees; redirect instead. It has to be thrown from the handler's hooks:
+ * an after-hook's replacement response keeps the original status (better-auth
+ * 1.6.9 `api/to-auth-endpoints.mjs` passes `status: result.status`), so a
+ * redirect thrown there went out as a 403 with a Location header browsers
+ * ignore.
+ */
+const throwAccountNotActive = (ctx: unknown): never => {
+  const c = ctx as {
+    path?: string;
+    query?: Record<string, unknown>;
+    context?: { baseURL?: string };
+  } | null;
+  const redirectTo = accountNotActiveRedirect({
+    path: c?.path,
+    query: c?.query,
+    authBaseURL:
+      c?.context?.baseURL ??
+      `${env.BETTER_AUTH_BASE_URL ?? env.APP_BASE_URL}/api/auth`,
+    webBaseURL: env.PUBLIC_WEB_URL ?? "http://localhost:3000",
+  });
+  if (redirectTo) {
+    throw new APIError("FOUND", undefined, { Location: redirectTo });
+  }
+  throw new APIError("FORBIDDEN", {
+    code: "ACCOUNT_NOT_ACTIVE",
+    message: "This account is not active.",
+  });
+};
+
+/**
+ * Is this AuthUser's email a banned human's mailbox? Throws on DB error.
+ * `callerReportsLookupFailure`: the caller reports a failure itself (the
+ * session gate does), so the ban lookup rethrows it unreported.
+ */
+const isAuthUserEmailBanned = async (
+  authUserId: string,
+  opts: { callerReportsLookupFailure?: boolean } = {},
+): Promise<boolean> => {
+  const row = await prisma.authUser.findUnique({
+    where: { id: authUserId },
+    select: { email: true },
+  });
+  if (!row?.email) return false;
+  return !(await isEmailAllowedForAccount(
+    { ...banGateDeps(), ...opts },
+    row.email,
+  ));
+};
+
+/** Refuse (403 ACCOUNT_NOT_ACTIVE) an address that is a banned human's. */
+const refuseBannedEmail = async (email: unknown): Promise<void> => {
+  if (!(await isEmailAllowedForAccount(banGateDeps(), email))) {
+    throw new APIError("FORBIDDEN", { ...ACCOUNT_NOT_ACTIVE_ERROR });
+  }
+};
+
 // ── Cross-subdomain session cookie ──────────────────────────────────────────
 // Prod: web origin (`ithasfire.com`) and api origin (`api.ithasfire.com`) are
 // different hosts, so the default host-only session cookie set by the API is
@@ -301,6 +728,64 @@ if (env.SESSION_COOKIE_DOMAIN && !crossSubDomainCookieDomain) {
     reason:
       "SESSION_COOKIE_DOMAIN is set but failed validation (must be a leading-dot registrable domain that the api host lives under); falling back to a host-only session cookie",
   });
+}
+
+/**
+ * Global hourly caps on passcode texts, one pool for phone verification
+ * (anonymous) and one for 2FA (post-password), so anonymous traffic cannot
+ * push 2FA codes to email. Built once so their throttled reporters keep
+ * their windows, and on the auth module's own lazy Redis client (see
+ * `rate-limit-storage.ts` for why auth cannot use the `buildDeps()` one).
+ * Fail open on a Redis error.
+ */
+let otpSmsRateLimit: RedisRateLimitAdapter | null = null;
+const getOtpSmsRateLimit = () =>
+  (otpSmsRateLimit ??= new RedisRateLimitAdapter(getAuthRateLimitRedis()));
+const otpSmsBudgetLogger = createPinoLoggerAdapter().child({
+  area: "auth_otp_sms_budget",
+});
+const otpSmsBudget = createOtpSmsBudget({
+  getRateLimit: getOtpSmsRateLimit,
+  pool: "phone",
+  maxPerHour: env.AUTH_OTP_SMS_MAX_PER_HOUR,
+  logger: otpSmsBudgetLogger,
+  reportError: safeReporter(Sentry.captureException),
+});
+const twoFactorSmsBudget = createOtpSmsBudget({
+  getRateLimit: getOtpSmsRateLimit,
+  pool: "2fa",
+  maxPerHour: env.AUTH_OTP_SMS_MAX_PER_HOUR,
+  logger: otpSmsBudgetLogger,
+  reportError: safeReporter(Sentry.captureException),
+});
+// One account's 2FA texts (5 per 15 min), charged before the shared pool.
+// Over it no code is sent: the before-hook answers 429 (read-only gate),
+// the sender's charge catches requests that raced past it.
+const twoFactorPerUserSmsCap = createOtpSmsPerUserCap({
+  getRateLimit: getOtpSmsRateLimit,
+  logger: otpSmsBudgetLogger,
+  reportError: safeReporter(Sentry.captureException),
+});
+const twoFactorSendOtpGuardHook = createTwoFactorSendOtpGuardHook({
+  isUnderCap: createOtpSmsPerUserGate({
+    getRateLimit: getOtpSmsRateLimit,
+    logger: otpSmsBudgetLogger,
+    reportError: safeReporter(Sentry.captureException),
+  }),
+  logger: otpSmsBudgetLogger,
+  reportError: safeReporter(Sentry.captureException),
+});
+// The consent ledger the 2FA sender reads (a number that replied STOP gets
+// its code by email). Built on first use and kept, not once per send.
+let twoFactorSmsConsent:
+  | ReturnType<typeof withGuardedRepos>["smsConsent"]
+  | undefined;
+function getTwoFactorSmsConsent(
+  logger: Parameters<typeof withGuardedRepos>[1],
+) {
+  twoFactorSmsConsent ??= withGuardedRepos(createPrismaRepos(prisma), logger)
+    .smsConsent;
+  return twoFactorSmsConsent;
 }
 
 export const auth = betterAuth({
@@ -386,9 +871,21 @@ export const auth = betterAuth({
   // (utils/get-request-ip.mjs): headers are tried IN ORDER; per header the
   // leftmost comma-separated entry must pass `isValidIP`, else the whole
   // header is skipped and the next one is tried.
+  //
+  // `x-th-verified-client-ip` goes FIRST: the visitor IP our web server
+  // vouched for with an HMAC on its server-to-server calls (`/token` on every
+  // signed-in SSR render, `/get-session`, the staff gate). Without it those
+  // calls all key on the web server's own IP and every signed-in visitor
+  // shares one `/token` bucket. Safe to trust only because
+  // plugins/verified-client-ip.ts deletes any inbound copy on every request
+  // and sets it only on a valid signature (invariant documented on
+  // VERIFIED_CLIENT_IP_HEADER in client-ip.ts). It lives in a separate list,
+  // NOT in the shared CLIENT_IP_HEADER_PRECEDENCE, because viewer-location.ts
+  // reuses that one for geo, and the visitor IP in geo would change what
+  // edge-cached SSR renders.
   advanced: {
     ipAddress: {
-      ipAddressHeaders: [...CLIENT_IP_HEADER_PRECEDENCE],
+      ipAddressHeaders: [...TRUSTED_CLIENT_IP_HEADER_PRECEDENCE],
     },
     // Only broaden the session cookie to a shared parent domain when
     // SESSION_COOKIE_DOMAIN is set AND validates. Both deployed prod and
@@ -418,22 +915,55 @@ export const auth = betterAuth({
       : {}),
   },
 
+  // ── Internal 500s reach Sentry (2026-09-29 review) ────────────────────
+  // better-call's router catches any NON-APIError thrown inside an endpoint
+  // or hook, calls this, and answers a bare 500 itself
+  // (`better-call/dist/router.mjs`: `console.error("# SERVER_ERROR")`), so
+  // such errors never reach the fastify plugin's Sentry capture in
+  // `plugins/better-auth.ts`. APIErrors are Better Auth's own, deliberate
+  // responses — including some 500s that ordinary traffic produces (e.g.
+  // `/phone-number/verify` for a number no account owns answers
+  // FAILED_TO_UPDATE_USER), so they are logged below Sentry's threshold
+  // rather than paged on. Must never throw.
+  onAPIError: {
+    onError: (error) => {
+      try {
+        if (error instanceof APIError) {
+          if (error.statusCode >= 500) {
+            createPinoLoggerAdapter().warn("better_auth_api_error_5xx", {
+              status: error.status,
+              code: (error.body as { code?: string } | undefined)?.code ?? null,
+            });
+          }
+          return;
+        }
+        createPinoLoggerAdapter().error("better_auth_api_error", {
+          err: error,
+        });
+        safeReporter(Sentry.captureException)(error, {
+          tags: { area: "auth", op: "better_auth_api_error" },
+        });
+      } catch {
+        // Reporting must not change the response.
+      }
+    },
+  },
+
   // Persist Better Auth state (users/accounts/sessions/verifications) in our Prisma DB.
   database: prismaAdapter(prisma, { provider: "postgresql" }),
 
   // Match our existing Prisma model names.
   //
-  // `changeEmail` is enabled in "unverified-only" mode (no confirmation
-  // flow): an unverified buyer who typo'd their email at sign-up can fix
-  // it from the verify-email card and immediately get a new OTP to the
-  // corrected address. Verified users cannot change their email through
-  // this path — that flow would need the full sendChangeEmailConfirmation
-  // round-trip which we don't have UX for yet.
   user: {
     modelName: "AuthUser",
+    // Better Auth's `/change-email` is ALSO refused in `hooks.before`
+    // (REFUSED_AUTH_ENDPOINTS). Both are off because an unverified account
+    // could rewrite its address with no proof, which laundered a
+    // password-reset link onto a squatted address (2026-09-29 review round 3).
+    // Email changes go through `POST /api/account/email-change/request` +
+    // `/email-otp/change-email`, which mail a code to the NEW address.
     changeEmail: {
-      enabled: true,
-      updateEmailWithoutVerification: true,
+      enabled: false,
     },
   },
   account: {
@@ -596,6 +1126,44 @@ export const auth = betterAuth({
     },
     resetPasswordTokenExpiresIn: 3600, // 1 hour
 
+    // ── A reset ends every existing credential (2026-09-29 review, F5) ──
+    // Whoever holds the reset link owns the inbox. Before this, a reset left
+    // the old sessions AND API keys live — so someone who had the old
+    // password (or a stolen session) stayed in after the owner recovered the
+    // account. Both options verified against better-auth 1.6.9
+    // (`api/routes/password.mjs` /reset-password, and the email-otp and
+    // phone-number reset routes): `onPasswordReset` runs first, then
+    // `revokeSessionsOnPasswordReset` deletes ALL the user's sessions.
+    revokeSessionsOnPasswordReset: true,
+    // Fires from all three 1.6.9 reset routes (`/reset-password`,
+    // `/email-otp/reset-password` routes.mjs:586, `/phone-number/
+    // reset-password`), AFTER the new password is written and BEFORE any
+    // emailVerified flip, so `user.emailVerified` is the pre-reset state.
+    // On an unverified account an email-proven reset also sweeps passkeys,
+    // TOTP, phone, delegate grants and invites (keeping the credential row,
+    // which now holds the new password). Never throws (a throw would skip
+    // the session revocation above); failures are reported inside.
+    onPasswordReset: async ({ user }, request) => {
+      await secureAccountAfterPasswordReset(
+        {
+          logger: createPinoLoggerAdapter(),
+          reportError: safeReporter(Sentry.captureException),
+          revokeApiKeysForAuthUser,
+          sweepUnprovenAccountAfterReset: (authUserId) =>
+            sweepUnprovenAccountInDb(authUserId, {
+              ...RESET_SWEEP_OPTIONS,
+              trigger: "password_reset",
+              auditOnlyIfSomethingRemoved: true,
+            }),
+        },
+        {
+          authUserId: user.id,
+          emailVerified: (user as { emailVerified?: boolean }).emailVerified,
+          proof: passwordResetProofFromUrl(request?.url),
+        },
+      );
+    },
+
     // ── Shadow profile upgrade ─────────────────────────────────────────
     // When a guest checkout (or future volunteer signup, comp ticket claim,
     // etc.) creates a shadow AuthUser via `ensureGuestHuman`, that user has
@@ -616,16 +1184,23 @@ export const auth = betterAuth({
       await handleShadowUpgrade(
         {
           logger,
-          findCredentialAccount: (userId) =>
-            prisma.authAccount.findUnique({
-              where: {
-                providerId_accountId: {
-                  providerId: "credential",
-                  accountId: userId,
-                },
+          reportError: safeReporter(Sentry.captureException),
+          loadUpgradeEligibility: async (userId) => {
+            const row = await prisma.authUser.findUnique({
+              where: { id: userId },
+              select: {
+                emailVerified: true,
+                _count: { select: { accounts: true, passkeys: true } },
               },
-              select: { id: true },
-            }),
+            });
+            return row
+              ? {
+                  emailVerified: row.emailVerified,
+                  accountCount: row._count.accounts,
+                  passkeyCount: row._count.passkeys,
+                }
+              : null;
+          },
           hashPassword,
           createCredentialAccount: async (userId, hashedPassword) => {
             await prisma.authAccount.create({
@@ -729,9 +1304,159 @@ export const auth = betterAuth({
   // NOTE: These hooks are intentionally defensive. If downstream services (e.g. mailer)
   // are not configured, we log and continue so auth itself still works.
   databaseHooks: {
+    // ── No session for a suspended/banned human (2026-09-29 review, F5) ──
+    // Before this, a BANNED human just signed in again with their password.
+    // Every session Better Auth mints goes through `createSession` →
+    // `session.create.before`: password, OTP, magic link, passkey, OAuth,
+    // 2FA completion. A thrown APIError propagates as the endpoint's error
+    // response (returning `false` instead would hand several 1.6.9 routes a
+    // null session they don't check). Existing sessions are deleted by
+    // adminSetHumanStatus; per-request JWT/API-key use is refused in the
+    // AuthN adapter.
+    session: {
+      create: {
+        before: async (session, ctx) => {
+          const userId = (session as { userId?: unknown }).userId;
+          if (typeof userId !== "string" || !userId) return;
+          const allowed = await isSessionAllowed(
+            {
+              loadHumanStatus: loadHumanStatusForAuthUser,
+              // Shadow / pre-existing accounts on a banned mailbox (guest
+              // checkout, RSVP, alt accounts) are refused here, the one
+              // choke point every sign-in method passes (ban-that-sticks).
+              // isSessionAllowed reports a lookup failure once, with the
+              // authUserId; the ban lookup must not report it again.
+              isEmailBanned: (authUserId) =>
+                isAuthUserEmailBanned(authUserId, {
+                  callerReportsLookupFailure: true,
+                }),
+              reportError: safeReporter(Sentry.captureException),
+            },
+            userId,
+          );
+          if (!allowed) throwAccountNotActive(ctx);
+          // ── No session for a two-factor account without its factor ──
+          // The twoFactor plugin challenges only
+          // `/sign-in/email|username|phone-number`; magic link, phone code,
+          // email code and Google / Apple would each mint a FULL session
+          // for a `twoFactorEnabled` account. Decided here from an
+          // ALLOWLIST of routes (password sign-in the plugin challenges,
+          // `/two-factor/verify-*`, passkey, change-password): any other
+          // route is refused for a two-factor account, including one added
+          // later. A staff account with a passkey and no TOTP gets a
+          // session only from that passkey. Runs only when a session is
+          // actually being minted.
+          // Route table, rule and reasoning: ./second-factor-bypass.ts.
+          await refuseSecondFactorBypassSession(ctx, userId, {
+            authBaseURL: `${env.BETTER_AUTH_BASE_URL ?? env.APP_BASE_URL}/api/auth`,
+            webBaseURL: env.PUBLIC_WEB_URL ?? "http://localhost:3000",
+            reportError: safeReporter(Sentry.captureException),
+            staffRolesOf: staffRolesOfAuthUser,
+          });
+          // ── No raw IP in the database (ban-that-sticks review) ──────
+          // Better Auth fills `ipAddress` from the request; blank it before
+          // the insert. The rate limiter reads the IP from the REQUEST
+          // (better-auth 1.6.9 `api/rate-limiter/index.mjs` → getIp), not
+          // from this column, so it is unaffected — unlike
+          // `advanced.ipAddress.disableIpTracking`, which makes getIp return
+          // null for the limiter too. Hashed network history lives in
+          // NetworkSighting instead.
+          return { data: { ipAddress: null } };
+        },
+        // ── Sign-in history, hashed (ban-that-sticks) ─────────────────
+        // Best-effort: `recordSightingFromHook` never throws, so a failed
+        // write can never fail the sign-in; failures are logged at ERROR
+        // and reported. A sign-up's first session lands here before the
+        // Human is linked; the row then carries only the AuthUser id.
+        after: async (session, ctx) => {
+          const s = session as {
+            userId?: unknown;
+            userAgent?: unknown;
+            createdAt?: unknown;
+          };
+          if (typeof s.userId !== "string" || !s.userId) return;
+          // First sign-in, stored once (owner ruling 2026-10-07). Never
+          // throws; dates the account for the invite new-account tier.
+          await stampFirstSignInFromHook(firstSignInStampDeps(), {
+            authUserId: s.userId,
+            sessionCreatedAt: s.createdAt,
+          });
+          // The IP comes from the request only (the session row holds none).
+          await recordSightingFromHook(sightingHookDeps(), {
+            authUserId: s.userId,
+            kind: "SIGN_IN",
+            ctx,
+            fallback: { userAgent: s.userAgent },
+          });
+        },
+      },
+    },
+    // ── Linking Google/Apple onto an unverified user (review F6) ─────────
+    // `trustedProviders` auto-links a Google/Apple sign-in onto an existing
+    // user even when that user never verified the address, then marks it
+    // verified (better-auth 1.6.9 `oauth2/link-account.mjs`). Whoever
+    // registered the address with a password first kept that password, their
+    // sessions and their API keys. `account.create.before` runs inline
+    // (after-hooks are deferred to the end of the request), AFTER the
+    // provider proved the inbox and BEFORE Better Auth creates the prover's
+    // session, so the prover ends up signed in and the squatter's credentials
+    // are gone. It throws on failure, which aborts the link and leaves no
+    // account row behind, so a retry re-runs the check.
+    //
+    // Scope note: `/link-social` (a signed-in user linking a provider from
+    // settings) goes through the same hook and would sign an UNVERIFIED
+    // linker out of their existing sessions. No client calls linkSocial today.
+    account: {
+      create: {
+        before: async (account, ctx) => {
+          const { userId, providerId } = account as {
+            userId?: unknown;
+            providerId?: unknown;
+          };
+          if (typeof userId !== "string" || typeof providerId !== "string") {
+            return;
+          }
+          if (!isInboxProvingProvider(providerId)) return;
+          await revokeUnprovenCredentials(unprovenCredentialDeps(), {
+            authUserId: userId,
+            trigger: "oauth_link",
+          });
+          // A provider SIGN-IN the session hook is about to refuse (a
+          // two-factor account) must not leave its link row and tokens
+          // behind: `false` skips the insert. After the sweep on purpose, so
+          // an unverified account's first link still goes through; linking
+          // from settings is not a sign-in and is left alone.
+          // See `skipsProviderLinkForTwoFactor` in ./second-factor-bypass.ts.
+          const skipLink = await skipsProviderLinkForTwoFactor(
+            ctx,
+            { userId, providerId },
+            {
+              reportError: safeReporter(Sentry.captureException),
+              staffRolesOf: staffRolesOfAuthUser,
+            },
+          );
+          if (skipLink) return false;
+        },
+      },
+    },
     user: {
       create: {
-        after: async (rawUser) => {
+        // ── A banned human cannot come back with the same mailbox ────────
+        // Every AuthUser Better Auth creates goes through here: email +
+        // password sign-up, and Google / Apple sign-up (OAuth answers the
+        // refusal as a redirect with `?error=`). Magic link and email code
+        // cannot create users (`disableSignUp`). The address is compared as
+        // mail is delivered (case, +tags, Gmail dots, googlemail.com). An
+        // EXACT match of the banned account's address never gets here —
+        // sign-up answers USER_ALREADY_EXISTS and sign-in is refused by the
+        // session gate above.
+        before: async (rawUser, ctx) => {
+          await refuseBannedEmail((rawUser as { email?: unknown }).email);
+          // `/sign-up/email` takes an `image` from the body: dropped, so
+          // only a provider's picture is ever stored (profile-image-sync.ts).
+          return dropUnverifiedImageOnCreate(rawUser, hookPath(ctx));
+        },
+        after: async (rawUser, ctx) => {
           const authUser = rawUser as {
             id?: string;
             email?: string;
@@ -748,10 +1473,9 @@ export const auth = betterAuth({
           const logger = createPinoLoggerAdapter();
           const clock = createSystemClock();
           const reposBase = createPrismaRepos(prisma);
-          const repos = withGuardedRepos(
-            reposBase,
+          const repos = withAuthSearchReindexDrain(
+            withGuardedRepos(reposBase, logger, provisionGuardConfig()),
             logger,
-            provisionGuardConfig(),
           );
 
           // Try to extract locale from the Google OAuth ID token.
@@ -790,7 +1514,7 @@ export const auth = betterAuth({
           // New humans are reconciled by the nightly `search.full-reindex`
           // cron, which is acceptable for the signup path (low frequency, low
           // staleness sensitivity).
-          await handleProvisioningWithRollback(
+          const provisioned = await handleProvisioningWithRollback(
             {
               logger,
               maskEmail,
@@ -830,6 +1554,15 @@ export const auth = betterAuth({
             },
           );
 
+          // Sign-up network, hashed (ban-that-sticks). Best-effort: never
+          // throws, failures are logged at ERROR and reported.
+          await recordSightingFromHook(sightingHookDeps(), {
+            authUserId,
+            humanId: provisioned.humanId,
+            kind: "SIGN_UP",
+            ctx,
+          });
+
           const maskedEmail = maskEmail(email);
           const hasDisplayName = Boolean(authUser.name?.trim());
 
@@ -842,43 +1575,96 @@ export const auth = betterAuth({
         },
       },
       update: {
-        after: async (rawUser) => {
-          // Sync profile avatar whenever Better Auth updates the user record
-          // (e.g. subsequent OAuth sign-ins that refresh the image URL).
-          const authUser = rawUser as {
-            id?: string;
-            email?: string;
-            name?: string;
-            image?: string;
-            humanId?: string;
-          };
-          const image = authUser?.image;
-          const humanId = authUser?.humanId;
-          if (!image || !humanId) return;
+        // ── Email-code / magic-link sign-in onto an unverified user (F6) ──
+        // Same squatting problem as the account hook above, for the two
+        // sign-ins that prove the inbox without linking an account. In both
+        // (better-auth 1.6.9), the only user update is the
+        // `{ emailVerified: true }` flip, made after the code/link validated
+        // and before the session is created. Runs BEFORE the flip so a
+        // failure aborts it and a retry re-checks. `/email-otp/verify-email`
+        // makes the same flip with no session required, so it sweeps too
+        // unless the request is signed in as that account (B2).
+        before: async (data, ctx) => {
+          // `/update-user` takes an `image` from the body: refused, so only
+          // a provider's picture is ever stored (profile-image-sync.ts).
+          refuseUnverifiedImageUpdate(data, hookPath(ctx));
 
-          const logger = createPinoLoggerAdapter();
-          try {
-            const reposBase = createPrismaRepos(prisma);
-            const page = await reposBase.entityPages.getByOwner(
-              "HUMAN",
-              humanId,
+          // A banned human's mailbox cannot be moved onto an account
+          // (`/email-otp/change-email`, or any other email write).
+          const newEmail = emailBeingSet(data);
+          if (newEmail) await refuseBannedEmail(newEmail);
+          // An unverified account holding email-attached rows (orders,
+          // tickets, coordinator seats, lineup links) proves its CURRENT
+          // address before moving it (B2): the change verifies the new
+          // address, and those rows would go with it.
+          if (newEmail) {
+            await refuseUnprovenEmailMove(
+              prismaUnprovenEmailMoveLookup(prisma),
+              hookPath(ctx),
+              ctx,
             );
-            if (page && page.avatarUrl !== image) {
-              await reposBase.entityPages.upsert({
-                ownerType: "HUMAN",
-                ownerId: humanId,
-                slug: page.slug,
-                displayName: page.displayName,
-                avatarUrl: image,
-              });
-              logger.info("auth_user_update_synced_avatar", { humanId, image });
-            }
-          } catch (error) {
-            logger.warn("auth_user_update_avatar_sync_failed", {
-              humanId,
-              error,
+          }
+
+          const trigger = resolveEmailProofTrigger(
+            (ctx as { path?: string } | null)?.path,
+            data as Record<string, unknown>,
+          );
+          if (!trigger) return;
+          const authUserId = await resolveEmailProofAuthUserId(ctx, trigger);
+          if (!authUserId) {
+            // Cannot tell whose flag is being flipped: fail closed rather
+            // than verify an address with the squatter's password attached.
+            const err = new Error(
+              `email-proof sign-in: could not resolve the auth user (${trigger})`,
+            );
+            createPinoLoggerAdapter().error("auth_email_proof_user_unresolved", {
+              trigger,
+              err,
+            });
+            safeReporter(Sentry.captureException)(err, {
+              tags: { area: "auth", op: "email_proof_resolve_user", trigger },
+            });
+            throw new APIError("INTERNAL_SERVER_ERROR", {
+              message: "Could not complete sign-in.",
             });
           }
+          // A banned human's mailbox (shadow / alt account) is refused
+          // BEFORE the emailVerified flip, so a refused sign-in leaves the
+          // row untouched; the session gate would refuse it anyway.
+          if (await isAuthUserEmailBanned(authUserId)) {
+            throwAccountNotActive(ctx);
+          }
+          // `/email-otp/verify-email` signed in as this same account: the
+          // holder proved their own inbox, nothing to evict (B2; see
+          // `isOwnInboxVerification`). Anyone else proving it sweeps.
+          if (
+            await isOwnInboxVerification(trigger, authUserId, () =>
+              sessionUserIdOf(ctx),
+            )
+          ) {
+            return;
+          }
+          await revokeUnprovenCredentials(unprovenCredentialDeps(), {
+            authUserId,
+            trigger,
+          });
+        },
+        after: async (rawUser, ctx) => {
+          // Sync the profile avatar when a PROVIDER updates the user's
+          // picture (`/link-social`); never from any other endpoint.
+          const authUser = rawUser as { image?: string | null; humanId?: string };
+          await syncProviderAvatarToPage(
+            {
+              entityPages: createPrismaRepos(prisma).entityPages,
+              logger: createPinoLoggerAdapter(),
+              reportError: safeReporter(Sentry.captureException),
+            },
+            {
+              path: hookPath(ctx),
+              humanId: authUser?.humanId,
+              image: authUser?.image,
+            },
+          );
         },
       },
     },
@@ -888,12 +1674,32 @@ export const auth = betterAuth({
   // It sends a 6-digit code instead of a link, avoiding scanner prefetch.
 
   plugins: [
-    jwt(),
+    jwt({
+      jwt: {
+        // Bind every JWT to the session it was minted from (2026-09-29
+        // review). Without `sid`, a 15-minute JWT outlived the session it came
+        // from: revoking sessions (ban, password reset, the account-takeover
+        // sweep) left it working. The AuthN adapter now refuses a JWT whose
+        // `sid` session no longer exists, in the same read that loads
+        // Human.status. The payload is otherwise the plugin default
+        // (`session.user`; better-auth 1.6.9 `plugins/jwt/sign.mjs`
+        // getJwtToken), so no existing claim consumer changes. Web, mobile and
+        // scanner all mint through `/api/auth/token` (or the get-session
+        // `set-auth-jwt` header), which both go through this function.
+        definePayload: ({ user, session }) => ({ ...user, sid: session.id }),
+      },
+    }),
     // Accept session tokens via `Authorization: Bearer <token>`. Mobile
     // clients can't read Set-Cookie headers (RN fetch limitation), so the
     // scanner caches the session token from sign-in's response body and
     // sends it as a Bearer header to mint JWTs via /api/auth/token.
     bearer(),
+    // A two-factor account always keeps a password or a passkey: refuses
+    // turning two-factor on without one, and removing the last one while it
+    // is on. Rule and routes: ./second-factor-bypass.ts.
+    twoFactorPrerequisites({
+      reportError: safeReporter(Sentry.captureException),
+    }),
     // Username plugin for username-based login (schema fields already exist)
     username(),
     // Replaces link verification with a 6-digit code typed into the
@@ -955,6 +1761,11 @@ export const auth = betterAuth({
                 code: otp,
                 expiresMinutes: 10,
                 productName: deps.productName,
+                // The template's variables are untyped (z.record), so this
+                // is the compile-time check that every better-auth OTP type
+                // is one the template can word. A new better-auth type fails
+                // here; add it to VERIFICATION_CODE_PURPOSES (and its phrase).
+                purpose: type satisfies VerificationCodePurpose,
               },
             },
             tags: ["auth", "verification", `email-otp-${type}`],
@@ -1004,8 +1815,28 @@ export const auth = betterAuth({
         }
       })(),
       origin: env.PUBLIC_WEB_URL,
+      // A passkey stands in for a two-factor or staff account's second
+      // factor only when it verified the user (PIN / biometric); the plugin itself only
+      // "prefers" that. Runs before the session is created.
+      authentication: {
+        afterVerification: (verified) =>
+          refuseUnverifiedPasskeyForTwoFactor(verified, {
+            reportError: safeReporter(Sentry.captureException),
+            staffRolesOf: staffRolesOfAuthUser,
+          }),
+      },
     }),
     magicLink({
+      // Magic links SIGN IN existing users; they never CREATE one (same rule
+      // as emailOTP above). Without this, `/magic-link/verify` calls
+      // `createUser({ emailVerified: true })` for an unknown address. Checked
+      // before flipping (2026-09-29): the scanner and consumer mobile apps use
+      // magic links only as SIGN-IN (the mobile "Create account" button opens
+      // web /sign-up; scanner operators must already hold an org role), and
+      // no web flow requests a magic link. An unknown address still gets the
+      // mail; following it redirects to `errorCallbackURL` with
+      // `?error=new_user_signup_disabled`.
+      disableSignUp: true,
       expiresIn: 60 * 15,
       sendMagicLink: async ({ email, url }) => {
         const deps = createAuthDeps();
@@ -1061,6 +1892,11 @@ export const auth = betterAuth({
       currentURL: env.BETTER_AUTH_BASE_URL ?? env.APP_BASE_URL,
     }),
     phoneNumber({
+      // US/NANP numbers only, before any code is generated or sent: our
+      // sending numbers are registered for the US, and refusing everything
+      // else closes SMS pumping to premium and international ranges. Better
+      // Auth answers 400 INVALID_PHONE_NUMBER (send-otp and sign-in).
+      phoneNumberValidator: (value) => isUsSmsNumber(value),
       sendOTP: async ({ phoneNumber: phoneNumberValue, code }) => {
         const deps = createAuthDeps();
         const sender = createPhoneOtpSender({
@@ -1068,6 +1904,8 @@ export const auth = betterAuth({
           mailer: deps.mailer!,
           logger: deps.logger,
           productName: deps.productName,
+          reportError: safeReporter(Sentry.captureException),
+          smsBudget: otpSmsBudget,
         });
         await sender({ phoneNumber: phoneNumberValue, code });
       },
@@ -1075,25 +1913,26 @@ export const auth = betterAuth({
       // verification is the user's affirmative opt-in, so mirror it into the
       // phone-consent ledger. Best-effort — verification must never fail
       // because the ledger write did (recordSmsOptIn is idempotent, and a
-      // later STOP reply still wins via the send-side consent gate).
+      // later STOP reply still wins via the send-side consent gate). A failed
+      // write is reported, not just logged (phone-verification-opt-in.ts).
       callbackOnVerification: async ({ phoneNumber: verifiedPhoneNumber }) => {
         const logger = createPinoLoggerAdapter().child({
           hook: "phoneNumber.callbackOnVerification",
         });
-        try {
-          const repos = withGuardedRepos(createPrismaRepos(prisma), logger);
-          await recordSmsOptIn(
-            { repos, clock: createSystemClock(), logger },
-            {
-              phoneNumber: verifiedPhoneNumber,
-              source: "phone_verification",
-            },
-          );
-        } catch (error) {
-          logger.warn("phone_verification_sms_opt_in_failed", {
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
+        const hook = createPhoneVerificationOptInHook({
+          logger,
+          reportError: safeReporter(Sentry.captureException),
+          recordSmsOptIn: (input) =>
+            recordSmsOptIn(
+              {
+                repos: withGuardedRepos(createPrismaRepos(prisma), logger),
+                clock: createSystemClock(),
+                logger,
+              },
+              input,
+            ),
+        });
+        await hook({ phoneNumber: verifiedPhoneNumber });
       },
     }),
     // Two-factor authentication with TOTP and OTP fallback
@@ -1107,6 +1946,11 @@ export const auth = betterAuth({
             mailer: deps.mailer!,
             logger: deps.logger,
             productName: deps.productName,
+            reportError: safeReporter(Sentry.captureException),
+            smsBudget: twoFactorSmsBudget,
+            perUserSmsCap: twoFactorPerUserSmsCap,
+            // A number that replied STOP gets its code by email.
+            smsConsent: getTwoFactorSmsConsent(deps.logger),
           });
           await sender({ user: user as any, otp }, ctx);
         },
@@ -1143,10 +1987,9 @@ export const auth = betterAuth({
       if (!humanId && authUser.id) {
         const logger = createPinoLoggerAdapter();
         const reposBase = createPrismaRepos(prisma);
-        const repos = withGuardedRepos(
-          reposBase,
+        const repos = withAuthSearchReindexDrain(
+          withGuardedRepos(reposBase, logger, provisionGuardConfig()),
           logger,
-          provisionGuardConfig(),
         );
         humanId = await resolveHumanIdWithSelfHeal(
           {
@@ -1197,48 +2040,16 @@ export const auth = betterAuth({
   // the only channel that survives the browser→app jump.
   hooks: {
     before: createAuthMiddleware(async (ctx) => {
-      // ── An email code must never stand in for a second factor ──────────
-      //
-      // The twoFactor plugin hooks sign-in by an explicit path allowlist:
-      // `/sign-in/email`, `/sign-in/username`, `/sign-in/phone-number`
-      // (better-auth dist/plugins/two-factor/index.mjs:192). `/sign-in/
-      // email-otp` is NOT in it, so for an account with `twoFactorEnabled`
-      // the OTP route returns a FULL session and the TOTP challenge is never
-      // raised. Whoever controls the inbox controls the account — which is
-      // exactly what enabling 2FA was meant to prevent, and it defeats the
-      // staff gate too, since `checkStaffAccess` tests whether a second
-      // factor is ENROLLED, not whether this session passed one.
-      //
-      // Refuse instead of trying to chain into the challenge: the people this
-      // route exists for (guest-checkout buyers reaching /my-tickets) never
-      // have 2FA, and anyone who does has a working primary method already.
-      // Revisit only by wiring OTP into the real 2FA flow — never by deleting
-      // this and assuming the plugin covers it.
-      if (ctx.path === "/sign-in/email-otp") {
-        const email =
-          typeof (ctx.body as { email?: unknown } | undefined)?.email ===
-          "string"
-            ? ((ctx.body as { email: string }).email satisfies string)
-            : null;
-        if (email) {
-          const found = (await ctx.context.internalAdapter.findUserByEmail(
-            email,
-          )) as { user?: { twoFactorEnabled?: boolean | null } } | null;
-          if (found?.user?.twoFactorEnabled) {
-            throw new APIError("BAD_REQUEST", {
-              code: "TWO_FACTOR_ACCOUNT_USE_PRIMARY_SIGN_IN",
-              message:
-                "This account uses two-factor authentication. Sign in with your password or passkey.",
-            });
-          }
-        }
+      // Endpoints that change the email without proving the new address.
+      // See REFUSED_AUTH_ENDPOINTS in ./account-security.ts.
+      const refused = refusedAuthEndpoint(ctx.path);
+      if (refused) {
+        throw new APIError("BAD_REQUEST", refused);
       }
-      if (ctx.path === "/email-otp/request-email-change") {
-        throw new APIError("BAD_REQUEST", {
-          code: "USE_ACCOUNT_EMAIL_CHANGE_REQUEST",
-          message: "Use the account email change request endpoint.",
-        });
-      }
+      // One account's quota of 2FA texts: 429 before a code is minted. Here,
+      // not in `sendOTP`, because the plugin turns anything `sendOTP` throws
+      // into a 200. No-op on every other path.
+      await twoFactorSendOtpGuardHook(ctx);
     }),
     after: createAuthMiddleware(async (ctx) => {
       // ── Kill the host-only shadow session cookie ──────────────────────

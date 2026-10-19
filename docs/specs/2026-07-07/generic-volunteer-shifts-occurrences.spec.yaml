@@ -1,0 +1,296 @@
+# Not built yet (2026-10-08 docs consolidation): Phase B only: no VolunteerShiftPattern model, no materializer job (schema holds only a reserved patternId column + comments)
+# generic-volunteer-shifts-occurrences.spec.yaml
+#
+# Real shift scheduling for standing volunteer asks: one-off dated slots and
+# recurring patterns that materialize into concrete occurrences with claiming,
+# per-date rosters, check-in/hours, reminders, and ICS — answering
+# "who's covering THIS Friday".
+
+version: "1.0"
+updated: "2026-07-07"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Standing asks (PLACE/ORG/HUMAN) advertise cadence as a purely descriptive
+    label — VolunteerAskCadence.RECURRING renders text, nothing more. A venue
+    posting "door help every Friday" has no Friday instances: no per-date
+    signup/roster, no "who's covering this Friday", no date-anchored reminders
+    or check-in. Only EVENT-subject volunteering has real shifts
+    (EventVolunteerShift). Approval-once-then-coordinate via groups/broadcasts
+    stops working the moment coverage per date matters.
+  solution: >
+    Two layers, built in order. (A) Occurrences + claims: concrete dated slots
+    (VolunteerShiftOccurrence) on ask roles, claimable by APPROVED volunteers
+    and assignable by owners/coordinators, with per-occurrence roster,
+    check-in-derived hours, reminders, and ICS. (B) Patterns: recurrence
+    definitions that a scheduled job materializes into occurrences over a
+    rolling horizon — REUSING the EventSeriesSchedule payload +
+    expand-recurrence.ts machinery (community listings) for date expansion and
+    VolunteerRoleTemplateShift's minute-of-day + endsNextDay encoding for the
+    time window. Approval stays once-per-person (existing VolunteerSignup);
+    claims are a new lightweight commitment entity — venues never re-approve
+    Jane 52 times a year.
+  users:
+    - Venue / org owners running standing asks
+    - Group coordinators scheduling their people
+    - Approved volunteers claiming dates
+  surfaces:
+    - web
+    - api
+    - jobs
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Schema (phase A): VolunteerShiftOccurrence — askId, roleId (role-scoped
+        like EventVolunteerShift), optional patternId, concrete UTC
+        startsAt/endsAt, soft capacity?, notes?, status SCHEDULED|CANCELLED,
+        @@unique([patternId, startsAt]). VolunteerOccurrenceClaim —
+        occurrenceId, signupId, status CLAIMED|WITHDRAWN, source SELF|ASSIGNED,
+        checkedInAt?, hoursWorked Decimal(5,2)?, @@unique([occurrenceId,
+        signupId]). Non-EVENT asks only.
+    - id: FR-002
+      description: >
+        Owner occurrence management: create one-off occurrences, edit
+        (time/capacity/notes), cancel. Authz via resolveAskOwnership. Cancel
+        notifies claimants (email + in-app via existing notify(), respecting
+        NotificationPreference and derived per-channel idempotency keys).
+    - id: FR-003
+      description: >
+        Claiming: a signed-in volunteer whose signup on the same ask+role is
+        APPROVED may claim an open occurrence and withdraw their claim.
+        Signup withdrawal auto-withdraws that signup's future claims (wire into
+        withdraw use case alongside the existing reward-revoke hook). Claim
+        checks happen in the same tx as the write (FOR UPDATE on occurrence
+        for the capacity read, mirroring countAcceptedOccupancy).
+    - id: FR-004
+      description: >
+        Assignment: owners may assign any APPROVED signup to an occurrence;
+        coordinators only signups within their own group (same scope rule as
+        pool-pull). Shadow (no-account) volunteers are assignable but cannot
+        self-claim. Assignment sends the volunteer an email with a
+        generateSingleEventIcs attachment.
+    - id: FR-005
+      description: >
+        Per-occurrence roster + check-in: occurrence view lists claims;
+        owner/coordinator checks a claim in, stamping claim.hoursWorked from
+        occurrence duration (overridable). Hours reporting
+        (listSignupsForHoursReport / per-ask CSV) aggregates signup-level AND
+        claim-level hours without double counting.
+    - id: FR-006
+      description: >
+        Schema (phase B): VolunteerShiftPattern — askId, roleId, label?,
+        schedule Json (EventSeriesSchedule payload: RRULE | FIXED_DATES —
+        same shape Event.recurrenceSchedule uses), startMinuteOfDay,
+        endMinuteOfDay, endsNextDay, timezone (IANA, defaulted from the
+        subject Place when resolvable, else "America/Chicago"), soft capacity?,
+        active. Expansion happens in pattern timezone via expand-recurrence.ts.
+    - id: FR-007
+      description: >
+        Materializer job `volunteering.materialize-shift-occurrences` (jobs
+        service + Cloud Scheduler, daily): expands active patterns to a rolling
+        8-week horizon, inserting occurrences idempotently via
+        @@unique([patternId, startsAt]). Deactivated/ended patterns stop
+        materializing; already-created occurrences are never bulk-deleted.
+    - id: FR-008
+      description: >
+        Pattern edit propagation: time/schedule changes regenerate FUTURE
+        occurrences with zero claims; occurrences with claims are left
+        untouched and surfaced to the owner as "needs manual attention"
+        (cancel + re-create is the manual path). No retroactive mutation of
+        claimed slots, ever.
+    - id: FR-009
+      description: >
+        Reminders: T-24h claim reminder (email; SMS when the ask has
+        smsOptInEnabled and the signup opted in) via the existing volunteer
+        reminder job in apps/jobs/src/jobs/volunteers.ts, deduped by a
+        claim-keyed unique mirroring VolunteerShiftNotification.
+    - id: FR-010
+      description: >
+        Surfacing: /v/[askId] shows the upcoming schedule (occurrences with
+        open-slot counts; claim buttons for signed-in approved volunteers).
+        Ask manage + coordinator console gain a schedule tab (occurrence list,
+        roster per occurrence, assign/check-in). The volunteer's existing ICS
+        feed (generateCalendarFeed) includes their claimed occurrences.
+        RECURRING cadence label becomes derived display when patterns exist.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        DST correctness: a weekly 19:00 pattern in America/Chicago stays 19:00
+        local across CDT/CST transitions; expansion is computed in pattern
+        timezone, stored UTC. Tests must cross a DST boundary in both
+        directions.
+    - id: NFR-002
+      description: >
+        Materializer is idempotent and bounded: re-runs insert nothing new
+        inside an unchanged horizon; a pattern can never create unbounded rows
+        (horizon cap enforced in the use case, not just the scheduler cadence).
+    - id: NFR-003
+      description: >
+        Anti-enumeration parity with existing public ask reads; claim/withdraw
+        endpoints leak nothing about other claimants beyond the public
+        open-slot count. PII-safe roster scoping matches existing group rules.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: manage-shift-occurrences (create/update/cancel)
+        description: Owner CRUD for one-off + materialized occurrences; cancel notifies claimants.
+        input: askId, roleId, occurrence fields | occurrenceId, actor
+        output: occurrence record
+        idempotent: true
+        money: false
+      - name: claim-occurrence / withdraw-claim
+        description: Self-serve claim by APPROVED same-role signup; FOR UPDATE capacity read.
+        input: occurrenceId, actor
+        output: claim record
+        idempotent: true
+        money: false
+      - name: assign-claim
+        description: Owner/coordinator assigns an APPROVED signup; coordinator limited to own group; sends ICS email.
+        input: occurrenceId, signupId, actor
+        output: claim record
+        idempotent: true
+        money: false
+      - name: check-in-claim
+        description: Stamps duration-derived (overridable) hoursWorked on the claim.
+        input: claimId, hoursOverride?, actor
+        output: claim record
+        idempotent: true
+        money: false
+      - name: manage-shift-patterns (create/update/deactivate)
+        description: Pattern CRUD with EventSeriesSchedule validation; edit triggers FR-008 propagation.
+        input: askId, roleId, schedule, window, timezone, actor
+        output: pattern record
+        idempotent: true
+        money: false
+      - name: materialize-shift-occurrences
+        description: Job-invoked horizon expansion via expand-recurrence.ts; system actor.
+        input: horizonWeeks (default 8), now
+        output: inserted/skipped counts
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - VolunteerRepo (extended: pattern/occurrence/claim CRUD, occurrence FOR UPDATE, claim rosters, feed query gains claims)
+      - MailerPort, NotificationsPort (existing notify() with derived channel keys)
+
+  adapters:
+    new: []
+    existing:
+      - packages/adapters/src/db/prisma/volunteering.ts
+
+  transport:
+    trpc_procedures:
+      - volunteer.schedule.* (occurrences/patterns CRUD — authed, owner)
+      - volunteer.schedule.claim / withdrawClaim (authed volunteer)
+      - volunteer.schedule.assign / checkIn (authed owner/coordinator)
+      - volunteer.public.ask.schedule (public open-slot view)
+    webhooks: []
+
+  ui:
+    pages:
+      - /v/[askId] (schedule section + claim buttons)
+      - /admin/[slug]/volunteers/asks/[askId] (schedule tab)
+      - /volunteers/coordinate/[askId] (schedule tab, group-scoped)
+    components:
+      - OccurrenceScheduleList, OccurrenceRosterPanel, ClaimButton,
+        PatternEditor (schedule + time window + timezone), NeedsAttentionBanner
+
+  jobs:
+    - volunteering.materialize-shift-occurrences (daily)
+    - volunteer reminder job extended to claims (T-24h)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - VolunteerShiftOccurrence
+    - VolunteerOccurrenceClaim
+    - VolunteerShiftPattern (phase B)
+    - claim-keyed reminder-dedupe record (mirrors VolunteerShiftNotification)
+  modified_models:
+    - VolunteerSignup (claims back-relation; withdraw cascades claims)
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Timezone/DST bugs shift real-world commitments by an hour — the classic
+      recurrence failure.
+    severity: HIGH
+    mitigation: >
+      Single expansion path through expand-recurrence.ts in pattern timezone;
+      DST-boundary tests both directions; store UTC, render local.
+  - risk: >
+      Pattern edits silently rewriting slots people committed to.
+    severity: HIGH
+    mitigation: >
+      FR-008 hard rule: claimed occurrences are never auto-mutated; explicit
+      needs-attention surface + owner-driven cancel (which notifies).
+  - risk: >
+      Materializer race / re-entry creating duplicate occurrences.
+    severity: MEDIUM
+    mitigation: >
+      @@unique([patternId, startsAt]) + idempotent insert (skip-on-conflict),
+      same pattern as the backfill precedents.
+  - risk: >
+      Claim capacity is soft (consistent with existing ask/role caps) — two
+      simultaneous claims can exceed a slot.
+    severity: LOW
+    mitigation: >
+      FOR UPDATE occurrence read narrows the window; true serialization rides
+      the existing soft-caps follow-up, not this spec.
+
+open_questions:
+  - Claim-withdrawal cutoff: lock self-withdrawal inside T-24h (forcing a
+    message to the coordinator) or keep it frictionless? (Lean frictionless —
+    calm product, no-show tracking stays cut.)
+  - Should the public page let a NOT-yet-approved visitor pick desired dates at
+    signup time (stored as preference, honored at approval), or is
+    approve-then-claim enough for v1? (Lean approve-then-claim.)
+  - Unify EventVolunteerShift onto occurrences later? Deferred — event shifts
+    keep working unchanged.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Hard capacity serialization (existing soft-caps follow-up)
+  - Availability preferences / auto-scheduling / shift-swap flows
+  - No-show or reliability tracking (stays cut per 2026-07-01 decisions)
+  - EVENT-subject asks (their shifts already exist; no recurrence for events
+    beyond the existing community recurrenceSchedule)
+  - Mobile/scanner surfaces
+  - Comp rewards interaction (rewards remain EVENT-only)
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - Weekly Friday 19:00-23:00 America/Chicago pattern materializes 8 weeks of
+    occurrences; re-running the job inserts zero duplicates; occurrences
+    spanning DST transitions stay 19:00 local.
+  - Claim by a PENDING/REJECTED/other-role/other-ask signup fails; APPROVED
+    same-role signup succeeds; withdrawing the signup withdraws its future
+    claims.
+  - Coordinator can assign only signups in their own group; owner can assign
+    any APPROVED signup; assignment email carries a valid .ics.
+  - Cancelling an occurrence notifies every claimant exactly once per channel
+    (derived idempotency keys).
+  - Pattern time edit regenerates future unclaimed occurrences only; claimed
+    ones are untouched and flagged.
+  - Check-in stamps duration-derived hours on the claim; ask hours report
+    includes claim hours without double counting.
+  - Volunteer ICS feed includes claimed occurrences.
+  - /v/[askId] shows open-slot counts publicly; claim buttons appear only for
+    signed-in approved volunteers.

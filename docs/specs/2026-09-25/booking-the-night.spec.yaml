@@ -1,0 +1,420 @@
+# Not built yet (2026-10-08 docs consolidation): the backend is built (book without terms, cancel booking, close request, saved reasons); no web caller yet for FR-009 Cancel booking (bookingRequests.cancelBooking), FR-010 venue Close request (bookingRequests.close), FR-013 reason templates (ReasonField / savedSnippets)
+# booking-the-night.spec.yaml
+#
+# Where a booking becomes an event. The sender agreeing the terms books the night
+# and creates the draft event; a venue may instead book without terms, but only
+# on a night the pitch asked for. Holds go back to being pencil: the standalone
+# hold confirm leaves the request flow.
+#
+# Written 2026-09-25 while fitting the bill (lineup-booking-requests-v3) and
+# venue booking standards (v1.1) into the flow as it runs. Owner decisions from
+# the grilling rounds that day are stamped N1–N12, each with the stage it acts
+# on. Every flow fact below was checked against the working tree that day; the
+# file:line references are the evidence.
+
+version: "1.0"
+updated: "2026-09-25"
+status: partial  # 2026-10-08 docs consolidation; was: draft (owner-locked 2026-09-25, not built)
+supersedes:
+  - "docs/specs/2026-09-05/completed/booking-accept-is-the-mint-point.spec.md: the mint point only (FR-001's accept-time mint). Its P-1..P-3 preparations and FR-006 date derivation stay useful; FR-002 (retire bookingHolds.confirm from the request flow) is adopted here as N4."
+amends:
+  - "docs/specs/2026-08-25/completed/booking-holds.spec.yaml: FR-008 confirm no longer mints (N4)."
+  - "docs/specs/2026-06-05/completed/booking-request-and-agreement-editor.spec.yaml: the agreement gains a quick version (N2) and a second home in the event's payout section (N7)."
+related:
+  - docs/specs/2026-09-25/lineup-booking-requests-v3.spec.yaml
+  - docs/specs/2026-09-25/venue-booking-standards.spec.yaml (v1.1)
+  - docs/specs/2026-08-27/venue-confirmation-and-booking-intents.spec.md (2026-09-25 amendment: no requests to unclaimed venues)
+
+# ── The flow as it runs today (verified 2026-09-25) ─────────────────────────
+
+as_built:
+  - Accepting a TO_VENUE request only drafts an agreement (DRAFT, proposer = sender, counterparty = venue side), seeded from the pitch. packages/core/src/use-cases/booking-requests/_shared/accept-agreement.ts:148-156; seed booking-agreements/_shared/pitch-seed.ts:267-399.
+  - The act answers terms with accept or decline (booking-agreements/respond-to-booking-agreement.ts:107-124). Accept notifies the other side in-app and does nothing else (:186-195).
+  - Confirming a hold takes the line, accepts an open request, rewrites the agreement date and mints the event after commit, on an agreement that may still be DRAFT or PROPOSED. booking-holds/confirm-booking-hold.ts:225,288-337,758-914; gate create-event-from-agreement.ts:200-205.
+  - The manual "Create event from this booking" needs ACCEPTED (create-event-from-agreement.ts:513-514). Two gates on one agreement.
+  - The mint needs a human with the venue's canCreateEvents (create-event-from-agreement.ts:452-461); the event saves as DRAFT (events/_shared/save-event-shared.ts:1924).
+  - TO_PERFORMER agreements never mint (create-event-from-agreement.ts:431-441).
+  - The hold picker already has "add the asked-for dates" and places up to 12 holds in one call (apps/web/src/components/bookings/HoldDatePicker.tsx:432,676-687; bookingHolds.placeMany). Selection starts empty.
+  - The event builder's payout editor is Splits (apps/web/src/app/admin/[slug]/events/new/_components/SplitsEditor.tsx, events.updateEventSplits), separate from the agreement's payout lines (apps/web/src/app/agreements/[agreementId]/_components/PayoutLinesSection.tsx).
+
+# ── Decisions (owner, 2026-09-25) ────────────────────────────────────────────
+
+decisions:
+  - id: N1
+    stage: agreement → event
+    text: >
+      Agreeing the terms books the night. When the sender (the act side of a
+      request-linked agreement, agreement-editor-side.ts:11-40) accepts a request-linked
+      agreement (PROPOSED → ACCEPTED), the draft event is created in the same
+      step, on the agreement's date. Accepting a request only opens draft terms.
+  - id: N2
+    stage: agreement
+    text: >
+      The agreement is always there, and it can be quick. When the venue has no
+      money to settle, "Send terms" sends the date alone in one action and
+      the sender agrees with one tap ("Agree & book"). (Button names decided
+      2026-09-29, R3: one venue button "Send terms" whether or not money is
+      drafted; one sender button "Agree & book".) The sender's tap is the only consent to the
+      specific night the venue picked; the pitch only named preferred dates.
+  - id: N3
+    stage: hold → event
+    text: >
+      A venue may also book without terms, on a night the pitch asked for
+      (a preferred date; for RENT/USE, inside the requested window) and nowhere
+      else. The draft event is created at once, with no agreement. Ticket money
+      goes 100% to the event's organiser (the venue for PERFORM, the requester
+      for RENT/USE) until terms are added. The sender gets the existing "your date
+      is booked" notice; their way out is the thread.
+  - id: N4
+    stage: hold
+    text: >
+      No hold is confirmed without agreed terms, except through N3. The
+      standalone hold Confirm leaves the request flow. Holds are pencil; the
+      night is booked by N1 or N3.
+  - id: N5
+    stage: agreement → hold
+    text: >
+      When N1 runs: if this request holds the agreement's date, that hold is
+      confirmed; if nobody holds it, a confirmed hold is written so the line
+      shows the night as booked; other acts on that line lose the date through
+      the existing lost_date notices.
+  - id: N6
+    stage: agreement → hold
+    text: >
+      Terms cannot be sent for a night where another act's hold is ahead of this
+      request's. The refusal points at the challenge: "Another act is 1st in line
+      on {date}. Challenge their hold, or pick another night." The check runs
+      again when the sender agrees; if the night went elsewhere in between, the
+      agree is refused and the venue is told to pick another night.
+  - id: N7
+    stage: event
+    text: >
+      For an event that came from a booking, the event builder's payout section
+      shows the agreement using the same editor component as the agreement page:
+      date, guarantee, lines with each payee's state, finalize. "Edit terms"
+      reopens the agreement to draft and needs the sender's tap again; the event is
+      untouched. Events with no booking keep Splits. An event booked without
+      terms shows "Add terms", which creates the agreement seeded from the pitch.
+  - id: N8
+    stage: hold
+    text: >
+      Requested-date hold buttons: a row of buttons, one per requested date
+      ("Hold Fri 17 Oct"). A tap places the hold at once. A used button becomes
+      its result ("Held · 2nd in line"); a date already booked or past shows
+      struck through with the reason and cannot be tapped. The picker stays for
+      any other date, so a hold on a date the pitch never named is allowed by
+      design.
+  - id: N9
+    stage: request
+    text: >
+      The sender hears when the venue answers. TO_VENUE accept and decline notify
+      the sender through one generalised variant, booking.request-responded
+      (in-app, email, push), carrying the decline reason. The TO_PERFORMER
+      variant booking.organizer-request-responded folds into it.
+  - id: N10
+    stage: event
+    text: >
+      The mint in N1 runs under the venue person who sent the terms for review;
+      their canCreateEvents authority is re-checked at mint time. If it fails,
+      the agreement is still ACCEPTED and the venue sees "Create event" as today
+      (now a retry, not a path).
+  - id: N11
+    stage: event
+    text: >
+      Scope: TO_VENUE requests only. TO_PERFORMER agreements keep today's
+      behaviour (no mint). An event-first request (originEventId set) never
+      mints: N1 and N3 link the agreement to the existing event, as
+      confirmVenueEvent already does (events/confirm-venue-event.ts:371-377).
+      (Owner, 2026-10-01.) If the origin event is cancelled or archived, the
+      night is not booked: Agree & book, Book without terms and Create event
+      refuse before anything on the line changes, and the venue is told. No
+      fresh event is minted in its place. No exception for a leftover draft
+      event from before this build (owner, 2026-10-01): a dead origin always
+      refuses, and so does a finalized link to a cancelled or archived event.
+  - id: N12
+    stage: all
+    text: >
+      Vocabulary (CONTEXT.md, updated 2026-09-25): a venue accepts a request;
+      the sender agrees the terms (for a solo act pitching themselves, that is the act); that books the night. "Book without terms" is
+      the N3 action. "Confirm" stays out of the booking arc's copy.
+
+  # ── Round 2 (owner, 2026-09-29, after the storyboard "How a booking plays out") ──
+  - id: N13
+    stage: event
+    text: >
+      One undo for a booked night: "Cancel booking" (venue or sender, with a
+      reason) cancels the terms and the event together and frees the night — the
+      booked hold is released and the line reopens. Today nothing frees a booked
+      night (release refuses CONFIRMED; cancelling an event releases nothing).
+  - id: N14
+    stage: request
+    text: >
+      An accepted request has exits until the night is booked: the sender can
+      Withdraw, the venue can "Close request" (with a reason). Both release the
+      request's holds and cancel the draft terms. Today ACCEPTED has no exit.
+  - id: N15
+    stage: event
+    text: >
+      Venue confirmation leaves the booking-request flow: no button in the
+      booking thread says "Confirm". It stays for events built first (event-first
+      requests) and for third-party events on the venue calendar.
+  - id: N16
+    stage: agreement
+    text: >
+      Declined terms go back to draft: when the sender declines, the agreement
+      returns to DRAFT with the reason on the thread, for the venue to change and
+      resend. Today DECLINED is terminal.
+  - id: N17
+    stage: hold
+    text: >
+      When the night is booked (N1 or N3), the request's other holds are
+      released (reason SIBLING_CONFIRMED), as today's hold confirm does. Runs of
+      several nights stay out of scope.
+
+  # ── Round 3 (owner, 2026-09-29, notes left on the canvas) ──
+  - id: N18
+    stage: all
+    text: >
+      One reason field everywhere a booking ends or is refused — venue declines
+      or closes a request, Cancel booking, the sender declines terms, an act
+      passes, a venue withdraws an event confirmation — required wherever
+      something ends. Each venue/org keeps customisable reason templates in its
+      booking settings, seeded with platform defaults it can edit or remove; the
+      field offers them as a picker and the inserted text stays editable. Built
+      as one "saved snippets" feature that the deferred ask templates reuse.
+  - id: N19
+    stage: hold
+    text: >
+      A challenge means "another act is ready to book this night" (owner). Keeping
+      a challenged hold is a commitment to the night, not a stall: if terms for
+      that night have been sent to the act at 1st hold, Keep is the same tap as
+      agreeing them (books the night, N1); if none have been sent, Keep asks the
+      venue to send them and the act must agree within a new deadline, else the
+      hold lapses and the line moves up. "Release" gives the night up.
+
+  - id: N20
+    stage: hold
+    text: >
+      (R4, owner 2026-09-29.) The venue can challenge the act at 1st hold only
+      when another act on that night is ready to book: a request behind it on the
+      same calendar and date has draft terms dated that night. "Ready" means
+      drafted, not sent — N6 still stops terms being SENT while another act is
+      ahead. The challenge dialog can also send terms to the 1st-hold act in the
+      same step, so Keep (N19) always has terms to agree. The notice says
+      "Another act is ready to book Oct 17, 2026. Agree your terms by {deadline}
+      to keep it." and never names the other act. If the 1st-hold act releases
+      or lapses, the ready act moves to 1st hold and the venue gets a one-tap
+      "Send terms" with the draft already done.
+      ALIGNMENT with docs/specs/2026-09-30/holds-without-a-request.spec.yaml
+      (another session, not built): that spec lets outside bookers and the
+      place challenge (H12) and has request-less holds answered by booking or
+      releasing (H13); its line "request-backed holds keep today's keep/release
+      answer" is superseded for request-backed holds by N19 here. Owner ruling
+      2026-10-01: a booker's or the place's own hold behind the 1st
+      hold counts as "ready" for N20, since its owner challenges in order to make
+      the event; build the readiness check as one function both specs call.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Agree-mints (N1, N5, N10, N11). respondToBookingAgreement, on accept of a
+        request-linked TO_VENUE agreement, runs one transaction: re-check N6 on
+        the agreement's calendar + date (a challenge open on that line refuses
+        too), CAS the agreement to ACCEPTED, take the line for this request
+        (confirm its hold, or write a CONFIRMED hold when the date has none),
+        write ledger booking_agreement.accepted and booking_hold.confirmed. After
+        commit it runs the mint (createEventFromAgreement's shared body) as the
+        recorded send-for-review actor, attaching the bill per
+        lineup-booking-requests-v3 FR-006. Event-first requests link instead of
+        minting. A mint failure leaves the agreement ACCEPTED and the hold
+        CONFIRMED; the venue retries with "Create event", which is idempotent on
+        draftEventId as today.
+    - id: FR-002
+      description: >
+        Send-for-review records its actor (Agreement.sentForReviewByHumanId, new
+        nullable column) and refuses with NIGHT_TAKEN { date, position } when
+        another request's hold is ahead on the agreement's date or a CONFIRMED
+        hold for another request exists on it (N6). The refusal carries
+        aheadHoldId, and the request's holds read gains, per held date, the
+        position-1 hold's id and whether it is challengeable, so the venue can
+        challenge it from this thread. Today the strip only offers Challenge on
+        this request's own position-1 hold (BookingHoldsStrip.tsx:848), and
+        challengeBookingHold takes the position-1 hold's id; the use case is
+        unchanged, only the data reaching the strip is new.
+    - id: FR-003
+      description: >
+        Quick terms (N2). One venue button, "Send terms", with or without money
+        ("Send for review", en.ts:8441, is renamed "Send terms"); the card
+        underneath says what is being sent: "Oct 17, 2026, 8:00 PM · no money
+        terms" or the deal in plain words. It sends
+        a DRAFT agreement with no payout lines changed, the date chosen from a
+        select that defaults to this request's position-1 hold, else the first
+        requested date. Server-side it is the existing header update +
+        send-for-review, one call. The sender's side renders one card with one
+        button, "Agree & book", showing the date and time and either "no money
+        terms" or the deal in plain words with "Open the deal" beside it; one tap
+        = FR-001. Both cards sit where
+        the expanded row's agreement area is today (BookingInbox.tsx:2193).
+    - id: FR-004
+      description: >
+        Book without terms (N3). New use case bookNightWithoutTerms(requestId,
+        holdId): venue authority canCreateEvents; the hold must belong to the
+        request and its date must be a preferred date (RENT/USE: inside the
+        requested window) — else DATE_NOT_ASKED_FOR; N6 applies. One transaction:
+        accept the request if still open (drafting no agreement terms beyond what
+        accept already writes), take the line, ledger booking_hold.confirmed
+        {withoutTerms: true}. After commit, mint with payout 100% to the event's
+        organiser. The sender gets booking.hold-confirmed (copy already says the
+        date is booked and a draft event exists). Note: accept still drafts an
+        agreement today; that agreement stays DRAFT and becomes what "Add terms"
+        opens (N7), so no second agreement is ever created.
+    - id: FR-005
+      description: >
+        Hold confirm leaves the request flow (N4). bookingHolds.confirm is removed
+        from the thread UI (BookingHoldsStrip "Confirm" button and dialog) and
+        refused server-side for request-linked holds (HOLD_CONFIRM_RETIRED).
+        takeLine stays as the shared mechanism for FR-001, FR-004 and publish-time
+        settling. The hold-confirmed renderer and its copy stay (they now follow
+        FR-001 and FR-004).
+    - id: FR-006
+      description: >
+        Requested-date buttons (N8). The thread has no page of its own: it is the
+        expanded inbox row, one column — stage rail, holds strip, pitch fields,
+        agreement, messages (BookingInbox.tsx:1652-2270). The holds strip there
+        (BookingHoldsStrip.tsx) gains "Asked for" and one button per preferred
+        date, above "Place hold"; each calls
+        bookingHolds.place for that date on the request's calendar, then renders
+        the result (position) or the refusal reason (booked, past). New buttons
+        use the strip's own date formatter and position wording
+        (BookingHoldsStrip.tsx:274-277, en.ts:7839), so one strip never mixes
+        formats. Built on the
+        existing HoldDatePicker data (preferredDates prop); no new endpoint.
+    - id: FR-007
+      description: >
+        The agreement in the event's payout section (N7). The event builder is
+        one scrolling page; money lives in its "Revenue splits" section
+        (EventBuilder.tsx:4455-4494, SplitsEditor.tsx). When the event has an
+        agreement (Agreement.draftEventId / eventId), that section mounts
+        AgreementEditor instead of SplitsEditor; when the event was booked
+        without terms, it shows "Add terms", which opens the request's DRAFT
+        agreement in place. Prerequisites: (a) AgreementEditor gains a third
+        chrome mode, "embedded", beside standalone and admin
+        (AgreementEditor.tsx:56), with no redirect for editor-side viewers
+        (:146-168); (b) FinalizeDialog accepts the builder's eventId instead of
+        asking the user to pick or create one (FinalizeDialog.tsx:85,478-516);
+        (c) finalize's blocked states are shown in place — lines unconfirmed,
+        countered or declined, payee not ready, no edit access
+        (finalize-booking-agreement.ts:112-121). The EventProvenanceNote card at
+        the top of the builder (EventProvenanceNote.tsx:409+) stays as the
+        summary. Reopen, send, finalize reuse the existing procedures; the
+        agreement page stays at its own URL.
+    - id: FR-008
+      description: >
+        Sender notified on the venue's answer (N9). respondToBookingRequest's
+        TO_VENUE accept and decline emit booking.request-responded to the sender
+        pair (human, or the owning org's edit-role members), with the decline
+        reason. Swallows follow the ReporterPort convention.
+    - id: FR-009
+      description: >
+        Cancel booking (N13). New use case cancelBooking(requestId, reason):
+        actor = the venue side (place booking authority) or the sender pair;
+        allowed once the night is booked and before the event starts. One
+        transaction: the agreement → CANCELLED (even if ACCEPTED/finalized: new
+        path, finalized terms also deactivated), the booked hold → RELEASED with
+        reason BOOKING_CANCELLED (a new HoldReleaseReason; the release use case
+        currently refuses CONFIRMED — this is the one path that may), the event →
+        CANCELLED through cancelEvent (refunds per its existing rules if tickets
+        were sold), ledger booking_request.booking_cancelled, both sides and the
+        joined acts notified. The request stays ACCEPTED as history and becomes
+        closed for new holds.
+    - id: FR-010
+      description: >
+        Exits after accept (N14). withdrawBookingRequest allows ACCEPTED while no
+        night is booked (today PENDING/VIEWED only,
+        withdraw-booking-request.ts:169); new closeBookingRequest (venue, reason)
+        for ACCEPTED with no booked night. Both: request → WITHDRAWN / DECLINED,
+        holds released (REQUEST_CLOSED), draft agreement → CANCELLED, joined acts
+        told (lineup-v3 L7).
+    - id: FR-011
+      description: >
+        Venue confirmation out of the request flow (N15). VenueConfirmationActions
+        is not mounted in the booking thread for requests without originEventId
+        (BookingInbox.tsx:2350-2360); the request variant of confirmVenueEvent is
+        refused for them (VENUE_CONFIRMATION_NOT_FOR_REQUESTS). Event-first and
+        venue-calendar uses unchanged. "Create event from this booking"
+        (CreateEventFromBookingAction) remains only as the retry of FR-001's
+        mint.
+    - id: FR-012
+      description: >
+        Declined terms → draft (N16). respondToBookingAgreement's decline writes
+        ledger booking_agreement.declined with the reason and sets the agreement
+        to DRAFT (not DECLINED) when it is request-linked; the venue is notified.
+        Unlinked agreements keep DECLINED. Closes lineup-v3 punch list item 2.
+    - id: FR-013
+      description: >
+        Reason templates (N18). New model SavedSnippet { ownerType ORG|HUMAN,
+        ownerId, kind (DECLINE_REASON | ASK — ASK reserved for later), label ≤ 60,
+        body ≤ 500 plain text, sortOrder, isStarter }. Platform default reasons
+        live in the i18n catalog and are copied into an owner's list on first use,
+        then editable. A per-list row (owner + kind) records that the defaults were
+        copied, so deleting every reason never brings them back, and is the lock
+        taken by copy, create and reorder (the 30-per-list cap). Every reason
+        field accepts up to 1000 characters except an act's pass (240); the picker
+        offers only saved reasons that fit the field. A shared ReasonField component (picker + textarea) replaces
+        every reason input: respondToBookingRequest decline, closeBookingRequest,
+        cancelBooking, the sender's terms decline (FR-012), passAct, venue
+        confirmation withdraw. Managed in the venue's booking settings ("Reasons
+        you often give").
+    - id: FR-014
+      description: >
+        Keep = commit (N19). answerBookingHoldChallenge "keep": when this
+        request's agreement is PROPOSED for that night, keep runs FR-001 (agree
+        + book) in the same call; otherwise it records keep, notifies the venue
+        "send terms to keep this night", and sets a new respondBy (default 48h)
+        by which the act must agree the terms that arrive; missing it lapses the
+        hold (existing lapse path). The challenge notice and the act's panel say
+        what Keep will do before they tap it.
+    - id: FR-015
+      description: >
+        Challenge needs a ready act (N20). challengeBookingHold refuses with
+        NO_ACT_READY unless a live hold behind the target on that calendar + date
+        belongs to a request whose agreement is DRAFT (or later) with
+        proposedDate on that night. The challenge UI lives on the ready act's row
+        ("Challenge their hold", using aheadHoldId from FR-002) and on the 1st
+        hold's row ("Challenge" — disabled with the reason when no act is ready).
+        The dialog has an optional "Also send terms to {1st-hold sender}" step
+        (the existing send, FR-003). On release/lapse, the ready request's thread
+        shows "You're 1st hold on Oct 17 — Send terms".
+  non_functional:
+    - id: NFR-001
+      description: >
+        FR-001 and FR-004 are all-or-nothing up to the post-commit mint, with the
+        same bounded retry story the hold path has today. No path creates an
+        event on a night whose line has another CONFIRMED hold.
+    - id: NFR-002
+      description: >
+        Every new refusal (NIGHT_TAKEN, DATE_NOT_ASKED_FOR, HOLD_CONFIRM_RETIRED)
+        carries a translated message; none leaks internals (see punch list item 4
+        in lineup-booking-requests-v3).
+
+# ── Acceptance criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - Venue sends the night for Fri 17 Oct with no money terms; the sender taps "Agree & book" → agreement ACCEPTED, this request's hold on 17 Oct CONFIRMED, other holds on 17 Oct get lost_date, a DRAFT event exists on 17 Oct owned by the venue, with the joined acts on its lineup.
+  - Venue tries to send terms for Thu 23 Oct where another act holds position 1 → NIGHT_TAKEN with the challenge wording; after that act releases, the send works.
+  - Another request's hold is confirmed on the date between send and agree → the agree is refused, the venue is notified, the agreement stays PROPOSED.
+  - Venue books without terms on a requested date → event created, payout 100% to the venue, act notified; on a date the pitch did not ask for the action is absent in the UI and refused by the server.
+  - The thread shows no hold Confirm button; the server refuses bookingHolds.confirm for a request-linked hold.
+  - The event builder's Revenue splits section for a booked event shows the agreement editor (embedded chrome); Finalize finalizes against this event without asking which event; "Edit terms" reopens it; an unbooked event shows Splits.
+  - A venue refused with NIGHT_TAKEN can challenge the hold ahead from the same thread; the button reads "Send terms" with or without money, and the sender's reads "Agree & book".
+  - A TO_VENUE decline notifies the sender with the reason; an accept notifies them that terms are being drafted.
+  - An event-first request's terms, when agreed, link to the existing event; no second event appears.
+
+out_of_scope:
+  - TO_PERFORMER minting.
+  - Paying out a guarantee (still not settled by the platform).
+  - An act-side "I can't do this night" button after a booking without terms (the thread carries it).
+  - Changing publish-time line settling (09-05 FR-018 stays).

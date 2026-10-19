@@ -1,0 +1,29 @@
+# Copilot Task: Implement sitemap telemetry hooks
+context:
+  references:
+    - ../platform/sitemaps-observability.spec.yaml
+    - sitemaps-generator.task.yaml
+    - sitemaps-transport.task.yaml
+  packages:
+  - apps/jobs
+    - apps/api
+    - @th/observability utilities
+  goal: |
+    Emit metrics, traces, and structured logs defined in the observability spec from the
+    generator job and transport routes.
+requirements:
+  - Instrument generator with counters/gauges/histograms (urls emitted, size bytes, duration, latency to publish).
+  - Record structured logs with required fields and integrate with existing logger.
+  - Ensure Fastify routes emit request metrics (`sitemap.transport.requests_total`, latency histograms).
+  - Add tracing spans annotated with shard metadata.
+  - Provide unit tests verifying metrics increments via test harness or mocks.
+  - Update telemetry configuration (Prometheus/OTel exporters) if new metrics require registration.
+implementation_notes:
+  - Use `withMetrics` helper in `@th/observability` if available; otherwise extend existing instrumentation pattern.
+  - Guard instrumentation behind feature flag to avoid noise before launch.
+validation:
+  - Run generator in staging and confirm metrics appear in dev Prometheus scraper.
+  - Use local telemetry test to ensure counters increment as expected.
+  - Add documentation snippet to observability spec when instrumentation opts into new resources.
+handoff:
+  - Share Grafana dashboard link with SEO/ops once metrics visible.

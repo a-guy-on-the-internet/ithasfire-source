@@ -1,0 +1,552 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Volunteering — Org-level role templates, per-event roles, shifts, signups,
+// plus generic asks (PLACE | ORG | HUMAN | EVENT subjects) with groups and
+// roster broadcasts. See docs/specs/2026-06-29/completed/generic-volunteering-asks.spec.yaml.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A generic "we need volunteers" ask. The subject is polymorphic —
+/// (subjectType, subjectId) points at a Place, Organization, Human, or Event
+/// with NO hard FK (matching the BookingRequest.performerOwnerType/OwnerId
+/// precedent in agreement.prisma). Event volunteering is the EVENT-subject
+/// case: the backfill migration creates one EVENT ask per volunteering-enabled
+/// event and stamps `askId` onto its roles and signups.
+model VolunteerAsk {
+  id          String               @id @default(uuid())
+  subjectType VolunteerSubjectType
+  /// Place.id | Organization.id | Human.id | Event.id — resolved in the repo layer.
+  subjectId   String
+  /// Denormalized owning org (nullable) for fast org-scoped permission checks
+  /// and org dashboards. Plain string, no FK — subjects are archived, never
+  /// hard-deleted, and the subject itself may be the org.
+  orgId       String?
+  title       String
+  description String?
+  status      VolunteerAskStatus   @default(DRAFT)
+  cadence     VolunteerAskCadence  @default(ONE_TIME)
+  /// Optional scheduling window (v1 scheduling = window + cadence label only).
+  startsAt    DateTime?
+  endsAt      DateTime?
+  /// IANA zone the organiser stated the window in (e.g. "America/Chicago").
+  /// Null on asks created before it was asked for (no backfill); readers
+  /// then fall back to the viewer's zone. May be set without a window;
+  /// meaningful only when startsAt/endsAt exist.
+  timezone    String?
+  capacity    Int?                 // Soft cap across the whole ask — UI indicator only
+  autoApprove     Boolean @default(false)
+  waiverRequired  Boolean @default(false)
+  /// Waiver template backing `waiverRequired` for non-EVENT signups. The gate
+  /// only arms when BOTH are set (waiverRequired && waiverTemplateId) —
+  /// mirroring Event.volunteerWaiverRequired + Event.waiverTemplateId
+  /// semantics, so `waiverRequired` without a template stays inert. Restrict
+  /// (not SetNull): deleting a template must never silently disarm a
+  /// liability gate.
+  waiverTemplateId String?
+  smsOptInEnabled Boolean @default(false)
+  /// Application questions (same shape as event application answers).
+  formSchema  Json                 @default("{}")
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+
+  waiverTemplate WaiverTemplate?     @relation(fields: [waiverTemplateId], references: [id], onDelete: Restrict)
+  roles          EventVolunteerRole[]
+  groups         VolunteerGroup[]
+  signups        VolunteerSignup[]
+  broadcasts     VolunteerBroadcast[]
+  rewards        VolunteerReward[]
+  occurrences    VolunteerShiftOccurrence[]
+
+  @@index([subjectType, subjectId])
+  @@index([orgId, status])
+  @@index([waiverTemplateId])
+}
+
+/// A named bucket of volunteers within an ask, with at most ONE assigned
+/// coordinator (v1). The coordinator can manage signups inside their group
+/// via a scoped authz check without holding org-wide rights.
+model VolunteerGroup {
+  id                 String   @id @default(uuid())
+  askId              String
+  name               String
+  description        String?
+  capacity           Int?     // Soft cap — UI indicator only
+  /// Single coordinator (v1). Need not be an OrgMember.
+  coordinatorHumanId String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  ask         VolunteerAsk      @relation(fields: [askId], references: [id], onDelete: Cascade)
+  coordinator Human?            @relation("VolunteerGroupCoordinator", fields: [coordinatorHumanId], references: [id], onDelete: SetNull)
+  members     VolunteerSignup[]
+
+  @@unique([askId, name])
+  @@index([askId])
+  @@index([coordinatorHumanId])
+}
+
+/// Audit + idempotency ledger for one-way roster announcements. One row per
+/// broadcast (sender, scope, subject/body, recipient count) — the send path
+/// keys on this row to never double-send on retry.
+model VolunteerBroadcast {
+  id             String   @id @default(uuid())
+  askId          String
+  senderHumanId  String
+  scopeType      String   // "ALL" | "ROLE" | "GROUP" | "POOL"
+  scopeId        String?  // roleId | groupId when scoped
+  subject        String
+  body           String
+  recipientCount Int      @default(0)
+  createdAt      DateTime @default(now())
+
+  ask    VolunteerAsk @relation(fields: [askId], references: [id], onDelete: Cascade)
+  sender Human        @relation("VolunteerBroadcastSender", fields: [senderHumanId], references: [id], onDelete: Cascade)
+
+  @@index([askId, createdAt])
+  @@index([senderHumanId])
+}
+
+/// Platform-curated bundle of volunteer role templates ("house show",
+/// "club night", …). Metadata only — a pack owns no columns of its own
+/// beyond presentation and targeting; the roles are ordinary
+/// VolunteerRoleTemplate rows pointing back at it via `packId`.
+/// Mirrors FeaturedItem (platform.prisma) as the curated-content shape.
+///
+/// Deletion: a pack's PLATFORM roles are meant to die with it, while an
+/// org's fork of one keeps `packId` as provenance and survives. Postgres
+/// FKs take exactly ONE referential action, so the FK below is SET NULL
+/// (the fork-safe half) and the platform-row cascade is done explicitly by
+/// the remove-pack use case — `deleteMany({ packId, isPlatform: true })`
+/// inside the same transaction as the pack delete, BEFORE it. Do not
+/// "simplify" the FK to Cascade: it would delete every org's fork too.
+///
+/// That ordering is DB-enforced, not documented-and-hoped: the CHECK
+/// constraint `VolunteerRoleTemplate_platform_pack_check` (20260728120000
+/// migration) requires every `isPlatform` row to carry a `packId`, so the
+/// FK's SET NULL on a platform row raises instead of silently leaving an
+/// orphan behind. Deleting a pack that still has platform roles therefore
+/// FAILS — delete the roles first, in the same transaction.
+model VolunteerPack {
+  id               String              @id @default(uuid())
+  /// Stable slug used by the seed path so dev/staging/prod converge on the
+  /// same packs, and so a re-seed updates rather than duplicates.
+  key              String              @unique
+  name             String
+  /// Staff-authored free text shown to organizers. Escaped on output —
+  /// no HTML passthrough (NFR-004).
+  blurb            String?
+  status           VolunteerPackStatus @default(DRAFT)
+  /// Category ids this pack is a good fit for. Plain String[] with no FK,
+  /// used only to rank packs in the organizer picker — a deleted category
+  /// degrades ranking, never breaks the pack.
+  /// The column is `TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[]` — Prisma cannot
+  /// express array nullability, so anything else would be a type lie the
+  /// client can't see. Invisible to Prisma's drift describer either way.
+  targetCategoryIds String[]            @default([])
+  /// Pin above category-matched packs in the picker.
+  rankFirst        Boolean             @default(false)
+  sortOrder        Int                 @default(0)
+  curatedByHumanId String?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  curator Human?                  @relation("VolunteerPackCurator", fields: [curatedByHumanId], references: [id], onDelete: SetNull)
+  roles   VolunteerRoleTemplate[]
+
+  @@index([status, sortOrder])
+  @@index([curatedByHumanId])
+}
+
+/// Reusable volunteer role template. Two kinds of row share this table:
+///
+///   - ORG row      — `orgId` set, `isPlatform` false, `packId` null
+///                    (or set, when it was forked from a pack).
+///   - PLATFORM row — `orgId` NULL, `isPlatform` true, `packId` set.
+///                    Staff-curated catalogue content, read-only to every
+///                    organizer, surfaced inline in their list when the
+///                    owning pack is LIVE.
+///
+/// Because `orgId` is nullable, "not org B's" is no longer the same test as
+/// "not null": every query states which kind it means (see the adapter's
+/// `listRoleTemplates` / `getRoleTemplateUsableBy`), and every MUTATING use
+/// case rejects `isPlatform` rows before it runs a membership check —
+/// there is no org to derive authz from on a platform row.
+///
+/// Expected drift (both SQL-only in the 20260728120000 migration, invisible
+/// to Prisma, same precedent as "VolunteerAsk_event_subject_key" and
+/// "VolunteerReward_ask_level_key"):
+///
+///   - `@@unique([orgId, name])` does not constrain platform rows, because
+///     Postgres treats NULLs as distinct — one pack could list "Door" twice.
+///     A raw partial unique index
+///     "VolunteerRoleTemplate_platform_pack_name_key" ON ("packId", "name")
+///     WHERE "orgId" IS NULL covers them. The invariant is PER PACK, not per
+///     catalogue: packs deliberately reuse role names ("Sound" in both the
+///     house-show and DIY packs), so a catalogue-global name index would
+///     make the launch catalogue unseedable.
+///   - A CHECK constraint "VolunteerRoleTemplate_platform_pack_check"
+///     (`"isPlatform" = false OR "packId" IS NOT NULL`) keeps every platform
+///     row inside that index — a pack-less one would key on (NULL, name) and
+///     escape it — and makes pack deletion fail loudly rather than orphan
+///     platform rows. See the VolunteerPack doc comment.
+model VolunteerRoleTemplate {
+  id              String   @id @default(uuid())
+  /// NULL = platform catalogue row (see `isPlatform`). Set = org-owned.
+  orgId           String?
+  name            String           // e.g., "Bar Staff", "Security", "Stage Hand"
+  description     String?
+  defaultCapacity Int?             // Suggested capacity when pulled into an event
+  sortOrder       Int      @default(0)
+  archived        Boolean  @default(false)
+  /// True only on catalogue rows, which always have `orgId` NULL. The flag
+  /// is the read-only gate; it is checked on its own so a mis-shaped row
+  /// (flag set WITH an orgId) still fails closed rather than open.
+  isPlatform      Boolean  @default(false)
+  /// Owning pack on a platform row; provenance of the source pack on an
+  /// org-owned fork. SetNull — see the VolunteerPack doc comment.
+  packId          String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  org    Organization?                @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  pack   VolunteerPack?               @relation(fields: [packId], references: [id], onDelete: SetNull)
+  roles  EventVolunteerRole[]
+  shifts VolunteerRoleTemplateShift[]
+
+  @@unique([orgId, name])
+  @@index([orgId, archived])
+  @@index([packId])
+  @@index([isPlatform, sortOrder])
+}
+
+/// Shift preset attached to a role template (org-owned or platform — there
+/// is no second shift model).
+///
+/// Stored as time-of-day (minute-of-day, 0–1439) plus a `dayOffset` from
+/// the event date. This mirrors how organizers actually think about
+/// shifts ("Setup is 4pm on event day, Cleanup runs until 12:30am the
+/// next day") and matches the pattern used by When I Work, Sling,
+/// Mobilize, etc. Concrete `startsAt`/`endsAt` are materialized at apply
+/// time against the event date; the organizer confirms via the shift
+/// composer — these rows are never auto-persisted as `EventVolunteerShift`.
+///
+/// `anchor` widens that: a wall-clock preset ("Load-in 16:00") is wrong for
+/// a 14:00 matinee, so a preset can instead be measured from the event's
+/// own start/end via `offsetMinutes`. WALL_CLOCK + offsetMinutes 0 is the
+/// default and reproduces the previous behaviour byte-for-byte, so no
+/// backfill is needed.
+model VolunteerRoleTemplateShift {
+  id               String   @id @default(uuid())
+  templateId       String
+  label            String   // Required — surfaces in the composer + apply preview
+  startMinuteOfDay Int      // 0..1439 (00:00–23:59 in event timezone)
+  endMinuteOfDay   Int      // 0..1439; when <= start, the shift wraps past midnight on dayOffset+1
+  startDayOffset   Int      @default(0) // -7..14 — usually 0 (event day)
+  /// True when end is the next calendar day vs start (set when end <= start).
+  endsNextDay      Boolean  @default(false)
+  capacity         Int?     // Optional per-shift soft cap
+  position         Int      @default(0) // Display + materialization order
+  /// What `startMinuteOfDay` / `offsetMinutes` are measured from.
+  /// WALL_CLOCK (default) ignores `offsetMinutes`.
+  anchor           VolunteerShiftAnchor @default(WALL_CLOCK)
+  /// Signed minutes from the anchor; negative = before. Ignored when
+  /// `anchor` is WALL_CLOCK. Only the START moves: the shift keeps its
+  /// duration, which is (endMinuteOfDay - startMinuteOfDay) PLUS a full day
+  /// when `endsNextDay` is set — see `templateShiftDurationMinutes`. On an
+  /// anchored preset the two minute columns stop naming wall-clock times and
+  /// carry only that length.
+  offsetMinutes    Int      @default(0)
+  /// Preset admin-only note copied onto the materialized
+  /// `EventVolunteerShift.notes` (meeting point, gear, …).
+  notes            String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  template VolunteerRoleTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@index([templateId, position])
+}
+
+/// A volunteer role attached to a specific event OR to a generic ask.
+/// May or may not originate from an org template. Event roles keep `eventId`
+/// (nullable since generic asks landed); generic roles set `askId` only.
+model EventVolunteerRole {
+  id          String   @id @default(uuid())
+  eventId     String?          // Null = generic (ask-owned) role
+  /// Owning generic ask. Backfilled for EVENT-subject asks; new generic
+  /// roles set this and leave `eventId` null.
+  askId       String?
+  templateId  String?          // Null = one-off role, not from a template
+  name        String           // Copied from template or freeform
+  description String?
+  capacity    Int?             // Soft cap — not enforced, used for UI indicators
+  autoApprove Boolean?         // Null = inherit event-level default
+  /// Optional owner-editable hours value stamped onto signup.hoursWorked at
+  /// check-in for ask-based roles that have no shift to derive a duration
+  /// from. Decimal(5,2) to match VolunteerSignup.hoursWorked.
+  defaultHours Decimal?        @db.Decimal(5, 2)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  event       Event?                 @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  ask         VolunteerAsk?          @relation(fields: [askId], references: [id], onDelete: Cascade)
+  template    VolunteerRoleTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  shifts      EventVolunteerShift[]
+  signups     VolunteerSignup[]
+  rewards     VolunteerReward[]
+  occurrences VolunteerShiftOccurrence[]
+
+  @@unique([eventId, name])
+  @@unique([askId, name])
+  @@index([eventId, sortOrder])
+  @@index([askId])
+  @@index([templateId])
+}
+
+/// A shift (time window) within a volunteer role.
+/// Free-form start/end — not quantized into slots.
+model EventVolunteerShift {
+  id        String   @id @default(uuid())
+  roleId    String
+  label     String?          // Optional human-readable label, e.g., "Morning shift"
+  startsAt  DateTime
+  endsAt    DateTime
+  capacity  Int?             // Soft cap per shift (independent of role-level cap)
+  notes     String?          // Admin-only notes (meeting point, gear, etc.)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  role    EventVolunteerRole @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  signups VolunteerSignup[]
+
+  @@index([roleId, sortOrder])
+}
+
+/// A volunteer signup / application for a role (and optionally a specific shift).
+model VolunteerSignup {
+  id              String                @id @default(uuid())
+  eventId         String?               // Null = generic (ask-only) signup; legacy event signups keep it populated
+  /// Owning generic ask. Backfilled for EVENT-subject asks; new-code reads
+  /// go via askId while eventId stays populated for backward compat.
+  askId           String?
+  roleId          String
+  shiftId         String?               // Null = general role signup, not shift-specific
+  /// Group assignment within the ask (separate step from approval). Null =
+  /// the ask's general pool.
+  groupId         String?
+  humanId         String?               // Null when shadow profile not yet linked
+  contactEmail    String                // Always captured — primary identifier before account
+  contactName     String?               // Captured at signup time
+  contactPhone    String?
+  /// TCPA opt-in for SMS shift reminders. False by default; the volunteer
+  /// must affirmatively tick the checkbox on the signup form. The
+  /// reminder dispatcher refuses to send SMS unless this is true AND
+  /// `contactPhone` is non-empty, so flipping `contactPhone` after the
+  /// fact never silently subscribes them.
+  smsOptIn        Boolean               @default(false)
+  status          VolunteerSignupStatus @default(PENDING)
+  /// Admin-overridable hours-worked value. NULL means "use the shift's
+  /// scheduled duration (endsAt - startsAt)" — set explicitly to record
+  /// a shorter/longer actual contribution after the event. Surfaces in
+  /// the per-event hours CSV export. Decimal with two places so we can
+  /// store fractional hours (e.g. 4.5) without floating-point drift.
+  hoursWorked     Decimal?              @db.Decimal(5, 2)
+  answers         Json                  @default("{}")  // Form answers (same shape as application answers)
+  reviewerHumanId String?
+  reviewedAt      DateTime?
+  checkedInAt     DateTime?
+  notes           String?               // Admin notes on this volunteer
+  metadata        Json                  @default("{}")
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @updatedAt
+
+  event            Event?                       @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  ask              VolunteerAsk?                @relation(fields: [askId], references: [id], onDelete: Cascade)
+  role             EventVolunteerRole           @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  shift            EventVolunteerShift?         @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  group            VolunteerGroup?              @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  human            Human?                       @relation("VolunteerSignupHuman", fields: [humanId], references: [id], onDelete: SetNull)
+  reviewer         Human?                       @relation("VolunteerSignupReviewer", fields: [reviewerHumanId], references: [id], onDelete: SetNull)
+  notifications    VolunteerShiftNotification[]
+  waiverAcceptance VolunteerWaiverAcceptance?
+  rewardGrants     VolunteerRewardGrant[]
+  occurrenceClaims VolunteerOccurrenceClaim[]
+
+  @@unique([eventId, roleId, contactEmail])  // Legacy: one signup per role per email (event-scoped)
+  @@unique([askId, roleId, contactEmail])    // One signup per role per email (ask-scoped)
+  @@index([eventId, status])
+  @@index([askId, status])
+  @@index([roleId])
+  @@index([shiftId])
+  @@index([groupId])
+  @@index([humanId])
+  @@index([reviewerHumanId])
+}
+
+/// A concrete dated volunteer slot on a STANDING (non-EVENT) ask —
+/// generic-volunteer-shifts-occurrences FR-001, phase A. Role-scoped like
+/// EventVolunteerShift, but stores absolute UTC instants against an ask
+/// role: "door help THIS Friday 19:00–23:00". One-off rows are created by
+/// owners directly; `patternId` is reserved for phase B's
+/// VolunteerShiftPattern materializer (plain column for now — the pattern
+/// model does not exist yet, so there is deliberately NO FK; phase B adds
+/// it). `@@unique([patternId, startsAt])` is the materializer's idempotency
+/// anchor — Postgres treats NULL patternId as distinct, so one-off
+/// occurrences are unconstrained by it.
+///
+/// Non-EVENT asks only (enforced in core, not the DB): EVENT-subject asks
+/// keep their existing EventVolunteerShift scheduling.
+model VolunteerShiftOccurrence {
+  id        String                    @id @default(uuid())
+  askId     String
+  roleId    String
+  /// Phase B: owning VolunteerShiftPattern. Always NULL for one-off rows.
+  patternId String?
+  startsAt  DateTime
+  endsAt    DateTime
+  /// Soft cap per occurrence — gates claiming (FOR UPDATE narrowed), but
+  /// consistent with the ask/role caps it is not a hard serialization.
+  capacity  Int?
+  notes     String?
+  status    VolunteerOccurrenceStatus @default(SCHEDULED)
+  createdAt DateTime                  @default(now())
+  updatedAt DateTime                  @updatedAt
+
+  ask    VolunteerAsk               @relation(fields: [askId], references: [id], onDelete: Cascade)
+  role   EventVolunteerRole         @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  claims VolunteerOccurrenceClaim[]
+
+  @@unique([patternId, startsAt])
+  @@index([askId, startsAt])
+  @@index([roleId, startsAt])
+}
+
+/// One volunteer's commitment to one occurrence (FR-001). Lightweight —
+/// approval stays once-per-person on VolunteerSignup; a claim never
+/// re-runs review. `@@unique([occurrenceId, signupId])` is the idempotency
+/// anchor: a signup holds at most one claim row per occurrence, and a
+/// withdrawn row flips back to CLAIMED on re-claim rather than duplicating.
+/// `hoursWorked` is stamped at per-occurrence check-in (duration-derived,
+/// overridable) — additive to signup-level hours, never a copy of them.
+model VolunteerOccurrenceClaim {
+  id           String                         @id @default(uuid())
+  occurrenceId String
+  signupId     String
+  status       VolunteerOccurrenceClaimStatus @default(CLAIMED)
+  source       VolunteerOccurrenceClaimSource @default(SELF)
+  checkedInAt  DateTime?
+  /// Per-occurrence hours: duration-derived at check-in, overridable.
+  /// Decimal(5,2) to match VolunteerSignup.hoursWorked.
+  hoursWorked  Decimal?                       @db.Decimal(5, 2)
+  createdAt    DateTime                       @default(now())
+  updatedAt    DateTime                       @updatedAt
+
+  occurrence VolunteerShiftOccurrence @relation(fields: [occurrenceId], references: [id], onDelete: Cascade)
+  signup     VolunteerSignup          @relation(fields: [signupId], references: [id], onDelete: Cascade)
+
+  @@unique([occurrenceId, signupId])
+  @@index([signupId, status])
+  @@index([occurrenceId, status])
+}
+
+/// Reminder dispatch ledger — one row per (signup, kind, channel) the
+/// scheduler has sent. Lets the cron handler be naive and idempotent:
+/// every tick selects upcoming signups missing a ledger row, and the
+/// unique constraint guarantees a second tick is a no-op even when two
+/// jobs windows overlap. Kept lightweight (no payload) since the email
+/// templates already render at dispatch time from current signup state.
+model VolunteerShiftNotification {
+  id        String                  @id @default(uuid())
+  signupId  String
+  kind      VolunteerReminderKind
+  channel   String                  // "email" | "sms" | "inapp"
+  sentAt    DateTime                @default(now())
+
+  signup    VolunteerSignup         @relation(fields: [signupId], references: [id], onDelete: Cascade)
+
+  @@unique([signupId, kind, channel])
+  @@index([signupId])
+}
+
+/// Comp-ticket reward policy attached to an ask (roleId null = whole-ask
+/// reward) or to a specific role within it. COMP-only per the 2026-07-01
+/// resolutions — "a free ticket is the max"; there is no DISCOUNT type and
+/// no percentOff/amountOffCents columns (additive later if ever). Rewards
+/// attach to EVENT-subject asks only in v1, so `ticketTypeId` (the type the
+/// comp is minted against) is always resolvable.
+///
+/// Uniqueness: at most ONE reward per (askId, roleId) pair. Postgres treats
+/// NULLs as distinct in `@@unique([askId, roleId])`, so the roleId-null
+/// ask-level case is enforced by a raw partial unique index
+/// ("VolunteerReward_ask_level_key") in the 20260702150000 migration —
+/// SQL-only, invisible to Prisma, shows up as expected drift (same
+/// precedent as "VolunteerAsk_event_subject_key").
+model VolunteerReward {
+  id           String                 @id @default(uuid())
+  askId        String
+  /// Null = applies to the whole ask; set = role-specific reward, which
+  /// takes precedence over an ask-level reward for that role's signups.
+  roleId       String?
+  /// The TicketType the comp targets (Order.source=COMP, $0 order).
+  ticketTypeId String
+  trigger      VolunteerRewardTrigger @default(ON_CHECK_IN)
+  /// Budget cap: max grants this reward may ever issue. Null = uncapped.
+  maxGrants    Int?
+  /// Budget counter checked against `maxGrants` at grant time. The grant
+  /// use case serializes on this row via `getRewardForUpdate`
+  /// (SELECT ... FOR UPDATE) inside the grant transaction, so concurrent
+  /// triggers can never overshoot the cap. Decremented (floored at 0) when
+  /// an unused grant is revoked, returning the budget slot.
+  grantsUsed   Int                    @default(0)
+  active       Boolean                @default(true)
+  createdAt    DateTime               @default(now())
+  updatedAt    DateTime               @updatedAt
+
+  ask        VolunteerAsk        @relation(fields: [askId], references: [id], onDelete: Cascade)
+  role       EventVolunteerRole? @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  // Cascade (not SetNull like Ticket.ticketTypeId): ticketTypeId is required
+  // here — a reward without a comp target is meaningless, so deleting the
+  // ticket type retires the policy. Issued grants survive via SetNull FKs.
+  ticketType TicketType          @relation(fields: [ticketTypeId], references: [id], onDelete: Cascade)
+  grants     VolunteerRewardGrant[]
+
+  @@unique([askId, roleId])
+  @@index([askId])
+}
+
+/// One issued reward — the idempotency + audit + revocation unit. The
+/// `@@unique([rewardId, signupId])` is the idempotency anchor: a signup can
+/// never be double-comped under the same reward, even across retried
+/// triggers. Comp linkage (compOrderId/ticketId) uses SetNull FKs so the
+/// ledger row outlives order/ticket cleanup.
+model VolunteerRewardGrant {
+  id             String                     @id @default(uuid())
+  rewardId       String
+  signupId       String
+  /// Null for shadow profiles pre-claim; the claim flow links it later.
+  humanId        String?
+  contactEmail   String
+  status         VolunteerRewardGrantStatus @default(GRANTED)
+  /// COMP order (Order.source=COMP, $0) issued for this grant.
+  compOrderId    String?
+  /// The minted comp Ticket — void/scan tracking hangs off its status.
+  ticketId       String?
+  /// TicketType.priceCents snapshot at grant time, integer cents.
+  /// Ledger/reporting ONLY — never re-derived from the ticket type and
+  /// never used in money math (the comp order itself is $0).
+  faceValueCents Int
+  grantedAt      DateTime                   @default(now())
+  redeemedAt     DateTime?
+  revokedAt      DateTime?
+  revokeReason   String?
+
+  reward    VolunteerReward @relation(fields: [rewardId], references: [id], onDelete: Cascade)
+  signup    VolunteerSignup @relation(fields: [signupId], references: [id], onDelete: Cascade)
+  human     Human?          @relation("VolunteerRewardGrantHuman", fields: [humanId], references: [id], onDelete: SetNull)
+  compOrder Order?          @relation("VolunteerRewardGrantCompOrder", fields: [compOrderId], references: [id], onDelete: SetNull)
+  ticket    Ticket?         @relation("VolunteerRewardGrantTicket", fields: [ticketId], references: [id], onDelete: SetNull)
+
+  @@unique([rewardId, signupId])
+  @@index([signupId])
+  @@index([rewardId, status])
+}

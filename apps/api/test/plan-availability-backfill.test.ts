@@ -4,7 +4,7 @@ import {
   planAvailabilityBackfill,
   type ExistingAvailabilityRow,
   type LegacyAvailabilityRow,
-} from "../src/scripts/plan-availability-backfill";
+} from "../src/scripts/backfill/done/plan-availability-backfill";
 
 /**
  * The `PlaceAvailability → CalendarAvailability` backfill's decision logic.

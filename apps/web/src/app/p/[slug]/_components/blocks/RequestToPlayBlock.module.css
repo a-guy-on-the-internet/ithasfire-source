@@ -1,0 +1,421 @@
+/* ── Request-to-play booking form ──────────────────────────────────────────
+   Inherits the entity-page theme via the --th-color-* custom properties so
+   the form stays on-brand for venue pages with custom themes. Strict Swiss:
+   square corners, visible borders, uppercase labels. */
+
+.panel {
+	display: flex;
+	flex-direction: column;
+	gap: 1rem;
+	margin-top: 0.75rem;
+	padding: 1rem;
+	border: 2px solid var(--th-color-primary, rgba(128, 128, 128, 0.45));
+	border-radius: 0;
+}
+
+/* Settings variant: the account "Booking defaults" editor hosts this form
+   inside an unframed settings SectionCard, where `--th-color-primary` is
+   undefined (the boxed panel would fall back to a flat gray card floating in
+   the section). Keep the vertical rhythm but drop the box — sibling settings
+   subsections group content with the `.sectionHeading` hairline rules + gap,
+   not a full border. The venue page keeps `.panel` unchanged. */
+.panelSettings {
+	display: flex;
+	flex-direction: column;
+	gap: 1rem;
+	border: 0;
+	margin: 0;
+	padding: 0;
+}
+
+.fieldGroup {
+	display: flex;
+	flex-direction: column;
+	gap: 0.375rem;
+}
+
+.fieldLabel {
+	font-size: 0.6875rem;
+	font-weight: 700;
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+	color: var(--th-color-text, inherit);
+	opacity: 0.8;
+}
+
+/* Compact structural subheading grouping related fields (strict Swiss). */
+.sectionHeading {
+	margin: 0.5rem 0 0;
+	font-size: 0.75rem;
+	font-weight: 700;
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+	color: var(--th-color-text, inherit);
+	padding-bottom: 0.375rem;
+	border-bottom: 1px solid rgba(128, 128, 128, 0.3);
+}
+
+/* Two-up field layout for compact number/select pairs; wraps on mobile. */
+.fieldRow {
+	display: flex;
+	gap: 0.75rem;
+	flex-wrap: wrap;
+}
+
+.fieldRow > .fieldGroup {
+	flex: 1;
+	min-width: 8rem;
+}
+
+/* Fee-type select keeps a stable basis so it does NOT stretch to fill the row
+   when the amount column is hidden (Negotiable / unspecified). Without this the
+   select snaps from full-width to half-width the instant a paying fee type
+   reveals the money input — a visible reflow of a fixed-format control. */
+.fieldRow > .feeTypeGroup {
+	flex: 0 1 12rem;
+}
+
+/* Accessible field grouping (role="group" + aria-labelledby). Mirrors the
+   vertical rhythm of the direct form children it wraps so the layout is
+   visually identical. */
+.section {
+	display: flex;
+	flex-direction: column;
+	gap: 1rem;
+	border: 0;
+	margin: 0;
+	padding: 0;
+	min-inline-size: 0;
+}
+
+/* Money input: Montserrat with tabular figures per the accounting-number rule. */
+.moneyRow {
+	display: flex;
+	align-items: stretch;
+	border: 1px solid rgba(128, 128, 128, 0.35);
+	background-color: rgba(128, 128, 128, 0.06);
+}
+
+.moneyPrefix {
+	display: flex;
+	align-items: center;
+	padding: 0 0.625rem;
+	font-variant-numeric: tabular-nums;
+	font-size: 0.9375rem;
+	opacity: 0.7;
+	border-right: 1px solid rgba(128, 128, 128, 0.35);
+}
+
+.moneyInput {
+	font: inherit;
+	font-variant-numeric: tabular-nums;
+	font-size: 0.9375rem;
+	color: var(--th-color-text, inherit);
+	background: transparent;
+	border: 0;
+	border-radius: 0;
+	padding: 0.5rem 0.625rem;
+	width: 100%;
+	min-height: 44px;
+	box-sizing: border-box;
+}
+
+.moneyInput:focus-visible {
+	outline: 2px solid var(--th-color-primary, currentColor);
+	outline-offset: 1px;
+}
+
+.fieldHint {
+	font-size: 0.75rem;
+	opacity: 0.6;
+	margin: 0;
+}
+
+/* The stats line is assembled from lowercase clauses joined by "·" (any of
+   them may open it once the performer switch is off), so the sentence case
+   is presentation: the first letter, whichever clause it belongs to. */
+.statsLine::first-letter {
+	text-transform: uppercase;
+}
+
+/* ── Intent picker (Step 1 of the booking dialog) ──────────────────────────
+   A wrapping radiogroup. Selected = accent border + accent wash + ink label
+   (v2 .chip.on); the full accent fill stays with the submit button. */
+.intentGroup {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.5rem;
+}
+
+.intentOption {
+	font: inherit;
+	font-size: 0.75rem;
+	font-weight: 700;
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+	flex: 1 1 auto;
+	min-height: 44px;
+	padding: 0.5rem 0.875rem;
+	border: 2px solid rgba(128, 128, 128, 0.35);
+	border-radius: 0;
+	background-color: transparent;
+	color: var(--th-color-text, inherit);
+	cursor: pointer;
+	transition: border-color 0.15s, background-color 0.15s;
+}
+
+.intentOption:hover:not(:disabled) {
+	border-color: var(--th-color-primary, #B93312);
+}
+
+.intentOption[aria-checked="true"] {
+	border-color: var(--th-color-primary, #B93312);
+	background-color: color-mix(
+		in srgb,
+		var(--th-color-primary, #B93312) 12%,
+		transparent
+	);
+}
+
+.intentOption:focus-visible {
+	outline: 2px solid var(--th-color-primary, currentColor);
+	outline-offset: 2px;
+}
+
+.intentOption:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
+/* Rental rate — a price, so the mono label idiom (lg step: 13px / 0.4px). */
+.rateLine {
+	margin: 0;
+	font-family: var(--font-mono, ui-monospace, monospace);
+	font-size: 0.8125rem;
+	font-weight: 600;
+	letter-spacing: 0.4px;
+	font-variant-numeric: tabular-nums;
+	color: var(--th-color-text, inherit);
+}
+
+/* A field whose VALUE is fixed (the only calendar a venue offers). Printed at
+   the control's own size so it reads as the answer to its label, with no box
+   — a box would suggest something to edit. */
+.readOnlyValue {
+	margin: 0;
+	font-size: 0.9375rem;
+	font-weight: 600;
+	color: var(--th-color-text, inherit);
+}
+
+/* The calendar's rooms, read-only: a meta line, so the mono label idiom at
+   the md step (11.5px / 1.4px tracking). Not uppercased — these are names. */
+.roomsLine {
+	margin: 0;
+	font-family: var(--font-mono, ui-monospace, monospace);
+	font-size: 0.71875rem;
+	letter-spacing: 1.4px;
+	line-height: 1.5;
+	color: var(--th-color-text, inherit);
+	opacity: 0.75;
+	overflow-wrap: anywhere;
+}
+
+.input,
+.select,
+.textarea {
+	font: inherit;
+	font-size: 0.9375rem;
+	color: var(--th-color-text, inherit);
+	background-color: rgba(128, 128, 128, 0.06);
+	border: 1px solid rgba(128, 128, 128, 0.35);
+	border-radius: 0;
+	padding: 0.5rem 0.625rem;
+	width: 100%;
+	min-height: 44px;
+	box-sizing: border-box;
+}
+
+.textarea {
+	min-height: 7rem;
+	resize: vertical;
+	line-height: 1.5;
+}
+
+.input:focus-visible,
+.select:focus-visible,
+.textarea:focus-visible,
+.inlineButton:focus-visible,
+.submitRow button:focus-visible {
+	outline: 2px solid var(--th-color-primary, currentColor);
+	outline-offset: 1px;
+}
+
+.repeatRow {
+	display: flex;
+	gap: 0.5rem;
+	align-items: center;
+}
+
+.checkboxRow {
+	display: flex;
+	gap: 0.625rem;
+	align-items: flex-start;
+	cursor: pointer;
+	padding: 0.25rem 0;
+	min-height: 44px;
+}
+
+.checkbox {
+	flex-shrink: 0;
+	width: 1.125rem;
+	height: 1.125rem;
+	margin-top: 0.125rem;
+	accent-color: var(--th-color-primary, #E2481D);
+	cursor: pointer;
+}
+
+.checkbox:focus-visible {
+	outline: 2px solid var(--th-color-primary, currentColor);
+	outline-offset: 2px;
+}
+
+.checkboxText {
+	display: flex;
+	flex-direction: column;
+	gap: 0.25rem;
+	font-size: 0.875rem;
+	line-height: 1.4;
+	color: var(--th-color-text, inherit);
+}
+
+.repeatRow > .input {
+	flex: 1;
+	min-width: 0;
+}
+
+.inlineButton {
+	font: inherit;
+	font-size: 0.8125rem;
+	font-weight: 600;
+	color: var(--th-color-primary, var(--th-color-text, inherit));
+	background: none;
+	border: 1px solid rgba(128, 128, 128, 0.35);
+	border-radius: 0;
+	padding: 0.375rem 0.625rem;
+	min-height: 44px;
+	cursor: pointer;
+	width: fit-content;
+	transition: background-color 0.15s;
+}
+
+.inlineButton:hover {
+	background-color: rgba(128, 128, 128, 0.1);
+}
+
+.inlineButton:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
+.submitRow {
+	display: flex;
+	gap: 0.5rem;
+	flex-wrap: wrap;
+	align-items: center;
+}
+
+/* Submit CTA pending state (BookingSubmitButton). The spinner slot is always
+   reserved and both labels share one grid cell so the button never changes
+   width when the request goes out. */
+.submitSpinnerSlot {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 1rem;
+	height: 1rem;
+	flex: 0 0 auto;
+}
+
+.submitLabelStack {
+	display: inline-grid;
+}
+
+.submitLabelStack > span {
+	grid-area: 1 / 1;
+	white-space: nowrap;
+}
+
+.submitLabelHidden {
+	visibility: hidden;
+}
+
+.errorText {
+	margin: 0;
+	font-size: 0.8125rem;
+	font-weight: 600;
+	/* ds-color-ok: the entity-page theme exposes no danger/error var (only
+	   --th-color-primary/bg/text, set in EntityPageContent.tsx), so a fixed
+	   accessible red is intentional here — themed primaries could render
+	   errors invisible. Swap to var(--th-color-danger, #dc2626) if one lands. */
+	color: #dc2626;
+}
+
+.statusText {
+	margin: 0;
+	font-size: 0.875rem;
+	opacity: 0.75;
+}
+
+.successPanel {
+	display: flex;
+	flex-direction: column;
+	gap: 0.375rem;
+	margin-top: 0.75rem;
+	padding: 1rem;
+	border: 2px solid var(--th-color-primary, rgba(128, 128, 128, 0.45));
+	border-radius: 0;
+}
+
+.successTitle {
+	margin: 0;
+	font-size: 0.9375rem;
+	font-weight: 700;
+}
+
+.gateTitle {
+	margin: 0;
+	font-size: 0.875rem;
+	font-weight: 700;
+	text-transform: uppercase;
+	letter-spacing: 0.05em;
+}
+
+.gateBody {
+	margin: 0;
+	font-size: 0.875rem;
+	line-height: 1.5;
+	opacity: 0.8;
+}
+
+/* Inline text link inside the panel (success screen / sender-org gate) —
+   themed via the same custom properties as the rest of the form. */
+.panelLink {
+	color: var(--th-color-primary, inherit);
+	font-weight: 700;
+	text-decoration: underline;
+	text-underline-offset: 2px;
+}
+
+.panelLink:focus-visible {
+	outline: 2px solid var(--th-color-primary, currentColor);
+	outline-offset: 2px;
+}
+
+/* Stays a VIEWPORT query: `.repeatRow` renders in OrganizerBookingDialog,
+   a Modal portaled to <body>, outside the `entity-page` container. */
+@media (max-width: 480px) {
+	.repeatRow {
+		flex-wrap: wrap;
+	}
+}

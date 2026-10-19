@@ -29,8 +29,20 @@ COPY apps ./apps
 # Generate Prisma Client (into node_modules/.prisma/client).
 RUN pnpm -C packages/db run generate
 
-# Type-check (non-blocking — allows deploy even if workspace has stale errors).
-RUN pnpm --filter audio-transcoder... build || true
+# Typecheck. BLOCKING on purpose: `apps/**` is excluded from `pnpm typecheck`
+# (tsconfig.base.json) and the CI quality gate runs only lint + vitest, so this
+# is the ONLY typecheck any of these three apps gets. The emitted dist is
+# discarded — the runtime CMD is `node --import tsx src/index.ts` and the
+# workspace packages export raw `src/*.ts` — so this step is a pure typecheck
+# and failing it costs nothing but a red build.
+# It used to end in `|| true`, which made it a no-op: a TS2322 in
+# apps/api/src/routes/e2e.ts rode green all the way to prod (2026-09-11).
+# 8 GB heap: tsc OOMs on the default Node heap on a GitHub runner
+# (exit 134, "Ineffective mark-compacts near heap limit"). That was
+# happening under the old `|| true` too — the swallow hid a step that
+# had never once completed. Mirrors apps/web/Dockerfile, which hit the
+# same wall and sized it the same way (ubuntu-latest has 16 GB).
+RUN NODE_OPTIONS="--max-old-space-size=8192" pnpm --filter audio-transcoder... build
 
 # Produce a self-contained deploy bundle (app source + prod deps).
 # NOTE: `pnpm deploy --legacy` RE-RESOLVES dependency ranges from the registry

@@ -1,0 +1,142 @@
+# venue-booking-toggle-and-block.spec.yaml
+#
+# Phase 1 (unblocker): a verified venue opts in to receiving booking requests,
+# and the entity-page builder gains an interactive "Request to Play" block.
+
+version: "1.0"
+updated: "2026-06-05"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The entity-page builder already supports Place pages (PLACE_BLOCK_KINDS in
+    packages/core/src/use-cases/entity-pages/block-config.ts), but the only
+    booking-related block is `booking_info`, a static "how to book" copy block.
+    There is no way for a venue to signal "I accept booking requests" and no
+    interactive surface for a performer to actually send one. The BookingRequest
+    model exists (agreement.prisma) but nothing renders a form against it.
+  solution: >
+    Add a single `Place.acceptsBookingRequests` toggle (verified venues only)
+    and a new interactive `request_to_play` PLACE block. When the venue has the
+    toggle on, the block renders the booking-request form (wired in spec (c));
+    otherwise it renders nothing / an editor-only placeholder. This is the
+    smallest slice that makes the booking flow "just appear" on a venue page.
+  users:
+    - Venue owner (verified Place owner) — flips the toggle, adds the block
+    - Performer (Human/Org in performer mode) — sees the CTA on the venue page
+  surfaces:
+    - web (admin Place page builder + public /p/[slug] renderer)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Place gains `acceptsBookingRequests Boolean @default(false)`. Only a
+        Place owner whose Place.verification == VERIFIED may set it to true.
+        Un-verified places may toggle it but it has no public effect until
+        verified (defense in depth: the public block also checks verification).
+    - id: FR-002
+      description: >
+        Add `request_to_play` to PLACE_BLOCK_KINDS with a block-config schema
+        entry (blockObjectSchema), a default config, a registry entry in
+        apps/web/src/app/p/[slug]/_components/blocks/block-registry.ts, and a
+        label in DraggableBlockList.tsx. Mirrors how `booking_info` is wired.
+    - id: FR-003
+      description: >
+        The public `request_to_play` block renders the booking-request CTA only
+        when ALL are true: Place.acceptsBookingRequests, Place.verification ==
+        VERIFIED, and the viewer is in performer mode (spec (b)). Otherwise it is
+        hidden on the public page. In the editor it always shows as a labelled
+        placeholder so owners can position it.
+    - id: FR-004
+      description: >
+        The block's configurable fields are copy-only for v1: an optional
+        heading and intro text (e.g. "Pitch us your set"). The actual form +
+        submission belong to spec (c); this block just hosts the entry point.
+  non_functional:
+    - id: NFR-001
+      description: >
+        Additive and default-false. Existing Place pages and the `booking_info`
+        block are untouched. No backfill.
+    - id: NFR-002
+      description: >
+        The block-kinds parametrized tests (block-kinds.test.ts) must continue
+        to pass with the new kind included in the PLACE count assertions.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: set-place-booking-acceptance
+        description: >
+          Toggle Place.acceptsBookingRequests. Requires Place ownership (mirror
+          getPlaceForEdit / get-venue-calendar ownership check) and rejects
+          enabling on an unverified place with code "place_not_verified".
+        input: "{ placeId, actorHumanId, accepts: boolean }"
+        output: "{ acceptsBookingRequests: boolean }"
+        idempotent: true
+        money: false
+  ports:
+    new: []
+    existing:
+      - PlacesRepo (add acceptsBookingRequests to the update path)
+      - EntityPagesRepo (block CRUD already exists — manage-page-blocks)
+  adapters:
+    new: []
+    existing:
+      - packages/adapters/src/db/prisma/places.ts
+  transport:
+    trpc_procedures:
+      - places.setBookingAcceptance (or fold into existing place update mutation)
+    webhooks: []
+  ui:
+    pages:
+      - apps/web/src/app/admin/[slug]/places/[placeId]/page (existing builder — add block + toggle)
+    components:
+      - RequestToPlayBlock (public renderer + editor placeholder)
+      - A "Accept booking requests" switch in the Place settings/builder chrome
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models:
+    - "Place: + acceptsBookingRequests Boolean @default(false)"
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      A `request_to_play` block left on a page after the toggle is switched off
+      would dangle. Mitigation: public render is gated on the live toggle, so
+      it simply hides — the block config can stay.
+    severity: LOW
+    mitigation: Gate render on the toggle + verification, not on block presence.
+
+open_questions:
+  - Should the toggle live as a dedicated switch in Place settings, or as a field on the `request_to_play` block config itself? (Recommend Place-level so it gates the whole venue, not one block instance.)
+    Answer: Place-level toggle, for clarity and to avoid dangling blocks.
+  - Do we want a lead-time / blackout hint here (e.g. bookingLeadDays), or defer all availability logic to PlaceAvailability + spec (c)? (Recommend defer.)
+    Answer: Defer all availability logic to PlaceAvailability and spec (c).
+  - Should the block config include editable copy fields (e.g. heading, intro text),
+    Answer: A simple text field would be fine to add with it.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - The booking-request form, submission, inbox, and agreement flow (spec (c)).
+  - The performer-mode gate itself (spec (b)) — this spec only consumes it.
+  - PlaceAvailability-constrained date pickers.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A verified Place owner can flip acceptsBookingRequests on/off; an unverified place is rejected with place_not_verified when enabling.
+  - `request_to_play` is a first-class PLACE block addable in the builder and rendered by the public block registry.
+  - On a verified, opted-in venue page, a performer-mode viewer sees the CTA; a non-performer or non-opted-in viewer does not.
+  - block-kinds tests pass with the new kind; existing booking_info behaviour unchanged.

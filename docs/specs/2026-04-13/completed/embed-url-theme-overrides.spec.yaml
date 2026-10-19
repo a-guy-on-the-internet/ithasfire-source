@@ -1,0 +1,170 @@
+status: complete
+# embed-url-theme-overrides.spec.yaml
+#
+# Allow embed consumers to override theme tokens via URL parameters.
+
+version: "1.0"
+updated: "2026-04-13"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The embed widget uses a hardcoded light theme (embed-theme.ts) that may clash
+    with the host site's branding. Eventbrite solves this with `themeSettings`
+    in their SDK; Ithas Fire has no runtime theme customization for embeds. Embed
+    consumers must accept the default palette or request custom builds.
+  solution: >
+    Read optional URL query parameters on the embed page (`?brandColor=FF5721&bg=F5F5F5&fontColor=181818`)
+    and use them to override the corresponding embed-theme tokens at runtime.
+    The JS SDK can also pass these as `createWidget({ theme: { brandColor, bg, fontColor } })`
+    which appends them to the iframe src.
+  users:
+    - embed consumer (site owner wanting brand alignment)
+  surfaces:
+    - embed
+    - web (admin preview + snippet generation)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        The embed page reads the following optional query parameters and applies them
+        as CSS custom properties on the root embed container:
+        - `brandColor` → overrides BRAND_ORANGE (primary CTA color)
+        - `bg` → overrides SURFACE_OPAQUE and SURFACE_MUTED base
+        - `fontColor` → overrides TEXT
+        - `accentColor` → overrides STEEL_BLUE (secondary structural color)
+    - id: FR-002
+      description: >
+        Values are 6-character hex strings (without `#`). Invalid values (non-hex,
+        wrong length) are silently ignored and the default token is used.
+    - id: FR-003
+      description: >
+        Overrides are applied via CSS custom properties (`--th-brand`, `--th-bg`,
+        `--th-text`, `--th-accent`) set on the embed root `<div>`. Components
+        reference these properties with fallbacks to the hardcoded defaults.
+    - id: FR-004
+      description: >
+        The admin page preview applies theme overrides in real-time — a "Theme"
+        section with color pickers for brand, background, text, and accent colors.
+        Changes update the preview iframe's URL params and the generated snippet.
+    - id: FR-005
+      description: >
+        The JS SDK accepts a `theme` option:
+        `HF.createWidget({ ..., theme: { brandColor: "FF5721", bg: "FFFFFF" } })`.
+        The SDK appends these as query params to the iframe src.
+    - id: FR-006
+      description: >
+        The admin snippet generator includes theme params in the iframe URL when
+        the user has customized colors.
+    - id: FR-007
+      description: >
+        Derived colors (hover states, muted variants) are computed from the base
+        override. E.g., `brandColorHover` darkens `brandColor` by 12%.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Theme override parsing and application adds < 50ms to initial render.
+    - id: NFR-002
+      description: >
+        CSS custom properties are set once on mount; no per-render recalculation.
+    - id: NFR-003
+      description: >
+        Hex validation rejects any value containing characters outside [0-9a-fA-F]
+        or not exactly 6 characters. No XSS vector via color params.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases: []
+
+  ports:
+    new: []
+    existing: []
+
+  adapters:
+    new: []
+    existing: []
+
+  transport:
+    trpc_procedures: []
+    webhooks: []
+
+  ui:
+    components:
+      - name: useEmbedThemeOverrides (hook)
+        location: apps/web/src/app/embed/[embedId]/_components/useEmbedThemeOverrides.ts
+        description: >
+          Reads URL search params, validates hex values, computes derived colors
+          (hover, muted), and sets CSS custom properties on the embed root element.
+          Returns the resolved theme object for components that need programmatic access.
+      - name: embed-theme.ts (update)
+        location: apps/web/src/app/embed/[embedId]/_components/embed-theme.ts
+        description: >
+          Update shared style objects to reference CSS custom properties with
+          fallbacks: `var(--th-brand, #FF5721)` instead of hardcoded `#FF5721`.
+      - name: EmbedsView theme section (update)
+        location: apps/web/src/app/admin/[slug]/embeds/_components/EmbedsView.tsx
+        description: >
+          Add a "Theme" card below the preview with color pickers for brandColor,
+          bg, fontColor, accentColor. Changes update the preview iframe URL and
+          the generated snippet code in real-time.
+    pages: []
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models:
+    - model: Embed
+      note: >
+        Consider adding optional `themeConfig JSONB` field to persist theme
+        customizations per embed. This is optional for v1 — URL params work
+        without storage — but useful if consumers want saved defaults.
+  migrations_needed: false # Optional for v1, deferred to follow-up
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Embed consumers may set low-contrast color combinations (e.g., white text
+      on white background) making the widget unusable.
+    severity: LOW
+    mitigation: >
+      We cannot prevent all bad combinations, but we can add a contrast check
+      warning in the admin preview ("Low contrast detected").
+  - risk: >
+      CSS custom property approach requires touching every component's styles
+      to add `var()` fallbacks.
+    severity: MEDIUM
+    mitigation: >
+      The embed has a manageable number of components (~10). Migrate them
+      incrementally. Most share styles from embed-theme.ts, so the blast
+      radius is small.
+
+open_questions:
+  - Should we persist theme settings in the Embed model (new `themeConfig` JSONB column) or keep it purely URL-param based for v1?
+  - Should we support a `borderRadius` override for consumers who want sharper/rounder cards?
+  - Should dark mode be an option (e.g., `?theme=dark`) or do we only support individual token overrides?
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Full dark mode theme (would require a parallel set of tokens)
+  - Custom font override (web font loading in iframes has CORS/performance implications)
+  - Parent-to-iframe postMessage-based theme changes after initial load
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - Loading `/embed/abc?brandColor=3B82F6` renders all CTAs in blue (#3B82F6) instead of orange.
+  - Loading `/embed/abc?bg=1A1A2E&fontColor=FFFFFF` renders a dark-themed widget.
+  - Invalid params (e.g., `?brandColor=xyz`) are ignored and defaults are used.
+  - The admin theme preview updates the iframe in real-time as colors are picked.
+  - Generated snippets include theme params when colors have been customized.
+  - No XSS is possible via color parameters (only hex characters accepted).

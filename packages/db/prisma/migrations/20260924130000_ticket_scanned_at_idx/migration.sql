@@ -1,0 +1,25 @@
+-- Venue track record (docs/specs/2026-09-24/venue-track-record-and-review-switch,
+-- FR-008 / NFR-005 / R12): bare `scannedAt` index for the activity-driven
+-- "a ticket at this place was scanned since lastCalculatedAt" arm of
+-- PlaceStatsRepo.listStalePlaceIds.
+--
+-- The stale query ranges over the last STALE_WINDOW_DAYS of scans platform-
+-- wide and joins to Event for the place. Probing the existing
+-- Ticket(eventId, scannedAt) per event instead means visiting EVERY event a
+-- venue ever hosted — measured at 500 places / 10k events / 200k tickets the
+-- correlated forms cost ~7 µs per event however written (hash semi-join
+-- 118 ms, LATERAL 72 ms), i.e. they scale with total history; the range over
+-- recent activity is single-digit ms. NULL for never-scanned tickets, which a
+-- range predicate excludes for free.
+--
+-- `Ticket` is a hot table (issuance, door scans). A plain `CREATE INDEX`
+-- would take a SHARE lock and block writes for the build, so this is
+-- `CONCURRENTLY` — which cannot run inside a transaction, so this file is
+-- kept to a single statement so Prisma migrate can execute it without an
+-- implicit BEGIN/COMMIT (precedent: 20260425190038, 20260707120000).
+--
+-- `IF NOT EXISTS`: a CONCURRENTLY build that fails part-way leaves an
+-- INVALID index behind under this name, and a re-run then SKIPS it rather
+-- than rebuilding. If a deploy fails here, `DROP INDEX "Ticket_scannedAt_idx"`
+-- before retrying.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "Ticket_scannedAt_idx" ON "Ticket"("scannedAt");

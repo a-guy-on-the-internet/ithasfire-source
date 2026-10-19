@@ -1,0 +1,28 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   `[data-print-hide]` — the print layer's one GLOBAL primitive
+   ═══════════════════════════════════════════════════════════════════════════
+
+   Deliberately its own file, holding exactly one rule, so an ordinary app page
+   can opt an element out of paper WITHOUT pulling in the whole paper
+   stylesheet.
+
+   This is the ONE print rule that is safe to leave in the document forever, and
+   that is why it is the only one still in a stylesheet at all. Next does not
+   unload route stylesheets on client-side navigation, so a rule here outlives
+   its route — harmless for an OPT-IN attribute selector (it can only affect an
+   element that asked to be hidden), fatal for `@page` / `html` / bare-element
+   rules, which is why those moved into `PaperSheet`'s un-hoisted <style>.
+
+   Two consumers today:
+     - `PaperSheet` (via `print.css`), which wraps the screen-only toolbar in it;
+     - `OrderDetail`, whose "Print tickets" entry point is an app control that
+       has no business appearing if a buyer prints the order page itself.
+
+   The hours statement and the volunteer badge get it for free.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@media print {
+  [data-print-hide] {
+    display: none !important;
+  }
+}

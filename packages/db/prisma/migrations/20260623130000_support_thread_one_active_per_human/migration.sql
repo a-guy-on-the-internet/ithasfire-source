@@ -1,0 +1,17 @@
+-- DB backstop for the "one active support thread per human" rule
+-- (support-chat-widget.spec.yaml). The use-case pre-check in
+-- send-support-message (findActiveThreadByHuman -> conditional createThread)
+-- races under concurrency: two concurrent first messages from the same human
+-- (double-tap / two tabs / poll+send overlap) can both read "no active thread"
+-- and both create one, splitting the conversation across duplicate parallel
+-- OPEN threads.
+--
+-- This partial unique index makes the loser fail with P2002; send-support-message
+-- catches that, re-reads the now-existing active thread, and appends to it
+-- instead of failing. An "active" thread is OPEN or AWAITING_HUMAN — RESOLVED
+-- threads are excluded so a human can always start a fresh thread after their
+-- previous one is closed.
+--
+-- Partial indexes are not expressible in the Prisma schema — this index is
+-- SQL-only (noted on the SupportThread model in support.prisma).
+CREATE UNIQUE INDEX "support_thread_one_active_per_human_key" ON "support_thread"("human_id") WHERE status IN ('OPEN','AWAITING_HUMAN');

@@ -1,0 +1,193 @@
+status: complete
+# embed-modal-mode.spec.yaml
+#
+# Modal/popup embed mode — open the widget in a fullscreen overlay triggered by a button.
+
+version: "1.0"
+updated: "2026-04-13"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Inline iframes consume vertical space on the host page and can feel intrusive,
+    especially on mobile where a 600px+ iframe dominates the viewport. Many embed
+    consumers want a "Get Tickets" button that opens the checkout in a modal overlay,
+    taking zero space until the user interacts. Eventbrite supports this via
+    `modal: true` in their SDK.
+  solution: >
+    Add a `mode: "modal"` option to the JS SDK. When active, the SDK renders a
+    trigger element (button or custom element) and opens a fullscreen / near-fullscreen
+    overlay containing the embed iframe when clicked. The overlay includes a close
+    button, backdrop click-to-close, and Escape key dismissal.
+  users:
+    - embed consumer (site owner who prefers a button trigger over inline iframe)
+    - end user (ticket buyer)
+  surfaces:
+    - embed
+    - web (admin snippet generation)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        `HF.createWidget({ mode: "modal", ... })` renders a trigger button inside
+        the specified container instead of an iframe.
+    - id: FR-002
+      description: >
+        Clicking the trigger opens a fullscreen overlay (`position: fixed`,
+        `inset: 0`, `z-index: 999999`) with a centered iframe (max-width 520px,
+        100% height minus safe-area padding).
+    - id: FR-003
+      description: >
+        The overlay includes a visible close button (top-right X icon) and closes
+        on backdrop click or Escape key press.
+    - id: FR-004
+      description: >
+        When the overlay opens, `document.body` gains `overflow: hidden` to prevent
+        background scrolling. Restored on close.
+    - id: FR-005
+      description: >
+        The trigger button is styleable via SDK options: `triggerText` (default
+        "Get Tickets"), `triggerStyle` ("branded" | "outline" | "unstyled", default
+        "branded"). "branded" uses Ithas Fire orange; "outline" renders a bordered
+        button; "unstyled" renders a bare `<button>` for full CSS control.
+    - id: FR-006
+      description: >
+        The overlay includes a subtle entrance animation (fade + scale from 95%)
+        and exit animation (fade out). Total animation duration < 200ms.
+    - id: FR-007
+      description: >
+        On mobile viewports (< 640px), the overlay is truly fullscreen (no margin,
+        no rounded corners). On desktop, the overlay has 24px margin and 12px
+        border-radius.
+    - id: FR-008
+      description: >
+        The `hf:orderComplete` postMessage auto-closes the overlay after a brief
+        delay (1.5s) to let the confirmation screen display.
+    - id: FR-009
+      description: >
+        The iframe inside the modal still auto-resizes within the overlay bounds
+        (scrollable if content exceeds viewport height).
+    - id: FR-010
+      description: >
+        The admin page snippet for modal mode generates:
+        ```html
+        <script src=".../hf-embed.js"></script>
+        <div id="th-tickets"></div>
+        <script>
+          HF.createWidget({
+            embedId: "abc",
+            container: "#th-tickets",
+            mode: "modal",
+            triggerText: "Get Tickets"
+          });
+        </script>
+        ```
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        The modal overlay is accessible: focus is trapped within the overlay,
+        the close button is the first focusable element, Escape closes it,
+        and `aria-modal="true"` + `role="dialog"` are set.
+    - id: NFR-002
+      description: >
+        The overlay renders above all host page content regardless of stacking
+        context (z-index: 999999).
+    - id: NFR-003
+      description: >
+        Opening the modal lazy-loads the iframe (src is only set when the overlay
+        opens), avoiding hidden network requests on page load.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases: []
+
+  ports:
+    new: []
+    existing: []
+
+  adapters:
+    new: []
+    existing: []
+
+  transport:
+    trpc_procedures: []
+    webhooks: []
+
+  ui:
+    components:
+      - name: Modal logic in hf-embed.js
+        location: apps/web/public/embed/hf-embed.js (or SDK source)
+        description: >
+          The SDK's modal mode creates a `<div>` overlay with backdrop, positions
+          the iframe centrally, manages focus trap, and handles open/close lifecycle.
+          All DOM is created programmatically — no framework dependency.
+      - name: EmbedsView modal snippet
+        location: apps/web/src/app/admin/[slug]/embeds/_components/EmbedsView.tsx
+        description: >
+          Add a "Modal" variant to the snippet tabs showing the modal SDK init code.
+
+    pages: []
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Some CMS platforms (e.g., Wix) may restrict inline scripts from creating
+      fixed-position overlays or manipulating `document.body.style`.
+    severity: MEDIUM
+    mitigation: >
+      Test on major CMS platforms (WordPress, Squarespace, Wix) during QA.
+      Document known limitations in the CMS guides.
+  - risk: >
+      Overlay z-index may conflict with host page modals or sticky headers.
+    severity: LOW
+    mitigation: >
+      Use an extremely high z-index (999999). Document that the overlay sits
+      above all host content.
+  - risk: >
+      Mobile Safari has quirks with fixed positioning inside iframes and with
+      body scroll lock.
+    severity: MEDIUM
+    mitigation: >
+      Use the well-tested `position: fixed; inset: 0` pattern with
+      `-webkit-overflow-scrolling: touch` for the iframe container. Test on
+      iOS Safari specifically.
+
+open_questions:
+  - Should closing the modal mid-checkout warn the user ("You have items in your cart")? Yes
+  - Should the modal support a `modalTriggerElementId` option (like Eventbrite) to attach to an existing button on the page instead of rendering a new one? yeah
+  - Should we support a URL-based modal trigger (e.g., `#th-checkout`) for SEO-friendly deep linking? SEO FRIENDLY DEEP LINKING
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Inline embed mode (already exists)
+  - JS SDK infrastructure (see embed-js-sdk.spec.yaml)
+  - postMessage bridge (see embed-postmessage-autoresize.spec.yaml)
+  - Multiple concurrent modals from different widgets
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A "Get Tickets" button renders in the container when `mode: "modal"` is set.
+  - Clicking the button opens a fullscreen overlay with the embed iframe.
+  - The overlay closes on X click, backdrop click, or Escape key.
+  - Background scroll is locked while the overlay is open.
+  - Focus is trapped inside the overlay (tab cycles through close button and iframe).
+  - On mobile (< 640px), the overlay is edge-to-edge fullscreen.
+  - Completing a purchase auto-closes the overlay after the confirmation screen displays.
+  - The admin page offers a "Modal" snippet variant.

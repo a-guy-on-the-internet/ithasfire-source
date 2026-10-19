@@ -1,0 +1,252 @@
+# payouts-ledger-export.spec.yaml
+#
+# A payee downloads its whole payouts ledger as one CSV file.
+
+version: "1.0"
+updated: "2026-10-15"
+
+# ── Rulings (owner; full text in memory session_payouts_ledger_export.plan.md) ─
+# R0  "Yes, build an export ledger." (owner, 2026-10-14) — the feature exists.
+# R1  "I'm good with all your recommendations." (owner, 2026-10-15) — accepts
+#     revised round 1 Q1–Q10: CSV only; all time, no picker; no row cap, never
+#     truncate, paged read, a background job only if real payees make it slow;
+#     columns Date (UTC ISO), Type, Description, Order, Event (blank without an
+#     order), Amount, Change (signed, 0 for holds/reserves), Balance after,
+#     Available from, Currency; plain decimals via toMajorUnits; same gate as
+#     the ledger read; an audit row, non-blocking + reportError; "Download CSV"
+#     in the Ledger header and the "more not shown" line points at it; headers
+#     in the viewer's language; a failed balance walk fails the export ("try
+#     again"); every currency, with a running balance per currency.
+# Earlier rules that still bind: docs/pro-social.md ("a person's data ...
+# history ... made harder to export" is on the enshittification list, so no
+# cap that hides history); CLAUDE.md ReporterPort convention.
+#
+# Claude's calls (technical, or copy small enough to ship and overrule; round 2
+# with the Astra pass, 2026-10-15; the owner may overrule any):
+# C1  Running balance walks FORWARD from 0 per currency over the snapshot. The
+#     ledger opened at zero and the nightly drift sweep (`listRollupDrift`)
+#     defines the balance as the signed sum of entries, so no rollup read is
+#     needed. (cleared by Astra, checked by Claude)
+# C2  Type cells use the same translated labels as the Ledger table
+#     (LEDGER_ENTRY_LABEL_KEY). Description is the stored text, verbatim: it is
+#     the record, and it is not translatable without parsing it.
+# C3  Audit: entity "payee", entityId = payeeId, action "payee_ledger_export".
+#     Free strings, so no model and no migration. (cleared by Astra, checked)
+# C4  The server returns rows; the web app builds the file (translated
+#     headers need `t`) through a guarded serializer. Text cells take the
+#     formula guard; number cells are ours and pass through, so a negative
+#     Change stays a number.
+# C5  A person's own payee: the use case and the procedure accept it, and the
+#     button serves it too: /admin/<slug>/payouts renders the person-owned
+#     ledger (PayoutsView `isOrg` false) and sends no orgId. (Astra's "no
+#     personal ledger page" was wrong; corrected at build, 2026-10-15)
+# C6  An empty ledger: the button still shows; the file has the header row only.
+# C7  Filename: `ledger-<org slug>-<YYYY-MM-DD>.csv` (the viewer's local date).
+# C8  Numbers: "." decimal point, no thousands separator, fixed decimals (2, or
+#     0 for a zero-decimal currency), whatever the viewer's language. A
+#     comma-separated file cannot also use the comma as a decimal point.
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The Payouts page shows the ledger 5 rows at a time and stops paging at
+    1,000 rows ("more not shown"). An organiser who needs the whole history
+    for their books has no way to take it with them.
+  solution: >
+    A "Download CSV" button in the Ledger section header. One request reads
+    every entry the payee has, in every currency, up to a snapshot taken when
+    the request starts, and the browser saves it as a CSV with a running
+    balance per currency.
+  users:
+    - Organiser with finance access to an org (owner, admin, finance roles)
+    - A person who sells as themselves (same page, their own payee)
+  surfaces:
+    - web
+    - api
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Gate: identical to getPayeeStatement. With `orgId`, `canFinanceOrg`
+        must allow the actor, else FORBIDDEN before any ledger read. Without
+        `orgId`, the subject is the actor's own human payee; there is no input
+        that names another human.
+    - id: FR-002
+      description: >
+        Every ledger entry of the payee, in every currency, with no row cap and
+        no truncation. Rows come back oldest first, ordered by (createdAt, id).
+    - id: FR-003
+      description: >
+        Snapshot: at the start the use case reads the newest entry's
+        (createdAt, id) and walks with KEYSET paging: each page is
+        (createdAt, id) > the previous page's last row AND <= the cursor,
+        ascending. No offset. A row is never repeated. createdAt is stamped
+        at insert, not commit, so a write committed late with an earlier
+        createdAt is in the file only if it sorts ahead of the walk; behind
+        the walk it is left out and appears in the next export (review
+        round 1). An empty ledger gives zero rows and no cursor.
+    - id: FR-004
+      description: >
+        Change per row = `ledgerEntryBalanceDeltaCents` (_shared/ledger-entry-delta.ts),
+        with DISPUTE_RELEASE relations resolved the same way the statement
+        does (shared helper, not a copy). Balance after = running sum of
+        Change for that row's currency only, starting at 0.
+    - id: FR-005
+      description: >
+        Any failed read (a page, the dispute-debit lookup, the event lookup)
+        fails the whole export. No partial file. The UI says it could not
+        build the file and offers to try again.
+    - id: FR-006
+      description: >
+        Event column: event name from `orders.getEventAttributionByIds`,
+        batched (chunks of at most 500 order ids). Blank when the row has no
+        order, or the order has no event (membership, deleted event).
+    - id: FR-007
+      description: >
+        Columns, in order, headers translated (en + es): Date (UTC ISO 8601),
+        Type (translated label, C2), Description (stored), Order (order id or
+        blank), Event, Amount (positive, as stored), Change (signed), Balance
+        after, Available from (UTC ISO or blank), Currency (upper case).
+        Money cells: major units by integer-string arithmetic (same 0/2 decimal
+        split as `toMajorUnits`, no float division), formatted per C8.
+    - id: FR-008
+      description: >
+        Audit row after the rows are read (C3), data {orgId | null,
+        actorHumanId, rowCount, currencies}. A failed audit write does not
+        block the export: logger.error + guarded `deps.reportError`.
+    - id: FR-009
+      description: >
+        Web: "Download CSV" button in the Ledger section header on
+        /admin/<slug>/payouts, shown whenever the ledger section renders
+        (C6). While building, the button shows a busy state and cannot be
+        pressed twice. The "more not shown" line (payoutsLedgerMoreNotShown)
+        tells the reader the full history is in the download.
+    - id: FR-010
+      description: >
+        The serializer guards text cells against formula injection (leading
+        = + - @ tab CR → apostrophe prefix) and quotes cells holding a quote,
+        comma or line break. Number cells are never prefixed. UTF-8 BOM, as
+        `downloadCsv` already adds.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Page size 500 per `listEntries` call; no per-request statement timeout
+        beyond the adapter default. Measure on the largest real payee before
+        deciding on a background job (R1); `EXPORT_BACKGROUND_THRESHOLD`
+        (25,000, apps/web/src/lib/csv-export.ts) is the attendee/orders
+        precedent, not a ledger cutoff.
+    - id: NFR-002
+      description: >
+        No buyer data: entry descriptions are system strings, the Order column
+        is an id. The file is the payee's own money record.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: exportPayeeLedger
+        description: >
+          packages/core/src/use-cases/payouts/export-payee-ledger.ts. Gate,
+          snapshot, paged walk, delta + per-currency balance, event names,
+          audit. Deps: repos (payeeLedger, payees, orders, audit), authz
+          (canFinanceOrg), clock, logger?, reportError?.
+        input: actorHumanId, orgId?
+        output: >
+          { payeeId | null, asOf, rows: [{ id, type, description, orderId,
+          eventName, createdAt, availableAt, currency, amountCents,
+          changeCents, balanceAfterCents }] }
+        idempotent: true
+        money: true
+    shared:
+      - >
+        Move `resolveDisputeReleaseRelations` out of get-payee-statement.ts
+        into _shared/ so both use cases call one implementation.
+
+  ports:
+    new: []
+    existing:
+      - >
+        PayeeLedgerRepo.listEntries — ADD option `atOrBefore?: { createdAt:
+        Date; id: string }` and `order?: "asc" | "desc"` (default desc, so
+        every current caller is unchanged).
+      - PayeeLedgerRepo.listDebitsForDispute
+      - PayeesRepo.getBySubject
+      - OrdersRepo.getEventAttributionByIds
+      - AuditRepo.log
+
+  adapters:
+    new: []
+    existing:
+      - packages/adapters/src/db/prisma/payee-ledger.ts (listEntries: cursor bound + order)
+
+  transport:
+    trpc_procedures:
+      - payouts.exportLedger (MUTATION, authedProcedure, input = schema minus actorHumanId, optional). A mutation because it writes an audit row: a refetch or a cross-site GET must not re-run it (review round 1).
+    webhooks: []
+
+  ui:
+    pages: []
+    components:
+      - apps/web/src/app/admin/[slug]/payouts/_components/PayoutsView.tsx (Ledger header button)
+      - apps/web/src/app/admin/[slug]/payouts/_components/ledger-csv.ts (rows → CSV, guarded)
+      - apps/web/src/i18n/messages/{en,es}.ts (keys, additive only; packages/locale JSON untouched)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+  lifecycle: >
+    No new model. The export is a read; the audit row is an AuditLog row
+    with a new action string (append-only, as every audit row is).
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      A very large payee makes the single response slow or heavy in memory.
+    severity: MEDIUM
+    mitigation: >
+      Measure the largest real payee (row count) before release; move to a
+      background job only if it is slow (R1).
+  - risk: >
+      Rows of two currencies interleave; one accumulator would print plausible,
+      wrong balances.
+    severity: HIGH
+    mitigation: Test with interleaved currencies; one accumulator per currency.
+  - risk: >
+      Balance after in the file disagrees with the page headline if the rollup
+      has drifted.
+    severity: LOW
+    mitigation: >
+      The file follows the entries (the drift sweep's truth); drift is the
+      nightly sweep's alert to raise.
+
+open_questions: []
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Date range picker, PDF, XLSX (R1)
+  - Background job / emailed file (R1: only if measured slow)
+  - The formula guard missing from rowsToCsv in the attendee and orders exports (follow-up in the plan)
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A finance member downloads a file whose row count equals the payee's entry count, all currencies.
+  - A non-finance member gets FORBIDDEN and no audit row is written.
+  - Each currency's last Balance after equals that currency's ledger balance on a drift-free ledger.
+  - DISPUTE_HOLD, RESERVE_HOLD, RESERVE_RELEASE and a hold-release DISPUTE_RELEASE show Change 0.
+  - An entry written mid-export is absent and nothing is duplicated (test with a fake repo).
+  - A description starting with "=" is written with a leading apostrophe; a negative Change is not.
+  - A failed page read returns an error and the UI offers to try again; no file is saved.
+  - Headers appear in Spanish for a Spanish viewer.
+  - The button works at 320px with no horizontal overflow and no new console errors.

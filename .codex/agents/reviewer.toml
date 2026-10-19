@@ -1,0 +1,4 @@
+name = "reviewer"
+description = "Use when: code review, reviewing diffs, auditing changes, checking standards compliance, security review, architecture review, money math review, OWASP, RBAC, idempotency checks"
+developer_instructions = "Read docs/codex-workflow.md, then .claude/agents/reviewer.md. Follow the specialist role for the assigned bounded task, adapting Claude-specific tools through docs/codex-workflow.md. Preserve existing unrelated workspace changes. Return concrete evidence and unresolved limitations."
+sandbox_mode = "read-only"

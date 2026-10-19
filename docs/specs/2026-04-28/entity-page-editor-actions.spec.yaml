@@ -1,0 +1,102 @@
+# Not built yet (2026-10-08 docs consolidation): central reducer, typed action stream, debounced autosave, save-retry
+# entity-page-editor-actions.spec.yaml
+# Centralize page-editor mutations behind typed actions, reducer state, undo, and autosave.
+
+version: "1.0"
+updated: "2026-04-28"
+
+summary:
+  problem: >
+    Entity-page editing currently sends tRPC mutations directly from child components. That makes
+    undo/redo, debounced autosave, optimistic previews, and analytics difficult because there is no
+    single action stream.
+  solution: >
+    Introduce a local page-editor reducer with typed actions inspired by Puck's action pipeline.
+    UI children dispatch editor actions; a top-level effect persists dirty state through existing
+    entityPages mutations.
+  users:
+    - Page editors on web
+  surfaces:
+    - web
+    - core
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        PageEditorView owns a reducer state containing blocks, profile fields, theme fields, dirty
+        status, pending save status, and undo/redo stacks.
+    - id: FR-002
+      description: >
+        Block insert, remove, reorder, visibility toggle, and data update flow through typed actions.
+    - id: FR-003
+      description: >
+        Undo and redo are available by button and keyboard shortcut on web.
+    - id: FR-004
+      description: >
+        Dirty block state persists through existing entityPages.managePageBlocks without changing
+        transport input shapes in the first iteration.
+    - id: FR-005
+      description: >
+        Failed saves leave local state visible and show a retry affordance without losing edits.
+  non_functional:
+    - id: NFR-001
+      description: >
+        Reducer logic is tested as pure TypeScript and does not import Tamagui or tRPC.
+    - id: NFR-002
+      description: >
+        Autosave debounce avoids mutation spam during drag and text edits.
+
+architecture:
+  core:
+    use_cases: []
+  ports:
+    new: []
+    existing: []
+  adapters:
+    new: []
+    existing: []
+  transport:
+    trpc_procedures:
+      - entityPages.managePageBlocks (existing)
+      - entityPages.updatePage (existing)
+      - entityPages.updatePageTheme (existing)
+    webhooks: []
+  ui:
+    pages:
+      - apps/web/src/components/entity-pages/PageEditorView.tsx
+    components:
+      - apps/web/src/components/entity-pages/PageBlocksEditor.tsx
+      - apps/web/src/components/entity-pages/EditableBlock.tsx
+      - apps/web/src/components/entity-pages/BlockSettingsPanel.tsx
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+
+risks:
+  - risk: >
+      Reordering and editing can conflict if server data changes while local state is dirty.
+    severity: MEDIUM
+    mitigation: >
+      Keep first version single-user optimistic, invalidate/refetch after successful save, and show
+      retry on failure; collaborative conflict handling stays out of scope.
+  - risk: >
+      Autosave can obscure when changes are persisted.
+    severity: MEDIUM
+    mitigation: >
+      Expose clear Saved/Saving/Error status in the existing editor header.
+
+open_questions:
+  - Should undo history survive tab changes and route refreshes, or only the current session?
+
+out_of_scope:
+  - Multi-user collaborative editing.
+  - New database revision/history tables.
+  - Puck dependency adoption.
+
+acceptance_criteria:
+  - Reducer tests cover insert, remove, reorder, update, undo, redo, and failed-save retry state.
+  - Existing block editing behavior is preserved through the current tRPC procedures.
+  - Web build and typecheck pass.

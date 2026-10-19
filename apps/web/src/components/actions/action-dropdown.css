@@ -1,0 +1,101 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Shared action dropdown (calendar, directions, etc.)
+ *
+ * Swiss International Typographic Style: sharp corners, thick borders,
+ * high-contrast color inversion on hover.
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+.action-dropdown-menu {
+  z-index: 9999;
+  min-width: 200px;
+  padding: 6px 0;
+  background: color-mix(in srgb, var(--foreground, #211C16) 95%, transparent);
+  border-radius: 0;
+  border: 2px solid color-mix(in srgb, var(--background, #F6F0E4) 20%, transparent);
+  overflow: hidden;
+  /* Slide-up entrance */
+  animation: actionDropdownIn 120ms ease-out;
+}
+
+@keyframes actionDropdownIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .action-dropdown-menu {
+    animation: none;
+  }
+}
+
+.action-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 14px;
+  background: none;
+  border: none;
+  color: var(--background, #F6F0E4);
+  font-size: 13px;
+  font-weight: 700;
+  font-family: inherit;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  cursor: pointer;
+  text-align: left;
+  text-decoration: none;
+  transition: background 120ms ease-out, color 120ms ease-out;
+}
+
+.action-dropdown-item:hover {
+  background: color-mix(in srgb, var(--background, #F6F0E4) 15%, transparent);
+}
+
+.action-dropdown-item svg {
+  flex-shrink: 0;
+}
+
+/* ── Trigger button (inline toggle mode) ──────────────────────────────────── */
+
+.action-dropdown-trigger {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  /* Mobile tap-target floor — the 13px label + 10px padding rested at ~40px. */
+  min-height: 44px;
+  box-sizing: border-box;
+  background: var(--surface, #FDFAF3);
+  border: 2px solid var(--borderColor, #211C16);
+  border-radius: 0;
+  color: var(--color, #211C16);
+  font-size: 13px;
+  font-weight: 700;
+  font-family: inherit;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 120ms ease-out, border-color 120ms ease-out,
+    color 120ms ease-out;
+}
+
+.action-dropdown-trigger:hover {
+  border-color: var(--brandSecondary, #E2481D);
+  color: var(--accentText, #A8300F);
+}
+
+.action-dropdown-trigger[aria-expanded="true"] {
+  border-color: var(--brandSecondary, #E2481D);
+  color: var(--accentText, #A8300F);
+}
+
+.action-dropdown-trigger svg {
+  flex-shrink: 0;
+}

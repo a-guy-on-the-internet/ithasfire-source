@@ -1,0 +1,174 @@
+status: complete
+# embed-js-sdk.spec.yaml
+#
+# Lightweight JavaScript SDK for embedding Ithas Fire widgets on third-party sites.
+
+version: "1.0"
+updated: "2026-04-13"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Embedding the Ithas Fire widget currently requires manually writing an iframe tag
+    and (after the postMessage spec) a resize listener script. This is error-prone,
+    not developer-friendly, and lacks callbacks for checkout events. Competitors like
+    Eventbrite offer a JS SDK (`EBWidgets.createWidget()`) that abstracts all of this
+    into a single function call.
+  solution: >
+    Ship a small (~3KB gzipped) vanilla JS bundle (`hf-embed.js`) that exposes a
+    `HF.createWidget()` API. It creates the iframe, handles auto-resize via the
+    postMessage bridge, and surfaces lifecycle callbacks (onReady, onNavigate,
+    onOrderComplete). The admin page generates a copy-paste `<script>` + init snippet.
+  users:
+    - embed consumer (third-party developer or site builder)
+  surfaces:
+    - embed
+    - web (admin snippet generation)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        A static JS file served at `/embed/hf-embed.js` (or via CDN) that exposes
+        a global `HF` namespace with a `createWidget` method.
+    - id: FR-002
+      description: >
+        `HF.createWidget(options)` accepts: `embedId` (required), `container`
+        (string selector or DOM element, required), `mode` ("inline" | "modal",
+        default "inline"), `height` (initial height, default "auto"), `onReady`,
+        `onNavigate`, `onOrderComplete`, `onError` callbacks.
+    - id: FR-003
+      description: >
+        In `mode: "inline"`, the SDK creates an iframe inside the specified
+        container and auto-resizes it via the postMessage bridge.
+    - id: FR-004
+      description: >
+        In `mode: "modal"`, the SDK renders a trigger button (styled or unstyled)
+        and opens a fullscreen overlay containing the iframe when clicked 
+        (see embed-modal-mode.spec.yaml for overlay behavior).
+    - id: FR-005
+      description: >
+        The SDK listens for `hf:ready`, `hf:resize`, `hf:navigate`, and
+        `hf:orderComplete` messages and dispatches them to the corresponding
+        callbacks.
+    - id: FR-006
+      description: >
+        The SDK validates `event.origin` against the known Ithas Fire domain
+        before processing any postMessage.
+    - id: FR-007
+      description: >
+        Multiple widgets can coexist on the same page. Each `createWidget` call
+        returns a handle with `destroy()` to clean up listeners and DOM.
+    - id: FR-008
+      description: >
+        The admin page (EmbedsView.tsx) offers a "JS SDK" tab alongside the
+        existing HTML/React tabs, generating a copy-paste snippet like:
+        ```html
+        <script src="https://app.hearthfire.community/embed/hf-embed.js"></script>
+        <div id="hf-widget"></div>
+        <script>
+          HF.createWidget({ embedId: "abc", container: "#hf-widget" });
+        </script>
+        ```
+    - id: FR-009
+      description: >
+        The SDK includes a TypeScript declaration file (`hf-embed.d.ts`) published
+        alongside the JS bundle for consumers who use TS.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        The SDK bundle is < 3KB gzipped with zero runtime dependencies.
+    - id: NFR-002
+      description: >
+        The SDK works in all browsers supporting ES2017+ (Chrome 63+, Firefox 57+,
+        Safari 11+, Edge 79+).
+    - id: NFR-003
+      description: >
+        Loading the script is non-blocking (async/defer by default in the snippet).
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases: []
+
+  ports:
+    new: []
+    existing: []
+
+  adapters:
+    new: []
+    existing: []
+
+  transport:
+    trpc_procedures: []
+    webhooks: []
+
+  ui:
+    pages: []
+    components:
+      - name: hf-embed.js (SDK source)
+        location: apps/web/public/embed/hf-embed.js (or built from apps/web/src/embed-sdk/)
+        description: >
+          Vanilla JS SDK. Compiled from TypeScript with no framework deps.
+          Exports `HF.createWidget()`, `HF.version`. Handles iframe creation,
+          postMessage bridge, origin validation, and callback dispatch.
+      - name: hf-embed.d.ts
+        location: apps/web/public/embed/hf-embed.d.ts
+        description: >
+          TypeScript declarations for the SDK API.
+      - name: EmbedsView snippet tab (update)
+        location: apps/web/src/app/admin/[slug]/embeds/_components/EmbedsView.tsx
+        description: >
+          Add a third "JS SDK" tab to the snippets section, generating the
+          script + init code with syntax highlighting.
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Versioning — breaking changes to the SDK API require a migration path
+      for existing embed consumers.
+    severity: MEDIUM
+    mitigation: >
+      Include `HF.version` in the SDK. Use a versioned path (`/embed/v1/hf-embed.js`)
+      from day one so future versions can coexist.
+  - risk: >
+      CDN caching may serve stale SDK versions after deploys.
+    severity: LOW
+    mitigation: >
+      Use content-hash filenames or a `?v=` cache-buster in the admin snippet.
+
+open_questions:
+  - Should the SDK support passing theme overrides in `createWidget()` options (e.g., `theme: { brandColor, bg }`) in addition to URL params? Sure
+  - Should we offer an npm package (`@ithasfire/embed`) for framework integrations, or is the global script + React snippet sufficient for now? I feel the package would be nice to have eventually but isn't a blocker for the initial launch since the global script + React snippet covers most use cases.
+  - Should `onOrderComplete` include line items or just orderId + total? I think our process sums it for us doesn't it?
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Modal overlay UI (see embed-modal-mode.spec.yaml)
+  - postMessage bridge internals (see embed-postmessage-autoresize.spec.yaml)
+  - Server-side rendering of embeds
+  - Analytics / tracking pixel integration
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A `<script src="/embed/hf-embed.js">` tag + `HF.createWidget({ embedId, container })` renders a working embed.
+  - The iframe auto-resizes without the consumer writing any postMessage handling.
+  - `onOrderComplete` fires with orderId and totalCents after a successful purchase.
+  - `destroy()` removes the iframe and cleans up all event listeners.
+  - Admin page shows a "JS SDK" snippet tab with correct copy-paste code.
+  - Two widgets on the same page work independently without interference.

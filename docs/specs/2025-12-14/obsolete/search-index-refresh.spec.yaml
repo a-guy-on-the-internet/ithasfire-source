@@ -1,0 +1,55 @@
+# Spec: Search Index Refresh Job
+meta:
+  owner: search-platform
+  status: draft
+  reviewers:
+    - platform-eng
+    - product
+summary: |
+  Batch job that rebuilds external search indexes (Algolia/Elastic) from canonical Postgres
+  datasets to keep discovery experiences fresh without burdening transactional services.
+scope:
+  included:
+    - Materializing denormalized event/organizer/place documents.
+    - Pushing batches to Algolia indices (events, organizers, venues).
+    - Cleaning up stale records that no longer meet visibility criteria.
+  excluded:
+    - Instant updates triggered by single record changes (handled via webhooks).
+    - UI-level search behavior.
+execution:
+  orchestration: keda-cronjob
+  image: ghcr.io/ithasfire/jobs:search-latest
+  command: ["node", "dist/search/rebuild-index.js"]
+  schedule:
+    cron: "15 * * * *"  # hourly baseline; adjust as needed
+inputs:
+  postgres_views:
+    - search_events_view
+    - search_organizers_view
+    - search_places_view
+  search_provider:
+    service: algolia
+    api_keys:
+      - ALGOLIA_ADMIN_API_KEY
+      - ALGOLIA_APP_ID
+outputs:
+  metrics:
+    - search.index.documents_pushed
+    - search.index.documents_deleted
+    - search.index.duration_ms
+  logs:
+    - Batch summaries with offsets and success/failure counts.
+  artifacts:
+    - Snapshot of last payload stored under `search/indexes/{env}/{timestamp}.json.gz`
+failure_modes:
+  - name: algolia_rate_limit
+    mitigation: apply backoff, resume from last offset.
+  - name: payload_too_large
+    mitigation: shrink batch size, log error, alert search team.
+acceptance_criteria:
+  - 99% of eligible records available in search within 30 minutes of change.
+  - No stale documents (>24h) remain in index.
+  - Error retries succeed without manual intervention in >95% of cases.
+rollout_notes:
+  - Coordinate with marketing before deleting large swaths of records.
+  - Keep feature flag to disable pushes during major index migrations.

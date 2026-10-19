@@ -1,0 +1,74 @@
+# event-grid-filters.component.yaml
+meta:
+  goal: Define a composable EventGridFilters surface that exposes standard filter controls and syncs with EventGrid state.
+  files:
+    shared:
+      component: packages/ui/src/ui/tamagui/components/event-grid/EventGridFilters.tsx
+      hook: packages/ui/src/ui/tamagui/components/event-grid/use-event-grid-filters.ts
+      tests: packages/ui/src/ui/tamagui/components/__tests__/EventGridFilters.test.tsx
+      stories: packages/ui/src/ui/tamagui/components/EventGridFilters.stories.tsx
+  exports:
+    - EventGridFilters
+    - useEventGridFilters
+    - EVENT_FILTER_KEYS
+  dependencies:
+    - @th/ui Text, Button, Input, Checkbox, Radio primitives
+    - Date picker component (verify availability; fallback to input[type=date] on web)
+props:
+  required:
+    - state: EventGridFilterState
+    - onChange: (next: EventGridFilterState) => void
+  optional:
+    - variant?: "inline" | "sheet" | "popover" (default inline)
+    - showSearch?: boolean (default true)
+    - availableCategories?: FilterOption[]
+    - availableVenues?: FilterOption[]
+    - availableOrganizers?: FilterOption[]
+    - dateLimits?: { min?: string; max?: string }
+    - priceRange?: { min?: number; max?: number; step?: number }
+    - align?: "start" | "center" | "end"
+    - testIdBase?: string (default "event-grid-filters")
+    - qaId?: string
+layout:
+  - Inline variant renders horizontal chip row with collapsible advanced filters on smaller breakpoints.
+  - Popover variant uses `Popover` primitive with trigger button showing active filter count.
+  - Sheet variant for mobile leverages `NavigationDrawer` / bottom sheet pattern (phase 2) but defaults to modal.
+  - Controls include:
+      - Search input (text) for title lookup.
+      - Date range picker (start/end).
+      - Category multi-select (checkbox group).
+      - Venue multi-select.
+      - Organizer multi-select.
+      - Price range slider or dual number inputs (subject to available component).
+  - Active filter chips displayed with clear/remove buttons.
+interactions:
+  - Changing any control triggers `onChange` with normalized state; debounce search input (250ms) before emit.
+  - "Clear all" resets to defaults and announces change.
+  - Keyboard accessible: Tab order flows logically, ESC closes popover/sheet.
+  - On mobile sheet/inline, scrollable body to host larger option lists.
+states:
+  - collapsed (default on mobile) vs expanded.
+  - disabled (when parent grid loading) dims controls.
+  - active filters summary: show count badge and list of active filter labels.
+a11y:
+  - Provide `aria-controls` linking to grid container when possible.
+  - Use `role="form"` semantics with labelled sections.
+  - Checkboxes and radios labelled via `Text` components; ensure focus management inside popovers.
+rendering:
+  - Compose using Tamagui `XStack`/`YStack`, `ScrollView` for overflow lists.
+  - Use theme tokens for spacing; ensure filter chips wrap gracefully.
+quality:
+  - Controlled state only; parent must own data fetch.
+  - Provide helper `useEventGridFilters` to manage reducer + defaults.
+  - Include analytics hook stub (emit `onAnalyticsEvent` optional) for future instrumentation.
+tests:
+  - Controlled state updates with each filter control change.
+  - Debounced search input using fake timers.
+  - Clear all resets state.
+  - Accessibility snapshot verifying aria labels, roles, popover attributes.
+non_goals:
+  - Server-driven option lists (parent provides options).
+  - Persisting filter selections across sessions (leave to caller).
+implementation_notes:
+  - Derive `FilterOption` type: { id: string; label: string; count?: number }.
+  - Provide utility to derive active chip labels from state for reuse in grid header.

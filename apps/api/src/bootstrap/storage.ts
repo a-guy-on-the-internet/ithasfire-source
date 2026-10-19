@@ -30,6 +30,17 @@ export const createS3FileStorage = (
     publicBaseUrl: env.S3_PUBLIC_BASE_URL,
     defaultPublic: env.S3_PUBLIC_READ === "true",
     logger,
+    // Tighter than the adapter's 120 s defaults so a request that holds an
+    // image strip slot (head + read + write, each bounded here) ends inside
+    // Cloud Run's 300 s request limit: 45 + 45 + 45 = 135 s. `requestMs`
+    // matches the deadlines because on handler 4.4 it caps each PUT attempt,
+    // upload included (25 MB in 45 s is ~570 KB/s). Jobs and the transcoder
+    // keep the defaults.
+    timeouts: {
+      readDeadlineMs: 45_000,
+      writeDeadlineMs: 45_000,
+      requestMs: 45_000,
+    },
   });
 
 export const registerFileStorage = <T extends AppWithPorts>(

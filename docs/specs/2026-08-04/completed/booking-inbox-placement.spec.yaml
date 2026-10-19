@@ -1,0 +1,516 @@
+# booking-inbox-placement.spec.yaml
+#
+# Placement-only refactor: the org's incoming booking-request inbox moves out
+# of org settings into the EXISTING /admin/[slug]/bookings surface, which
+# becomes the one first-class "Bookings" destination; booking CONFIGURATION
+# (performer switches, booking defaults) stays in settings. Plus the open-count
+# endpoint that the admin-nav-regroup badges were deferred for.
+#
+# REALITY CHECK ENCODED UP FRONT — the codebase is further along than the
+# request assumes, and this spec builds on what exists instead of re-creating
+# it:
+#
+#   1. "Getting booked" is NOT a tail on one long settings page. Org settings
+#      is one-route-per-section (settings/[section]/page.tsx over
+#      ORG_SETTINGS_SECTION_SLUGS, org-settings-routes.ts:21-30) and "Getting
+#      booked" is a settings NAV GROUP (group id "booking",
+#      org-settings-sections.tsx:124-147; label admin.settingsGroupBooking =
+#      "Getting booked", i18n/messages/en.ts:2462) holding three rail
+#      destinations: `performer` (OrgPerformerSection.tsx:42-71 — the
+#      PerformerModeToggle + BookingAcceptanceToggle pair), `booking-defaults`
+#      (OrgBookingDefaultsSection.tsx:37-43, wrapping the shared
+#      BookingDefaultsEditor), and `booking-requests`
+#      (OrgBookingRequestsSection.tsx:20-35, wrapping the shared
+#      ReceivedBookingRequestsList with scope "performer-inbox").
+#   2. A first-class org-level "Bookings" admin nav item ALREADY EXISTS
+#      (admin-nav-sections.tsx:86-94, route "bookings", HeartHandshake,
+#      ORG_NON_SCANNER) rendering BookingsHub
+#      (bookings/_components/BookingsHub.tsx): the org's SENT requests to acts
+#      (scope "organizer", :53-56), links to per-place venue inboxes with
+#      open-count badges derived from up to 12 full client-side list queries
+#      (:35, :75-86), and a pointer to performer settings (:324-344). What the
+#      hub does NOT contain is the org's RECEIVED-as-act inbox — that still
+#      lives in settings. This spec does not create the nav item; it makes the
+#      existing destination the inbox's real home.
+#   3. No count endpoint exists — confirmed. The bookingRequests router
+#      (packages/transport/trpc/src/routers/booking-requests.ts:101-466)
+#      exposes create/createToPerformer/list/markViewed/claim/resendInvite/
+#      listMySenders/respond/withdraw and nothing count-shaped; BookingsHub
+#      fakes counts by fetching full lists. NavigationItem.badgeCount is
+#      already rendered by the rail (packages/ui/src/ui/types/navigation.ts:28;
+#      NavigationRail.tsx:878-879, 1001-1002) but nothing feeds it.
+#   4. DELIBERATE REVERSAL, stated: org-settings-sections.tsx:12-15 encodes a
+#      "HARD PRODUCT RULE" that org booking defaults AND "the org's
+#      received-request inbox" live on the settings page. This spec keeps the
+#      rule for CONFIG and reverses it for the INBOX: an inbox is a work
+#      queue with daily traffic, not configuration, and it belongs beside
+#      Events/Places/Orders, not behind a settings rail. The comment (and
+#      OrgBookingRequestsSection's "why this is its own rail destination"
+#      rationale) must be rewritten, not just contradicted.
+#
+# COORDINATION FLAG: admin-nav-sections.tsx and AdminShell.tsx are BOTH
+# dirty in the working tree from a concurrent session (git status at spec
+# time). Every nav-touching FR here (FR-006, FR-007) must be sequenced with —
+# or rebased onto — that in-flight change; do not land blind edits to those
+# two files.
+
+version: "1.0"
+updated: "2026-08-04"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Reviewing an incoming booking request — an act asking one of the org's
+    venues for a slot, or an organizer asking THIS org (as an act) to play —
+    is scattered across two homes with opposite prominence. Venue-directed
+    requests have a proper inbox (DataTable, tabs, accept/decline) but it is
+    buried one place deep at /admin/[slug]/places/[placeId]/bookings, reached
+    from the Bookings hub via link-out cards; requests to the org AS AN ACT
+    are buried in org settings ("Getting booked" › "Booking requests"), where
+    a daily work queue sits behind a configuration rail nobody re-visits.
+    Meanwhile the admin rail's existing Bookings item carries no signal — the
+    nav-regroup count badges were deferred because no count endpoint exists,
+    and the hub's stand-in (a capped fan-out of full list queries) can neither
+    feed the rail nor scale.
+  solution: >
+    Commit to one split: CONFIG STAYS IN SETTINGS, THE INBOX MOVES TO
+    BOOKINGS. The "Getting booked" settings group keeps the performer
+    switches and booking defaults (org configuration, per the standing
+    settings rule) and loses the `booking-requests` section. The existing
+    /admin/[slug]/bookings route is rebuilt from a link-out hub into the
+    org-level Bookings workspace: a "Requests to you" tab (the org-as-act
+    inbox, upgraded to the BookingInbox DataTable pattern), a "Sent to acts"
+    tab (the hub's existing organizer-scope list), and a "Venue inboxes"
+    section that keeps per-place inboxes canonical and links to them —
+    org-level does NOT aggregate venue rows, because the data model scopes
+    venue reads by placeId with place-level authz and the place inbox already
+    owns the respond flow. A new bookingRequests.countOpen procedure returns
+    all open counts in one call, powering the hub badges and — coordinated
+    with the in-flight nav session — a rail badge on Bookings. The old
+    settings URL redirects.
+  users:
+    - Org OWNER/ADMIN/EDITOR reviewing and answering incoming requests
+    - Org members (VIEWER and up) checking booking state read-only
+    - Acts and organizers whose requests get answered faster
+  surfaces:
+    - web
+    - api
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        PLACEMENT DECISION (config): the org booking configuration stays in
+        org settings, unmoved. "Getting booked" keeps `performer`
+        (PerformerModeToggle + BookingAcceptanceToggle,
+        OrgPerformerSection.tsx:42-71) and `booking-defaults`
+        (OrgBookingDefaultsSection wrapping BookingDefaultsEditor). Nothing
+        moves to the entity-page editor: that surface
+        (apps/web/src/components/entity-pages/ — PageBlocksEditor and
+        friends) is an in-flight, partly-uncommitted direction and it edits
+        PUBLIC PAGE CONTENT, not private operational config; parking
+        availability/rates there would put org settings behind a page editor.
+        Embed configuration likewise stays at /admin/[slug]/embeds. This FR
+        is a no-op in code except comment updates mandated by FR-004.
+    - id: FR-002
+      description: >
+        PLACEMENT DECISION (inbox): /admin/[slug]/bookings becomes the
+        org-level Bookings workspace, restructured into tabs — "Requests to
+        you" (default when any open request exists), "Sent to acts", plus the
+        venue-inboxes block. The route id, path, nav item, and
+        ORG_NON_SCANNER view gate are all unchanged (admin-nav-sections.tsx:
+        86-94); respond/withdraw stay server-gated to ORG_EDIT_ROLES inside
+        the use cases exactly as today. The human-admin-context fallback
+        (BookingsHub.tsx:133-148 — pointer to /account/settings) is retained:
+        personal performer surfaces stay in account settings.
+    - id: FR-003
+      description: >
+        The "Requests to you" tab renders the org-as-act inbox (list scope
+        "performer-inbox", performerOwnerType "org" — the exact query
+        OrgBookingRequestsSection mounts today) using the BookingInbox
+        DataTable pattern (places/[placeId]/bookings/_components/
+        BookingInbox.tsx): DataTable columns (sender/org, event or dates,
+        fee, status, received), open/all filter, expand-to-detail with
+        mark-viewed on expand, accept/decline with decline-reason,
+        renderMobileCard for <600px, and the accessible tab wiring. Feature
+        behaviour is PARITY with ReceivedBookingRequestsList — same
+        mutations (markViewed, respond), same open-status set
+        (OPEN_BOOKING_STATUSES), same agreement link on accepted rows — only
+        the presentation and placement change. Column set is adapted to
+        TO_PERFORMER rows (organizerOrgName + attachedEventTitle/StartsAt
+        from bookingRequestSummarySchema, list-booking-requests.ts:53-66)
+        rather than copied blind from the venue table.
+    - id: FR-004
+      description: >
+        Org settings loses the inbox: remove "booking-requests" from
+        ORG_SETTINGS_SECTION_SLUGS (org-settings-routes.ts:21-30), from the
+        entitlement/nav build (org-settings-sections.tsx:131-141), and from
+        the OrgSettingsView switch (OrgSettingsView.tsx:67-68); delete
+        OrgBookingRequestsSection. ReceivedBookingRequestsList itself
+        SURVIVES — the account-settings human performer inbox still mounts
+        it. Rewrite the now-false comments: the "HARD PRODUCT RULE" block
+        (org-settings-sections.tsx:12-15) narrows to configuration, and
+        OrgPerformerSection.tsx:13-18's route pointer is updated. The
+        settings group label "Getting booked" stays accurate for what
+        remains (switches + defaults).
+    - id: FR-005
+      description: >
+        Redirects — the old URL keeps working. /admin/[slug]/settings/
+        booking-requests issues a server-side redirect to
+        /admin/[slug]/bookings. NOT via the unknown-slug fallback (which
+        lands on the settings index, org-settings-routes.ts:17-19 contract):
+        the [section]/page.tsx guard gets an explicit legacy-redirect map
+        checked before slug validation, so the intent is stated and testable.
+        In-app links audited: the only non-test producers of the slug are the
+        settings nav itself and the route vocabulary (grep at spec time);
+        BookingsHub's settings pointer (BookingsHub.tsx:324-344) already
+        targets `performer` and keeps working.
+    - id: FR-006
+      description: >
+        COUNT ENDPOINT (the deferred-badge unblock): new query
+        bookingRequests.countOpen over a new core use case
+        count-open-booking-requests. Input: { orgId }. Output: {
+        performerInbox: number, venues: [{ placeId: string, openCount:
+        number }] } — open = status in PENDING|VIEWED. Authz mirrors the
+        list scopes it summarizes: requireOrgMembership(ORG_ANY_ROLE) for
+        the org, venues limited to org-owned places (the
+        requirePlaceOwnership relation, list-booking-requests.ts:355). Repo
+        gains COUNT-shaped queries (groupBy placeId / count where) — the
+        endpoint must not be implemented by mapping full list results.
+        BookingsHub's VENUE_COUNT_QUERY_CAP fan-out (BookingsHub.tsx:35,
+        75-86) is deleted in favour of one countOpen call, which also
+        removes the ">12 venues get no badge" hole.
+    - id: FR-007
+      description: >
+        Nav badge: the admin rail's Bookings item shows badgeCount =
+        performerInbox + sum(venues.openCount) when > 0. ADMIN_SECTIONS is a
+        static const, so AdminShell (its only runtime consumer besides
+        AdminPageHeader/layout) injects the count at render time from a
+        countOpen query — capped display ("99+") and silent-on-error (a
+        failed count never blocks the rail; meta.silent, no toast).
+        SEQUENCING: AdminShell.tsx and admin-nav-sections.tsx are being
+        edited by a concurrent session — this FR lands LAST, rebased onto
+        that work, and is severable if the conflict is awkward (the page
+        itself is complete without the rail badge).
+    - id: FR-008
+      description: >
+        i18n: new keys (tab labels, empty states, badge aria-label) land in
+        BOTH catalogs (packages json base + app en.ts/es.ts overrides — the
+        dual-catalog rule; a missing key renders raw). Existing bkRcv* /
+        bkHub* / bkInbox* keys are reused where copy is unchanged; keys
+        orphaned by the settings-section removal (settingsBookingRequests,
+        bkRcvSectionTitle/Desc if unused after the move) are removed from
+        both catalogs, not left to rot.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        ZERO regression to the public booking surfaces. The performer-facing
+        request form, the embed widget (/embed/book/[embedId]), and every
+        bookingRequests mutation path (create, createToPerformer, respond,
+        claim, resendInvite, withdraw) are untouched — this is placement
+        only. The venue place-scoped inbox route keeps its URL and
+        behaviour. Existing router/use-case tests must pass unmodified.
+    - id: NFR-002
+      description: >
+        Nav coordination is an explicit gate, not a hope: before touching
+        admin-nav-sections.tsx or AdminShell.tsx, diff against the
+        concurrent session's state and rebase; AdminShell.test.tsx and
+        admin-nav-sections.test.tsx pins (e.g. the no-children-on-settings
+        pin, admin-nav-sections.tsx:229-239) must be preserved.
+    - id: NFR-003
+      description: >
+        countOpen is cheap and cacheable: COUNT/groupBy queries only, one
+        round trip per surface, staleTime aligned with the hub's existing
+        15-30s windows. It is a read-only summary — no viewedAt writes, no
+        side effects.
+    - id: NFR-004
+      description: >
+        Any new catch-and-fallback branch (e.g. badge count fetch failing
+        soft) follows the ReporterPort convention — deliberate swallows
+        declare reportError?: ReporterPort and report; never a bare
+        logger.warn (CLAUDE.md, the Jun 2026 outage lesson). The corrupt-row
+        swallow already inside listBookingRequests keeps its existing
+        reporting.
+    - id: NFR-005
+      description: >
+        A11y/responsive parity with the venue inbox: roving-tabindex tab
+        strip, tabpanel labelling, 44px touch targets, DataTable mobile card
+        mode at <600px, zero horizontal overflow at 320px. Run-it QA (step
+        8) is mandatory: drive /admin/[slug]/bookings and the redirect in
+        the real app; green unit tests are not evidence the page works.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: count-open-booking-requests
+        description: >
+          Open-request counts for an org: performer-inbox count (TO_PERFORMER
+          rows addressed to the org as act) + per-owned-place venue counts
+          (TO_VENUE). New file in
+          packages/core/src/use-cases/booking-requests/.
+        input: actorHumanId, orgId
+        output: "{ performerInbox, venues: [{ placeId, openCount }] }"
+        idempotent: true
+        money: false
+        authz: requireOrgMembership(ORG_ANY_ROLE); places restricted to org-owned
+      - name: list-booking-requests (UNCHANGED)
+        description: >
+          All four scopes stay as-is (venue | performer | organizer |
+          performer-inbox, list-booking-requests.ts:131). No aggregation
+          scope is added — the org-level venue view stays link-out (see
+          risks).
+      - name: respond-to-booking-request / mark-booking-request-viewed (UNCHANGED)
+        description: Reused by the moved inbox tab with identical inputs.
+
+  ports:
+    new: []
+    existing:
+      - BookingRequestsRepo — gains countOpenForPerformerOwner and
+        countOpenByPlaceForOrg (COUNT queries; port lives with the existing
+        listForPerformer/list* finders)
+      - ReporterPort (NFR-004)
+
+  adapters:
+    new: []
+    existing:
+      - packages/adapters prisma booking-requests repo — implements the two
+        count queries (count / groupBy on status in PENDING,VIEWED)
+
+  transport:
+    trpc_procedures:
+      - bookingRequests.countOpen (authed query; router
+        packages/transport/trpc/src/routers/booking-requests.ts)
+    webhooks: []
+
+  ui:
+    pages:
+      - apps/web/src/app/admin/[slug]/bookings/page.tsx (existing route —
+        renders the restructured workspace)
+      - apps/web/src/app/admin/[slug]/settings/[section]/page.tsx (legacy
+        redirect for "booking-requests")
+    components:
+      # Quoted: the bare "tabs: " inside this scalar made YAML read it as an
+      # implicit map key, so this file never parsed. Nothing consumes specs
+      # programmatically today, but a .spec.yaml should be valid YAML.
+      - "BookingsWorkspace (rebuilt BookingsHub — tabs: Requests to you /
+        Sent to acts; venue-inboxes block; human-context fallback retained)"
+      - OrgReceivedRequestsTable (new — performer-inbox scope on the
+        BookingInbox DataTable pattern; shares accept/decline/mark-viewed
+        flow helpers with ReceivedBookingRequestsList where extraction is
+        cheap, but taste-level layout follows BookingInbox)
+      - BookingInbox (UNCHANGED — canonical per-place venue inbox)
+      - ReceivedBookingRequestsList (retained for account settings only)
+      - OrgBookingRequestsSection (DELETED)
+      - org-settings-sections.tsx / org-settings-routes.ts /
+        OrgSettingsView.tsx (section removal + comment rewrite)
+      - admin-nav-sections.tsx / AdminShell.tsx (badge wiring — COORDINATE,
+        FR-007/NFR-002)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  new_enums: []
+  modified_models: []
+  migrations_needed: false
+  migration_notes: >
+    None. Placement-only: no schema change; open-count queries run on
+    existing BookingRequest columns (status, placeId, performerOwnerType/Id,
+    direction — agreement.prisma:65+, enums.prisma:26-44). Existing indexes
+    on the list paths are expected to cover the counts; verify with EXPLAIN
+    before adding any.
+
+# ── Build Order ──────────────────────────────────────────────────────────────
+#
+# Severable steps, reviewed per the dev loop; 6 lands last on purpose.
+
+build_order:
+  - step: 1
+    what: >
+      Core + port + adapter: count-open-booking-requests, repo count
+      queries, unit + adapter tests.
+  - step: 2
+    what: >
+      Transport: bookingRequests.countOpen procedure + router test.
+  - step: 3
+    what: >
+      Bookings workspace rebuild: tabs, OrgReceivedRequestsTable
+      (performer-inbox on the DataTable pattern), venue block switched from
+      list fan-out to countOpen. Component tests + BookingsHub test update.
+  - step: 4
+    what: >
+      Settings removal + redirect: slug removal, section deletion, legacy
+      redirect map, comment rewrites, org-settings-sections tests.
+  - step: 5
+    what: >
+      i18n both catalogs; orphaned-key sweep.
+  - step: 6
+    what: >
+      Nav badge (FR-007) — rebased onto the concurrent nav session's landed
+      state. Skippable without blocking 1-5.
+  - step: 7
+    what: >
+      Run it: live-stack drive of /admin/[slug]/bookings (both tabs, accept +
+      decline, mark-viewed), the settings redirect, account-settings human
+      inbox unchanged, 320px pass, zero new console errors.
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Colliding edits to admin-nav-sections.tsx / AdminShell.tsx with the
+      concurrent session — silent clobber or duplicated nav entries.
+    severity: HIGH
+    mitigation: >
+      NFR-002 gate + FR-007 sequenced last and severable; rebase-and-diff
+      before any nav commit; nav pin tests must pass.
+  - risk: >
+      The settings "hard product rule" comment keeps getting cited and the
+      inbox drifts back into settings in a future change.
+    severity: MEDIUM
+    mitigation: >
+      FR-004 rewrites the rule at its source to "configuration lives here;
+      work queues live in Bookings", and the org-settings-sections test
+      asserts booking-requests is no longer a section.
+  - risk: >
+      Feature drift during the "parity" rebuild of the received tab —
+      accept/decline semantics quietly diverging from
+      ReceivedBookingRequestsList (e.g. anonymous-claim affordances that
+      only exist on TO_VENUE rows leaking in, or the withdraw action
+      appearing on received rows).
+    severity: MEDIUM
+    mitigation: >
+      FR-003 pins parity to the existing mutations and the TO_PERFORMER
+      summary fields; acceptance criteria below exercise both actions; the
+      venue inbox's TO_VENUE-only affordances (invite-to-claim, resend) are
+      explicitly not part of the received tab.
+  - risk: >
+      Org-level users expect venue rows IN the org inbox and judge the tabbed
+      page "still not an inbox" for multi-venue orgs.
+    severity: MEDIUM
+    mitigation: >
+      Deliberate data-model-grounded call (scope "venue" is placeId-keyed
+      with place-level authz; aggregation would need a new cross-place scope
+      and duplicate the respond surface). The venue block now carries live
+      counts, so triage-at-a-glance works from the org page. Revisit with an
+      aggregate read scope only if real usage shows venue-heavy orgs living
+      in the org tab — recorded as the follow-up path, not built now.
+  - risk: >
+      countOpen and the list views disagree (e.g. EXPIRED rows counted, or
+      expiry lag) making badges look wrong.
+    severity: LOW
+    mitigation: >
+      One shared open-status definition (OPEN_BOOKING_STATUSES /
+      PENDING+VIEWED) imported by both paths; acceptance criterion compares
+      endpoint counts against list results in a seeded state.
+
+# All three were RESOLVED at build time (2026-08-10). Kept with their answers
+# rather than deleted, so the next reader inherits the decision instead of
+# re-litigating it.
+open_questions:
+  - >
+      RESOLVED — YES. Should the venue-inboxes block collapse for orgs with
+      zero owned places (pure act orgs), promoting "Requests to you" to the
+      whole page? Built that way: VenueInboxesBlock renders nothing at zero
+      owned places, pinned by a test. Empty-state polish, not placement.
+  - >
+      RESOLVED — SUMMED, as the spec proposed. The rail badge is
+      performerInbox + Σ venues.openCount, wired in AdminShell and pinned by
+      AdminShell.test.tsx ("bookings=5" for 2 act rows + venues 3/0). Revisit
+      only if multi-venue noise is observed drowning the act inbox.
+  - >
+      RESOLVED — WIDENED DELIBERATELY, matching the venue-inbox posture.
+      EDITOR/VIEWER-role visibility: the page stays ORG_NON_SCANNER view and
+      respond stays ORG_EDIT_ROLES server-side, so a VIEWER/EDITOR can now SEE
+      received requests that the old settings inbox hid from them (it was
+      OWNER/ADMIN-only BY LISTING — org-settings-sections.tsx gated on
+      canEdit). This is a real widening of who can read booking-request
+      contents (message, contact details, fee terms), accepted because those
+      same members could already reach any owned place's inbox at
+      /admin/[slug]/places/[placeId]/bookings and read the identical fields.
+      Nothing about WHO CAN ACT changed. If the org-as-act inbox should be
+      narrower than the venue inbox, that is a NEW requirement — gate the tab,
+      not the page, and note that the rail badge count would leak the
+      existence of requests even if the tab were hidden.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Any booking feature change — no new request fields, statuses, notify
+    flows, agreement mechanics, expiry rules, or embed behaviour.
+  - Cross-place aggregated venue inbox / new list scope (recorded follow-up,
+    see risks).
+  - Personal (human) performer surfaces in /account/settings — unchanged,
+    including ReceivedBookingRequestsList there.
+  - Entity-page editor involvement of any kind (FR-001 decision).
+  - Embed management UI (/admin/[slug]/embeds) and the booking embed widget.
+  - Mobile apps and scanner.
+  - Dashboard cards/badges beyond the Bookings rail badge (SuggestionInbox
+    precedent stays as-is).
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  # FR-002 / FR-003
+  - >
+      /admin/[slug]/bookings shows "Requests to you" and "Sent to acts" tabs
+      for an org context; a seeded TO_PERFORMER request to the org appears in
+      the received tab with organizer org name and attached-event details;
+      expanding it marks PENDING → VIEWED; accept links the agreement; decline
+      takes an OPTIONAL reason — identical server results to the old settings
+      section for the same seeded row.
+
+      CORRECTED 2026-08-10. The original wording demanded a >=3-char reason on
+      decline. That was wrong for THIS direction and contradicted FR-003's own
+      parity mandate. `respond-to-booking-request.ts` enforces the reason only
+      on the TO_VENUE branch — its schema comment states plainly that
+      TO_PERFORMER declines need none — and the received tab renders
+      TO_PERFORMER rows. The surface this replaced
+      (ReceivedBookingRequestsList) always treated it as optional; the venue
+      inbox (BookingInbox) hard-gates on >=3 chars because ITS rows are
+      TO_VENUE, and copying that gate here would have made declining
+      impossible without a reason. Shipped behaviour — an empty reason OMITS
+      the `declineReason` key from the mutation (never sent as ""), and a
+      typed reason is still floored at 3 chars by the respond schema. Verified
+      over the wire: `bookingRequests.respond` with only a bookingRequestId
+      and action "decline" returns 200 DECLINED. Pinned by tests in
+      OrgReceivedRequestsTable.test.tsx; do not "fix" the code back to match
+      the original wording.
+  - The received tab shows no TO_VENUE-only affordances (no invite-to-claim,
+    no resend-invite) and no withdraw action.
+  # FR-001 / FR-004
+  - /admin/[slug]/settings still lists "Getting booked" with exactly
+    Performer and Booking defaults; the booking-requests section is gone from
+    slugs, entitlement, and the view switch; the account-settings human
+    performer inbox is byte-identical in behaviour.
+  # FR-005
+  - GET /admin/[slug]/settings/booking-requests server-redirects to
+    /admin/[slug]/bookings for an entitled member; an unknown slug still
+    lands on the settings index (existing contract preserved).
+  # FR-006
+  - bookingRequests.countOpen for a seeded org (2 open org-as-act requests,
+    2 owned places with 3 and 0 open venue requests) returns
+    performerInbox=2 and venues counts 3/0, matching the corresponding list
+    query results; EXPIRED/DECLINED/WITHDRAWN/ACCEPTED rows are never
+    counted; a non-member gets the same not-found/forbidden shape as the
+    list scopes; the Bookings page issues no per-venue list queries for
+    badge purposes (network panel — one countOpen call).
+  # FR-007
+  - With the seeded counts above, the rail's Bookings item shows badge 5;
+    with zero opens it shows no badge; a failing countOpen renders the rail
+    without a badge and without a toast, and the swallow is reported per the
+    ReporterPort convention.
+  # NFR-001
+  - Full existing bookingRequests router/use-case test suites pass with no
+    test-file modifications; the embed booking flow and place-scoped
+    BookingInbox behave unchanged in a live-stack drive.
+  # NFR-005
+  - At 320px both tabs render without horizontal page scroll (DataTable card
+    mode); the tab strip is keyboard-operable (arrow keys, roving tabindex);
+    zero new console errors across the driven flows.

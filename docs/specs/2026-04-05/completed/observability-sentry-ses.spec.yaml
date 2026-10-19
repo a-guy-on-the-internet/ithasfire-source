@@ -1,0 +1,352 @@
+spec: observability-sentry-ses
+title: "Sentry Error Tracking & SES Email Delivery Observability"
+status: complete
+created: 2026-03-27
+updated: 2026-04-05
+area: platform/observability
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Summary
+# ─────────────────────────────────────────────────────────────────────────────
+summary: |
+  Activate Sentry error tracking (already code-complete but not yet
+  configured) across all deployed services (API, Web, Jobs), and add
+  email delivery observability via SES's built-in feedback forwarding
+  and an optional Configuration Set for SES Console metrics.
+
+  Design principles:
+  - Zero additional AWS services (no CloudWatch custom metrics, no SNS,
+    no Lambda). Bounce/complaint notifications use SES's native email
+    forwarding to the admin inbox.
+  - SES Configuration Set (free) gives per-email metrics in the SES
+    Console. The SMTP adapter injects the header when the env var is set.
+  - Future: if volume or alerting needs grow, add SNS → API webhook →
+    Sentry breadcrumbs as a follow-up.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Current State (what already exists)
+# ─────────────────────────────────────────────────────────────────────────────
+current_state:
+  sentry_sdk:
+    api:
+      - "apps/api/src/instrument.ts — full @sentry/node init with Fastify integration"
+      - "apps/api/src/app.ts — Sentry.setupFastifyErrorHandler(app) registered"
+      - "apps/api/src/index.ts — `import './instrument'` at top of entry point"
+      - "apps/api/src/lib/env.ts — SENTRY_DSN env var parsed (optional)"
+      - "Guarded: Sentry.init() only fires when SENTRY_DSN is truthy"
+    web:
+      - "apps/web/sentry.server.config.ts — @sentry/nextjs server init"
+      - "apps/web/sentry.edge.config.ts — @sentry/nextjs edge init"
+      - "apps/web/instrumentation.ts — register() loads server/edge configs; exports onRequestError"
+      - "apps/web/next.config.ts — withSentryConfig() wraps Next config"
+      - "apps/web/next.config.ts — tunnelRoute: '/monitoring' (ad-blocker bypass)"
+      - "apps/web/next.config.ts — widenClientFileUpload: true"
+      - "apps/web/Dockerfile — build-args: SENTRY_AUTH_TOKEN, SENTRY_ORG, SENTRY_PROJECT, NEXT_PUBLIC_SENTRY_DSN"
+      - "apps/web/src/config/env.server.ts — NEXT_PUBLIC_SENTRY_DSN + SENTRY_DSN parsed (optional)"
+    jobs:
+      - "No Sentry SDK integration yet — apps/jobs has no @sentry imports"
+  terraform:
+    - "infra/terraform/variables.tf — sentry_dsn, sentry_auth_token, sentry_org (default 'hearth-fire'), sentry_project (default 'hearth-fire-web')"
+    - "infra/terraform/envs/dev/dev.tfvars — sentry vars commented out (lines 169-170)"
+    - "Terraform already injects SENTRY_DSN / NEXT_PUBLIC_SENTRY_DSN into Cloud Run env when the variable is non-null"
+  ci:
+    - "deploy-dev.yml — passes NEXT_PUBLIC_SENTRY_DSN as build-arg when non-empty"
+    - "cloud-run-images.yml — passes SENTRY_AUTH_TOKEN, SENTRY_ORG, SENTRY_PROJECT as build-args"
+    - ".github/workflows/DEPLOYMENT_SECRETS.md — documents TF_VAR_SENTRY_DSN, TF_VAR_SENTRY_AUTH_TOKEN"
+  email:
+    - "SMTPMailAdapter (packages/adapters/src/comms/mail/smtp-mail.ts) logs structured events:"
+    - "  smtp.send.success — { messageId, recipients, template }"
+    - "  smtp.send.failed — { error, recipients, template }"
+    - "Deployed API uses SES SMTP (email-smtp.us-east-1.amazonaws.com:587)"
+    - "SES domain identity: hearthfire.community (Terraform-managed, DKIM verified)"
+    - "Custom MAIL FROM: mail.hearthfire.community"
+    - "From address: no-reply@hearthfire.community (aliased to admin Google Workspace inbox)"
+    - "Feedback forwarding was NOT explicitly configured (SES default is enabled, but never verified)"
+    - "No SES Configuration Set"
+  terraform_changes_already_applied:
+    - "aws_sesv2_email_identity_feedback_attributes — explicitly enables email forwarding"
+    - "aws_sesv2_configuration_set — optional config set for SES Console metrics"
+    - "Stack output ses_configuration_set_name piped through to API env as SES_CONFIGURATION_SET"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Work Items
+# ─────────────────────────────────────────────────────────────────────────────
+work_items:
+
+  # ── 1. Sentry Project & Secrets Setup ───────────────────────────────────
+  - id: sentry-project-setup
+    title: "Create Sentry project and populate secrets"
+    layer: infra
+    effort: S
+    description: |
+      Manual steps (no code changes):
+      1. Log in to sentry.io, create org "hearth-fire" if it doesn't exist.
+      2. Create a project — platform "Node.js" — slug "ithasfire-api".
+         Copy the DSN.
+      3. Create a second project — platform "Next.js" — slug "hearthfire-web".
+         Copy the DSN.
+      4. (Optional for now) Create a third project "ithasfire-jobs" for the
+         jobs service once Sentry is added there.
+      5. Generate an Auth Token at Settings → Auth Tokens with scopes:
+         `project:releases`, `org:read`.
+      6. Store secrets in GitHub:
+         - Repository secret: `TF_VAR_sentry_dsn` → API DSN
+         - Repository secret: `NEXT_PUBLIC_SENTRY_DSN` → Web DSN
+         - Repository secret: `TF_VAR_sentry_auth_token` → Auth Token
+         - Repository variable: `SENTRY_ORG` → "hearth-fire"
+         - Repository variable: `SENTRY_PROJECT` → "hearthfire-web"
+      7. Store the same DSN values in 1Password vault for local dev reference.
+    acceptance:
+      - "Sentry dashboards reachable at sentry.io for both projects"
+      - "GitHub secrets populated (verify with a dry-run deploy or `gh secret list`)"
+
+  # ── 2. Uncomment Terraform Sentry vars ──────────────────────────────────
+  - id: terraform-sentry-activate
+    title: "Activate Sentry Terraform variables in dev.tfvars"
+    layer: infra
+    effort: XS
+    description: |
+      In `infra/terraform/envs/dev/dev.tfvars`, uncomment:
+      ```
+      # - TF_VAR_sentry_dsn
+      # - TF_VAR_sentry_auth_token
+      ```
+      These are documentation comments reminding operators which GitHub
+      secrets must be set. No actual tfvars value change needed — the
+      secrets flow through the CI env. Verify Terraform plan shows
+      SENTRY_DSN and NEXT_PUBLIC_SENTRY_DSN appearing in Cloud Run
+      service env_vars.
+    depends_on: [sentry-project-setup]
+    acceptance:
+      - "`terraform plan` diff shows SENTRY_DSN injected into hf-dev-api, hf-dev-web"
+
+  # ── 3. Separate Sentry DSNs for API vs Web ─────────────────────────────
+  - id: sentry-dsn-separation
+    title: "Support separate DSNs for API and Web projects"
+    layer: infra
+    effort: S
+    description: |
+      Currently `variables.tf` has a single `sentry_dsn`. For proper
+      project separation:
+      - Keep `sentry_dsn` for the API service (injected as `SENTRY_DSN`
+        into hf-dev-api and hf-dev-jobs Cloud Run envs).
+      - The Web DSN is already handled separately via the
+        `NEXT_PUBLIC_SENTRY_DSN` build-arg in deploy-dev.yml.
+      - Verify both DSNs can be different values. If Terraform currently
+        injects `sentry_dsn` into the Web service's runtime env as well,
+        ensure the Web service uses `NEXT_PUBLIC_SENTRY_DSN` (baked at
+        build time) and not the runtime `SENTRY_DSN` for client-side
+        reporting.
+
+      Alternatively, if one project is sufficient initially, use the same
+      DSN everywhere and split later.
+    depends_on: [sentry-project-setup]
+    acceptance:
+      - "API errors appear in the API Sentry project"
+      - "Web client + SSR errors appear in the Web Sentry project"
+
+  # ── 4. Add Sentry to the Jobs service ───────────────────────────────────
+  - id: sentry-jobs-integration
+    title: "Integrate @sentry/node into apps/jobs"
+    layer: apps/jobs
+    effort: S
+    description: |
+      The jobs service has no Sentry integration today.
+      1. Install `@sentry/node` in apps/jobs.
+      2. Create `apps/jobs/src/instrument.ts` mirroring the API pattern:
+         ```ts
+         import * as Sentry from "@sentry/node";
+         const dsn = process.env.SENTRY_DSN;
+         if (dsn) {
+           Sentry.init({
+             dsn,
+             sendDefaultPii: true,
+             environment: process.env.SENTRY_ENVIRONMENT ?? process.env.NODE_ENV ?? "development",
+             tracesSampleRate: process.env.NODE_ENV === "production" ? 0.1 : 1.0,
+             includeLocalVariables: true,
+             debug: process.env.SENTRY_DEBUG === "true",
+           });
+         }
+         export { Sentry };
+         ```
+      3. Import `./instrument` at the very top of the jobs entry point.
+      4. Ensure SENTRY_DSN is injected into the hf-dev-jobs Cloud Run
+         service via Terraform.
+    depends_on: [sentry-project-setup]
+    acceptance:
+      - "Unhandled exceptions in job workers appear in Sentry"
+      - "Job name / queue name visible in Sentry breadcrumbs"
+
+  # ── 5. Verify end-to-end Sentry capture ─────────────────────────────────
+  - id: sentry-e2e-verify
+    title: "Deploy and verify errors flow to Sentry"
+    layer: ops
+    effort: S
+    description: |
+      After deploying with secrets populated:
+      1. Trigger a known error on the dev API (e.g., hit an invalid
+         tRPC procedure or throw from a test endpoint).
+      2. Trigger a client-side error on the dev Web (e.g., navigate to
+         a broken page or trigger a React error boundary).
+      3. Confirm both errors appear in their respective Sentry projects
+         within ~60 seconds.
+      4. Verify source maps are resolved (stack traces show original TS,
+         not minified JS).
+      5. Check that the `/monitoring` tunnel route on the Web service
+         proxies events correctly.
+    depends_on: [terraform-sentry-activate, sentry-dsn-separation]
+    acceptance:
+      - "API error visible in Sentry with resolved stack trace"
+      - "Web client error visible in Sentry with resolved source maps"
+      - "Environment tag reads 'development' (matching SENTRY_ENVIRONMENT)"
+
+  # ── 6. SES Feedback Forwarding & Configuration Set (Terraform) ─────────
+  - id: ses-feedback-and-config-set
+    title: "Deploy SES feedback forwarding + configuration set via Terraform"
+    layer: infra
+    effort: S
+    status: code-complete
+    description: |
+      Terraform changes already applied to the SES module:
+
+      1. `aws_sesv2_email_identity_feedback_attributes` — explicitly
+         enables email forwarding on the hearthfire.community identity.
+         SES will send bounce/complaint notifications as emails to the
+         From address (no-reply@hearthfire.community), which is aliased
+         to the admin's Google Workspace inbox.
+
+      2. `aws_sesv2_configuration_set` — creates a lightweight config
+         set (`hf-dev-emails`) with reputation metrics enabled and
+         BOUNCE/COMPLAINT suppression. This gives per-email
+         send/delivery/bounce/complaint stats in the SES Console at
+         zero additional cost (no CloudWatch, no SNS, no Lambda).
+
+      3. Stack output `ses_configuration_set_name` piped through to
+         Cloud Run API env as `SES_CONFIGURATION_SET`.
+
+      Files changed:
+      - infra/terraform/modules/ses/main.tf
+      - infra/terraform/modules/ses/variables.tf
+      - infra/terraform/modules/ses/outputs.tf
+      - infra/terraform/stack/outputs.tf
+      - infra/terraform/main.tf
+
+      Remaining manual step: run `terraform apply` to create the
+      resources, then verify feedback forwarding by sending a test
+      email to bounce@simulator.amazonses.com.
+    acceptance:
+      - "`terraform apply` creates feedback attributes + configuration set"
+      - "SES Console shows the configuration set with reputation metrics"
+      - "Bounce notification email arrives in admin inbox after simulator test"
+
+  # ── 7. Verify admin inbox receives bounce/complaint emails ──────────────
+  - id: ses-feedback-verify
+    title: "Smoke-test SES feedback forwarding to admin inbox"
+    layer: ops
+    effort: XS
+    description: |
+      After terraform apply:
+      1. Confirm no-reply@hearthfire.community is set up as an alias
+         in Google Workspace Admin → Users → (admin account) → Aliases.
+         (If it's only a "Send mail as" alias in Gmail settings, inbound
+         mail won't route. It must be a proper user alias or group.)
+      2. Send a test email to bounce@simulator.amazonses.com using the
+         SES Console or the running API (trigger any transactional email
+         to that address).
+      3. Within 1-5 minutes, a bounce notification email from SES should
+         arrive in the admin inbox.
+      4. Repeat with complaint@simulator.amazonses.com to verify
+         complaint forwarding.
+    depends_on: [ses-feedback-and-config-set]
+    acceptance:
+      - "Bounce notification arrives in admin Gmail inbox"
+      - "Complaint notification arrives in admin Gmail inbox"
+      - "Notification contains the original messageId and bounce reason"
+
+  # ── 8. SMTP Adapter: Configuration Set Header ──────────────────────────
+  - id: smtp-adapter-ses-header
+    title: "Add SES configuration set header to SMTPMailAdapter"
+    layer: packages/adapters
+    effort: S
+    description: |
+      Modify `SMTPMailAdapterOptions` to accept an optional
+      `sesConfigurationSet` string. When present, add:
+      ```
+      headers: {
+        "X-SES-CONFIGURATION-SET": this.sesConfigurationSet,
+        "X-TH-Template-Key": templateKey,
+      }
+      ```
+      to every `sendMail` call.
+
+      The `X-TH-Template-Key` header lets SES tag events with the
+      template ID for filtering in the SES Console.
+
+      Env var: `SES_CONFIGURATION_SET` — already piped from Terraform
+      to the API Cloud Run env. Just needs to be read in env.ts and
+      passed to the adapter constructor.
+    depends_on: [ses-feedback-and-config-set]
+    files:
+      - packages/adapters/src/comms/mail/smtp-mail.ts
+      - apps/api/src/lib/env.ts
+    acceptance:
+      - "Emails sent through SES include X-SES-CONFIGURATION-SET header"
+      - "Emails include X-TH-Template-Key header with template ID"
+      - "Existing send/batch flows unchanged when env var is unset"
+      - "SES Console shows per-config-set metrics after sending test emails"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Future Enhancements (out of scope for now)
+# ─────────────────────────────────────────────────────────────────────────────
+future:
+  - title: "SNS → API webhook → Sentry breadcrumbs"
+    description: |
+      If email volume grows or the team wants bounce/complaint alerts
+      in Sentry instead of (or in addition to) email, add an SNS topic
+      as a Configuration Set event destination, subscribe a Cloud Run
+      endpoint on the API, and fire Sentry issues for hard bounces and
+      complaints.
+  - title: "Suppression list management"
+    description: |
+      The configuration set has BOUNCE/COMPLAINT suppression enabled.
+      SES automatically stops sending to repeatedly-bouncing addresses.
+      If a legitimate user gets suppressed, the admin can remove them
+      via SES Console → Suppression list. A future admin page could
+      expose this.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rollout Plan
+# ─────────────────────────────────────────────────────────────────────────────
+rollout:
+  phase_1: "Sentry activation (items 1-5) — populate secrets, deploy, verify"
+  phase_2: "SES email observability (items 6-8) — terraform apply, verify inbox, wire adapter header"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Risk & Notes
+# ─────────────────────────────────────────────────────────────────────────────
+risks:
+  - title: "Source map upload failures in CI"
+    detail: |
+      If SENTRY_AUTH_TOKEN is missing or expired, `next build` will
+      still succeed but source maps won't upload. The
+      `withSentryConfig` silent option suppresses build failures.
+      Monitor Sentry for unresolved stack traces.
+  - title: "SES sandbox mode"
+    detail: |
+      If the SES account is still in sandbox mode, only verified
+      addresses can receive mail. Configuration Set events will still
+      fire but delivery will fail for unverified recipients. Request
+      production access via SES Console when ready for real users.
+  - title: "Admin inbox alias misconfiguration"
+    detail: |
+      If no-reply@hearthfire.community is only a Gmail "Send mail as"
+      alias (not a Google Workspace admin alias), inbound SES
+      bounce/complaint emails won't route. Must be a proper alias in
+      Google Workspace Admin Console.
+  - title: "Cost"
+    detail: |
+      Sentry free tier: 5K errors/month, 10K transactions/month.
+      SES: $0.10 per 1K emails. Configuration Set: free. Feedback
+      forwarding: free (uses SES send quota for the notification
+      emails themselves, negligible). No CloudWatch, SNS, or Lambda
+      costs.

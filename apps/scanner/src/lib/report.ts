@@ -1,5 +1,6 @@
 /**
- * Sentry capture for the scan flow's catch-and-degrade branches (NFR-006).
+ * Sentry capture for the scan flow's catch-and-degrade branches (NFR-006),
+ * and for the Sell tab's card failures ({@link reportPosIssue}).
  *
  * ## Why this exists
  *
@@ -73,6 +74,72 @@ export function reportScanIssue(
           eventId: context.eventId,
           ...context.tags,
         },
+        extra: context.extra,
+      },
+    );
+  });
+}
+
+/**
+ * The Sell tab's report context: same shape and same payload rule as
+ * {@link ScanReportContext}, keyed by the order instead of the event. Tags are
+ * classifications (the SDK's error code, the step, the phase); never a
+ * PaymentIntent client secret, an SDK message or anything the buyer typed.
+ */
+export type PosReportContext = {
+  /** Where in the sale this was caught, e.g. `tap_to_pay_sdk_error`. */
+  branch: string;
+  orderId: string;
+  /** Sentry's default ("error") when omitted; "warning" for buyer-side outcomes. */
+  level?: "warning";
+  tags?: Record<string, string>;
+  /** Counts and classifications ONLY — never secrets, messages or PII. */
+  extra?: Record<string, number | string | boolean | null>;
+};
+
+/**
+ * Capture a Sell-tab failure the screen caught and turned into operator copy.
+ * Never throws (same isolation as {@link reportScanIssue}).
+ */
+export function reportPosIssue(error: unknown, context: PosReportContext): void {
+  safeReport(() => {
+    Sentry.captureException(
+      error instanceof Error ? error : new Error(context.branch),
+      {
+        ...(context.level ? { level: context.level } : {}),
+        tags: {
+          feature: "pos",
+          branch: context.branch,
+          orderId: context.orderId,
+          ...context.tags,
+        },
+        extra: context.extra,
+      },
+    );
+  });
+}
+
+/**
+ * Capture a failed removal of cached attendee data (`docs/scanner-pii.md`): a
+ * people drop in the manifest sync, or a step of the access-denied wipe. The
+ * caller carries on, so without this a wipe that did not happen would look
+ * like one that did. Never throws.
+ *
+ * `branch` names the step. `extra` is counts and classifications only, and the
+ * error is SQLite's or React Query's own: no name, email or ticket code.
+ */
+export function reportRetentionIssue(
+  error: unknown,
+  context: {
+    branch: string;
+    extra?: Record<string, number | string | boolean | null>;
+  },
+): void {
+  safeReport(() => {
+    Sentry.captureException(
+      error instanceof Error ? error : new Error(context.branch),
+      {
+        tags: { feature: "pii_retention", branch: context.branch },
         extra: context.extra,
       },
     );

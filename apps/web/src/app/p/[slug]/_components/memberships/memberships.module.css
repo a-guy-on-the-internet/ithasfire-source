@@ -1,0 +1,370 @@
+/* ── Entity-page Membership tab (recurring-memberships spec) ─────────────
+   Strict-Swiss content styling on APP tokens (ink/paper), not the entity
+   `--th-color-*` vars — the tab strip and panel are page chrome shared by
+   every entity theme, so they stay legible whatever accent a venue picks.
+   Every var() fallback is the Stub value
+   (what SSR/first paint renders). */
+
+/* ── Tab strip ─────────────────────────────────────────────────────────── */
+
+.tabStrip {
+  width: 100%;
+  border-bottom: 2px solid var(--color, #211C16);
+}
+
+.tabRow {
+  display: flex;
+  gap: 0.25rem;
+  width: 100%;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 1rem;
+}
+
+.tabLink {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
+  padding: 0.625rem 1rem;
+  border: 0;
+  border-bottom: 3px solid transparent;
+  font-family: var(--font-montserrat, var(--font-sans, system-ui, sans-serif));
+  font-size: 0.8125rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-decoration: none;
+  color: var(--colorMuted, #5C544A);
+  transition: color 0.15s, border-color 0.15s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tabLink {
+    transition: none;
+  }
+}
+
+.tabLink:hover {
+  color: var(--color, #211C16);
+}
+
+.tabLink[aria-current="page"] {
+  color: var(--color, #211C16);
+  border-bottom-color: var(--accent, #E2481D);
+}
+
+.tabLink:focus-visible {
+  outline: 2px solid var(--color, #211C16);
+  outline-offset: -2px;
+}
+
+/* ── Membership panel ──────────────────────────────────────────────────── */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  max-width: 48rem;
+  width: 100%;
+  margin: 0 auto;
+  padding: 2rem 1rem 3rem;
+  font-family: var(--font-montserrat, var(--font-sans, system-ui, sans-serif));
+}
+
+.panelHeader {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+  border-bottom: 2px solid color-mix(in srgb, var(--color, #211C16) 12%, transparent);
+  padding-bottom: 1.25rem;
+}
+
+/* Decorative kicker — accent as ornament type is sanctioned (DS §9). */
+.kicker {
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--accent, #E2481D);
+}
+
+.heading {
+  font-size: 1.75rem;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  color: var(--color, #211C16);
+}
+
+.subheading {
+  font-size: 0.9375rem;
+  color: var(--colorMuted, #5C544A);
+}
+
+.centerNote {
+  padding: 2rem 0;
+  text-align: center;
+  color: var(--colorMuted, #5C544A);
+  font-size: 0.9375rem;
+}
+
+/* ── Tier cards ────────────────────────────────────────────────────────── */
+
+.tierGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(272px, 1fr));
+  gap: 0.75rem;
+  align-items: stretch;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.tierCard {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+  min-width: 0;
+  padding: 1.25rem 1rem;
+  border: 2px solid var(--color, #211C16);
+  border-radius: 0;
+  background: var(--surface, #FDFAF3);
+}
+
+.tierName {
+  font-size: 0.9375rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color, #211C16);
+  overflow-wrap: anywhere;
+}
+
+.tierPriceRow {
+  display: flex;
+  align-items: baseline;
+  gap: 0.375rem;
+}
+
+.tierPrice {
+  font-size: 1.625rem;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  color: var(--color, #211C16);
+}
+
+.tierInterval {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--colorMuted, #5C544A);
+}
+
+.tierDescription {
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: var(--color, #211C16);
+  overflow-wrap: anywhere;
+}
+
+/*
+ * What members get, in the OWNER'S words. Set apart from `.tierDescription`
+ * with a rule so a visitor can tell the pitch from the promise — same type
+ * scale, no colour change, since this is the owner's claim and not ours to
+ * emphasise or discount.
+ */
+.tierBenefits {
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: var(--color, #211C16);
+  overflow-wrap: anywhere;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+.taxNote {
+  font-size: 0.75rem;
+  color: var(--colorMuted, #5C544A);
+}
+
+/* ── Buttons (v2 grammar: blocky uppercase, inversion hovers) ──────────── */
+
+.joinButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2.75rem;
+  padding: 0.5rem 1.25rem;
+  /* margin:auto pinning — footer CTA aligns across unequal card bodies. */
+  margin-top: auto;
+  border: 2px solid var(--brandSecondaryHover, #B93312);
+  border-radius: 0;
+  background: var(--brandSecondaryHover, #B93312);
+  color: var(--onBrandSecondary, #FFFFFF);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background-color 0.15s, border-color 0.15s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .joinButton,
+  .secondaryButton {
+    transition: none;
+  }
+}
+
+.joinButton:hover {
+  background: var(--brandSecondaryStrong, #94270C);
+  border-color: var(--brandSecondaryStrong, #94270C);
+}
+
+.joinButton:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.joinButton:focus-visible,
+.secondaryButton:focus-visible {
+  outline: 2px solid var(--color, #211C16);
+  outline-offset: 2px;
+}
+
+.secondaryButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2.75rem;
+  padding: 0.5rem 1.25rem;
+  border: 2px solid var(--color, #211C16);
+  border-radius: 0;
+  background: transparent;
+  color: var(--color, #211C16);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.secondaryButton:hover {
+  background: var(--color, #211C16);
+  color: var(--background, #F6F0E4);
+}
+
+.secondaryButton:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* ── Join form ─────────────────────────────────────────────────────────── */
+
+.joinForm {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+  padding-top: 0.625rem;
+  border-top: 1px solid color-mix(in srgb, var(--color, #211C16) 20%, transparent);
+}
+
+.fieldLabel {
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color, #211C16);
+}
+
+.fieldInput {
+  min-height: 2.75rem;
+  padding: 0.5rem 0.75rem;
+  border: 2px solid var(--color, #211C16);
+  border-radius: 0;
+  background: var(--surface, #FDFAF3);
+  color: var(--color, #211C16);
+  font-family: inherit;
+  font-size: 0.9375rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.fieldInput:focus-visible {
+  outline: var(--focus-width) solid var(--focus-color);
+  outline-offset: var(--focus-offset);
+}
+
+.fieldHint {
+  font-size: 0.75rem;
+  color: var(--colorMuted, #5C544A);
+}
+
+.formActions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.errorText {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--dangerSoft, #B91C1C);
+}
+
+/* ── Payment step (Stripe Elements confirms the first invoice) ─────────── */
+
+.paymentForm {
+  display: flex;
+  flex-direction: column;
+  gap: 0.875rem;
+  padding-top: 0.25rem;
+}
+
+/* ── Member state / success ────────────────────────────────────────────── */
+
+.memberCard {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+  padding: 1.25rem 1rem;
+  border-top: 2px solid var(--color, #211C16);
+  border-bottom: 1px solid var(--color, #211C16);
+  background: var(--surface, #FDFAF3);
+}
+
+.memberBadge {
+  align-self: flex-start;
+  padding: 0.25rem 0.625rem;
+  border: 2px solid var(--color, #211C16);
+  font-size: 0.6875rem;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--color, #211C16);
+}
+
+.memberTierName {
+  font-size: 1.125rem;
+  font-weight: 800;
+  color: var(--color, #211C16);
+}
+
+.memberMeta {
+  font-size: 0.875rem;
+  color: var(--colorMuted, #5C544A);
+}
+
+.memberActions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding-top: 0.25rem;
+}
+
+.memberBlocks {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}

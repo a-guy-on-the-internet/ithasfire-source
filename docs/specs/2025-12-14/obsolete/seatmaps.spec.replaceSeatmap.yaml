@@ -1,0 +1,111 @@
+title: use-case | seatmaps.replace-seatmap
+owner: core
+file: packages/core/src/use-cases/seatmaps/replace-seatmap.ts
+goal: >
+  Replace a venue's canonical seatmap by importing a normalized geometry snapshot,
+  regenerating sections + seats, updating the stored seatmap metadata, and
+  producing a diff summary for auditing.
+
+ports:
+  - SeatmapRepo
+  - SeatmapBlobRepo
+  - SeatGeometryParserPort
+  - SeatStatusRepo
+  - AuthzRepo
+  - FeatureFlagPort
+  - IdempotencyPort
+  - SeatmapStreamingPort
+  - Repos
+  - Clock
+  - Logger
+  - Metrics
+
+invariants:
+  - Feature flag `feature.seatmap` must be enabled for the venue's org.
+  - Actor must have organizer-level role for the venue's org.
+  - Replace operation is idempotent: repeated requests with same idempotency key
+    must yield identical checksum + diff summary.
+  - Seats and sections are regenerated atomically inside `repos.tx()`. Any
+    failure must roll back to the previous canonical seatmap.
+  - Imported snapshot must provide geometry for every seat; missing geometry is
+    a hard failure (`invalid_input`).
+  - Existing holds/orders remain associated by seatId; regenerate seats with
+    stable deterministic ids to avoid orphaned records.
+
+input_schema:
+  venueId: uuid # required
+  actor:
+    humanId: uuid # organizer-level human performing the import
+    orgContext: { orgId: uuid; roles: string[] }
+  upload:
+    ref: string # pointer to parser-ready blob (S3, etc.)
+    format: enum[cad,svg,csv]
+    source: enum[admin_wizard,api]
+  options?:
+    dryRun?: boolean # if true, returns diff only, no mutation
+    idempotencyKey?: string # required when dryRun=false
+
+preconditions:
+  - Validate input via zod; missing venueId/upload data yields `invalid_input`.
+  - Ensure actor has org access + `seatmap.manage` role via AuthzRepo.
+  - Confirm seatmap feature flag enabled. If not, return `forbidden`.
+  - Acquire idempotency key when dryRun=false; fail with `conflict` if in progress.
+
+execution:
+  1. Retrieve venue + current seatmap (if any) via SeatmapRepo.
+  2. Invoke SeatGeometryParserPort.parse with upload context to obtain glyphs,
+     sections, stage metadata, and issues.
+  3. If parser returns errors, abort with `invalid_input` including issue payload.
+  4. Derive deterministic seat + section ids:
+     a. Generate stable uuid5 using venueId + original identifiers.
+     b. Build seat index (R-tree) from glyph geometry.
+  5. Compute diff against existing seatmap (if present) to populate LayoutDiff.
+  6. If options.dryRun=true, return diff + parser issues without mutating.
+  7. Else, within repos.tx():
+     a. Delete existing seats/sections for venue.
+     b. Insert new sections, seats, and stage anchor data.
+     c. Persist glyph snapshot via SeatmapBlobRepo.putForVenue.
+     d. Store seatmap metadata, stage, seat index via SeatmapRepo.replaceWithSnapshot.
+     e. Upsert seat availability records to ensure status table references valid seatIds.
+  8. Emit metrics (seat counts, import duration, diff stats) and structured log.
+  9. Release idempotency entry with success payload { checksum, diff }.
+
+output_schema:
+  checksum: string
+  diff:
+    added: number
+    removed: number
+    moved: number
+    sectionsChanged: string[]
+  issues: array<ParserIssue>
+  seatCount: number
+  sectionCount: number
+  seatIndexBounds: { minX: number; minY: number; maxX: number; maxY: number }
+
+side_effects:
+  - Replaces Seat + SeatSection rows for venue.
+  - Writes seatmap glyph snapshot blob.
+  - Updates VenueSeatmap row with metadata + seat index.
+  - Ensures SeatStatusRepo entries align with new seatIds (reset unknown seats to AVAILABLE).
+  - Emits event via SeatmapStreamingPort.publishSeatmapReplaced.
+  - Updates idempotency ledger and metrics.
+
+errors:
+  - invalid_input(422): invalid uuid, parser errors, missing geometry, mismatched sections.
+  - forbidden(403): actor lacks permission or feature flag disabled.
+  - conflict(409): idempotency replay with differing payload.
+  - dependency_failed(424): blob storage failure, repo rollback error.
+  - transient(503): upstream timeouts (parser, repos).
+
+notes:
+  - Preserve customer-facing seatIds by hashing venueId + section label + seat label.
+  - Maintain mapping of legacy seatIds to new ids for analytics; emit in diff warnings if seats removed.
+  - Parser warnings should surface but not block import; include them in `issues` output.
+  - Consider batching inserts for >10k seats to avoid transaction timeout (use repo helper).
+
+tests:
+  - happy path import replacing existing seatmap with deterministic ids.
+  - dry-run returns diff + issues without persisting changes.
+  - parser error bubbles as invalid_input and does not mutate data.
+  - idempotent retry with same key returns cached checksum/diff.
+  - dependency failure (blob write) triggers rollback and transient error.

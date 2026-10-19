@@ -6,7 +6,7 @@
  * Why a generator and not four checked-in sound-design files: the tones must
  * be tiny (they ship in the binary), deterministic, and — critically —
  * *provably* distinct from one another. FR-002 of
- * docs/specs/2026-08-04/scan-ticket-redesign.spec.yaml replaces one ~40-byte
+ * docs/specs/2026-08-04/completed/scan-ticket-redesign.spec.yaml replaces one ~40-byte
  * click replayed at three playback rates, which was indistinguishable over a
  * venue PA. Distinctness here is designed on two axes at once:
  *

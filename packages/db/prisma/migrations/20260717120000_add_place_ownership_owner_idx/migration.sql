@@ -1,0 +1,24 @@
+-- Owner-keyed index backing `places.listOwnedBySubject`
+-- (packages/adapters/src/db/prisma/places.ts) — the public, actor-free embed
+-- widget read path that filters PlaceOwnership on
+-- (ownerType, ownerId, verified, revokedAt) with NO placeId. The existing
+-- `@@unique([placeId, ownerType, ownerId])` and `@@index([placeId])` both LEAD
+-- with placeId, so neither can serve an owner-keyed lookup — today every
+-- anonymous embed request forces a sequential scan of PlaceOwnership. This
+-- mirrors SavedLocation's identical `@@index([ownerType, ownerId])`.
+--
+-- A plain `CREATE INDEX` takes a SHARE lock and blocks writes to
+-- PlaceOwnership (claim / verify / revoke flows) for the duration of the
+-- build. We use `CONCURRENTLY` so production deploys don't stall those
+-- writes, matching this repo's other index-only migrations
+-- (AuditLog_at_idx, Ticket_eventId_ownerHumanId_idx). `CONCURRENTLY` cannot
+-- run inside a transaction; this file is intentionally kept to a single
+-- statement so Prisma migrate can execute it without an implicit
+-- BEGIN/COMMIT.
+--
+-- NOTE: this repo's dev DB is db-push-managed, not migrate-deploy-managed.
+-- This migration file was written but NOT applied — apply via
+-- `pnpm -F @th/db prisma db push` (dev) or the normal migrate-deploy path
+-- (prod) as a manual follow-up step.
+-- CreateIndex
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "PlaceOwnership_ownerType_ownerId_idx" ON "PlaceOwnership"("ownerType", "ownerId");

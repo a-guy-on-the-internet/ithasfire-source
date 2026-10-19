@@ -4,6 +4,8 @@ import { z } from "zod";
 
 import { recordSmsOptOut } from "@th/core/use-cases/comms/record-sms-opt-out";
 import { recordSmsOptIn } from "@th/core/use-cases/comms/record-sms-opt-in";
+import { createThrottledReporter } from "@th/core/lib/throttled-reporter";
+import { redactedError } from "@th/core/lib/comms/redacted-error";
 import { isAppError } from "@th/errors";
 import type { ClockPort } from "@th/ports/clock";
 import type { LoggerPort } from "@th/ports/logger";
@@ -67,15 +69,13 @@ const STOP_KEYWORDS = new Set([
   "TD",
 ]);
 
-/** START-family re-consent keywords. */
-const START_KEYWORDS = new Set([
-  "START",
-  "UNSTOP",
-  "YES",
-  "OPTIN",
-  "OPT-IN",
-  "OPT IN",
-]);
+/**
+ * START-family re-consent keywords: the carrier-standard opt-in set that AWS
+ * End User Messaging registers by default (START, UNSTOP). Nothing that reads
+ * like conversation: "Yes thanks" in reply to a reminder must never opt a
+ * number back in.
+ */
+const START_KEYWORDS = new Set(["START", "UNSTOP"]);
 
 export type InboundKeywordClassification = {
   kind: "opt_out" | "opt_in" | "other";
@@ -152,6 +152,12 @@ export type SmsInboundDeps = {
 export async function handleSmsInboundNotification(
   deps: SmsInboundDeps,
   rawMessage: string,
+  /**
+   * The SNS envelope's signature-covered `Timestamp`: when the reply was
+   * published. Orders the decision against the ledger so a redelivered
+   * older keyword cannot undo a newer one.
+   */
+  occurredAt?: Date,
 ): Promise<SmsInboundHandleResult> {
   let parsedJson: unknown;
   try {
@@ -189,8 +195,12 @@ export async function handleSmsInboundNotification(
           ...(message.inboundMessageId
             ? { providerMessageId: message.inboundMessageId }
             : {}),
+          ...(occurredAt ? { occurredAt } : {}),
         },
       );
+      if (!result.applied) {
+        return { action: "ignored", reason: "stale_opt_out" };
+      }
       return { action: "opted_out", phoneE164: result.phoneE164 };
     }
 
@@ -199,8 +209,15 @@ export async function handleSmsInboundNotification(
       {
         phoneNumber: message.originationNumber,
         source: SOURCE,
+        ...(message.inboundMessageId
+          ? { providerMessageId: message.inboundMessageId }
+          : {}),
+        ...(occurredAt ? { occurredAt } : {}),
       },
     );
+    if (!result.applied) {
+      return { action: "ignored", reason: "stale_opt_in" };
+    }
     return { action: "opted_in", phoneE164: result.phoneE164 };
   } catch (error) {
     // A phone AWS relayed that we cannot normalize will never succeed on
@@ -223,10 +240,14 @@ export type SmsInboundRouteOptions = {
   confirmSubscription?: (subscribeUrl: string) => Promise<void>;
 };
 
+const SIGNATURE_VERSION_REPORT_WINDOW_MS = 15 * 60 * 1000;
+
 const defaultConfirmSubscription = async (
   subscribeUrl: string,
 ): Promise<void> => {
-  const response = await fetch(subscribeUrl);
+  // No redirects: the SubscribeURL host was validated, its redirect target
+  // was not.
+  const response = await fetch(subscribeUrl, { redirect: "error" });
   if (!response.ok) {
     throw new Error(`sns_subscribe_confirm_failed_${response.status}`);
   }
@@ -240,6 +261,20 @@ const plugin: FastifyPluginAsync<SmsInboundRouteOptions> = async (
   const fetchCertPem = opts.fetchCertPem ?? defaultFetchCertPem;
   const confirmSubscription =
     opts.confirmSubscription ?? defaultConfirmSubscription;
+  // The signature-version check runs before the signature is verified, so
+  // anyone who knows the topic ARN can trigger it. The error log (Sentry via
+  // pino) and the report fire at most once per window; every request still
+  // logs at warn.
+  const reportSignatureVersion = createThrottledReporter((error, context) => {
+    logger.error("sns_sms_inbound_unsupported_signature_version", {
+      ...(context?.extra ?? {}),
+    });
+    try {
+      app.deps.trpc.reportError?.(error, context);
+    } catch {
+      // Reporting is best-effort; the 400 stands either way.
+    }
+  }, SIGNATURE_VERSION_REPORT_WINDOW_MS);
 
   app.post("/webhooks/aws/sms-inbound", async (request, reply) => {
     const allowedTopicArn = env.AWS_SNS_SMS_INBOUND_TOPIC_ARN;
@@ -274,21 +309,56 @@ const plugin: FastifyPluginAsync<SmsInboundRouteOptions> = async (
       return reply.status(400).send({ ok: false, error: "bad_envelope" });
     }
 
+    // Topic allow-list BEFORE the schema and any cert fetch (NFR-002): a
+    // payload for a topic we never subscribed to is rejected outright, and
+    // the checks below then speak only about OUR topic.
+    const rawEnvelope =
+      typeof envelopeJson === "object" && envelopeJson !== null
+        ? (envelopeJson as Record<string, unknown>)
+        : {};
+    if (rawEnvelope.TopicArn !== allowedTopicArn) {
+      logger.warn("sns_sms_inbound_topic_not_allowed", {
+        topicArn:
+          typeof rawEnvelope.TopicArn === "string"
+            ? rawEnvelope.TopicArn.slice(0, 256)
+            : undefined,
+      });
+      return reply.status(403).send({ ok: false, error: "topic_not_allowed" });
+    }
+
+    // Our own topic signing with anything but v2 (SHA256) means the topic's
+    // SignatureVersion attribute was changed: every delivery, STOP replies
+    // included, would be refused from here on. Loud (error + report), but
+    // throttled: this runs before signature verification.
+    if (rawEnvelope.SignatureVersion !== "2") {
+      const signatureVersion =
+        typeof rawEnvelope.SignatureVersion === "string"
+          ? rawEnvelope.SignatureVersion.slice(0, 8)
+          : typeof rawEnvelope.SignatureVersion;
+      logger.warn("sns_sms_inbound_unsupported_signature_version", {
+        signatureVersion,
+      });
+      reportSignatureVersion(
+        new Error("sns_sms_inbound_unsupported_signature_version"),
+        {
+          tags: {
+            route: "webhooks/aws/sms-inbound",
+            stage: "signature_version",
+          },
+          extra: { signatureVersion },
+        },
+      );
+      return reply
+        .status(400)
+        .send({ ok: false, error: "unsupported_signature_version" });
+    }
+
     const envelopeParsed = snsEnvelopeSchema.safeParse(envelopeJson);
     if (!envelopeParsed.success) {
       logger.warn("sns_sms_inbound_bad_envelope", {});
       return reply.status(400).send({ ok: false, error: "bad_envelope" });
     }
     const envelope = envelopeParsed.data;
-
-    // Topic allow-list BEFORE any cert fetch (NFR-002): a payload for a
-    // topic we never subscribed to is rejected outright.
-    if (envelope.TopicArn !== allowedTopicArn) {
-      logger.warn("sns_sms_inbound_topic_not_allowed", {
-        topicArn: envelope.TopicArn,
-      });
-      return reply.status(403).send({ ok: false, error: "topic_not_allowed" });
-    }
 
     // Replay bound: `Timestamp` is signature-covered, so a validly-signed
     // envelope this far outside the window is a replay (or hopeless queue
@@ -360,6 +430,7 @@ const plugin: FastifyPluginAsync<SmsInboundRouteOptions> = async (
           logger,
         },
         envelope.Message,
+        new Date(timestampMs),
       );
       logger.info("sns_sms_inbound_processed", {
         messageId: envelope.MessageId,
@@ -368,15 +439,20 @@ const plugin: FastifyPluginAsync<SmsInboundRouteOptions> = async (
       });
       return reply.send({ ok: true, action: result.action });
     } catch (error) {
-      // Log with the canonical AppErrorCode, then re-throw UNCHANGED so
-      // Fastify's default 500 preserves SNS's retry semantics (mirrors the
-      // resend webhook's failure contract).
+      // Log with the canonical AppErrorCode, then re-throw so Fastify's
+      // default 500 preserves SNS's retry semantics (mirrors the resend
+      // webhook's failure contract). A database error can print its
+      // arguments, the sender's number among them, and both the log line
+      // and the thrown error reach Sentry: anything that is not our own
+      // AppError (fixed codes, no number) goes out as a redacted copy,
+      // which still answers 500.
+      const safeError = isAppError(error) ? error : redactedError(error);
       logger.error("sns_sms_inbound_processing_failed", {
-        error: error instanceof Error ? error.message : String(error),
+        error: safeError instanceof Error ? safeError.message : String(safeError),
         appCode: resolveWebhookAppCode(error) ?? undefined,
         messageId: envelope.MessageId,
       });
-      throw error;
+      throw safeError;
     }
   });
 };

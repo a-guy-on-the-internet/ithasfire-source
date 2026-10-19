@@ -1,0 +1,215 @@
+# booking-conversation-and-event-step.spec.yaml
+#
+# Completes the booking loop the embed button opens: a message thread on every
+# booking request (works for anonymous submitters via tokenized email access),
+# and a "Create event" step off a finalized agreement so accepted bookings
+# stop dead-ending in the inbox.
+
+version: "1.0"
+updated: "2026-07-14"
+
+# BUILD TRIGGER — SPLIT 2026-07-14 (user call):
+# EVENT STEP (FR-006/FR-007): PROMOTED to build-now. Rationale: the venue
+#   pitch is "paste one line → request → accept → show goes live"; the
+#   hand-create-an-event dead-end breaks the demo in front of the exact
+#   venues the launch depends on. It is also the small/safe half (no new
+#   tokens or anonymous surfaces — assembly of finalize + EventHuman +
+#   event editor).
+# THREAD (FR-001..005): STILL GATED — build when a real venue replies to a
+#   real request (mailto today) or asks to reply on-platform. Observed
+#   friction decides its shape (web thread vs reply-by-email ingestion).
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    A booking request today is accept-or-decline with no conversation — real
+    booking talk (dates, backline, draw, money) has nowhere to happen, so it
+    leaks to email/DMs and the platform loses the thread. And after accept →
+    agreement → finalize, the finalize dialog can only LINK an event the venue
+    already created by hand elsewhere (FinalizeDialog event picker); nothing
+    creates the event from the booking, so the loop never closes on-platform.
+  solution: >
+    (1) A two-party message thread attached to each booking request: venue
+    replies from the inbox, performer replies from their sent-requests view;
+    each side is notified through the existing notify() pipeline. Anonymous
+    (unclaimed) submitters participate by email with a tokenized thread link —
+    same hashed-single-token discipline as the claim token. (2) A
+    "Create event from this booking" action on ACCEPTED agreements that mints
+    a DRAFT event prefilled from the request/agreement (place, date, performer
+    lineup via EventHuman) and runs the existing finalize linking when the
+    agreement is finalizable.
+  users:
+    - Venue owner/staff (inbox thread, accept, create event)
+    - Performer (sent-request thread, notified of replies)
+    - Anonymous submitter (email + tokenized thread view until they claim)
+  surfaces:
+    - web
+    - embed (thread link from the success email chain)
+    - jobs (none new — notify pipeline)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        New BookingRequestMessage model: bookingRequestId, authorSide
+        (VENUE | PERFORMER | SYSTEM), authorHumanId? (null for anonymous
+        performer-side messages), body (sanitized plain text, 1..4000),
+        createdAt, readAt?. Modeled on SupportThread/SupportMessage but
+        anchored to BookingRequest (no separate thread row — the request IS
+        the thread; lastMessageAt denormalized onto BookingRequest).
+    - id: FR-002
+      description: >
+        sendBookingRequestMessage use case: venue side requires
+        requirePlaceOwnership (any member may reply; mirror inbox read
+        access); performer side requires sender ownership (requireOwnerAccess)
+        OR a valid thread token (FR-004). Thread stays writable while the
+        request is PENDING/VIEWED/ACCEPTED; closed for
+        DECLINED/WITHDRAWN/EXPIRED (calm read-only state).
+    - id: FR-003
+      description: >
+        Notifications ride the existing pipeline: account-holding
+        counterparties get notify() (in-app + email + push, variant
+        booking.message-received, per-message idempotency key, deep link into
+        the thread). Anonymous submitters get a direct mailer send (new
+        template booking.message_received_guest) containing the message and a
+        tokenized reply link.
+    - id: FR-004
+      description: >
+        Guest thread access token: hashed at rest on BookingRequest
+        (threadTokenHash, single active token, 30d rolling expiry re-stamped
+        on each outbound guest email), granting access ONLY to a minimal
+        thread page (read messages + reply + see status). Claim-token
+        discipline applies: raw token only in email links, constant-time-safe
+        hash lookup, rotated if the venue suspects leakage (reuse resend
+        affordance pattern). Claiming the request supersedes the token (the
+        account view takes over).
+    - id: FR-005
+      description: >
+        Thread UI: (a) venue inbox expanded row gains the thread (messages +
+        reply box) above the accept/decline actions; (b) performer
+        sent-requests view (account settings) gains the same; (c) new
+        minimal guest page /booking-requests/thread/[token] (noindex, calm,
+        strict Swiss). Unread indicators via readAt (per-side).
+    - id: FR-006
+      description: >
+        createEventFromAgreement use case: given an ACCEPTED agreement whose
+        bookingRequest is linked, creates a DRAFT event prefilled with the
+        place (venueId), first preferred date (editable), a title suggestion
+        ("{actName} at {placeName}"), and the performer attached as an
+        EventHuman PERFORMER row (humanId when owned/claimed; externalName
+        from actName otherwise). If the agreement is finalizable (existing
+        requireFinalizableAgreement gates: confirmed lines, ready payees),
+        run finalizeBookingAgreement against the new event in the same flow;
+        otherwise create+prefill only and surface "finalize when payouts are
+        confirmed" (the existing FinalizeDialog then links it).
+    - id: FR-007
+      description: >
+        Web wiring for FR-006: the agreement page (NegotiationBar /
+        FinalizeDialog) gains "Create a new event from this booking" alongside
+        the existing pick-an-event flow; on success, route into the standard
+        event editor with the draft. Venue-side inbox ACCEPTED rows link to
+        the agreement as today (unchanged).
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        All message bodies sanitized server-side (plainTextMultiline; same
+        rules as pitch text); guest page rate-limited per token and per IP;
+        message sends rate-limited per actor (e.g. 30/hour) to keep threads
+        from becoming spam channels.
+    - id: NFR-002
+      description: >
+        Thread token never logged; guest page noindex; Referrer-Policy
+        strips the path cross-origin (verify same posture as claim page).
+    - id: NFR-003
+      description: >
+        Notification failures never fail the send (ReporterPort swallow +
+        regression tests, house convention). Event creation is transactional:
+        a failed finalize inside FR-006 must not leave an orphan half-linked
+        event (create event + link in one tx; finalize CAS rules unchanged).
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: send-booking-request-message
+        description: Auth (place / sender / token) → sanitize → append message + stamp lastMessageAt → notify counterparty (notify() or guest mailer).
+        idempotent: false
+        money: false
+      - name: list-booking-request-messages
+        description: Same three auth paths; marks readAt for the reading side.
+        idempotent: true
+        money: false
+      - name: get-booking-thread-by-token
+        description: Hash lookup → minimal thread view model (request summary + messages). Fail-closed.
+        idempotent: true
+        money: false
+      - name: create-event-from-agreement
+        description: >
+          ACCEPTED agreement + linked booking request → DRAFT event (place,
+          date, title, EventHuman) → finalize-link when finalizable.
+          Actor: venue side (requirePlaceOwnership edit roles) — the venue
+          hosts the event; revisit organizer-initiated creation later.
+        idempotent: true (agreement.eventId is @unique — second call returns the linked event)
+        money: true (runs existing finalize/payout-terms activation path when finalizable)
+      - name: rotate-booking-thread-token (folded into send path or explicit)
+        description: Fresh token on each outbound guest email (rolling expiry).
+  ports:
+    new: []
+    existing: [booking-requests repo (messages child + thread token), agreements, events, event-humans, notify pipeline, mailer, rate-limit, reporter, idempotency, audit]
+  transport:
+    trpc_procedures:
+      - bookingRequests.sendMessage / listMessages (authed)
+      - bookingRequests.getThreadByToken / replyByToken (public, token-gated, rate-limited + Turnstile on reply)
+      - bookingAgreements.createEventFromAgreement (authed)
+  ui:
+    pages:
+      - /booking-requests/thread/[token] (guest thread, noindex)
+    components:
+      - BookingInbox thread panel; SentBookingRequestsList thread panel
+      - Agreement page "Create event from this booking" (FinalizeDialog sibling action)
+      - ui-email templates: booking.message_received_guest (+ notify variant booking.message-received)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - BookingRequestMessage (bookingRequestId FK cascade, authorSide enum, authorHumanId?, body, createdAt, readAt?; @@index([bookingRequestId, createdAt]))
+  modified_models:
+    - BookingRequest: + lastMessageAt?, threadTokenHash? @unique, threadTokenExpiresAt?
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: Thread token is a long-lived bearer credential to PII (the conversation).
+    severity: MEDIUM
+    mitigation: Hashed at rest, single active, rolling 30d expiry, page is read/reply only (no accept/claim actions), rotation on every outbound email, security review before ship.
+  - risk: Guest reply endpoint is a new anonymous write surface (spam).
+    severity: MEDIUM
+    mitigation: Token possession required + per-token and per-IP rate limits + Turnstile on guest replies + sanitization; venue can decline to close the thread.
+  - risk: create-event-from-agreement crosses booking, events, payout-terms — the three most invariant-heavy subsystems.
+    severity: MEDIUM
+    mitigation: Reuse finalizeBookingAgreement verbatim (no new money logic); event mint uses the standard createEvent internals; adversarial review on the transaction boundaries.
+
+open_questions:
+  - Should SYSTEM messages record lifecycle moments in the thread (accepted, invite sent, claimed, event created)? Cheap and gives the thread a spine — leaning yes.
+  - Venue-side author display: individual staff name or venue name? (Support shows typed authors; venues may prefer speaking as the venue.)
+
+out_of_scope:
+  - Structured counter-offers in the thread (the agreement editor owns negotiation mechanics)
+  - Attachments/media in messages
+  - Retrofitting threads onto agreements, orders, or other entities (booking requests only)
+  - Organizer-initiated event creation from the agreement (venue-side first)
+
+acceptance_criteria:
+  - Venue replies from the inbox → signed-in performer sees the message in their sent view + gets in-app/email/push; their reply round-trips.
+  - Venue replies to an ANONYMOUS request → submitter gets the email → tokenized page shows the thread → their reply appears in the venue inbox; expired/rotated token shows the calm invalid state.
+  - Claiming a request retires the guest token; the thread continues seamlessly in the account view.
+  - DECLINED request → thread read-only both sides.
+  - On an ACCEPTED agreement, "Create event from this booking" produces a DRAFT event with place, date, title, and the performer in the lineup; when payout lines are confirmed the same action finalize-links it (Agreement.eventId set, terms ACTIVE); when not, the draft exists and FinalizeDialog can link it later.
+  - Message spam attempts hit rate limits; all bodies stored sanitized.

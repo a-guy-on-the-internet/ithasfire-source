@@ -1,0 +1,16 @@
+-- Venue track record (FR-008 / NFR-005 / R12): bare `updatedAt` index for the
+-- "an eligible order at this place changed since lastCalculatedAt" arm of
+-- PlaceStatsRepo.listStalePlaceIds — same reasoning as the sibling
+-- 20260924130000_ticket_scanned_at_idx. `updatedAt` is Prisma's @updatedAt,
+-- bumped by every refund / status change, which is exactly what should make
+-- the stats stale.
+--
+-- `Order` is a hot table (checkout, Stripe webhooks). `CONCURRENTLY` so the
+-- build does not block writes; single statement so Prisma migrate runs it
+-- outside a transaction (precedent: 20260425190038, 20260707120000).
+--
+-- `IF NOT EXISTS`: a CONCURRENTLY build that fails part-way leaves an
+-- INVALID index behind under this name, and a re-run then SKIPS it rather
+-- than rebuilding. If a deploy fails here, `DROP INDEX "Order_updatedAt_idx"`
+-- before retrying.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "Order_updatedAt_idx" ON "Order"("updatedAt");

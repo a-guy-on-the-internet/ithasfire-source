@@ -5,12 +5,22 @@
  * job infrastructure (cron schedules, Pub/Sub topics).
  *
  * Terraform reads the same JSON file directly via jsondecode(file(...)).
+ * Some fields are Terraform-only and deliberately absent from ScheduleEntry
+ * (`attemptDeadline`, `triggerTopic`, `payload`, `retry`); the full key list
+ * and its checks live in `scripts/scheduled-entry-fields.ts`.
  */
 import manifestJson from "../../jobs.manifest.json";
 
 export interface ScheduleEntry {
   cron: string;
   timezone: string;
+  /**
+   * Manifest-level default for the Cloud Scheduler job. Absent means ON.
+   * Distinct from the RUNTIME pause staff set from /platform/jobs, which the
+   * run tracker holds and `GET /jobs/status` reports as the top-level
+   * `enabled` — this one is `schedule.enabled` in that payload.
+   */
+  enabled?: boolean;
 }
 
 /**
@@ -26,5 +36,13 @@ export function getSchedule(jobName: string): ScheduleEntry {
       `Job "${jobName}" is not in jobs.manifest.json — add it before defining the handler.`,
     );
   }
-  return { cron: entry.cron, timezone: entry.timezone };
+  // `enabled` is spread in ONLY when the manifest sets it, so entries without
+  // the key produce a `schedule` object byte-identical to what
+  // `registry.generated.ts` carries — the registry drift test compares them by
+  // deep equality, and an `enabled: undefined` key would fail it.
+  return {
+    cron: entry.cron,
+    timezone: entry.timezone,
+    ...(entry.enabled !== undefined ? { enabled: entry.enabled } : {}),
+  };
 }

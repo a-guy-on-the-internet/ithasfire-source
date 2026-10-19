@@ -75,7 +75,6 @@ const seedBookingLoop: FastifyPluginAsync = async (app) => {
       const place = await prisma.place.create({
         data: {
           name: placeName,
-          slug: `e2e-bk-place-${suffix}`,
           address: "42 Booking Loop, Test City, TS 00042",
           city: "Test City",
           region: "TS",
@@ -93,6 +92,34 @@ const seedBookingLoop: FastifyPluginAsync = async (app) => {
           ownerId: org.id,
           verified: true,
         },
+      });
+
+      // A VERIFIED, accepting place is NOT yet a bookable one. Both create
+      // paths — `createBookingRequest` and the embed's `createBookingInquiry`
+      // — fail closed on a place with zero CalendarAvailability rows
+      // (availability-onboarding FR-005, docs/specs/2026-08-31): an
+      // unconfigured venue is publicly "not taking requests right now", and
+      // the refusal reads `booking_requests_unconfigured`.
+      //
+      // Without these rows every spec that submits an inquiry has to finish
+      // the venue itself, which means an AUTHORIZED
+      // `places.upsertCalendarAvailability` call and all the sign-in plumbing
+      // that drags in. Seeding it here is what makes "seeded venue" actually
+      // mean bookable.
+      //
+      // Place-wide (`calendarId: null`) on purpose: `countAvailabilityForPlace`
+      // counts by placeId alone, and a place-wide window is the shape a venue
+      // with no named calendars has.
+      await prisma.calendarAvailability.createMany({
+        data: [5, 6].map((dayOfWeek) => ({
+          placeId: place.id,
+          calendarId: null,
+          dayOfWeek,
+          date: null,
+          startTime: "18:00",
+          endTime: "23:30",
+          isOpen: true,
+        })),
       });
 
       await prisma.entityPage.create({
@@ -232,6 +259,7 @@ const seedBookingLoop: FastifyPluginAsync = async (app) => {
             repos: app.deps.trpc.repos,
             search: multiSearch,
             clock: app.deps.trpc.clock,
+            reportError: app.deps.trpc.reportError ?? undefined,
           },
           { fullReindex: true },
         );

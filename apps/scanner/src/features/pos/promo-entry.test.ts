@@ -9,8 +9,8 @@ import {
   normalizePromoCode,
   promoCodesForSale,
   promoErrorMessage,
+  isPromoSettled,
   saleErrorMessage,
-  selectCartTotals,
   type PromoApplication,
   type PromoPreviewOutput,
   type PromoPreviewRequest,
@@ -42,6 +42,10 @@ const previewOutput = (
   applications,
   totalDiscountCents: applications.reduce((n, a) => n + a.discountCents, 0),
   orderSubtotalCents,
+  // The till never reads either: the door total comes from `quotePosCart`,
+  // and the door preview names no held cart, so the server answers null.
+  platformFeeReductionCents: 0,
+  heldCartFees: null,
 });
 
 /** Use-case errors arrive as `TRPCClientError` — a plain `.message` carrier. */
@@ -133,7 +137,7 @@ describe("promoErrorMessage", () => {
   });
 });
 
-describe("selectCartTotals", () => {
+describe("isPromoSettled", () => {
   const applied = (over: Partial<PromoState>): PromoState => ({
     ...EMPTY_PROMO_STATE,
     codes: ["DOOR10"],
@@ -142,52 +146,27 @@ describe("selectCartTotals", () => {
     ...over,
   });
 
-  it("subtracts the discount from the door subtotal", () => {
-    const totals = selectCartTotals({
-      subtotalCents: 6_000,
-      cartKey: cartKeyOf(CART_2GA),
-      promo: applied({}),
-    });
-    expect(totals).toEqual({
-      subtotalCents: 6_000,
-      discountCents: 1_000,
-      totalCents: 5_000,
-      isStale: false,
-    });
+  it("is settled when the codes were previewed against this cart", () => {
+    expect(isPromoSettled(applied({}), cartKeyOf(CART_2GA))).toBe(true);
   });
 
-  it("clamps a discount larger than the cart to zero, never negative", () => {
-    const totals = selectCartTotals({
-      subtotalCents: 500,
-      cartKey: cartKeyOf(CART_2GA),
-      promo: applied({ totalDiscountCents: 1_000 }),
-    });
-    expect(totals.discountCents).toBe(500);
-    expect(totals.totalCents).toBe(0);
-  });
-
-  it("flags stale when the cart moved past the previewed one", () => {
+  it("is NOT settled once the cart moved past the previewed one", () => {
     expect(
-      selectCartTotals({
-        subtotalCents: 9_000,
-        cartKey: cartKeyOf([{ ticketTypeId: GA, qty: 3 }]),
-        promo: applied({}),
-      }).isStale,
-    ).toBe(true);
+      isPromoSettled(applied({}), cartKeyOf([{ ticketTypeId: GA, qty: 3 }])),
+    ).toBe(false);
   });
 
-  it("is never stale and never discounts with no codes applied", () => {
-    const totals = selectCartTotals({
-      subtotalCents: 6_000,
-      cartKey: cartKeyOf(CART_2GA),
-      promo: EMPTY_PROMO_STATE,
-    });
-    expect(totals).toEqual({
-      subtotalCents: 6_000,
-      discountCents: 0,
-      totalCents: 6_000,
-      isStale: false,
-    });
+  it("is NOT settled while a preview is in flight, even before the first code lands", () => {
+    expect(
+      isPromoSettled(
+        { ...EMPTY_PROMO_STATE, isPreviewing: true },
+        cartKeyOf(CART_2GA),
+      ),
+    ).toBe(false);
+  });
+
+  it("is settled with no codes applied, whatever the cart", () => {
+    expect(isPromoSettled(EMPTY_PROMO_STATE, cartKeyOf(CART_2GA))).toBe(true);
   });
 });
 
@@ -204,7 +183,7 @@ describe("promoCodesForSale", () => {
 });
 
 describe("createPromoController — apply", () => {
-  it("previews at DOOR pricing against the current cart and updates the total", async () => {
+  it("previews against the current cart and updates the total", async () => {
     const h = harness(async () =>
       previewOutput([application({ normalizedCode: "DOOR10" })]),
     );
@@ -217,7 +196,6 @@ describe("createPromoController — apply", () => {
         codes: ["DOOR10"],
         ticketSelections: [{ ticketTypeId: GA, qty: 2 }],
         source: "manual",
-        pricing: "DOOR",
       },
     ]);
     expect(h.state.codes).toEqual(["DOOR10"]);
@@ -225,13 +203,7 @@ describe("createPromoController — apply", () => {
     expect(h.state.error).toBeNull();
     expect(h.state.isPreviewing).toBe(false);
 
-    const totals = selectCartTotals({
-      subtotalCents: 6_000,
-      cartKey: cartKeyOf(CART_2GA),
-      promo: h.state,
-    });
-    expect(totals.totalCents).toBe(5_000);
-    expect(totals.isStale).toBe(false);
+    expect(isPromoSettled(h.state, cartKeyOf(CART_2GA))).toBe(true);
   });
 
   it("shows the error inline and does NOT add a rejected code", async () => {
@@ -336,13 +308,7 @@ describe("createPromoController — cart changes", () => {
     const bigger = [{ ticketTypeId: GA, qty: 4 }];
     h.controller.syncCart(ctx(bigger));
     // Stale until the re-preview lands.
-    expect(
-      selectCartTotals({
-        subtotalCents: 12_000,
-        cartKey: cartKeyOf(bigger),
-        promo: h.state,
-      }).isStale,
-    ).toBe(true);
+    expect(isPromoSettled(h.state, cartKeyOf(bigger))).toBe(false);
 
     await vi.advanceTimersByTimeAsync(PROMO_PREVIEW_DEBOUNCE_MS + 1);
 
@@ -350,16 +316,9 @@ describe("createPromoController — cart changes", () => {
     expect(h.requests[1]).toMatchObject({
       codes: ["HALF"],
       ticketSelections: [{ ticketTypeId: GA, qty: 4 }],
-      pricing: "DOOR",
     });
     expect(h.state.totalDiscountCents).toBe(6_000);
-    expect(
-      selectCartTotals({
-        subtotalCents: 12_000,
-        cartKey: cartKeyOf(bigger),
-        promo: h.state,
-      }).isStale,
-    ).toBe(false);
+    expect(isPromoSettled(h.state, cartKeyOf(bigger))).toBe(true);
   });
 
   it("coalesces a burst of stepper taps into a single preview", async () => {
@@ -682,13 +641,7 @@ describe("createPromoController — self-healing staleness", () => {
     expect(h.state.codes).toEqual(["DOOR10"]);
     // The quote must have caught up with the cart the operator is looking at.
     expect(h.state.previewedCartKey).toBe(h.liveKey);
-    expect(
-      selectCartTotals({
-        subtotalCents: 12_000,
-        cartKey: h.liveKey,
-        promo: h.state,
-      }).isStale,
-    ).toBe(false);
+    expect(isPromoSettled(h.state, h.liveKey)).toBe(true);
     expect(h.requests).toHaveLength(2);
   });
 
@@ -708,13 +661,7 @@ describe("createPromoController — self-healing staleness", () => {
 
     expect(h.state.codes).toEqual(["DOOR10"]); // rejected code not added
     expect(h.state.previewedCartKey).toBe(h.liveKey); // and not wedged
-    expect(
-      selectCartTotals({
-        subtotalCents: 12_000,
-        cartKey: h.liveKey,
-        promo: h.state,
-      }).isStale,
-    ).toBe(false);
+    expect(isPromoSettled(h.state, h.liveKey)).toBe(true);
   });
 
   it("does not re-request when the cart returns to the already-quoted shape", async () => {
@@ -757,21 +704,21 @@ describe("createPromoController — self-healing staleness", () => {
   });
 });
 
-describe("selectCartTotals — in-flight gating", () => {
-  it("is stale while previewing even when the previewed cart key matches", () => {
+describe("isPromoSettled — in-flight gating", () => {
+  it("is not settled while previewing even when the previewed cart key matches", () => {
     // This is the guard that keeps both CTAs disabled during the first apply.
-    const totals = selectCartTotals({
-      subtotalCents: 6_000,
-      cartKey: cartKeyOf(CART_2GA),
-      promo: {
-        ...EMPTY_PROMO_STATE,
-        codes: ["DOOR10"],
-        totalDiscountCents: 1_000,
-        previewedCartKey: cartKeyOf(CART_2GA),
-        isPreviewing: true,
-      },
-    });
-    expect(totals.isStale).toBe(true);
+    expect(
+      isPromoSettled(
+        {
+          ...EMPTY_PROMO_STATE,
+          codes: ["DOOR10"],
+          totalDiscountCents: 1_000,
+          previewedCartKey: cartKeyOf(CART_2GA),
+          isPreviewing: true,
+        },
+        cartKeyOf(CART_2GA),
+      ),
+    ).toBe(false);
   });
 });
 
@@ -857,7 +804,7 @@ describe("createPromoController — reconcile termination", () => {
 describe("saleErrorMessage", () => {
   it("gives sale-specific copy instead of promo copy for a capacity failure", () => {
     expect(saleErrorMessage(serverError("TICKET_TYPE_TEMPORARILY_HELD"))).toBe(
-      "Someone else is mid-sale on the last of these. Try again in a moment.",
+      "These tickets are held in someone else's checkout. If they don't finish, they go back on sale.",
     );
     expect(saleErrorMessage(serverError("TICKET_TYPE_SOLD_OUT"))).toBe(
       "That ticket type just sold out.",

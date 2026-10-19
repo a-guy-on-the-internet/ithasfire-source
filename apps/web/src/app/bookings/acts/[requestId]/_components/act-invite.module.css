@@ -1,0 +1,278 @@
+/*
+ * Lineup invite page (board I1 "Letter"). Strict Swiss content: radius 0,
+ * rules instead of boxes, theme tokens only (each with its Stub fallback so
+ * first paint matches the default theme). The shell supplies the 16px phone
+ * gutter; this is one readable column, never a rail.
+ */
+
+.page {
+	display: flex;
+	flex-direction: column;
+	gap: 28px;
+	width: 100%;
+	max-width: 680px;
+	margin: 0 auto;
+	padding: 16px 0 48px;
+	min-width: 0;
+}
+
+@media (min-width: 900px) {
+	.page {
+		padding-top: 40px;
+	}
+}
+
+.head {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	min-width: 0;
+}
+
+.wrap {
+	overflow-wrap: anywhere;
+	min-width: 0;
+}
+
+/* ── Facts (definition list) ─────────────────────────────────────────── */
+
+.facts {
+	margin: 0;
+	display: grid;
+	grid-template-columns: minmax(0, 1fr);
+	row-gap: 4px;
+	border-top: 2px solid var(--borderColor, #211c16);
+	border-bottom: 2px solid var(--borderColor, #211c16);
+	padding: 16px 0;
+}
+
+.facts dt {
+	padding-top: 10px;
+}
+
+.facts dt:first-child {
+	padding-top: 0;
+}
+
+.facts dd {
+	margin: 0;
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+
+@media (min-width: 640px) {
+	.facts {
+		grid-template-columns: 170px minmax(0, 1fr);
+		column-gap: 14px;
+		row-gap: 12px;
+		align-items: baseline;
+	}
+
+	.facts dt {
+		padding-top: 0;
+	}
+}
+
+.dateList {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+
+/* ── The bill ────────────────────────────────────────────────────────── */
+
+.billSection {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	min-width: 0;
+}
+
+.bill {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	border-top: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+.billRow {
+	display: grid;
+	grid-template-columns: 32px minmax(0, 1fr);
+	gap: 10px;
+	padding: 12px 0;
+	border-bottom: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+/*
+ * The viewer's own spot: the tint bleeds 8px past the column on both sides
+ * (negative margin + matching padding), so the index and name stay on the
+ * same x as every other row. 8px sits inside the shell's 16px phone gutter,
+ * so it never reaches the viewport edge.
+ */
+.billRowMine {
+	background: var(--surfaceMuted, #efe7d6);
+	margin-left: -8px;
+	margin-right: -8px;
+	padding-left: 8px;
+	padding-right: 8px;
+}
+
+.billBody {
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+	min-width: 0;
+}
+
+.billName {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px 10px;
+	min-width: 0;
+}
+
+.tag {
+	border: 1px solid var(--borderColor, #211c16);
+	padding: 1px 6px;
+	line-height: 1.4;
+}
+
+/* ── Answer block ────────────────────────────────────────────────────── */
+
+.answer {
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+	min-width: 0;
+}
+
+.answeringAs {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px 10px;
+	padding: 8px 0;
+	border-bottom: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+.select {
+	font: inherit;
+	font-weight: 700;
+	font-size: 15px;
+	color: var(--color, #211c16);
+	background-color: var(--surface, #fdfaf3);
+	border: 1px solid var(--borderColor, #211c16);
+	border-radius: 0;
+	min-height: 44px;
+	padding: 0 12px;
+	max-width: 100%;
+	min-width: 0;
+	flex: 1 1 200px;
+}
+
+@media (min-width: 640px) {
+	.select {
+		flex: 0 1 auto;
+		margin-left: auto;
+	}
+}
+
+.actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 12px;
+}
+
+.state {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	border-top: 2px solid var(--borderColor, #211c16);
+	padding-top: 14px;
+}
+
+/* ── Pass / leave form ───────────────────────────────────────────────── */
+
+.passForm {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	border-top: 2px solid var(--borderColor, #211c16);
+	padding-top: 14px;
+	min-width: 0;
+}
+
+.reasonLabel {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 6px;
+}
+
+.textarea {
+	font: inherit;
+	font-size: 15px;
+	line-height: 1.5;
+	color: var(--color, #211c16);
+	background-color: var(--surface, #fdfaf3);
+	border: 1px solid var(--borderColor, #211c16);
+	border-radius: 0;
+	padding: 10px 12px;
+	width: 100%;
+	min-height: 7rem;
+	resize: vertical;
+	box-sizing: border-box;
+}
+
+.reasonMeta {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: space-between;
+	gap: 4px 12px;
+}
+
+.notes {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+/* ── Status screens (loading / error / not found) ────────────────────── */
+
+.panel {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 12px;
+	border-top: 2px solid var(--borderColor, #211c16);
+	padding-top: 16px;
+}
+
+/*
+ * Local copy of globals.css `th-skeleton-pulse`: CSS Modules hash keyframe
+ * names, so referencing the global one from here would never animate.
+ */
+@keyframes pulse {
+	0%,
+	100% {
+		opacity: 0.4;
+	}
+	50% {
+		opacity: 1;
+	}
+}
+
+.pulse {
+	background-color: var(--surfaceMuted, #efe7d6);
+	animation: pulse 1.8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.pulse {
+		animation: none;
+	}
+}

@@ -1,0 +1,11 @@
+{{= it.productName }} verification code
+
+Hi!
+Your verification code is: {{= it.otpCode }}
+
+Enter this code to complete your sign-in.
+This code expires in 5 minutes.
+
+If you didn't request this, please secure your account.
+Thanks,
+The {{= it.productName }} team

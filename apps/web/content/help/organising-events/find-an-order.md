@@ -16,7 +16,7 @@ When a customer emails you about a purchase, they will usually quote an order co
 
 ## Before you start
 
-Order lookup is limited to members with **Owner**, **Admin**, or **Finance** access. Editors, viewers and scanners can search events, attendees and venues, but orders will not appear in their results.
+Order lookup is limited to members with **Owner**, **Admin**, or **Finance** access. Editors, viewers and scanners can search events, attendees and places, but orders will not appear in their results.
 
 ## Find the order
 
@@ -57,6 +57,14 @@ So if a code returns nothing, check it against the customer's own email rather t
 Two orders can, very rarely, share the same eight-character code. When that happens the code alone is not enough to identify one order and no result is shown. Use the full order ID from the customer's link instead.
 :::
 
+## Reading the money on an order
+
+A paid order shows two figures. **Buyer paid** is what the buyer was charged, with its lines below it: the ticket price, the platform fee, the processing fee, any tax, and **Credit applied** when an Ithas Fire credit lowered the charge. The ticket price is always shown; the other lines are left out when they are zero. A credit is why **Buyer paid** can be less than what your event is credited. A few older door cash sales have no line-by-line record, so they show the total alone. An order that took no money, such as a cart the buyer left, is headed **Order total** and says **Nothing was charged.** A bank payment that has not settled yet says **Payment still processing.** Neither shows a credit.
+
+**Credited to the event** is what the sale credited your event. On tickets sold since 13 October 2026 that is the full ticket price, because the buyer pays the platform fee on top. On older orders you also see the platform fee that was taken from the price. If your event's payout terms split ticket money between several payees, the order says so, and each payee receives its share of that figure. A free ticket is credited $0.00. A paid order whose credit has not been written yet shows **Not credited yet** and the credit it is expected to get. If the credit cannot be read when you open the order, it shows **Credit could not be loaded**; open the order again later. A door cash sale shows no credit, since you hold that cash yourself. Resales and comps show none either.
+
 ## Next steps
 
 Once you have the order open you can issue a refund, resend tickets, or check its settlement status — see [payouts and settlements](/help/organising-events/payouts-and-settlements) for what happens to the money afterwards.
+
+If the buyer has disputed the charge with their card issuer, the refund controls are replaced by a note saying so. You can refund again once the dispute is won. A lost dispute can't be refunded — the cardholder already has the money back. See [refunds and chargebacks](/help/organising-events/payouts-and-settlements#refunds-and-chargebacks).

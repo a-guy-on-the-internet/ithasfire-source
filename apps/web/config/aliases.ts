@@ -51,6 +51,12 @@ export const buildVitestAliasEntries = (
         "packages/core/src/lib/embeds/index.ts",
       ),
     },
+    // Test fakes (vitest only — nothing in the app imports these). Mirrors the
+    // `@th/test-utils/*` path tsconfig.json already declares.
+    {
+      find: /^@th\/test-utils\/(.*)$/,
+      replacement: path.resolve(workspaceRoot, "packages/test-utils/src/$1"),
+    },
     {
       find: /^@th\/core\/(.*)$/,
       replacement: path.resolve(workspaceRoot, "packages/core/src/$1"),

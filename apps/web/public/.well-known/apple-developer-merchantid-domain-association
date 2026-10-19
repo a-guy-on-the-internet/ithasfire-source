@@ -1,0 +1,22 @@
+PLACEHOLDER — Stripe Apple Pay domain verification
+====================================================
+
+To activate Apple Pay (Express Checkout) on web:
+
+1. Stripe Dashboard → Settings → Payment methods → Apple Pay → "Configure"
+   → "Add new domain" → enter `ithasfire.com`.
+2. Stripe will give you a verification file to download. Open it — it's
+   a base64-looking blob of text (one long string, no JSON, no header).
+3. REPLACE the entire contents of this file with the contents Stripe gave
+   you. Do not add any wrapper text.
+4. Deploy.
+5. Back in the Stripe dashboard, click "Verify" — Stripe fetches this
+   URL and checks the token matches.
+6. Repeat for every domain that embeds Stripe Elements (e.g.
+   `web-dev.ithasfire.com` for dev, plus any embed host if used).
+
+Notes:
+- Served via the next.config.ts headers rule with Content-Type: text/plain.
+- Apple Pay button stays hidden in Express Checkout until verification passes.
+- Token rotates every ~12 months — Stripe will email you when re-verification
+  is needed; replace this file's contents and redeploy.

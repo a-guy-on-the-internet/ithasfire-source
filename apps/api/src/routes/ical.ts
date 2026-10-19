@@ -1,12 +1,17 @@
 import fp from "fastify-plugin";
-import type { FastifyPluginAsync, FastifyRequest } from "fastify";
-import { getVenueCalendar } from "@th/core/use-cases/events";
-import { exportMyVolunteeringIcs } from "@th/core/use-cases/volunteering";
+import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
+// File subpath (not the `use-cases/events` barrel): the feeds are the whole
+// of these routes, and the route tests exercise them for real.
 import {
-  generateVenueCalendarFeed,
-  generateSingleEventIcs,
-} from "@th/core/lib/ical";
+  buildOwnerCalendarFeed,
+  buildPlaceCalendarFeed,
+  feedSequence,
+  PUBLIC_CALENDAR_FEED_NOT_FOUND_CODES,
+} from "@th/core/use-cases/events/public-calendar-feeds";
+import { exportMyVolunteeringIcs } from "@th/core/use-cases/volunteering";
+import { generateSingleEventIcs } from "@th/core/lib/ical";
 import type { ICalEvent } from "@th/core/lib/ical";
+import { publicIcalLocation } from "@th/core/lib/location/public-ical-location";
 import { createPrismaRepos } from "@th/adapters/db/prisma-repos";
 import { withGuardedRepos } from "@th/adapters/decorators/with-dependency-guard";
 import { createSystemClock } from "@th/adapters/infra/clock";
@@ -18,7 +23,14 @@ import { Sentry } from "../instrument";
 /**
  * Public iCal routes for calendar feeds and single-event downloads.
  *
- * GET /api/venues/:placeId/calendar.ics   → venue feed (webcal:// subscribable)
+ * The three public feeds are built in core (`public-calendar-feeds.ts`), which
+ * owns what they list: PUBLIC + PUBLISHED shows, plus upcoming called-off ones
+ * as `STATUS:CANCELLED`, every LOCATION/GEO through `publicIcalLocation`.
+ * These handlers only map the result to HTTP: any "no such public feed"
+ * (unknown or malformed id, unverified or inactive place, inactive owner) is
+ * one uniform 404 and is not reported; anything else is a reported 500.
+ *
+ * GET /api/venues/:placeId/calendar.ics   → place feed (webcal:// subscribable)
  * GET /api/orgs/:orgId/calendar.ics       → org feed (webcal:// subscribable)
  * GET /api/humans/:humanId/calendar.ics   → human/host feed (webcal:// subscribable)
  * GET /api/events/:eventId/event.ics      → single event download
@@ -26,64 +38,61 @@ import { Sentry } from "../instrument";
  *                                         → "my volunteering" feed
  *                                           (token-authenticated, webcal:// subscribable)
  */
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isFeedNotFound(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === "string" && PUBLIC_CALENDAR_FEED_NOT_FOUND_CODES.has(code);
+}
+
+/**
+ * The feed language rides in the URL (`?lang=es`), never Accept-Language: the
+ * feeds are cached publicly by URL. Core maps unknown values to English; a
+ * repeated param (an array) or a non-string is treated as absent.
+ */
+function langParam(value: unknown): string | undefined {
+  return typeof value === "string" ? value.slice(0, 35) : undefined;
+}
+
 const plugin: FastifyPluginAsync = async (app) => {
   const rawRepos = createPrismaRepos(prisma);
   const repos = withGuardedRepos(rawRepos, app.deps.logger);
   const logger = app.deps.logger;
   const clock = createSystemClock();
+  const feedDeps = { repos, clock, logger, appBaseUrl: env.PUBLIC_WEB_URL };
   const toErrorMessage = (error: unknown) =>
     error instanceof Error ? error.message : String(error);
+  const webBase = env.PUBLIC_WEB_URL.replace(/\/+$/, "");
 
-  // ── Venue calendar feed ────────────────────────────────────────────────
+  const sendFeed = (reply: FastifyReply, icsBody: string) =>
+    reply
+      .header("Content-Type", "text/calendar; charset=utf-8")
+      .header("Content-Disposition", `inline; filename="calendar.ics"`)
+      .header("Cache-Control", "public, max-age=3600")
+      .send(icsBody);
+
+  // ── Place calendar feed ────────────────────────────────────────────────
   app.get(
     "/api/venues/:placeId/calendar.ics",
-    async (request: FastifyRequest<{ Params: { placeId: string } }>, reply) => {
+    async (
+      request: FastifyRequest<{
+        Params: { placeId: string };
+        Querystring: { lang?: unknown };
+      }>,
+      reply,
+    ) => {
       const { placeId } = request.params;
 
       try {
-        const result = await getVenueCalendar(
-          { repos, logger },
-          { mode: "public" as const, placeId },
-        );
-
-        // Look up the place for the calendar name + location
-        const place = await repos.places.getById(placeId);
-        const calendarName = place?.name
-          ? `${place.name} — Ithas Fire`
-          : "Venue Calendar — Ithas Fire";
-        const venueLocation = place?.formattedAddress ?? place?.name ?? null;
-
-        const icalEvents: ICalEvent[] = result.events.map((e) => ({
-          uid: `${e.eventId}@ithasfire.com`,
-          title: e.title,
-          startsAt: e.startsAt,
-          endsAt: e.endsAt,
-          location: venueLocation,
-          description: e.slug
-            ? `View event: https://ithasfire.com/events/${e.slug}`
-            : undefined,
-          url: e.slug
-            ? `https://ithasfire.com/events/${e.slug}`
-            : undefined,
-          geo:
-            place?.lat != null && place?.lng != null
-              ? { lat: place.lat, lng: place.lng }
-              : null,
-        }));
-
-        const ics = generateVenueCalendarFeed(icalEvents, {
-          calendarName,
-          refreshInterval: "PT1H",
+        const { icsBody } = await buildPlaceCalendarFeed(feedDeps, {
+          placeId,
+          lang: langParam(request.query.lang),
         });
-
-        return reply
-          .header("Content-Type", "text/calendar; charset=utf-8")
-          .header("Content-Disposition", `inline; filename="calendar.ics"`)
-          .header("Cache-Control", "public, max-age=3600")
-          .send(ics);
+        return sendFeed(reply, icsBody);
       } catch (err: unknown) {
-        const error = err as { code?: string };
-        if (error.code === "not_found") {
+        if (isFeedNotFound(err)) {
           return reply.status(404).send({ error: "venue_not_found" });
         }
         await logAndReport({
@@ -113,84 +122,26 @@ const plugin: FastifyPluginAsync = async (app) => {
   // ── Organization calendar feed ─────────────────────────────────────────
   app.get(
     "/api/orgs/:orgId/calendar.ics",
-    async (request: FastifyRequest<{ Params: { orgId: string } }>, reply) => {
+    async (
+      request: FastifyRequest<{
+        Params: { orgId: string };
+        Querystring: { lang?: unknown };
+      }>,
+      reply,
+    ) => {
       const { orgId } = request.params;
 
       try {
-        const org = await repos.organizations.getById(orgId);
-        if (!org || org.status !== "ACTIVE") {
-          return reply.status(404).send({ error: "org_not_found" });
-        }
-
-        const calendarName = `${org.name} — Ithas Fire`;
-
-        // Fetch published events owned by this org (most recent 200, last 90 days + future)
-        const now = new Date();
-        const from = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000); // include recent past
-        const result = await repos.events.listByOwner({
+        const { icsBody } = await buildOwnerCalendarFeed(feedDeps, {
           ownerType: "ORGANIZATION",
           ownerId: orgId,
-          status: ["PUBLISHED"],
-          limit: 200,
-          offset: 0,
+          lang: langParam(request.query.lang),
         });
-
-        // Only include events that haven't ended more than 30 days ago
-        const relevantEvents = result.items.filter((e) => {
-          const end = e.endsAt ?? e.startsAt;
-          return end >= from;
-        });
-
-        const icalEvents: ICalEvent[] = await Promise.all(
-          relevantEvents.map(async (e) => {
-            let location: string | null = null;
-            let geo: { lat: number; lng: number } | null = null;
-
-            if (e.placeId) {
-              const place = await repos.places.getById(e.placeId);
-              if (place) {
-                location = place.formattedAddress ?? place.name;
-                if (place.lat != null && place.lng != null) {
-                  geo = { lat: place.lat, lng: place.lng };
-                }
-              }
-            } else if (e.addressText) {
-              location = e.addressText;
-            }
-            if (!geo && e.lat != null && e.lng != null) {
-              geo = { lat: e.lat, lng: e.lng };
-            }
-
-            return {
-              uid: `${e.id}@ithasfire.com`,
-              title: e.title,
-              startsAt: e.startsAt,
-              endsAt: e.endsAt,
-              location,
-              organizerName: org.name,
-              description: e.slug
-                ? `View event: https://ithasfire.com/events/${e.slug}`
-                : undefined,
-              url: e.slug
-                ? `https://ithasfire.com/events/${e.slug}`
-                : undefined,
-              geo,
-            };
-          }),
-        );
-
-        const ics = generateVenueCalendarFeed(icalEvents, {
-          calendarName,
-          prodId: "-//Ithas Fire//OrgCalendar//EN",
-          refreshInterval: "PT1H",
-        });
-
-        return reply
-          .header("Content-Type", "text/calendar; charset=utf-8")
-          .header("Content-Disposition", `inline; filename="calendar.ics"`)
-          .header("Cache-Control", "public, max-age=3600")
-          .send(ics);
+        return sendFeed(reply, icsBody);
       } catch (err) {
+        if (isFeedNotFound(err)) {
+          return reply.status(404).send({ error: "org_not_found" });
+        }
         await logAndReport({
           logger,
           level: "error",
@@ -218,84 +169,26 @@ const plugin: FastifyPluginAsync = async (app) => {
   // ── Human / host calendar feed ─────────────────────────────────────────
   app.get(
     "/api/humans/:humanId/calendar.ics",
-    async (request: FastifyRequest<{ Params: { humanId: string } }>, reply) => {
+    async (
+      request: FastifyRequest<{
+        Params: { humanId: string };
+        Querystring: { lang?: unknown };
+      }>,
+      reply,
+    ) => {
       const { humanId } = request.params;
 
       try {
-        const human = await repos.humans.getById(humanId);
-        if (!human || human.status !== "ACTIVE") {
-          return reply.status(404).send({ error: "host_not_found" });
-        }
-
-        const calendarName = human.name
-          ? `${human.name} — Ithas Fire`
-          : "Host Calendar — Ithas Fire";
-
-        const now = new Date();
-        const from = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-        const result = await repos.events.listByOwner({
+        const { icsBody } = await buildOwnerCalendarFeed(feedDeps, {
           ownerType: "HUMAN",
           ownerId: humanId,
-          status: ["PUBLISHED"],
-          limit: 200,
-          offset: 0,
+          lang: langParam(request.query.lang),
         });
-
-        const relevantEvents = result.items.filter((e) => {
-          const end = e.endsAt ?? e.startsAt;
-          return end >= from;
-        });
-
-        const icalEvents: ICalEvent[] = await Promise.all(
-          relevantEvents.map(async (e) => {
-            let location: string | null = null;
-            let geo: { lat: number; lng: number } | null = null;
-
-            if (e.placeId) {
-              const place = await repos.places.getById(e.placeId);
-              if (place) {
-                location = place.formattedAddress ?? place.name;
-                if (place.lat != null && place.lng != null) {
-                  geo = { lat: place.lat, lng: place.lng };
-                }
-              }
-            } else if (e.addressText) {
-              location = e.addressText;
-            }
-            if (!geo && e.lat != null && e.lng != null) {
-              geo = { lat: e.lat, lng: e.lng };
-            }
-
-            return {
-              uid: `${e.id}@ithasfire.com`,
-              title: e.title,
-              startsAt: e.startsAt,
-              endsAt: e.endsAt,
-              location,
-              organizerName: human.name ?? undefined,
-              description: e.slug
-                ? `View event: https://ithasfire.com/events/${e.slug}`
-                : undefined,
-              url: e.slug
-                ? `https://ithasfire.com/events/${e.slug}`
-                : undefined,
-              geo,
-            };
-          }),
-        );
-
-        const ics = generateVenueCalendarFeed(icalEvents, {
-          calendarName,
-          prodId: "-//Ithas Fire//HostCalendar//EN",
-          refreshInterval: "PT1H",
-        });
-
-        return reply
-          .header("Content-Type", "text/calendar; charset=utf-8")
-          .header("Content-Disposition", `inline; filename="calendar.ics"`)
-          .header("Cache-Control", "public, max-age=3600")
-          .send(ics);
+        return sendFeed(reply, icsBody);
       } catch (err) {
+        if (isFeedNotFound(err)) {
+          return reply.status(404).send({ error: "host_not_found" });
+        }
         await logAndReport({
           logger,
           level: "error",
@@ -326,44 +219,46 @@ const plugin: FastifyPluginAsync = async (app) => {
     async (request: FastifyRequest<{ Params: { eventId: string } }>, reply) => {
       const { eventId } = request.params;
 
+      if (!UUID_RE.test(eventId)) {
+        return reply.status(404).send({ error: "event_not_found" });
+      }
+
       try {
         const event = await repos.events.getById(eventId);
-        if (!event || event.status !== "PUBLISHED") {
+        // Anonymous and cached: only an event a stranger may see in full —
+        // PUBLISHED, PUBLIC (a PRIVATE event is link-only, and an id is not
+        // an invitation) and UNGATED (a password/application gate protects
+        // the schedule and location; the gated preview is title + hero
+        // only). Everything else is the same 404, so the route is no oracle
+        // for which of those an id is.
+        if (
+          !event ||
+          event.status !== "PUBLISHED" ||
+          event.visibility !== "PUBLIC" ||
+          event.gateType !== "NONE"
+        ) {
           return reply.status(404).send({ error: "event_not_found" });
         }
 
-        let location: string | null = null;
-        let geo: { lat: number; lng: number } | null = null;
+        const { location, geo } = publicIcalLocation(
+          event,
+          event.placeId ? await repos.places.getById(event.placeId) : null,
+        );
 
-        if (event.placeId) {
-          const place = await repos.places.getById(event.placeId);
-          if (place) {
-            location = place.formattedAddress ?? place.name;
-            if (place.lat != null && place.lng != null) {
-              geo = { lat: place.lat, lng: place.lng };
-            }
-          }
-        } else if (event.addressText) {
-          location = event.addressText;
-        }
-
-        if (!geo && event.lat != null && event.lng != null) {
-          geo = { lat: event.lat, lng: event.lng };
-        }
-
+        const url = event.slug ? `${webBase}/events/${event.slug}` : null;
         const icalEvent: ICalEvent = {
           uid: `${event.id}@ithasfire.com`,
           title: event.title,
           startsAt: event.startsAt,
           endsAt: event.endsAt,
           location,
-          description: event.slug
-            ? `View event: https://ithasfire.com/events/${event.slug}`
-            : undefined,
-          url: event.slug
-            ? `https://ithasfire.com/events/${event.slug}`
-            : undefined,
+          description: url,
+          url,
           geo,
+          lastModified: event.updatedAt ?? null,
+          // Same UID as the feed entry, so the same SEQUENCE: a client that
+          // matches UIDs across calendars must not see this copy as older.
+          sequence: feedSequence(event.updatedAt ?? null),
         };
 
         const ics = generateSingleEventIcs(icalEvent);

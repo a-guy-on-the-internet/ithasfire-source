@@ -1,0 +1,131 @@
+# event-slugging.yaml
+
+meta:
+  goal: Integrate canonical slugs into Event publishing, regeneration, and lookup.
+  affected_model: Event (new columns: slug, regionCode, shortId)
+  affected_tables: EventSlugHistory (for redirects if needed)
+
+changes_to_existing_use_case:
+  - name: publishEvent
+    modification:
+      description: >
+        When an Event transitions from DRAFT to PUBLISHED,
+        generate and persist a unique human-readable slug based on
+        org/human, geographic info, and event metadata.
+      slug_generation:
+        components:
+          - orgOrHumanName
+          - countryCode
+          - cityOrRegionCode
+          - eventTitle
+          - startDate (yyyy-mm-dd-hhmm)
+          - shortId (6 chars)
+        format: "{orgOrHumanName}/{countryCode}/{region}/{title}-{datetime}--{shortid}"
+        constraints:
+          - unique within orgId or humanId scope
+          - immutable after publish
+        side_effects:
+          - add slug to Event table
+          - insert EventSlugHistory(eventId, slug) for lookup redirects
+          - emit log "event.slug_assigned"
+
+new_use_cases:
+
+  - name: resolveEventBySlug
+    goal: Resolve a canonical or historical slug into the corresponding Event.
+    invariants:
+      - Slug uniquely maps to one event under an org/human scope.
+      - Redirect flag is true if slug came from EventSlugHistory.
+    inputs:
+      - slug: string
+    outputs:
+      - eventId: uuid
+      - currentSlug: string
+      - redirect: boolean
+    side_effects:
+      - none (read-only)
+    error_codes:
+      - not_found: slug not found in any table
+
+  - name: regenerateEventSlug
+    goal: Allow an org admin to regenerate an Event’s slug after title or location changes.
+    invariants:
+      - Only allowed for DRAFT or ADMIN users on PUBLISHED events.
+      - Old slug is moved into EventSlugHistory.
+      - New slug follows generation rules (org/human/location/title/date--shortid).
+    inputs:
+      - actorHumanId: uuid
+      - eventId: uuid
+      - clientKey: string (for idempotency)
+    outputs:
+      - eventId: uuid
+      - newSlug: string
+      - previousSlug: string
+    side_effects:
+      - update Event.slug
+      - insert EventSlugHistory(previousSlug)
+      - log audit: event.slug_regenerated
+    error_codes:
+      - forbidden: actor not authorized
+      - conflict: slug collision
+      - transient: idempotency lock in progress
+adapters:
+  - name: TRPC Router (packages/transport/trpc/src/routers/events.ts)
+    add:
+      - procedure: events.resolveBySlug
+        call: core.useCases.events.resolveEventBySlug
+      - procedure: events.regenerateSlug
+        call: core.useCases.events.regenerateEventSlug
+        auth: ADMIN | EDITOR
+
+web_app:
+  new_pages:
+    - path: apps/web/src/app/(public)/events/[...slug]/page.tsx
+      goal: Fetch and render event via TRPC by slug.
+      features:
+        - Display event details (title, date, location, hero image, tickets)
+        - Include EventJsonLd component for AIEO
+        - Generate <title>, <meta>, canonical, and OG tags
+        - Support fallback to shortId redirect if slug not found
+
+    - path: apps/web/src/app/(public)/events/[...slug]/opengraph-image.tsx
+      goal: Generate dynamic OG image showing event title + date + location.
+
+  components:
+    - path: apps/web/src/app/_components/SeoJsonLd/EventJsonLd.tsx
+      goal: Output schema.org/Event JSON-LD metadata.
+      props:
+        - id
+        - title
+        - description
+        - startDate
+        - endDate
+        - image
+        - location (venue, city, region, geo)
+        - organizer (org or human)
+        - offers (ticket link, price)
+      render:
+        - <script type="application/ld+json">{JSON.stringify({...})}</script>
+
+  infra:
+    - sitemap.ts: stream all published events (slug URLs)
+    - robots.txt: allow /events/*, disallow /embed/*
+
+  metrics:
+    - name: web.event.view
+      tags:
+        - eventId
+        - referrerDomain
+        - via ("slug" | "shortId" | "embed")
+
+  logging:
+    - on publish: "event.slug_assigned"
+    - on regenerate: "event.slug_regenerated"
+    - on resolve: "event.slug_resolved"
+
+notes:
+  - Slugs improve AI & human discovery; shortIds serve for sharing.
+  - Ensure TRPC and Prisma repos can query by slug or shortId efficiently.
+  - Maintain audit trail of slug regenerations in EventSlugHistory.
+  - Emit JSON-LD markup to support AI entity resolution and structured data indexing.
+  - Test coverage: slug generation collisions, slug history redirects, resolve flow.

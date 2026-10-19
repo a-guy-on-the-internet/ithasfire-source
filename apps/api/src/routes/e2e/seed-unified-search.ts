@@ -305,6 +305,7 @@ const seedUnifiedSearch: FastifyPluginAsync = async (app) => {
             repos: app.deps.trpc.repos,
             search: multiSearch,
             clock: app.deps.trpc.clock,
+            reportError: app.deps.trpc.reportError ?? undefined,
           },
           { fullReindex: true },
         );
@@ -324,6 +325,7 @@ const seedUnifiedSearch: FastifyPluginAsync = async (app) => {
             repos: app.deps.trpc.repos,
             search: multiSearch,
             clock: app.deps.trpc.clock,
+            reportError: app.deps.trpc.reportError ?? undefined,
           },
           { fullReindex: true },
         );

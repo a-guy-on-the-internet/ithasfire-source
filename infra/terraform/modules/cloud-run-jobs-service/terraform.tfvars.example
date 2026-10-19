@@ -1,0 +1,7 @@
+# Example vars for validating the module in isolation.
+
+project_id   = "hf-dev"
+region       = "us-central1"
+environment  = "dev"
+jobs_image   = "us-docker.pkg.dev/hf-dev/ithasfire/jobs:latest"
+service_name = "jobs"

@@ -46,7 +46,7 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: dev
         ports:
-          - 5432
+          - 5432:5432
         options: >-
           --health-cmd="pg_isready -U postgres" --health-interval=5s --health-timeout=2s --health-retries=10
       # Required by apps/api's auth-atomic-rate-limit-concurrency suite, which
@@ -60,13 +60,13 @@ jobs:
       redis:
         image: redis:7-alpine
         ports:
-          - 6379
+          - 6379:6379
         options: >-
           --health-cmd="redis-cli ping" --health-interval=5s --health-timeout=2s --health-retries=10
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Enable corepack and pnpm
         run: |
@@ -74,7 +74,7 @@ jobs:
           corepack prepare pnpm@10.16.1 --activate
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v4
         with:
           node-version: '24'
 
@@ -85,22 +85,22 @@ jobs:
         run: |
           echo "Waiting for Postgres to be ready..."
           for i in {1..20}; do
-            pg_isready -h postgres -p 5432 -U postgres && break || sleep 3
+            pg_isready -h localhost -p 5432 -U postgres && break || sleep 3
           done
 
       - name: Validate Prisma schema
         env:
-          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
-        run: pnpm -F @th/db exec prisma validate
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dev
+        run: pnpm -F @th/db exec prisma validate --config ../../prisma.config.ts
 
       - name: Generate Prisma client
         env:
-          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dev
         run: pnpm exec prisma generate
 
       - name: Apply Prisma migrations
         env:
-          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dev
         run: pnpm -F @th/db exec prisma migrate deploy --config ../../prisma.config.ts
 
       - name: Build repository
@@ -121,6 +121,16 @@ jobs:
       # vitest step aimed at a package with no tests (exits non-zero on arrival).
       - name: Check CI test coverage is real
         run: node scripts/ci/check-ci-test-coverage.mjs
+
+      # `pnpm tsc:status` reads the shared typecheck daemon's result, and its
+      # verdict logic is the only thing between a mis-parsed tsc line and a green
+      # exit. It shipped with exactly that bug: tsc reported 3 errors, 0 parsed,
+      # and the reader printed "clean" and exited 0. These assertions pin the
+      # fix — including that `--mine` narrows what is LISTED and never the
+      # verdict. Mutation-tested: restoring the bug fails 3 of them. Node-only,
+      # no DB, well under a second.
+      - name: Check tsc:status cannot report an unearned green
+        run: pnpm tsc:status:selftest
 
       # @th/types — 161 tests / 18 files that ran in NO workflow until now: money,
       # safe-external-url, the ~12 SEO builders (JSON-LD / metadata) and passkey-name.
@@ -188,12 +198,14 @@ jobs:
 
       - name: Run core unit tests
         env:
-          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dev
         run: pnpm -F @th/core exec vitest --run
 
       - name: Run adapter unit tests
         env:
-          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dev
+          # The `redis` service above: the rate-limit integration suite runs the real Lua against it (skips under CI without it).
+          TESTCONTAINERS_REUSE_REDIS_URL: redis://localhost:6379
         run: pnpm -F @th/adapters exec vitest --run
 
       # @th/trpc (packages/transport/trpc) — 464 tests that ran in NO workflow
@@ -205,7 +217,7 @@ jobs:
       # than excluded, so this starts green with no quarantine.
       - name: Run transport/trpc unit tests
         env:
-          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dev
         run: pnpm -F @th/trpc exec vitest --run
 
       # Gates the Design System v2 token invariants (docs/design/design-system-v2.md):
@@ -230,7 +242,7 @@ jobs:
       # apps/web/vitest.ci.config.ts.
       - name: Run web unit tests
         env:
-          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dev
           NODE_OPTIONS: "--max-old-space-size=4096"
         run: pnpm -F web run test:ci
 
@@ -264,7 +276,7 @@ jobs:
         env:
           # See the `redis` service above. Without this the concurrency suite
           # falls back to Docker-in-Docker Testcontainers and fails on arrival.
-          TESTCONTAINERS_REUSE_REDIS_URL: redis://redis:6379
+          TESTCONTAINERS_REUSE_REDIS_URL: redis://localhost:6379
         run: pnpm -F api exec vitest --run --testTimeout=30000 --hookTimeout=30000
 
       # apps/jobs — same gap as apps/api above: `test` defined, never invoked.
@@ -284,10 +296,23 @@ jobs:
       # release-expired-carts.test.ts is no longer excluded — it failed at COLLECT
       # on "Cannot find package '@th/core/use-cases/resale'", fixed by the @th/*
       # aliases in apps/jobs/vitest.config.ts (see the API step above).
+      # The manifest validator's Terraform override drift gate (section 5 of
+      # apps/jobs/src/scripts/validate-manifest.ts) compares jobs.manifest.json's
+      # `schedulerOverriddenIn` declarations against every
+      # infra/terraform/envs/*/*.tfvars `jobs_scheduler_overrides` block.
+      #
+      # This step is NOT the gate. ci.yml is manual-dispatch only (see the
+      # header), so a tfvars-only push to main never reaches it. The real gate
+      # is the `manifest_drift_guard` job in deploy-dev.yml and deploy-prod.yml,
+      # which the terraform jobs there require to succeed before they apply.
+      # This copy exists so a dispatched CI run reports the same thing.
+      - name: Validate jobs manifest and Terraform override drift
+        run: pnpm -C apps/jobs validate:manifest
+
       - name: Run jobs unit tests
         env:
-          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
-          TESTCONTAINERS_REUSE_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dev
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dev
+          TESTCONTAINERS_REUSE_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dev
         run: pnpm -F jobs exec vitest --run --testTimeout=30000 --hookTimeout=30000
 
       # apps/audio-transcoder — `test:ci`, NOT `test`. The package's full suite
@@ -325,7 +350,7 @@ jobs:
       - name: Run scanner unit tests
         run: pnpm -F scanner exec vitest --run
 
-      # @th/ui-native — the RN design-system token layer (palette, tone families).
+      # @th/ui-native — the RN design-system token layer (palette, verdict tones).
       # Same "ran in NO workflow" gap as @th/types and @th/errors above: its
       # palette tests (identical key sets across Ember/Stub, contrast pairings)
       # were a phantom gate — green locally, executed by nothing. Both apps/scanner
@@ -358,7 +383,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 

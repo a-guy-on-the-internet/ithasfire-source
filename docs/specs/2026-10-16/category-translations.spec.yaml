@@ -1,0 +1,204 @@
+# Built 2026-10-17 (7f3e7a16f 457422164 daef6f2b9 02d498b2b 064a62b4c), NOT pushed; driven live. Owner note 2026-10-16: "Build it" (spec confirmed).
+# category-translations.spec.yaml
+#
+# Event category names in the viewer's language (en + es now, more later).
+
+version: "1.0"
+updated: "2026-10-16"
+
+# ── Rulings (owner, 2026-10-16; full text in memory session_category_translations.plan.md) ──
+# R0  "Also our categories need a translation set up too" — the ask.
+# R1  "Yeah, tags are not relevant." — event categories only.
+# R4  "Yep." — a missing translation shows the English name, unflagged.
+# R5  yes, plus "like a button to just google search the word in a different language on the platform page".
+# R6  "You can autofill them. You can do that" — machine-filled translations are allowed.
+# R9  "Yes" — searching a translated name finds the category's events.
+# R10–R12 "Yep" — editor picker in the organiser's language, typeahead across languages; Claude drafts es for
+#     existing categories, entered on /platform; es names unique within es.
+# R13–R17 "Sure. Let's do all of those." — JSON column; every name shipped, browser picks; shared English slug
+#     (Spanish SEO scoped later as its own project); a Google Translate link; autofill via Google Cloud Translation.
+# Earlier rulings that still bind: CLAUDE.md Model Lifecycle Convention; "place", never "venue";
+#     memory session_platform_category_create.plan.md (rename keeps the slug).
+
+summary:
+  problem: >
+    A category has one English name, and every page shows it in English, Spanish included.
+    Categories are data made on /platform or by approving a request, so static i18n keys can't cover them.
+  solution: >
+    Category gains a JSON map of names by language beside the English `name`. The API sends every name and the
+    browser shows the one for its language, falling back to English. Staff write translations on /platform,
+    with blanks prefilled by Google Cloud Translation and a Google Translate link beside each field.
+  users:
+    - viewer browsing or searching events (any language)
+    - organiser picking or requesting a category in the event editor
+    - platform staff (ADMIN / DEVELOPER) creating, editing and approving categories
+  surfaces:
+    - web
+    - api
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Category stores `nameTranslations`: a JSON object keyed by a supported non-English locale ("es"), values
+        validated by `normalizeAndValidateCategoryName`. English stays in `Category.name` and remains the source
+        of the slug. An absent or empty key means no translation.
+    - id: FR-002
+      description: >
+        Every category output (`categories.list`, `listBrowsable`, `listAll`, `setEventCategory`, geo-category
+        combos; the event record's category feeds SEO only, which stays English per NFR-001) carries `names: { en, es? }`. A shared web helper
+        `categoryDisplayName(category, locale)` returns names[locale] ?? names.en, and every surface in
+        "Surfaces" uses it.
+    - id: FR-003
+      description: >
+        A translated name is unique within its language, case-insensitively, checked inside the existing naming
+        lock (`categories.lockNaming()`) by every write path. Refused with CATEGORY_ALREADY_EXISTS.
+    - id: FR-004
+      description: >
+        /platform/categories create and edit forms show one name field per supported language. English is
+        required; others are optional. Clearing a field removes that translation. Setting translations writes an
+        audit row like rename does. ADMIN / DEVELOPER only.
+    - id: FR-005
+      description: >
+        When a create, edit or approve form opens with a blank translation, it is prefilled from the
+        TranslatorPort and marked as a suggestion. Staff can change it; nothing is saved until they submit.
+        Translation failure leaves the field blank and the form usable.
+    - id: FR-006
+      description: >
+        Beside each non-English field, a "Translate ↗" link opens
+        https://translate.google.com/?sl=en&tl=<locale>&text=<English name> in a new tab (rel="noopener noreferrer").
+    - id: FR-007
+      description: >
+        A category request records the requester's locale (`EventCategoryRequest.locale`, sent by the browser).
+        The approval form puts the requested name under that language; when it is not English, the English
+        field is prefilled by the TranslatorPort and staff confirm it. The slug derives from the English name.
+    - id: FR-008
+      description: >
+        Event search documents carry the category's names in every language as a searchable field (not a tag
+        or facet), in both the Meilisearch and Postgres search adapters. Changing a category's English name or
+        translations marks that category's events for reindex.
+    - id: FR-009
+      description: >
+        The event editor's category picker shows names in the organiser's language, and its typeahead matches
+        a name in any language.
+    - id: FR-010
+      description: >
+        The dev seed sets Spanish names for every seeded category (the list in `seed_es` below).
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Page metadata, OG text, JSON-LD and the sitemap stay English (no per-language URLs exist; R15).
+    - id: NFR-002
+      description: >
+        The suggestion procedure is staff-only and rate-limited; a TranslatorPort error is reported through
+        `reportError` (CLAUDE.md swallow convention) and returns no suggestion.
+    - id: NFR-003
+      description: >
+        Server render uses the Accept-Language locale like the rest of the page; the client switches on its
+        stored locale the same way static strings do, with no new hydration warnings.
+
+architecture:
+  core:
+    use_cases:
+      - name: setCategoryTranslations
+        description: Replace a category's non-English names. Staff only. Audit row; marks its events for reindex.
+        input: actorHumanId, categoryId, translations { es?: string | null }
+        output: category (with names)
+        idempotent: true
+        money: false
+      - name: suggestCategoryTranslations
+        description: Machine-translate a name into the requested languages for a form prefill. Writes nothing.
+        input: actorHumanId, text, sourceLocale, targetLocales
+        output: suggestions { [locale]: string } (missing on failure)
+        idempotent: true
+        money: false
+      - name: createCategory / renameCategory / reviewCategoryRequest / requestCategoryOption (modified)
+        description: >
+          create and approve accept translations; rename re-checks uniqueness and marks events for reindex;
+          request records locale.
+        money: false
+  ports:
+    new:
+      - TranslatorPort (packages/ports/src/translator.ts) — translate(text, source, targets)
+    existing: [Repos (categories, categoryRequests), AuthZPort, ClockPort, LoggerPort, ReporterPort, RateLimitPort]
+  adapters:
+    new:
+      - Google Cloud Translation v3 adapter, same GCP service account as the existing Google API adapters
+      - in-memory/fake translator for tests and local dev without credentials
+    existing: [prisma categories, prisma category-requests, prisma events (category select), search index builders]
+  transport:
+    trpc_procedures:
+      - categories.setTranslations (authed, staff)
+      - categories.suggestTranslations (authed, staff, rate-limited)
+      - categories.create / reviewRequest / requestOption gain optional translations / locale
+  ui:
+    pages: [/platform/categories]
+    components:
+      - name fields per language + Translate link + suggestion marker on create, edit and approve
+      - categoryDisplayName helper used by every surface below
+
+surfaces:
+  - apps/web/src/app/_components/home/CategoryBrowseSection.tsx, HomeHero.tsx, useCategoryBrowse.ts
+  - apps/web/src/app/events/category/[slug]/** (visible heading only; metadata stays English)
+  - apps/web/src/app/search/_components/search-category-filter.ts, UniversalSearchPage.tsx
+  - apps/web/src/app/admin/[slug]/search/_components/AdminSearchFacets.tsx, components/search/SpotlightAdminFacets.tsx
+  - apps/web/src/app/admin/[slug]/events/new/_components/category-picker-helpers.ts, CategoryTagsSection.tsx, CommunityCategoryField.tsx
+  - apps/web/src/app/admin/[slug]/places/[placeId]/calendars/_components/CalendarsManager.tsx
+  - apps/web/src/app/platform/categories/page.tsx, _components/CategoryTile.tsx
+  - mobile and scanner show no category today (checked 2026-10-16)
+
+data:
+  new_models: []
+  modified_models:
+    - Category.nameTranslations Json @default("{}") (camelCase column like the rest of the table)
+    - EventCategoryRequest.locale String? (null on existing rows = English)
+  migrations_needed: true
+
+lifecycle:
+  create: built — on category create and request approval (FR-004, FR-007)
+  read: built — every category output carries names (FR-002)
+  update: built — setCategoryTranslations from the /platform edit form
+  remove: built — clearing a field removes that translation; translations live on the Category row, so a deleted
+    category takes them with it. No dependents.
+
+seed_es:
+  # Claude's draft (R11); staff enter it on /platform after deploy, autofill shows the machine version.
+  Music: Música
+  Nightlife: Vida nocturna
+  Food & Drink: Comida y bebida
+  Community: Comunidad
+  Film & Media: Cine y medios
+  Arts & Culture: Arte y cultura
+  Sports & Fitness: Deporte y bienestar
+  Conference & Workshop: Conferencias y talleres
+  Support & Recovery: Apoyo y recuperación
+  Open Mics: Micrófono abierto
+  Other: Otros
+
+risks:
+  - risk: Web deploys before the API and reads `names` from an old API.
+    severity: MEDIUM
+    mitigation: Web falls back to `name` when `names` is absent; the field is additive and output schemas are not strict on the client.
+  - risk: Google Cloud Translation is not enabled on the GCP project.
+    severity: LOW
+    mitigation: Infra step enables the API and grants the role; without it the adapter fails and the form shows blanks (FR-005).
+  - risk: A rename or translation change leaves search documents stale.
+    severity: MEDIUM
+    mitigation: Both write paths mark the category's events for reindex (FR-008); test asserts it.
+
+open_questions: []
+
+out_of_scope:
+  - Spanish SEO (/es/ URLs, hreflang, translated slugs and metadata) — its own project (R15).
+  - Tags (R1). Static i18n strings. Locales beyond es (the shape allows them).
+  - Machine translation anywhere except the staff forms.
+
+acceptance_criteria:
+  - With the browser locale set to es, home chips, the category page heading, the search filter and the editor picker show "Música" for Music.
+  - A category with no es name shows its English name in es.
+  - Searching "música" on /search returns Music events.
+  - Staff can set, change and clear the es name on /platform; a duplicate es name is refused.
+  - Opening the create form with only an English name typed shows a prefilled es suggestion; the Translate link opens Google Translate with the name.
+  - A request made in es lands on the approval form with the es name in place and an English suggestion.
+  - Category page <title> and OG text stay English in every locale.

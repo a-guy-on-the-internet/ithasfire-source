@@ -1,0 +1,14 @@
+-- AlterTable
+-- The venue owner's standing consent to OWNERLESS community listings at this
+-- place (community-listings-at-claimed-venues FR-001). A COMMUNITY event has no
+-- owner by DB constraint, so the "event owner is a place owner" arm of venue
+-- confirmation can never hold for one; this column is the venue's side of that
+-- relationship, given once for the venue rather than per event.
+--
+-- Nothing is stamped: `isVenueConfirmed` reads this live, so flipping it
+-- retroactively confirms the community listings already attached here — and
+-- an accepted listing then also OCCUPIES its slot for booking availability.
+--
+-- Additive and default-false (consent is explicit); existing rows are
+-- unaffected.
+ALTER TABLE "Place" ADD COLUMN IF NOT EXISTS "accepts_community_listings" BOOLEAN NOT NULL DEFAULT false;

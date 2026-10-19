@@ -1,0 +1,49 @@
+# event-card-skeleton.component.yaml
+meta:
+  goal: Provide a skeleton placeholder mirroring EventCard layout for loading states and grid skeleton rendering.
+  files:
+    shared:
+      component: packages/ui/src/ui/tamagui/components/event-grid/EventCardSkeleton.tsx
+      stories: packages/ui/src/ui/tamagui/components/EventCardSkeleton.stories.tsx
+      tests: packages/ui/src/ui/tamagui/components/__tests__/EventCardSkeleton.test.tsx
+  exports:
+    - EventCardSkeleton
+    - EventCardSkeletonGroup
+props:
+  optional:
+    - layout?: "vertical" | "horizontal" (default vertical)
+    - animate?: boolean (default true, honors prefers-reduced-motion)
+    - width?: number | string # optional override, defaults to 100%
+    - height?: number | string # computed from aspect ratio when not provided
+    - testIdBase?: string (default "event-card-skeleton")
+    - qaId?: string
+layout:
+  - Uses Tamagui `Stack` + `Skeleton` primitives (create lightweight shimmering rectangles).
+  - Mirror EventCard structure:
+      - Media block placeholder with aspect ratio and subtle gradient.
+      - Badge/favorite circle placeholders positioned top corners.
+      - Content stack with title bar, two metadata lines, price/status bar.
+  - `EventCardSkeletonGroup` renders N skeletons with responsive spacing, inheriting layout from EventGridSkeleton.
+interactions:
+  - Non-interactive; ensure pointer events disabled.
+states:
+  - animate (default) vs static (when prefers-reduced-motion or `animate=false`).
+  - horizontal variant reorganizes placeholder blocks accordingly.
+a11y:
+  - Mark root with `aria-hidden="true"` and `role="presentation"`.
+  - Provide optional `SkeletonText` wrappers that set `aria-label` for screen readers if consumer chooses to announce loading.
+rendering:
+  - Implement shimmer using linear gradient via Tamagui `LinearGradient` or CSS animation on web.
+  - On native, leverage `Skeleton` polyfill or fallback to opacity pulsing using `Animated`.
+quality:
+  - Ensure consistent sizing tokens to avoid layout shift when real content loads.
+  - Use theme-aware colors ($surfaceMuted, $borderColor).
+tests:
+  - Snapshot layout for vertical + horizontal variants.
+  - Respects `animate=false` by disabling animation classes.
+  - Honors prefers-reduced-motion by mocking media query.
+non_goals:
+  - Data-driven skeleton; remains static placeholder.
+implementation_notes:
+  - Consider centralizing skeleton token colors for reuse.
+  - Export from main `components/index.ts` for consumers.

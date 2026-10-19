@@ -17,6 +17,8 @@ A waiver is a block of text buyers must agree to before the **Pay** button unloc
 
 ## Before you start
 
+Waivers can be attached only to events run by an organisation. Events on your personal profile have no **Waiver** section.
+
 Decide which template fits — Ithas Fire provides three:
 
 - **General event** — light attendance terms

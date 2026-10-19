@@ -1,0 +1,62 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "target": "ES2020",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "baseUrl": ".",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "tsBuildInfoFile": "../../node_modules/.cache/tsc-daemon/apps-web.tsbuildinfo",
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "paths": {
+      "@/*": ["./src/*"],
+      "@th/core/*": ["../../packages/core/src/*"],
+      "@th/adapters/*": ["../../packages/adapters/src/*"],
+      "@th/trpc": ["../../packages/transport/trpc/src/index.ts"],
+      "@th/trpc/*": ["../../packages/transport/trpc/src/*"],
+      "@th/schema": ["../../packages/schema/src/index.ts"],
+      "@th/schema/*": ["../../packages/schema/src/*"],
+      "@th/ports": ["../../packages/ports/src/index.ts"],
+      "@th/ports/*": ["../../packages/ports/src/*"],
+      "@th/services-rich-text-html": [
+        "../../packages/service/rich-text-html/src/index.ts"
+      ],
+      "@th/services-rich-text-html/*": [
+        "../../packages/service/rich-text-html/src/*"
+      ],
+      "@th/errors/*": ["../../packages/errors/src/*"],
+      "@th/types": ["../../packages/types/src/index.ts"],
+      "@th/types/*": ["../../packages/types/src/*"],
+      "@th/test-utils": ["../../packages/test-utils/src/index.ts"],
+      "@th/test-utils/*": ["../../packages/test-utils/src/*"],
+      "@th/locale": ["../../packages/locale/src/index.ts"],
+      "@th/locale/*": ["../../packages/locale/*"]
+    }
+  },
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts",
+    "src/app/.well-known/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "**/*.stories.ts",
+    "**/*.stories.tsx",
+    "**/*.stories.mdx"
+  ]
+}

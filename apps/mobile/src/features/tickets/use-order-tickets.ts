@@ -1,11 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { trpc, type RouterOutputs } from "@/lib/trpc";
-import { loadOrderTickets, saveOrderTickets } from "./ticket-cache";
+import {
+  isEmailVerificationRequired,
+  retryUnlessVerificationRequired,
+} from "@/features/auth/email-verification-required";
+import { useEmailVerificationLatch } from "@/features/auth/use-email-verification-latch";
+import {
+  clearOrderTickets,
+  loadOrderTickets,
+  saveOrderTickets,
+} from "./ticket-cache";
 import type { CachedOrderTickets } from "./ticket-cache-codec";
 import {
+  applyCacheRead,
   buildCacheFingerprint,
   resolveOrderTicketsState,
+  shouldWriteCache,
   toCacheableTickets,
   toIsoOrNull,
   type DisplayTicket,
@@ -33,6 +44,14 @@ export type UseOrderTicketsResult = {
   isLoading: boolean;
   /** Set when the live fetch failed AND no cache covered for it. */
   errorMessage: string | null;
+  /**
+   * The server refused with `email_verification_required` (B2): show
+   * `EmailVerificationPrompt`. Latched: it holds through a refetch and lets go
+   * when the query answers with anything else.
+   */
+  verificationRequired: boolean;
+  /** The live query is in flight (drives pull-to-refresh). */
+  isFetching: boolean;
   refetch: () => void;
 };
 
@@ -59,8 +78,15 @@ export const useOrderTickets = (
 ): UseOrderTicketsResult => {
   const query = trpc.orders.listMyOrderTickets.useQuery(
     { orderId },
-    { staleTime: 30_000, retry: 1 },
+    { staleTime: 30_000, retry: retryUnlessVerificationRequired(1) },
   );
+  const verificationRequired = useEmailVerificationLatch({
+    gated: isEmailVerificationRequired(query.error),
+    answered: query.isSuccess || query.isError,
+  });
+  // Read by the cache-load effect, which can settle after the gate arrived.
+  const gatedRef = useRef(verificationRequired);
+  gatedRef.current = verificationRequired;
 
   const [cached, setCached] = useState<CachedOrderTickets | null>(null);
   const [cacheChecked, setCacheChecked] = useState(false);
@@ -74,7 +100,7 @@ export const useOrderTickets = (
     void (async () => {
       const entry = await loadOrderTickets(orderId);
       if (cancelled) return;
-      setCached(entry);
+      setCached(applyCacheRead(entry, gatedRef.current));
       setCacheChecked(true);
     })();
 
@@ -86,10 +112,24 @@ export const useOrderTickets = (
   // Write through on every successful fetch. Keyed on the payload so a
   // refetch returning identical data doesn't churn the keychain.
   const lastWritten = useRef<string | null>(null);
+
+  // The gate means the server answered and said no, so a cached copy must not
+  // outlive it: drop it from state and from the keychain. Otherwise a later
+  // offline open would show it.
+  useEffect(() => {
+    if (!verificationRequired) return;
+    setCached(null);
+    // After a verify the same payload must be written again.
+    lastWritten.current = null;
+    void clearOrderTickets(orderId);
+  }, [verificationRequired, orderId]);
+
   const liveTickets = query.data?.tickets as WireTicket[] | undefined;
 
   const eventStartsAtIso = toIsoOrNull(eventStartsAt);
 
+  // `verificationRequired` is a dependency so the write runs again once a
+  // verify lets the latch go, even when the payload is unchanged.
   useEffect(() => {
     if (!liveTickets) return;
 
@@ -99,11 +139,20 @@ export const useOrderTickets = (
       serializable,
       eventStartsAtIso,
     );
-    if (lastWritten.current === fingerprint) return;
+    if (
+      !shouldWriteCache({
+        hasLiveTickets: true,
+        gated: verificationRequired,
+        fingerprint,
+        lastWritten: lastWritten.current,
+      })
+    ) {
+      return;
+    }
     lastWritten.current = fingerprint;
 
     void saveOrderTickets(orderId, serializable, eventStartsAtIso);
-  }, [liveTickets, orderId, eventStartsAtIso]);
+  }, [liveTickets, orderId, eventStartsAtIso, verificationRequired]);
 
   // Depend on the bound method, not the whole query object — the latter is a
   // fresh reference every render, which would defeat the memo and churn every
@@ -120,7 +169,8 @@ export const useOrderTickets = (
     isQueryLoading: query.isLoading,
     isQueryError: query.isError,
     queryErrorMessage: query.error?.message ?? null,
+    isVerificationRequired: verificationRequired,
   });
 
-  return { ...resolved, refetch };
+  return { ...resolved, isFetching: query.isFetching, refetch };
 };

@@ -14,6 +14,11 @@
  * - Direct HTTP calls (testing/debugging)
  */
 
+// Sentry must be imported before any other module for auto-instrumentation.
+// A static import hoists above the dynamic imports below, which is what we
+// want — see the note in ./instrument about dotenv ordering in local dev.
+import "./instrument";
+
 // Mark as ES module for top-level await
 export {};
 

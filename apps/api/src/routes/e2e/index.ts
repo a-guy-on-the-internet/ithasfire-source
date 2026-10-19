@@ -26,7 +26,11 @@ import seedPlaceLayoutDesigner from "./seed-place-layout-designer.js";
 import seedAdjustableCheckout from "./seed-adjustable-checkout.js";
 import seedBookingLoop from "./seed-booking-loop.js";
 import seedVenueCellCreate from "./seed-venue-cell-create.js";
+import seedInviteLure from "./seed-invite-lure.js";
+import { registerE2ePublicReadReset } from "./public-read-reset.js";
 const e2ePlugin: FastifyPluginAsync = async (app) => {
+  // Before the routes: every POST /e2e/* invalidates the anonymous-read caches.
+  registerE2ePublicReadReset(app, app.deps.trpc);
   await app.register(resetAndAuth);
   await app.register(seedPaidCheckout);
   await app.register(seedUnifiedSearch);
@@ -45,6 +49,7 @@ const e2ePlugin: FastifyPluginAsync = async (app) => {
   await app.register(seedAdjustableCheckout);
   await app.register(seedBookingLoop);
   await app.register(seedVenueCellCreate);
+  await app.register(seedInviteLure);
 };
 
 export default fp(e2ePlugin as unknown as never) as unknown as never;

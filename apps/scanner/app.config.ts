@@ -13,7 +13,7 @@ import type { ExpoConfig } from "expo/config";
  *   publishing entitlement. Builds will fail to sign for App Store
  *   distribution until that approval lands.
  *
- * See docs/specs/2026-04-26/scanner-deployment-tap-to-pay.spec.yaml for
+ * See docs/specs/2026-04-26/completed/scanner-deployment-tap-to-pay.spec.yaml for
  * the full strategy and the binary-version safety check that prevents
  * v1.0 users from ever seeing the Sell UI.
  */

@@ -13,7 +13,7 @@ import type { ExpoConfig } from "expo/config";
  *     EXPO_PUBLIC_SENTRY_DSN locally for `expo start`, or rely on the
  *     EAS build env which gets it from EXPO_PUBLIC_SENTRY_DSN.
  *
- * See docs/specs/2026-04-26/scanner-deployment-tap-to-pay.spec.yaml →
+ * See docs/specs/2026-04-26/completed/scanner-deployment-tap-to-pay.spec.yaml →
  * mobile_app section for the full deployment story.
  */
 

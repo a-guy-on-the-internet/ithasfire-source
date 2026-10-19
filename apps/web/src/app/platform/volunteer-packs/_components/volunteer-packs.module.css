@@ -1,0 +1,57 @@
+/* ── Staff volunteer-pack catalogue (FR-014) ───────────────────────────────
+   Table-like rows → GRID, because the columns have to line up across rows
+   (DS §5). Fixed metric columns, fluid identity, content-sized actions.
+   Collapses by RE-DECLARING grid-template-columns — never by hiding a cell.
+
+   No colours live here: every surface/border on these rows is a Tamagui
+   semantic token on the component itself. */
+
+.catalogueRow {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) 96px 132px auto;
+	gap: 20px;
+	align-items: center;
+	width: 100%;
+}
+
+/* Below the 900px breakpoint the four columns stop fitting side by side, so
+   the row becomes a single-column stack. Each metric is then its own full-width
+   row, with its label and numeral turned onto ONE baseline-aligned line — the
+   numeral no longer needs display weight once nothing sits beside it. */
+@media (max-width: 900px) {
+	.catalogueRow {
+		grid-template-columns: minmax(0, 1fr);
+		gap: 16px;
+	}
+
+	.catalogueRow > .metric {
+		display: flex;
+		flex-direction: row;
+		align-items: baseline;
+		gap: 8px;
+	}
+}
+
+/* One metric cell: an overline label above a large tabular numeral. */
+.metric {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+}
+
+/* The editor's two-column region: the pack's own fields beside its targeting.
+   Explicit asymmetric fr, never 50/50 (DS §5). */
+.editorColumns {
+	display: grid;
+	grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+	gap: 24px;
+	width: 100%;
+	align-items: start;
+}
+
+@media (max-width: 900px) {
+	.editorColumns {
+		grid-template-columns: minmax(0, 1fr);
+	}
+}

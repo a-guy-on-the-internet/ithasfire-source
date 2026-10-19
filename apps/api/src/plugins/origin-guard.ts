@@ -81,7 +81,12 @@ const plugin: FastifyPluginAsync = async (app) => {
       return;
     }
 
-    const expected = env.ORIGIN_SHARED_SECRET;
+    // Trimmed because Cloudflare stamps the TRIMMED secret
+    // (`origin_secret_trimmed` in the Terraform module); a stored secret with
+    // a trailing newline would otherwise mismatch every request. The provided
+    // header is not trimmed: HTTP parsing already strips surrounding OWS, and
+    // the edge sends the trimmed value. An all-whitespace secret is unset.
+    const expected = env.ORIGIN_SHARED_SECRET?.trim();
     const provided = request.headers[HEADER_NAME];
 
     const matches =

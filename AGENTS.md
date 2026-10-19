@@ -4,6 +4,10 @@ This file is the application-level entry point for AI coding agents (Cursor, Cop
 
 For project architecture, the dev orchestrator, and the full skill index, see [CLAUDE.md](./CLAUDE.md).
 
+## Codex
+
+When running in Codex, read [docs/codex-workflow.md](./docs/codex-workflow.md) before using the Claude workflow. It maps tools and specialist roles to Codex while retaining the shared project rules. Discoverable skills live in `.agents/skills/`; native custom agents live in `.codex/agents/`.
+
 ## Design System Rules
 
 The full Swiss International design spec lives in the `[skill:ui]` skill. Two rules are important enough to surface here so they aren't missed:

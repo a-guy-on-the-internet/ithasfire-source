@@ -1,0 +1,515 @@
+# Spec: Automatic SEO Enhancements
+# All items are "zero-touch" — event creators, venue owners, and org admins
+# get these benefits without doing anything beyond normal platform usage.
+
+meta:
+  owner: platform-eng
+  status: draft
+  reviewers:
+    - seo
+    - frontend
+    - backend
+  created: 2026-02-12
+  last_updated: 2026-02-12
+  open_questions_resolved: 2026-02-12
+
+summary: |
+  Identify and close every gap in Ithas Fire's automatic SEO surface so that
+  events, places (venues), organizers, and human profiles are maximally
+  discoverable via search engines and social media previews without requiring
+  any manual action from the user.
+
+  This spec covers sitemap expansion, structured data (JSON-LD), OpenGraph /
+  Twitter card metadata, canonical URLs, breadcrumbs, and homepage search-box
+  integration.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Sitemap expansion
+# ─────────────────────────────────────────────────────────────────────────────
+
+sitemap_expansion:
+  current_state: |
+    `sitemap.ts` emits the homepage URL + published event URLs via
+    `listEventSitemapEntries()`. No other entity types are included.
+    Static marketing pages are absent. No `<lastmod>` is set on event entries.
+
+  items:
+
+    - id: SITEMAP-PLACES
+      title: Add active places to the sitemap
+      priority: high
+      effort: small
+      description: |
+        Create `listPlaceSitemapEntries()` use case (or server helper) that
+        returns all places with `status = ACTIVE`. Include canonical URL
+        (`/places/id/{placeId}`) and `lastmod` from `place.updatedAt`.
+      acceptance:
+        - Active places with at least one currently-published event appear in sitemap.xml.
+        - Places with no published events never appear (even if ACTIVE).
+        - ARCHIVED places never appear.
+        - Each entry has `<loc>` and `<lastmod>`.
+      implementation_notes: |
+        - New tRPC public procedure `places.listPlaceSitemapEntries` (or reuse
+          an existing list endpoint filtered to ACTIVE).
+        - Server helper `listPlaceSitemapEntries()` in `apps/web/src/server/places.ts`.
+        - Append results in `sitemap.ts` alongside event entries.
+
+    - id: SITEMAP-STATIC
+      title: Include static pages in the sitemap
+      priority: medium
+      effort: trivial
+      description: |
+        Hard-code entries for known static routes: `/events`, `/events/search`,
+        `/terms`, `/privacy`, `/cookie-policy`. Set `changefreq: monthly` and
+        `priority: 0.3`.
+      acceptance:
+        - All listed static pages appear in sitemap.xml with correct `<loc>`.
+      implementation_notes: |
+        - Add a `STATIC_PAGES` array in `sitemap.ts` and spread into the return.
+
+    - id: SITEMAP-LASTMOD
+      title: Emit lastmod on event sitemap entries
+      priority: medium
+      effort: small
+      description: |
+        The upstream `listEventSitemapEntries` use case should return
+        `updatedAt` (or `publishedAt` as fallback) per event. The web
+        `sitemap.ts` should map this to the `lastModified` field so crawlers
+        know which pages changed.
+      acceptance:
+        - Every event entry in sitemap.xml has a `<lastmod>` tag.
+        - Value reflects the event's most recent material update, not "now".
+      implementation_notes: |
+        - Extend `listEventSitemapEntriesOutputSchema` to include
+          `lastModified: z.string().datetime()`.
+        - Adapter query adds `ORDER BY updated_at DESC` and selects
+          `updated_at` or `COALESCE(updated_at, published_at)`.
+
+    - id: SITEMAP-CATEGORIES
+      title: Include category pages in the sitemap
+      priority: low
+      effort: small
+      description: |
+        Enumerate known category slugs and emit `/events/category/{slug}`
+        entries. Categories are a finite, application-defined list.
+      acceptance:
+        - Every active category has an entry in sitemap.xml.
+      implementation_notes: |
+        - Import the canonical category list from `@th/schema` (or `@th/types`)
+          and map each to a sitemap entry with `priority: 0.5`.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. JSON-LD structured data
+# ─────────────────────────────────────────────────────────────────────────────
+
+json_ld:
+  current_state: |
+    Event detail pages emit a full `schema.org/Event` JSON-LD block via
+    `buildEventJsonLd()`. Covers name, dates, location (Place + PostalAddress +
+    GeoCoordinates), organizer (Organization), offers (AggregateOffer), images,
+    eventStatus, and eventAttendanceMode.
+
+    No other page types emit JSON-LD.
+
+  items:
+
+    - id: JSONLD-PLACE
+      title: Emit schema.org/EventVenue JSON-LD on place pages
+      priority: high
+      effort: medium
+      description: |
+        Place pages (`/places/id/{placeId}`) should render a
+        `schema.org/EventVenue` (subtype of Place) JSON-LD block containing:
+          - `name`
+          - `address` (PostalAddress from formattedAddress / city / region / countryCode)
+          - `geo` (GeoCoordinates from lat/lng)
+          - `event` (array of upcoming `schema.org/Event` stubs with name, startDate, url)
+          - `maximumAttendeeCapacity` (from capacity, if set)
+      acceptance:
+        - Google Rich Results Test validates the output as a valid Place.
+        - At least name + address + geo are always present for ACTIVE places.
+        - Upcoming events listed under `event` property (max 10).
+      implementation_notes: |
+        - New `buildPlaceJsonLd()` in `packages/types/src/seo/buildPlaceJsonLd.ts`.
+        - New `PlaceJsonLd` component in place page `_components/`.
+        - Reuse existing `SeoJsonLd` renderer.
+        - Input type `SeoPlace` defined in `packages/types/src/seo/types.ts`.
+
+    - id: JSONLD-BREADCRUMB
+      title: Emit BreadcrumbList JSON-LD on event detail pages
+      priority: high
+      effort: small
+      description: |
+        Event slugs encode a hierarchy: `{host}/{country}/{region}/{title}`.
+        Emit a `schema.org/BreadcrumbList` so Google renders breadcrumbs in
+        SERPs (e.g., "Ithas Fire > US > CA > Event Name").
+      acceptance:
+        - Event pages with a valid slug emit a BreadcrumbList JSON-LD block.
+        - Breadcrumb items: Home → Events → {country} → {region} → {event name}.
+        - Google Rich Results Test validates the block.
+      implementation_notes: |
+        - New `buildEventBreadcrumbJsonLd(event, siteUrl)` in
+          `packages/types/src/seo/buildEventBreadcrumbJsonLd.ts`.
+        - Parse slug segments to derive the hierarchy.
+        - Render via a `<EventBreadcrumbJsonLd>` component alongside the
+          existing `<EventJsonLd>` in the event page.
+        - Country and region breadcrumb `item` URLs are omitted for now
+          (text-only) because the search page does not yet support
+          region/country faceted filtering. Revisit when faceted search lands.
+
+    - id: JSONLD-ITEMLIST
+      title: Emit ItemList JSON-LD on event listing pages
+      priority: medium
+      effort: small
+      description: |
+        Pages that render a list of events (homepage, search results, category
+        pages) should emit `schema.org/ItemList` with `ListItem` entries
+        pointing to each event's canonical URL.
+      acceptance:
+        - Homepage, `/events/search`, and `/events/category/{slug}` emit
+          ItemList JSON-LD when events are present.
+        - Each ListItem has `position`, `url`, and `name`.
+      implementation_notes: |
+        - New generic `buildItemListJsonLd(items: { url, name }[])` helper.
+        - Render in a `<EventListJsonLd>` component used by each listing page.
+        - Homepage uses the initial local events payload.
+        - Search/category pages use their server-fetched results.
+
+    - id: JSONLD-WEBSITE-SEARCH
+      title: Emit WebSite + SearchAction JSON-LD on the homepage
+      priority: medium
+      effort: trivial
+      description: |
+        Add `schema.org/WebSite` with a `potentialAction` of type
+        `SearchAction` pointing to `/events/search?search={search_term_string}`.
+        This enables the Google sitelinks search box.
+      acceptance:
+        - Homepage emits a WebSite JSON-LD block.
+        - SearchAction target matches the actual search URL template.
+        - Google Rich Results Test validates the block.
+      implementation_notes: |
+        - Inline in the root layout or homepage layout.
+        - Static JSON — no data fetching needed.
+        - Example:
+          ```json
+          {
+            "@context": "https://schema.org",
+            "@type": "WebSite",
+            "url": "https://hearthfire.community",
+            "potentialAction": {
+              "@type": "SearchAction",
+              "target": {
+                "@type": "EntryPoint",
+                "urlTemplate": "https://hearthfire.community/events/search?search={search_term_string}"
+              },
+              "query-input": "required name=search_term_string"
+            }
+          }
+          ```
+
+    - id: JSONLD-ORGANIZATION
+      title: Emit Organization JSON-LD for org profile pages
+      priority: low
+      effort: medium
+      description: |
+        When org profile pages are built (future), emit
+        `schema.org/Organization` with name, url, logo, and a list of
+        upcoming events. Defer until org public profile routes exist.
+      acceptance:
+        - Org profile pages emit valid Organization JSON-LD.
+      implementation_notes: |
+        - Blocked on public org profile routes.
+        - Prepare `buildOrgJsonLd()` when the route is implemented.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. OpenGraph and Twitter card metadata
+# ─────────────────────────────────────────────────────────────────────────────
+
+social_metadata:
+  current_state: |
+    Event detail pages have full OpenGraph + Twitter card metadata via
+    `buildEventMetadata()`. Root layout has default OG/Twitter for the site.
+
+    Place pages (`/places/id/{placeId}`) return only bare `title` and
+    `description` — no `openGraph`, `twitter`, `alternates.canonical`, or
+    images.
+
+    Category pages have a basic title + description but no canonical, OG, or
+    Twitter.
+
+  items:
+
+    - id: OG-PLACE
+      title: Add OpenGraph and Twitter metadata to place pages
+      priority: high
+      effort: small
+      description: |
+        Extend `generateMetadata` on `/places/id/[placeId]/page.tsx` to return:
+          - `openGraph.type: "website"`
+          - `openGraph.title`: "{place.name} — {siteName}"
+          - `openGraph.description`: "Events at {name} in {city}, {region}"
+          - `openGraph.url`: canonical place URL
+          - `twitter.card`: "summary"
+          - `twitter.title` / `twitter.description`: same as OG
+          - `alternates.canonical`: canonical place URL
+      acceptance:
+        - Sharing a place URL on Twitter/Facebook/Slack/iMessage renders a rich
+          preview with title and description.
+        - `<link rel="canonical">` tag is present in the HTML.
+      implementation_notes: |
+        - Build a `buildPlaceMetadata()` helper in
+          `packages/types/src/seo/buildPlaceMetadata.ts` (mirrors
+          `buildEventMetadata`).
+        - Call from the place page's `generateMetadata`.
+
+    - id: OG-CATEGORY
+      title: Add canonical URL and OG metadata to category pages
+      priority: medium
+      effort: trivial
+      description: |
+        Add `alternates.canonical`, `openGraph`, and `twitter` fields to the
+        existing `generateMetadata` on `/events/category/[slug]/page.tsx`.
+      acceptance:
+        - Category pages have a canonical URL.
+        - Sharing a category page renders a rich preview.
+      implementation_notes: |
+        - Inline in the existing `generateMetadata` — no new helper needed.
+
+    - id: OG-SEARCH
+      title: Add canonical URL to the search page
+      priority: low
+      effort: trivial
+      description: |
+        `/events/search` and `/events` should have a canonical URL to prevent
+        Google from treating parameterized variants as duplicates.
+      acceptance:
+        - `/events/search` has `<link rel="canonical">` pointing to itself
+          (without query params).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Place slug pages
+# ─────────────────────────────────────────────────────────────────────────────
+
+place_slugs:
+  current_state: |
+    `/places/[slug]/page.tsx` exists but immediately calls `notFound()`.
+    Places are only reachable via `/places/id/{placeId}`.
+
+  items:
+
+    - id: PLACE-SLUG-ROUTE
+      title: Implement place slug resolution and rendering
+      priority: medium
+      effort: medium
+      description: |
+        Give places human-friendly URLs (`/places/{slug}`) analogous to events.
+        The slug page should resolve via a `resolvePlaceBySlug` use case, render
+        the same content as the ID-based route, and set a canonical URL.
+      acceptance:
+        - `/places/{slug}` renders the place page.
+        - `/places/id/{placeId}` redirects (301) to the slug URL when a slug
+          is available.
+        - Sitemap uses slug URLs when available, falling back to ID URLs.
+      implementation_notes: |
+        - Requires `slug` column on the Place model (already present per
+          PlaceRecord type).
+        - New `resolvePlaceBySlug` use case or extension of existing resolver.
+        - Update `/places/[slug]/page.tsx` to call the resolver and render.
+        - Update `/places/id/[placeId]/page.tsx` to redirect to slug when
+          available.
+      dependencies:
+        - Place slug generation logic (may mirror event slug pattern).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Miscellaneous SEO improvements
+# ─────────────────────────────────────────────────────────────────────────────
+
+miscellaneous:
+
+  items:
+
+    - id: ROBOTS-NOINDEX-CHECKOUT
+      title: Ensure checkout pages are noindexed
+      priority: medium
+      effort: trivial
+      description: |
+        Add `robots: { index: false, follow: false }` to
+        `generateMetadata` (or static `metadata` export) on the checkout
+        page to prevent crawlers from indexing transactional flows.
+      acceptance:
+        - `/events/checkout/{slug}` pages have `<meta name="robots"
+          content="noindex, nofollow">`.
+      implementation_notes: |
+        - Add a static `metadata` export or `generateMetadata` returning
+          `robots: { index: false, follow: false }` in
+          `apps/web/src/app/events/checkout/[...slug]/page.tsx`.
+
+    - id: ROBOTS-NOINDEX-ADMIN
+      title: Ensure all admin pages are noindexed
+      priority: medium
+      effort: trivial
+      description: |
+        The admin layout (`/admin/[slug]/layout.tsx`) should set
+        `robots: { index: false, follow: false }` so no admin surface is
+        ever crawled.
+      acceptance:
+        - All `/admin/*` pages have noindex/nofollow meta tags.
+      implementation_notes: |
+        - Add a static `metadata` export in the admin layout or a shared
+          admin `generateMetadata`.
+
+    - id: EVENT-OG-TYPE
+      title: Use og:type "event" for event detail pages
+      priority: low
+      effort: trivial
+      description: |
+        The current `buildEventMetadata` sets `openGraph.type: "website"`.
+        For event pages, `og:type` should ideally be a more specific value.
+        OpenGraph does not have a native "event" type in the standard
+        protocol, but custom `event:*` meta tags are already emitted.
+        Evaluate whether keeping "website" is acceptable or whether a
+        namespace prefix is worth adding.
+      acceptance:
+        - Decision documented. If changed, OG type updated and validated.
+      implementation_notes: |
+        - Research: Facebook/Meta supports custom OG objects via app
+          namespaces but the standard protocol types are limited.
+        - Likely keep as-is ("website") since non-standard types can cause
+          preview failures on some platforms.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Implementation order
+# ─────────────────────────────────────────────────────────────────────────────
+
+implementation_phases:
+  phase_1:
+    title: Quick wins — trivial/small effort, high impact
+    items:
+      - SITEMAP-STATIC
+      - ROBOTS-NOINDEX-CHECKOUT
+      - ROBOTS-NOINDEX-ADMIN
+      - OG-CATEGORY
+      - OG-SEARCH
+      - JSONLD-WEBSITE-SEARCH
+    estimated_effort: "1-2 hours"
+    notes: |
+      All items are isolated changes to existing files with no new use cases,
+      adapters, or schema changes. Can be done in a single PR.
+
+  phase_2:
+    title: Place SEO — fills the biggest content gap
+    items:
+      - OG-PLACE
+      - JSONLD-PLACE
+      - SITEMAP-PLACES
+      - SITEMAP-LASTMOD
+    estimated_effort: "3-5 hours"
+    notes: |
+      Requires a new `buildPlaceJsonLd` + `buildPlaceMetadata` in
+      `@th/types`, a new sitemap helper, and wiring into the place page and
+      `sitemap.ts`. Add tests alongside each builder.
+
+  phase_3:
+    title: Structured data enrichment
+    items:
+      - JSONLD-BREADCRUMB
+      - JSONLD-ITEMLIST
+      - SITEMAP-CATEGORIES
+    estimated_effort: "2-3 hours"
+    notes: |
+      New JSON-LD builders + components. Breadcrumb parsing requires slug
+      segment decomposition. ItemList requires threading server-fetched event
+      lists into a shared component.
+
+  phase_4:
+    title: Place slugs and org profiles (future)
+    items:
+      - PLACE-SLUG-ROUTE
+      - JSONLD-ORGANIZATION
+      - EVENT-OG-TYPE
+    estimated_effort: "4-6 hours"
+    notes: |
+      Place slug route requires schema/migration + use case work. Org
+      profiles are blocked on the public org route existing. OG type is a
+      research/decision item.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Acceptance criteria (spec-level)
+# ─────────────────────────────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - All Phase 1 items pass `pnpm -F web build` with no new errors.
+  - All JSON-LD outputs validate against Google Rich Results Test.
+  - `sitemap.xml` includes events, places, static pages, and categories.
+  - Every public page has a `<link rel="canonical">` tag.
+  - Every public page has `openGraph` and `twitter` metadata.
+  - Checkout and admin pages have `noindex, nofollow`.
+  - No new runtime dependencies introduced.
+  - Each builder has unit tests in `packages/types/src/seo/__tests__/`.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Open questions
+# ─────────────────────────────────────────────────────────────────────────────
+
+decisions:
+  - question: |
+      Should place sitemap entries be gated on "has at least one published
+      event" to avoid indexing empty venue pages?
+    answer: |
+      Yes. Only places with at least one currently-published event should
+      appear in the sitemap. This avoids thin/empty pages in the index.
+    impact:
+      - SITEMAP-PLACES acceptance criteria updated to require the
+        "has published event" filter.
+
+  - question: |
+      Should breadcrumb country/region items link to filtered search pages,
+      or be text-only (no `item` URL)?
+    answer: |
+      Ideally they would link to filtered search pages (e.g.,
+      `/events/search?country=US&region=CA`), but the search page currently
+      only supports a freetext `?search=` param — there is no region/country
+      faceted filtering yet. Start with text-only breadcrumb items (no `item`
+      URL). When faceted search lands, revisit and add links.
+    impact:
+      - JSONLD-BREADCRUMB implementation notes updated: country/region
+        breadcrumb entries omit `item` URL for now.
+
+  - question: |
+      Do we want an OG image generation service (dynamic images with event
+      title/date overlaid on hero) for events without a hero image?
+    answer: |
+      No dynamic generation. Use a static black-and-white Ithas Fire
+      default image as the fallback OG image for events that lack a hero.
+    impact:
+      - No new service needed. Add a static fallback OG image asset.
+
+  - question: |
+      When org public profiles ship, should the organizer JSON-LD on event
+      pages link to the org profile URL?
+    answer: |
+      Yes. Linking the organizer JSON-LD to the org profile URL strengthens
+      the entity graph for search engines and helps surface org pages. Wire
+      this up when org public profile routes are implemented.
+    impact:
+      - JSONLD-ORGANIZATION notes updated to include cross-linking from
+        event organizer JSON-LD to org profile URL.
+
+  - question: |
+      Should the sitemap include past/completed events beyond 120 days for
+      long-tail discoverability, or honor the existing exclusion window?
+    answer: |
+      There is no explicit exclusion window in code. The current
+      `listPublishedForSitemap` query selects only events with
+      `status = PUBLISHED` and `visibility = PUBLIC`. Once an event's status
+      changes (e.g., to COMPLETED or CANCELLED), it drops out automatically.
+
+      The SEO benefit of keeping past events indexed is marginal for a
+      ticketing platform — the pages have no actionable content once sales
+      close, and Google may treat them as soft-404s anyway. Keep the current
+      behavior: only PUBLISHED events appear in the sitemap. If we later
+      build "past event archive" pages with value (photos, recap, related
+      upcoming events), we can revisit.
+    impact:
+      - No change to sitemap logic. Current PUBLISHED-only filter is
+        intentional and sufficient.

@@ -1,0 +1,229 @@
+# Confirmed by the owner 2026-10-12 ("Yep I'm good with that"). Not built yet (2026-10-12): nothing built; the deal-terms FR-003 builder comes first.
+# Owner note 2026-10-12: board pick "RC1" (the resale clause inside The deal).
+# Owner note 2026-10-12 on tax for a buyer-paid share: "Yea... we'll deal with that as we go? We need a laywer... We need to keep track of accounting and legal tax questions like this"
+# organiser-resale-share.spec.yaml
+#
+# Every resale of a ticket pays a share, set up front in the event's agreement,
+# to the people who put on the night. Replaces the split of the markup above face.
+
+version: "1.0"
+updated: "2026-10-12"
+related:
+  - docs/specs/2026-09-29/deal-terms-and-settlement.spec.yaml (FR-003 is the agreement builder this clause lives in; build it first)
+  - docs/specs/2026-04-20/completed/resale-markup-and-refunds.spec.yaml (FR-002, the markup split, is superseded by this spec)
+  - docs/specs/2026-03-06/completed/item-level-settlements-and-resale.md ("Listing lifecycle")
+  - handoffs/2026-10-12-cancel-event-resale-chain.md (multi-hop cancel refunds; see FR-010)
+design: canvas QVdGnAjDwxNyTPa5L5LnMz rows 17 (RC1, RC2) and 18 (DA1, SV1, BV1)
+
+# ── Rulings (owner, verbatim; full text in memory session_organiser_resale_share.plan.md) ──
+# R1  2026-10-10 "Our reselling should inherently give money back to the artists/organization that it's tied to anyway. That should be apart of resell."
+# R2  2026-10-11 "Yes. Reselling is infinite"
+# R3  2026-10-12 "Resale should have a percentage or a fee designed up front to allow organziers to have some of the resell value to go back to the organizers who ran it"
+# R4  2026-10-12 "Resaling moves ownership of the ticket. We don't refund someone who already moved on the cost to someone else."
+# R5  Percentage or flat: "It's apart of the agreement structure that we can add different clauses for both scenarios. The agreement strucutrue should help dictate how reselling works"
+# R6  Who pays: "Configurable, default to seller money"
+# R7  Every resale incl. at or below face, every hop: "Yes"
+# R8  The markup split: "replace."
+# R9  Where it is set: "APART OF THE EVENT AND AGREEMENT PROCESS"; "Agreements are just the tool to set the rules in the event. We have a default agreement"
+# R10 A ticket keeps the terms of its first sale, across the chain, shown on every listing: "Fixed"; "Yep"
+# R11 Platform take: "ABSOLUTELY NOTHING. We need to support arbitrary reselling."
+# R12 One or the other per clause: "Our agreement builder should have a clause builder to add either or."
+# R13 Who decides: "Reference our booking/agreement builder processs for this. The tickets being resold for an event are dictated by the organizers of said event"
+# R14 Who receives it: the event's resale split lines: "Yep"
+# R15 "Original price" = the organiser's price at the first sale, always: "Yep"
+# R16 Limit: "we need some standard limit. Use your best judgement. Research fairness if possible in this" → set by the orchestrator, see FR-002.
+# R17 Builder scope: "B is what the agreement builder should be now." (the general clause builder, deal-terms FR-003)
+# R18 "two specs"; R19 rename the org "Resale policy" page to "Default agreement": "Yeah rename it."
+
+summary:
+  problem: >
+    A resale pays the event side only half of any markup above what the seller
+    paid, so a resale at or below face pays the people who ran the night nothing,
+    and on a second-hand ticket "face" is the previous resale price. The owner
+    wants every resale to feed the event, on terms set up front.
+  solution: >
+    The event's agreement carries a resale clause: a percentage of the sale or a
+    flat amount, paid by the seller by default or added for the buyer, at most
+    10% of each sale. Each ticket records the clause in force at its first sale
+    and keeps it on every resale. The platform pays the share on every resale
+    sale over the event's resale split lines and takes nothing itself.
+  users: [resale sellers, resale buyers, organisers, places and acts on a booked night, finance and support]
+  surfaces: [web, api, stripe webhooks, jobs]
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        The clause. RESALE PayoutTerms gain: `resaleShareType` PERCENT | FLAT |
+        null (null = not set), `resaleShareBps` (0..1000) or `resaleShareCents`
+        (> 0), and `resaleSharePayer` SELLER (default) | BUYER. Zero is a valid
+        setting. Resale cannot be switched on for a ticket type, and an event
+        that allows resale cannot publish (extends RESALE_TERMS_MISSING), while
+        the event's clause is not set.
+    - id: FR-002
+      description: >
+        The limit (orchestrator's call under R16). The share on any one sale is
+        at most 10% of that sale's asking price. A percentage above 10% is
+        refused at write. A flat amount is held to floor(ask × 10%) on a sale
+        where it would exceed it, and the seller sees the held amount. With
+        BUYER payer, ask + share must not exceed the ticket's resale cap
+        (`effectiveResaleCapCents`); a listing above it is refused with the
+        highest ask that fits. Reason: NSW, Maine and Vermont allow 10% over
+        face; AXS and Tixel (AU) cap resale at 10% above the original price;
+        Twickets charges a 10% buyer fee; Ireland, NSW, Vermont and the UK plan
+        count fees toward a face cap. Sources in the plan file.
+    - id: FR-003
+      description: >
+        Recorded at the first sale. Every primary sale (checkout, embed, POS
+        card and cash, comp) writes on each ticket's OrderItem the resale clause
+        in force: type, amount, payer, the terms id and version, and the
+        ticket's original unit price. A resale finalize copies the same record
+        onto the buyer's OrderItem, so it travels down the chain (R2, R10).
+        Changing the event's clause applies only to tickets sold afterwards.
+        A ticket moved to another event (`migrateEventOrders`) keeps its
+        first-sale clause; its share is paid over the event it now belongs
+        to (R10, noted 2026-10-13 in the B3 build).
+    - id: FR-004
+      description: >
+        A ticket sold before this ships has no record. At its first listing the
+        event's clause at that moment is written onto its purchase OrderItem
+        and used from then on. (Resale is off in production, so this is
+        expected to cover dev and test data only; to be confirmed against prod
+        before the migration, FR-015.)
+    - id: FR-005
+      description: >
+        Pricing replaces `computeResalePricing`'s markup split. share = PERCENT
+        ? floor(ask × bps / 10000) : min(cents, floor(ask × 1000 / 10000)).
+        SELLER payer: the buyer pays ask (+ processing + tax), the seller gets
+        ask − share. BUYER payer: the buyer pays ask + share (+ processing on
+        that total + tax), the seller gets ask. In both, seller + share equals
+        the order's basis to the cent, the invariant
+        `resolveResaleSellerSplit` already guards.
+    - id: FR-006
+      description: >
+        The share runs over the event's RESALE payout lines (the existing
+        organiser-side split), so every payee is credited, held, disputed and
+        refunded by the paths that exist today. Ithas Fire takes nothing on a
+        resale order: a test asserts platform revenue on a resale order is 0.
+    - id: FR-007
+      description: >
+        Original price. Listings, listing detail, resale checkout and the
+        seller's form show "Original price" = the original unit price recorded
+        in FR-003, never the previous resale price (R15). The resale cap's floor
+        (`effectiveResaleCapCents`) uses the same original price.
+    - id: FR-008
+      description: >
+        The seller sees, before listing and on each live listing, asking price,
+        "To the people who put on the night" with the share, and "You receive"
+        (SV1). When the asking price is at or below what they paid, the form
+        says in plain words how much less than they paid they get back. The
+        markup lines ("Positive markup", "Your markup share", "Organizer markup
+        share") and the "Seller economics" copy are replaced.
+    - id: FR-009
+      description: >
+        The buyer sees on each listing card, the listing page and checkout:
+        the price they pay (with a BUYER-payer share included in the total shown
+        first, per the FTC all-in rule), "Original price", and how much goes to
+        the people who put on the night (BV1).
+    - id: FR-010
+      description: >
+        Refunds and claims. An approved claim, a refund and a dispute return the
+        share with the rest of the order through the existing per-payee debits;
+        a BUYER-paid share is part of what the buyer gets back. The multi-hop
+        cancel work (cancel-event-resale-chain handoff) must unwind each hop's
+        share the same way.
+    - id: FR-011
+      description: >
+        Where it is written, by the agreement builder (deal-terms FR-003, built
+        first under R17), as one clause section: in the booking terms (written
+        by the event's organiser side via `requireAgreementTermsEditor`; the act
+        sees it before agreeing, R13), in the event builder's Revenue splits for
+        an event without a booking (event edit roles), and on the default
+        agreement page. Layout: RC1, the Resale block inside The deal after Off
+        the top (owner pick 2026-10-12). The clause is labelled "Paid through Ithas Fire", unlike the
+        deal's "Settled directly" clauses: the platform pays it on every resale.
+    - id: FR-012
+      description: >
+        Default agreement page (R19). Settings → Policies → "Resale policy"
+        becomes "Default agreement" at /admin/[slug]/settings/default-agreement
+        (the old path redirects). It holds the ticket-sales default (the builder)
+        and the resale clause (empty until set) and the seller release days that
+        exist today. New events copy it. Writers: ORG_ADMIN_ROLES, as today.
+    - id: FR-013
+      description: >
+        A resale listing does not need the event's agreement to carry its own
+        fee policy: processing is priced from the same scoped fee policy a
+        primary sale resolves (`resolve-scoped-fee-policy`). This removes the
+        AGREEMENT_MISSING_FEE_POLICY refusal and its wrong copy ("This agreement
+        is missing its fee terms. Add them and try again.").
+    - id: FR-014
+      description: >
+        The markup split is removed: `PayoutTerms.resaleSellerMarkupShareBps`,
+        `TicketType.resaleSellerMarkupShareBpsOverride`, the org page's seller
+        share field, and the markup snapshot columns on ResaleListing and
+        OrderItem are replaced by the share columns (`eventShareCents`,
+        `sharePayer`) and dropped in the same migration.
+    - id: FR-015
+      description: >
+        Migration and backfill: new columns; any RESALE terms row gets
+        `resaleShareType` null (resale off until set); live ACTIVE or HELD
+        listings at migration time (expected none in production; the build
+        checks first) are cancelled with a notice to the seller to list again.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Money paths (pricing, finalize, refunds) are built on opus with a Codex
+        second opinion (CLAUDE.md "Hard"), and keep the to-the-cent invariant
+        seller + share = basis.
+    - id: NFR-002
+      description: >
+        Every amount a seller or buyer is shown comes from the same pricing
+        function the server charges with; no client-side recomputation.
+
+architecture:
+  core:
+    use_cases:
+      - {name: computeResalePricing (rewritten), money: true, idempotent: true}
+      - {name: createResaleListing / createResaleCheckout / finalize (resale branch), money: true, idempotent: true, note: "read the ticket's FR-003 record, not live terms"}
+      - {name: mintTicketsForOrder callers, money: true, note: "write the FR-003 record at every primary sale"}
+      - {name: setDefaultAgreement (replaces setOrganizationResalePolicy), money: false, authz: ORG_ADMIN_ROLES}
+      - {name: deal-terms clause write (setAgreementDeal / updateEventSplits), money: false, note: "accepts the resale clause"}
+  data:
+    migrations_needed: true
+    modified_models: [PayoutTerms, OrderItem, ResaleListing, TicketType]
+    new_models: []
+    lifecycle: >
+      No new model. The clause is part of PayoutTerms and follows its existing
+      lifecycle. The FR-003 record on OrderItem is written once per sale and
+      never updated (append-only, like the rest of the purchase snapshot).
+
+risks:
+  - risk: No source found on whether a required organiser share of resales is lawful; Ithas Fire is the merchant of record.
+    severity: HIGH
+    mitigation: Counsel reviews before resale is switched on in production. Resale stays behind its flag, which is off.
+  - risk: Sales tax on a BUYER-paid share (is it part of the taxable ticket price?) varies by jurisdiction.
+    severity: MEDIUM
+    mitigation: Treat it as part of the ticket price for tax, matching the tax base work, until counsel says otherwise (owner 2026-10-12, "we'll deal with that as we go"). Tracked in docs/legal-and-tax-questions.md.
+  - risk: A seller at a face-value cap gets back less than they paid.
+    severity: LOW
+    mitigation: Ruled (R7). Shown before listing in plain words (FR-008).
+
+open_questions:
+  - "Tax on a BUYER-paid share: part of the ticket price or outside it? Owner 2026-10-12: deal with it as we go, needs a lawyer. Build treats it as part of the ticket price; tracked in docs/legal-and-tax-questions.md."
+  - "Is a required organiser share of every resale lawful? Counsel, before resale is switched on in production; tracked in docs/legal-and-tax-questions.md."
+
+out_of_scope:
+  - The general agreement builder itself (deal-terms FR-003; built first, own spec).
+  - A /platform/features toggle for resale, and switching resale on in production.
+  - Paying event-level deal clauses (guarantees, versus) through the platform (deal-terms stage 2).
+  - Multi-hop cancel refunds (own handoff), except the share rule in FR-010.
+
+acceptance_criteria:
+  - "A ticket first sold at $40 under a 10% SELLER clause, resold for $50: buyer pays $50 + processing + tax; seller credited $45; event payees credited $5 split by the resale lines; platform revenue $0."
+  - "The same ticket resold again for $70 after the organiser changed the clause to 5%: the 10% clause still applies ($7)."
+  - "A FLAT $8 clause on a $50 resale takes $5 (10% limit) and the seller form shows $5."
+  - "A BUYER clause on a ticket capped at $40: a $40 ask with a $4 share is refused; the form offers $36.37, the highest ask that fits ($36.37 + $3.63 = $40.00). Corrected 2026-10-13 from \"$36\", an arithmetic slip found in the B2 build; the rule (offer the highest ask that fits) is unchanged."
+  - "A resold ticket's listing shows 'Original price $40.00' on the second and third resale."
+  - "An approved claim on a resale credits back the seller and every event payee; a BUYER-paid share is refunded to the buyer."
+  - "An event with resale allowed and no resale clause set cannot publish."

@@ -11,23 +11,20 @@ Set the following variables in `apps/web/.env.local` or your shell:
 | `NEXT_PUBLIC_SITE_URL`            | Public origin used for canonical URLs and metadata.                                                                 | `http://localhost:3000`                                         |
 | `NEXT_PUBLIC_SITE_NAME`           | Human-readable site name applied to metadata.                                                                       | `Ithas Fire`                                                    |
 | `WEB_API_BASE_URL`                | Base URL for the internal API used to load event data.                                                              | `http://localhost:3001` (auto-set by `scripts/run-web-dev.cjs`) |
-| `WEB_EVENT_RESOURCE_PATH`         | Path segment for the events resource on the API.                                                                    | `/v1/events`                                                    |
+| `WEB_EVENT_RESOURCE_PATH`         | Path for the events resource on the API; a leading slash is added if missing. Only the URL helpers in `src/config/api.ts` read it, and they have no callers, so setting it changes nothing today. | `/v1/events`                                                    |
 | `WEB_SMOKE_BUILD`                 | When set to `true`, skips live API calls and serves fixture sitemap data.                                           | _unset_                                                         |
-| `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` | Browser key for the Google Maps JavaScript API (enables map previews + selectors).                                  | _unset_                                                         |
 | `NEXT_PUBLIC_TILESERVER_URL`      | Base URL of the self-hosted TileServer GL instance. Required for map previews, static maps, and coordinate pickers. | _unset_                                                         |
 | `NEXT_PUBLIC_GEOAPIFY_API_KEY`    | Geoapify API key for geocoding.                                                                                     | _unset_                                                         |
-| `NEXT_PUBLIC_GOOGLE_MAPS_MAP_ID`  | Optional vector map ID used to style embedded maps.                                                                 | _unset_                                                         |
 
 Example:
 
 ```bash
 NEXT_PUBLIC_SITE_URL=https://tickets.example.com
 WEB_API_BASE_URL=https://api.example.com
-WEB_EVENT_RESOURCE_PATH=/v1/events
-NEXT_PUBLIC_GOOGLE_MAPS_API_KEY=your-browser-key
+NEXT_PUBLIC_TILESERVER_URL=https://tiles.example.com
 ```
 
-Map previews and the coordinate picker gracefully no-op when the API key is missing, but you will want it configured for a realistic editing experience.
+Map previews and the coordinate picker need `NEXT_PUBLIC_TILESERVER_URL`; geocoding needs `NEXT_PUBLIC_GEOAPIFY_API_KEY`. Maps render with MapLibre against the tile server, not Google Maps. Configure both for a realistic editing experience.
 
 ## Development
 
@@ -59,17 +56,21 @@ Some TRPC v11 packages (`@trpc/client`, `@trpc/react-query`, `@trpc/server`) shi
 
 ## Testing
 
+Run web vitest from inside `apps/web` (project rule; other working directories break it):
+
 ```bash
-pnpm -C apps/web exec vitest --run
+cd apps/web && pnpm test:run
 ```
 
-Tests cover the SEO components (`EventJsonLd`, `SeoJsonLd`) and the server helpers that translate API responses into `SeoEvent` payloads.
+Typecheck with `pnpm typecheck:web`. Plain `pnpm typecheck` covers `packages/**` only and skips this app. For e2e, see `apps/web/e2e/README.md`: set `E2E_USE_LIVE_STACK=1` or the harness wipes your dev database.
+
+Tests cover the SEO components (`apps/web/src/components/seo`), the server helpers that translate API responses into `SeoEvent` payloads, and the rest of the app.
 
 ## Architecture Notes
 
 - Shared SEO logic lives under `packages/types/src/seo`. The web app consumes these helpers for deterministic JSON-LD and metadata output.
 - `apps/web/src/components/seo` contains server components that render structured data safely.
 - `apps/web/src/server/events.ts` fetches event details and normalises them with `mapEventToSeo`. The sitemap-index plus per-section sub-sitemaps are generated nightly by the `sitemaps.generate` job (`apps/jobs/src/jobs/sitemaps.ts`) and served from the public CDN bucket; `robots.ts` advertises the CDN URL when `SITEMAP_CDN_URL` is configured.
-- Event detail pages reside at `/events/[slug]`, revalidating every 60 seconds by default.
+- Event detail pages are served by the catch-all `apps/web/src/app/events/[...slug]/page.tsx` (`/events/<slug>`), revalidating every 60 seconds by default.
 
 For additional guardrails, review `docs/engineering-standards.md` and the SEO helper tests in `packages/types/src/seo/__tests__`.

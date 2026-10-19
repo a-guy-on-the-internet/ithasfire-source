@@ -1,0 +1,41 @@
+{
+  "name": "@th/types",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./money": {
+      "types": "./src/money.ts",
+      "default": "./src/money.ts"
+    },
+    "./datetime": {
+      "types": "./src/datetime.ts",
+      "default": "./src/datetime.ts"
+    },
+    "./verification-code-purpose": {
+      "types": "./src/verification-code-purpose.ts",
+      "default": "./src/verification-code-purpose.ts"
+    },
+    "./*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "test": "vitest --run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "luxon": "^3.7.2",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@th/tsconfig": "workspace:^",
+    "@types/luxon": "^3.3.3",
+    "vitest": "^3.2.4"
+  }
+}

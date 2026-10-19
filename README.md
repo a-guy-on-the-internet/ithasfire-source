@@ -7,7 +7,7 @@ Monorepo for the Ithas Fire platform -- transparent, developer-grade ticketing a
 ## Index
 
 - [Documentation](#documentation)
-- [Contributing](CONTRIBUTING.md)
+- [Contributing rules](docs/engineering-standards.md#17-contributing)
 - [CI workflow](#ci-workflow)
 - [Quick infra start (local dev)](#quick-infra-start-local-dev)
 - [App surfaces & helper scripts](#app-surfaces--helper-scripts)
@@ -17,9 +17,8 @@ Monorepo for the Ithas Fire platform -- transparent, developer-grade ticketing a
 See **[`docs/README.md`](docs/README.md)** for the full documentation index. Key starting points:
 
 - [`docs/engineering-standards.md`](docs/engineering-standards.md) -- Engineering standards and architecture
-- [`docs/env.md`](docs/env.md) -- Environment variables reference
 - [`docs/db-setup.md`](docs/db-setup.md) -- Database setup and Prisma workflow
-- [`docs/production-checklist.md`](docs/production-checklist.md) -- Production deployment guide
+- [`docs/deploy.md`](docs/deploy.md) -- Deploys, env vars and secrets, operations
 
 ## CI workflow
 
@@ -44,17 +43,19 @@ export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/dev?schema=pu
 pnpm db:validate
 
 # Generate Prisma client
-pnpm -F @th/db prisma generate
+pnpm -F @th/db run generate
 
 # Build and typecheck
 pnpm build
-pnpm -w tsc -p tsconfig.base.json
+pnpm typecheck
 
 # Lint
 pnpm lint
 ```
 
 ## Quick infra start (local dev)
+
+Prerequisites: Node 24 (CI runs 24), pnpm 10 (`corepack enable` picks the version from `packageManager`), and Docker for Postgres and Redis.
 
 This repo includes `infra/docker/docker-compose.yml` and `infra/.env` (keep `.env` local). A safe example is included at `infra/.env.example` — copy it to `infra/.env` and edit secrets locally.
 
@@ -80,7 +81,7 @@ Then apply Prisma migrations and run a smoke test:
 export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/dev?schema=public"
 cd packages/db
 pnpm -F @th/db prisma migrate dev --name init
-pnpm -F @th/db prisma generate
+pnpm -F @th/db run generate
 node test-smoke.js
 ```
 

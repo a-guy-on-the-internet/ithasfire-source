@@ -6,8 +6,11 @@ import {
   CheckCheck,
   CheckCircle2,
   CircleDollarSign,
+  Clock,
+  DoorOpen,
   HelpCircle,
   SearchX,
+  ServerOff,
   ShieldAlert,
   ShieldQuestion,
   Tag,
@@ -34,9 +37,10 @@ import {
   planResultDetail,
   type ResultDetailPlan,
 } from "../lib/result-detail-plan";
-import type {
-  ScanGlyphId,
-  ScanPresentation,
+import {
+  verdictStampKey,
+  type ScanGlyphId,
+  type ScanPresentation,
 } from "../lib/scan-result-presentation";
 import {
   provenanceOf,
@@ -82,18 +86,28 @@ export type {
  * `footer`, the hold handlers, and the `· CONFIRM MANUALLY` suffix.
  */
 
-/** `ScanGlyphId` → icon. Lives here so the decision table stays node-pure. */
-const GLYPHS: Record<ScanGlyphId, LucideIcon> = {
+/**
+ * `ScanGlyphId` → icon. The key → name table is SHARED (`@th/types`'
+ * `SCAN_GLYPHS`, also read by the web); only this name → component half is
+ * per-surface, because a Lucide component cannot live in `@th/types`. Typed
+ * over the shared `ScanGlyphId`, so a new name is a type error here until it
+ * resolves. Exported so the scan screen's failure verdict renders the same
+ * glyph through the same map.
+ */
+export const SCAN_GLYPH_COMPONENTS: Record<ScanGlyphId, LucideIcon> = {
   CheckCircle2,
+  DoorOpen,
   CheckCheck,
   CircleDollarSign,
   Ban,
   Tag,
   XCircle,
   CalendarX2,
+  Clock,
   HelpCircle,
   SearchX,
   ShieldAlert,
+  ServerOff,
   UserCheck,
   WifiOff,
   ShieldQuestion,
@@ -102,9 +116,6 @@ const GLYPHS: Record<ScanGlyphId, LucideIcon> = {
 const announce = (message: string) => {
   AccessibilityInfo.announceForAccessibility(message);
 };
-
-const isVipType = (name: string | null | undefined): boolean =>
-  name ? /vip|backstage|premium/i.test(name) : false;
 
 export const UnifiedResultView = ({
   result,
@@ -125,6 +136,7 @@ export const UnifiedResultView = ({
   onHoldEnd,
   footer,
   layout,
+  reducedMotion,
   testID,
 }: {
   result: AnyScanResult;
@@ -157,6 +169,12 @@ export const UnifiedResultView = ({
   footer?: ReactNode;
   /** `inline` for the manual-search screen — see `ToneResultState`. */
   layout?: "fill" | "inline";
+  /**
+   * The OS reduce-motion flag. Passing it (as the door screen does) opts this
+   * verdict into the stamp; omitting it (the manual-search screen) leaves the
+   * state static. See `ToneResultState`'s `## Motion`.
+   */
+  reducedMotion?: boolean;
   testID?: string;
 }) => {
   const provenance = provenanceOf(result);
@@ -175,16 +193,18 @@ export const UnifiedResultView = ({
     // ordering below is the whole point and a live region cannot express it.
     //
     // Provenance FIRST: it qualifies everything after it, so a screen-reader
-    // user hears "Offline result…" before they hear a verdict.
+    // user hears "Offline result…" before they hear a verdict. Then the DS
+    // reading order — state, then word, then who.
     const parts: Array<string | null> = [
       provenanceLabel?.announce ?? null,
-      presentation.verdict,
+      `${presentation.state}.`,
+      `${presentation.word}.`,
       result.kind === "ticket" ? `Holder ${result.holderDisplay}.` : null,
       result.kind === "volunteer" ? `${result.displayName}.` : null,
       result.kind === "ticket" && result.ticketTypeName
         ? `${result.ticketTypeName}.`
         : null,
-      presentation.guidance,
+      presentation.detail,
     ];
     announce(parts.filter(Boolean).join(" "));
     // `presentation` is derived from `result`; keying on both would re-announce
@@ -229,19 +249,20 @@ export const UnifiedResultView = ({
   return (
     <ToneResultState
       tone={presentation.tone}
-      glyph={GLYPHS[presentation.glyph]}
-      verdict={presentation.verdict}
-      badge={presentation.badge}
+      glyph={SCAN_GLYPH_COMPONENTS[presentation.glyph]}
+      state={presentation.state}
+      word={presentation.word}
       name={ticketFields.name ?? volunteerName}
       typeName={ticketFields.typeName}
-      typeEmphasis={isVipType(ticketFields.typeName)}
       code={ticketFields.code}
-      guidance={presentation.guidance}
+      detail={presentation.detail}
       onDismiss={onDismiss}
       onHoldStart={onHoldStart}
       onHoldEnd={onHoldEnd}
       footer={footer}
       layout={layout}
+      stampKey={verdictStampKey(presentation, result)}
+      reducedMotion={reducedMotion}
       provenance={
         provenanceLabel ? (
           <MetaChip

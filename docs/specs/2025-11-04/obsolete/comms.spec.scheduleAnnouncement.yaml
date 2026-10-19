@@ -1,0 +1,56 @@
+title: use-case | comms.schedule-announcement
+owner: comms
+file: packages/core/src/use-cases/comms/schedule-announcement.ts
+goal: >
+  Move a DRAFT announcement to SCHEDULED with a future scheduledAt UTC time,
+  enqueue a job for actual send.
+
+ports:
+  - Repos (announcements, authz)
+  - JobQueue (enqueue "comms.sendAnnouncement")
+  - Logger
+  - Clock
+  - Idempotency
+
+invariants:
+  - Announcement must be DRAFT at schedule time.
+  - scheduledAt must be >= now + 2 minutes
+  - Actor must own rights same as creation.
+  - Content must still be valid (subject or template).
+
+input_schema:
+  actorHumanId: uuid
+  announcementId: uuid
+  scheduledAtISO: string(ISO-8601)
+  clientKey: string(min:8)
+
+output_schema:
+  announcementId: uuid
+  status: enum[SCHEDULED]
+  scheduledAt: date
+
+side_effects:
+  - DB: update Announcement.status=SCHEDULED, scheduledAt
+  - Queue: enqueue "comms.sendAnnouncement" for at=scheduledAt
+  - Audit: comms.announcement.scheduled
+
+idempotency:
+  key: comms:schedule:${announcementId}:${clientKey}
+  ttl_sec: 60
+  behavior: replay same response if identical; conflict on mismatch.
+
+errors:
+  - invalid_input(422): not ISO; scheduledAt too soon/past
+  - forbidden(403): no rights
+  - not_found(404): announcement missing
+  - conflict(409): not DRAFT; idempotency payload mismatch
+  - dependency_failed(424): queue enqueue failure
+  - transient(503): idem contention
+
+notes:
+  - If already SCHEDULED with same time → replay ok.
+  - If SCHEDULED different time → conflict.
+tests:
+  - schedule ok
+  - already scheduled → replay vs conflict cases
+  - enqueue failure → dependency_failed

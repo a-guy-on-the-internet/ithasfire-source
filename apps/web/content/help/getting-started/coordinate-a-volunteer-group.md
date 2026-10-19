@@ -17,9 +17,9 @@ An organiser can hand you a **group** of volunteers to run — a bar crew, a doo
 
 ## Getting the invite
 
-An organiser assigns you by email. If you already have an Ithas Fire account, you become a coordinator straight away. If you don't, you'll get an email inviting you to finish setting up an account with that address — once you do, you're coordinating.
+An organiser assigns you by email. If you already have an Ithas Fire account, you become a coordinator straight away, and you get an email and an in-app notification saying who assigned you and which group is yours. If you don't have an account yet, create one with the address the organiser used; you're a coordinator from then on.
 
-Either way, the "you're coordinating…" email links straight to your **coordinator console** for that ask. Open that link to get started; bookmark it if you'll come back to it.
+The notification links straight to your **coordinator console** for that ask. Open that link to get started; bookmark it if you'll come back to it.
 
 ## What you can do
 
@@ -44,6 +44,7 @@ Pulling from the general pool only ever moves a volunteer **into your own** grou
 
 - **"Forbidden" when opening the console** — you're signed in as someone other than the account the organiser invited. Sign in with the invited email address.
 - **No pool to pull from** — every approved volunteer is already in a group, or none have been approved yet. Approve applicants to your group first, or ask the organiser to route more people your way.
+- **"New volunteers can't be added right now"** — taking on volunteers is paused for this ask. You can still reject applications, and volunteers already approved keep their place.
 - **You can't find the reward settings** — that's expected. Coordinators see comp status but never configure comps; that lives with the organiser's finance team.
 
 For the organiser's side of this — creating the ask, groups, and assigning you — see [recruit standing volunteers](/help/organising-events/recruit-standing-volunteers).

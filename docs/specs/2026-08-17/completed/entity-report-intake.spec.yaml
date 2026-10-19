@@ -1,0 +1,276 @@
+# entity-report-intake.spec.yaml
+#
+# Replace the CAB "Report" stub (venue + human/org entity pages) with a real
+# authed report form backed by a /platform review queue. Named follow-up of
+# community-managed-event-listings.spec.yaml ("report/flag path... deliberate
+# follow-up").
+
+version: "1.1"
+updated: "2026-08-18"   # v1.1: re-homed from /moderate (community) to /platform (staff) — entity reports are platform-level T&S
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The CAB "Report" action on venue (/p/[slug]) and human/org entity pages is
+    a wired stub: it toasts "Opening support…" and routes to the generic
+    /support hub (VenueCabActions.tsx:223, EntityCabActions.tsx:104). Nothing
+    is recorded, no one is notified, and the help center's only guidance is
+    "reach out to the organizer." There is no way to actually report a
+    problematic or incorrect listing.
+  solution: >
+    An in-place report dialog (reason + optional details, authed-only) that
+    submits to a new EntityReport moderation queue: PENDING → platform staff
+    resolve/dismiss in /platform/reports (beside claims + verification review).
+    Entity reports are PLATFORM-level trust & safety (impersonation, T&S calls
+    on platform entities), NOT community-listing stewardship — so they do NOT
+    live in /moderate and COMMUNITY_MODERATORs have no access. In-app
+    notifications on submit (to platform staff) and on resolution (reporter).
+  users:
+    - Any signed-in visitor (reporter)
+    - Platform staff — ADMIN / SUPPORT / DEVELOPER (reviewer); NOT community moderators
+  surfaces:
+    - web
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        CAB "Report" on venue and entity pages opens an in-place dialog (not a
+        navigation). Signed-out users get the sign-in overlay via
+        showSignInOverlay({ redirect: pathname }) — same pattern as
+        openWizardOrSignIn in VenueCabActions.tsx:166.
+    - id: FR-002
+      description: >
+        The form collects exactly: a required reason (fixed enum, varies by
+        subject type) and an optional free-text details field (max 2000 chars).
+        PLACE reasons: CLOSED_OR_GONE, INCORRECT_INFO, DUPLICATE,
+        INAPPROPRIATE, SPAM, OTHER. HUMAN/ORG reasons: IMPERSONATION,
+        INCORRECT_INFO, INAPPROPRIATE, SPAM, OTHER. OTHER requires details.
+    - id: FR-003
+      description: >
+        submitEntityReport creates a PENDING EntityReport row (polymorphic
+        subjectType PLACE | HUMAN | ORGANIZATION + subjectId), validates the
+        subject exists and is publicly visible, writes an audit log entry, and
+        dedupes: a reporter with an existing PENDING report on the same subject
+        gets REPORT_ALREADY_OPEN (idempotent-friendly, no second row).
+    - id: FR-004
+      description: >
+        On submit, best-effort in-app notification to platform staff:
+        union of listHumanIdsByStaffRole("ADMIN") + ("SUPPORT"), reporter
+        filtered out. Deep-link route: /platform/reports. Notification
+        failure never fails the submit (same tolerant-wrapper pattern as
+        suggestion-notifications).
+    - id: FR-005
+      description: >
+        reviewEntityReport lets platform staff (ADMIN/SUPPORT/DEVELOPER) set status
+        RESOLVED or DISMISSED with an optional reviewNote, recording
+        reviewedByHumanId/reviewedAt. Authz check runs before any state claim
+        (authz-before-claim ordering, review-event-edit-suggestion.ts:44).
+        Resolution is a verdict + note only — it does NOT auto-takedown or
+        modify the subject (takedown stays ADMIN-only per parent spec).
+    - id: FR-006
+      description: >
+        On review, best-effort in-app notification to the reporter (SUCCESS on
+        RESOLVED, INFO on DISMISSED, body includes reviewNote), mirroring
+        notifySuggestionReviewed.
+    - id: FR-007
+      description: >
+        /platform/reports queue section in PlatformShell (nav entry with
+        rbac STAFF_CUSTOMER = ADMIN/SUPPORT/DEVELOPER; no nav badge —
+        PLATFORM_SECTIONS is a static server declaration and no platform nav
+        item carries a live count; the pending count renders in the queue
+        page header instead), beside claims/verification.
+        Queue rows show subject (name + link), reason, details, reporter
+        (name), age; actions: Resolve / Dismiss with note. Component shape
+        mirrors ImageModerationQueue (the smaller precedent).
+    - id: FR-008
+      description: >
+        Reporter-side visibility: the report dialog's success state confirms
+        submission and states that the reporter will be notified in-app when
+        reviewed. No "my reports" list page in v1.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        submit procedure is authedProcedure + rateLimit keyed
+        `report:h:${actorHumanId}`, 5 requests / 300s (copies
+        event-suggestions.ts:82). No IP stored — authed-only removes the
+        submitterIp retention question the suggestions TODO carries.
+    - id: NFR-002
+      description: >
+        Staff procedures are authedProcedure + platform-staff authz inside
+        the use cases (ADMIN/SUPPORT/DEVELOPER — the requirePlatformStaff
+        role class). 2FA step-up: the global
+        requireStaffSecondFactor middleware gates ONLY paths listed in
+        SECOND_FACTOR_GATED_MODERATION_PATHS (guard.ts) — both staff
+        procedures must be added to that allowlist.
+    - id: NFR-003
+      description: >
+        Notification loops run after commit and never fail the mutation.
+        Per the Sentry convention, every new swallow branch (including the
+        notification catches — they are NEW code, not sheltered by the
+        suggestions precedent) keeps its logger.warn AND calls
+        deps.reportError?.() guarded, with regression tests for the report.
+    - id: NFR-004
+      description: >
+        Report dialog is keyboard/screen-reader accessible and usable at
+        320px (radiogroup for reasons follows the roving-tabindex pattern).
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: submit-entity-report
+        description: >
+          Validate subject + reason, dedupe on (reporter, subject, PENDING),
+          create EntityReport, audit-log, notify platform staff post-commit.
+        input: "{ subjectType, subjectId, reason, details?, actorHumanId }"
+        output: "{ reportId }"
+        idempotent: true   # duplicate PENDING → REPORT_ALREADY_OPEN, no new row
+        money: false
+      - name: list-entity-reports
+        description: >
+          Platform-staff-only paged list, filter by status (default PENDING)
+          and subjectType; hydrates subjectName/subjectSlug/reporterName.
+          Also serves the PlatformShell badge count.
+        input: "{ actorHumanId, status?, subjectType?, cursor? }"
+        output: "{ items[], nextCursor?, pendingCount }"
+        idempotent: true
+        money: false
+      - name: review-entity-report
+        description: >
+          Platform-staff-only RESOLVED/DISMISSED verdict + note; CAS on PENDING
+          so two reviewers can't double-resolve; audit-log; notify reporter
+          post-commit.
+        input: "{ reportId, verdict, reviewNote?, actorHumanId }"
+        output: "{ report }"
+        idempotent: true   # non-PENDING → REPORT_ALREADY_REVIEWED
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - AuthzPort.hasStaffRole / listHumanIdsByStaffRole
+      - NotificationsRepo (in-app create)
+      - AuditPort
+      - RateLimitPort (via existing trpc guard middleware)
+      - ReporterPort (swallow branches)
+
+  adapters:
+    new:
+      - EntityReportRepo (Prisma) — create / findPendingByReporterAndSubject /
+        listPaged / claimPendingForReview (CAS update)
+    existing:
+      - Subject visibility lookups reuse existing place/human/org repos
+
+  transport:
+    trpc_procedures:
+      - entityReports.submit        # authedProcedure + rateLimit
+      - entityReports.listForModeration  # authed + inline staff check
+      - entityReports.review        # authed + inline staff check
+    webhooks: []
+
+  ui:
+    pages:
+      - /platform/reports (queue section + PlatformShell nav entry with badge)
+    components:
+      - ReportEntityDialog (shared; reason radiogroup + details + success
+        state; subject-type-aware reason set)
+      - Replace stub bodies in VenueCabActions.tsx and EntityCabActions.tsx
+        (open dialog / sign-in overlay; delete the /support router.push and
+        the reportOpeningToast usage)
+      - EntityReportQueue (+ View) mirroring ImageModerationQueue
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - >
+      EntityReport { id, subjectType (PLACE|HUMAN|ORGANIZATION), subjectId,
+      reporterHumanId, reason (EntityReportReason enum), details?,
+      status (PENDING|RESOLVED|DISMISSED, default PENDING),
+      reviewedByHumanId?, reviewedAt?, reviewNote?, createdAt, updatedAt.
+      Plain-string human ids (house style, no FK — mirrors
+      EventEditSuggestion). Indexes: [status, createdAt],
+      [subjectType, subjectId, status], [reporterHumanId, status].
+  modified_models: []
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Report spam/harassment campaigns against a listing (many accounts, one
+      target).
+    severity: MEDIUM
+    mitigation: >
+      Authed-only + per-human rate limit + per-reporter dedupe in v1; the
+      [subjectType, subjectId, status] index makes a future per-subject
+      pending-cap or auto-collapse cheap to add.
+  - risk: >
+      Queue goes unwatched in early prod.
+    severity: MEDIUM
+    mitigation: >
+      Submit notifications go directly to ADMIN + SUPPORT staff (no volunteer
+      indirection), and the queue badge sits in the platform console staff
+      already use for claims/verification.
+  - risk: >
+      Reports reference subjects that get deleted (no FK).
+    severity: LOW
+    mitigation: >
+      Queue rows render "subject no longer exists" and remain
+      resolvable/dismissable; same posture as other plain-string-id models.
+
+open_questions:
+  - Should a resolved report leave a visible marker for other staff on the
+    subject's /platform pages (e.g. report count on the humans/orgs consoles)?
+    Deferred unless cheap.
+  - Future delegation split (recorded 2026-08-18, deliberately NOT built):
+    the venue-hygiene reasons (CLOSED_OR_GONE, INCORRECT_INFO, DUPLICATE) are
+    community-knowledge tasks that COULD be delegated to COMMUNITY_MODERATORs
+    later, while IMPERSONATION/INAPPROPRIATE/SPAM stay platform-only. The data
+    model already supports it (reason is on the row) — if the community
+    moderator program matures, only authz + routing change.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Anonymous reporting (authed-only by decision)
+  - Reporting EVENTS (suggest-an-edit + organizer contact cover them; the CAB
+    report stub only exists on venue/entity pages today)
+  - Auto-takedown / hiding a subject on report or on resolution (takedown
+    stays ADMIN-only per community-managed-event-listings decisions)
+  - Email notifications (in-app only, matching suggestion-notifications)
+  - "My reports" history page for reporters
+  - Mobile / scanner surfaces
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - Pressing Report on /p/[slug] signed-out shows the sign-in overlay; signed
+    in, it opens the dialog in place (no navigation, no toast-to-/support).
+  - Submitting reason=OTHER without details is rejected client- and
+    server-side.
+  - A second submit by the same reporter on the same subject while one is
+    PENDING returns REPORT_ALREADY_OPEN and creates no row.
+  - A non-platform-staff authed user (INCLUDING a COMMUNITY_MODERATOR)
+    calling entityReports.listForModeration or .review gets FORBIDDEN.
+  - Two concurrent reviews of the same report: exactly one wins; the other
+    gets REPORT_ALREADY_REVIEWED (CAS verified by test).
+  - Submit notifies ADMIN + SUPPORT staff (reporter excluded), deep-linking
+    /platform/reports.
+  - /platform/reports shows the pending count in the page header and lets
+    platform staff resolve with a note; the reporter receives the in-app
+    notification.
+  - /moderate has NO reports tab and community moderators see no trace of the
+    reports queue.
+  - The reportOpeningToast i18n key and /support stub behavior are removed,
+    and EntityCabActions.test.tsx's "/support" assertion is replaced (both
+    en + es catalogs updated for all new keys).
+  - Help-center updates: the-action-bar.md mentions Report;
+    community-listings.md's "reach out to the organizer" guidance gains the
+    report path for venue/entity pages.

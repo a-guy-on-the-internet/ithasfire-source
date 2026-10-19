@@ -1,0 +1,11 @@
+{
+  "CORSRules": [
+    {
+      "AllowedOrigins": ["https://ithasfire.com"],
+      "AllowedMethods": ["GET", "HEAD", "PUT"],
+      "AllowedHeaders": ["*"],
+      "ExposeHeaders": ["ETag"],
+      "MaxAgeSeconds": 3600
+    }
+  ]
+}

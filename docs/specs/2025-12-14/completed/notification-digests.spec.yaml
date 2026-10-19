@@ -1,0 +1,61 @@
+# Spec: Notification Digests Job
+meta:
+  owner: lifecycle-marketing
+  status: draft
+  reviewers:
+    - platform-eng
+    - product-ops
+summary: |
+  Scheduled job that aggregates sales, attendance, and feedback signals to send digest emails
+  or in-app notifications to organizers and attendees.
+scope:
+  included:
+    - Compiling metrics per organizer (tickets sold, revenue, upcoming events).
+    - Triggering attendee feedback prompts 24 hours after event end.
+    - Rendering email bodies via `@th/ui-email` templates and dispatching via provider.
+    - Recording notification history and unsubscribes.
+  excluded:
+    - Real-time transactional emails (handled elsewhere).
+    - Complex segmentation logic (handled by marketing automation tools).
+execution:
+  orchestration: keda-cronjob
+  image: ghcr.io/ithasfire/jobs:notifications-latest
+  command: ["node", "dist/notifications/digests.js"]
+  schedule:
+    organizer_digest: "0 9 * * MON"  # weekly Monday morning
+    attendee_feedback: "0 */1 * * *"  # hourly pass to catch post-event windows
+inputs:
+  postgres_tables:
+    - events
+    - orders
+    - tickets
+    - feedback_requests
+  email_provider:
+    service: resend
+    template_ids:
+      organizer: organizer-weekly-digest
+      attendee: attendee-feedback-request
+  config:
+    unsubscribe_list: marketing.unsubscribe_digest
+outputs:
+  metrics:
+    - digests.organizer.sent_total
+    - digests.attendee.sent_total
+    - digests.attendee.opt_out
+  notifications:
+    - Email sends via provider
+    - Optional push notifications queued to apps/mobile
+  audit:
+    - Entries in notification_log table with payload hash
+failure_modes:
+  - name: email_provider_failure
+    action: retry with exponential backoff; if still failing notify marketing on-call.
+  - name: invalid_template
+    action: log payload to R2, disable send flag, raise ticket.
+acceptance_criteria:
+  - Emails sent within SLA (organizer Monday 9am local, attendee within 24h post-event).
+  - Bounce/complaint rate < 2%.
+  - Metrics available in marketing dashboard same day.
+rollout_notes:
+  - Begin with small cohort (beta organizers) before global rollout.
+  - Ensure unsubscribe links present and audit log captures consent state.

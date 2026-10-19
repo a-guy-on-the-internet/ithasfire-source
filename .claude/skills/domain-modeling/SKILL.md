@@ -9,10 +9,10 @@ Actively build and sharpen the project's domain model as you design. This is the
 
 ## File structure in this repo
 
-- **Glossary**: `CONTEXT.md` at the repo root. Create it lazily — when the first term is resolved. This repo is one bounded context (the hexagonal monorepo shares `core`/`ports` across all apps), so a single root glossary is correct; do not create per-package CONTEXT files.
+- **Glossary**: `CONTEXT.md` at the repo root; read it before the first term you challenge. This repo is one bounded context (the hexagonal monorepo shares `core`/`ports` across all apps), so a single root glossary is correct; do not create per-package CONTEXT files.
 - **Decision records**: `docs/decisions/` (already exists). Slug-named files (`place-layout-rename.md`), not numbered. Add a row to `docs/decisions/README.md`'s table for every new record. Use the format in [ADR-FORMAT.md](./ADR-FORMAT.md).
 
-This codebase is dense with terminology that has been mangled before — some seeds worth capturing when they come up: Payee vs Settlement, ledger-authoritative payouts, situs, CAB ("action bar" to users), comp ledger states, Place vs Venue, PlaceLayout (never "seatmap"), Event vs EventDate vs occurrence, community listing, entity page, Human vs User vs authUser.
+This codebase is dense with terminology that has been mangled before — seeds not yet in the glossary, worth capturing when they come up: ledger-authoritative payouts, situs, CAB ("action bar" to users), comp ledger states, PlaceLayout (never "seatmap"), community listing, entity page, Human vs User vs authUser.
 
 ## During the session
 

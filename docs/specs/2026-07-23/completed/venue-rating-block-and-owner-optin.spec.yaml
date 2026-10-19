@@ -1,0 +1,464 @@
+# venue-rating-block-and-owner-optin.spec.yaml
+#
+# "Rate this venue" becomes a standard, role-forked entry point on the venue
+# entity-page template. Customer/attendee reviews become PRIVATE owner feedback
+# (raw text included) published only on owner opt-in; performer reviews stay
+# anonymized-public (moat + anti-deanonymization threat model unchanged). Adds
+# an UNVERIFIED, venue-direct community review path to solve the cold-start
+# problem, kept provenance-tagged and segregated from verified signal.
+#
+# Related specs:
+#   - specs/2026-06-05/completed/venue-booking-toggle-and-block.spec.yaml
+#       (the pattern this mirrors: Place-level boolean toggle + gated PLACE block)
+#   - specs/2026-07-14/completed/attendee-reviews.spec.yaml
+#       (the customer/attendee pipeline this consumes + AMENDS: eventId/humanId
+#        become optional; +source discriminator; +anonymous fields; raw text now
+#        visible to the venue owner. Record these reversals in that spec.)
+#   - specs/2026-07-13/completed/place-review-anonymization.spec.yaml
+#       (the performer-review anonymity policy this spec must NOT weaken; the
+#        venue is the adversary there, so performer reviews are never owner-gated)
+#   - specs/2026-07-13/completed/booking-review-data-weave.spec.yaml
+#       (venue_stats block + Request-to-Play stats line — performer-facing,
+#        stays public and owner-uncontrollable)
+#   - specs/2026-04-08/completed/place-review-form-v3.spec.md
+#       (the PRECEDENT for unverified seed reviews: PlaceReview.anonymousName/
+#        anonymousEmail + source enum + nullable humanId — mirror it for attendees)
+#   - specs/2026-04-15/human-reviews-and-vouching.spec.md
+#       (draft, NOT built: reviewing humans/orgs — explicitly out of scope here)
+
+version: "1.3"
+updated: "2026-07-23"
+# v1.3: self-review pass — all "reuse X" claims verified against code (embedded
+# PlaceReviewForm variant + initialPlaceId props, rateLimit helper,
+# get-attendee-review-eligibility, recompute-review-aggregates, adapter PLACE
+# enumeration over nullable placeId, set-place-booking-acceptance pattern, DS
+# Modal + BottomSheet). Closed 4 gaps: FR-010 sharpened (exact change points +
+# per-source suppression + owner/event/series exclusion), FR-014 (place-scoped
+# community moderation), NFR-004 (anonymousEmail SAR/deletion coverage).
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    We have two role-split review pipelines — performer→venue (PlaceReview,
+    /review-a-place) and verified attendee→event (AttendeeReview, rolling up to
+    the venue via ReviewAggregate(PLACE)). Three gaps: (1) neither form has a
+    standing entry point ON the venue page; (2) attendee aggregates
+    (audience_stats) are public-by-default, but the venue owner wants those to be
+    PRIVATE feedback they choose to publish; (3) the attendee path is
+    scanned-ticket-only, so a young venue with no platform ticket history gets
+    ZERO customer reviews — a cold-start dead end. (The performer path already
+    solved cold-start via anonymous seed reviews; the attendee path never did.)
+  solution: >
+    Add one role-forked "Rate this venue" block to the PLACE:venue template.
+    Performers route to the existing PlaceReview form. Attendees get a verified
+    event-review upsell when eligible AND an always-available UNVERIFIED,
+    venue-direct "community review" (fully open — name/email, no ticket, no event
+    required) that mirrors PlaceReview's anonymous seed pattern. All attendee
+    feedback (verified + community, including raw text) is visible privately to
+    the venue owner; PUBLIC display of the attendee venue aggregate is gated
+    behind a new Place-level owner opt-in toggle, and community reviews are
+    provenance-tagged so they never inflate the "verified" signal. Performer
+    reviews/aggregates are untouched: anonymized-public, owner-uncontrollable.
+  users:
+    - Venue owner (verified Place owner) — adds the block, reads private attendee
+      feedback (aggregate + raw text), flips the publish toggle
+    - Performer (Human/Org in performer mode) — rates a venue they played
+    - Verified attendee (scanned-ticket holder) — verified event review
+    - Community reviewer (unverified, no ticket) — venue-direct community review
+  surfaces:
+    - web
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Add a new PLACE-only block kind `rate_venue` to PLACE_BLOCK_KINDS
+        (block-config.ts) with a schema entry (owner-editable heading + optional
+        intro copy only), a default config, a public renderer in
+        p/[slug]/_components/blocks/, and a label. Seed it into the PLACE_VENUE
+        starter template (page-templates.ts) tagged with the next `sinceRevision`
+        so already-seeded venue pages gain it exactly once. Mirrors how
+        `request_to_play` was wired (venue-booking-toggle spec FR-002).
+    - id: FR-002
+      description: >
+        The public `rate_venue` block opens a MODAL on the venue page (no
+        full-page navigation) presenting a role fork: "Did you perform here?" /
+        "Did you attend / visit here?" The chosen form runs INSIDE the modal,
+        reusing the existing conversational orchestrators in their embedded
+        variant (PlaceReviewForm already ships variant="embedded", used on the
+        homepage; AttendeeReviewForm gains the same). Performer → the PlaceReview
+        form seeded with this placeId via its existing initialPlaceId/
+        initialPlaceName props (skips venue selection — confirmed present);
+        Attendee → the attendee entry path (FR-003) in the same modal. The
+        dedicated routes (/review-a-place,
+        /review-event/[eventId], /rate-venue/[placeId]) REMAIN as shareable,
+        noindex deep-links for the post-event email prompts and external links —
+        the modal is the on-page UX, the routes are the deep-link fallback (same
+        components, same submit paths). Editor renders a labelled placeholder.
+        Modal is accessible (focus trap, Esc, scroll-lock, restore focus) and
+        responsive (full-height sheet on mobile). No new PERFORMER form is built.
+    - id: FR-003
+      description: >
+        Attendee entry path — community floor + verified upsell, to maximise
+        cold-start volume:
+          (a) The UNVERIFIED venue-direct community review (FR-009) is ALWAYS
+              offered, to everyone (signed-in or not), fully open. This is the
+              default/floor.
+          (b) ADDITIONALLY, for a signed-in viewer with review-eligible events
+              at this place (scanned ticket, not already reviewed, within
+              window), surface a "you attended <event> — leave a verified review"
+              upsell routing to /review-event/[eventId]. Multiple eligible →
+              lightweight "which show?" picker.
+        New read use case get-place-attendee-review-options returns the eligible
+        events for the upsell; its absence never blocks the community floor.
+    - id: FR-004
+      description: >
+        Add `Place.attendeeReviewsPublic Boolean @default(false)`. Only the Place
+        owner may set it (mirror set-place-booking-acceptance ownership check).
+        Default false = attendee venue aggregate is PRIVATE. This gate governs
+        ONLY the customer/attendee aggregate on the venue page — never performer
+        data.
+    - id: FR-005
+      description: >
+        The public `audience_stats` PLACE block renders the attendee aggregate
+        ONLY when Place.attendeeReviewsPublic is true (defense in depth: the
+        public read also checks the flag, not just block visibility). When false
+        it renders nothing public (editor shows a "hidden until you publish"
+        placeholder). Change its template seed from VISIBLE to this gated
+        behaviour. When shown, VERIFIED and COMMUNITY counts are displayed
+        distinctly (FR-010) — community never folded into the verified headline.
+        NOTE: reverses shipped attendee-reviews FR-005 (public-by-default) — record
+        in that spec's changelog.
+    - id: FR-006
+      description: >
+        Owner private feedback surface: regardless of the publish toggle, the
+        venue owner sees ALL attendee feedback for the Place — the private
+        aggregate (facet scores + counts, no suppression delay) AND the raw
+        free-text of each review, on the venue admin page. Text stays
+        UNATTRIBUTED (no reviewer identity shown to the owner) and is labelled
+        VERIFIED vs COMMUNITY. New owner-scoped read use case:
+        get-place-attendee-feedback (auth: Place owner). This overturns the v1
+        aggregate-only draft: the owner reads the words.
+    # SUPERSEDED 2026-09-24 by docs/specs/2026-09-24/completed/venue-track-record-and-review-switch.spec.yaml
+    # (rulings R1/R3): a place may switch performer reviews off; the four surfaces
+    # below hide when `Place.communityReviewsEnabled` is false. Kept verbatim for history.
+    - id: FR-007
+      description: >
+        Performer reviews and aggregates are UNCHANGED and NOT owner-gated:
+        venue_stats, get-place-public-stats, the Request-to-Play stats line, and
+        get-trusted-venues-near-place keep serving the anonymized performer
+        snapshot as today, and must never read attendeeReviewsPublic. Regression
+        test asserts this.
+    - id: FR-008
+      description: >
+        The attendee community fork does NOT depend on attendeeReviewsPublic — a
+        viewer can always submit private feedback even when the owner has not
+        published aggregates.
+    - id: FR-009
+      description: >
+        UNVERIFIED venue-direct community review (cold-start). Extend the
+        AttendeeReview pipeline (one pipeline, mirroring PlaceReview's seed
+        pattern) rather than adding a second model:
+          - eventId becomes OPTIONAL; community reviews anchor to placeId only
+            (no event, no ownerType/ownerId/seriesId rollup — PLACE only).
+          - humanId becomes OPTIONAL; add anonymousName / anonymousEmail for
+            not-signed-in submitters.
+          - add `source AttendeeReviewSource` { VERIFIED_TICKET, COMMUNITY }.
+            Scanned-ticket path = VERIFIED_TICKET; venue-direct path = COMMUNITY.
+        Submission is FULLY OPEN for v1 (no email confirmation, no approval
+        queue) — name + REQUIRED-but-unverified email + overallRating (+ optional
+        facets + text). The conversational form reuses the AttendeeReviewForm
+        orchestrator in a venue-direct embedded mode (per the review-forms
+        conversational pattern), hosted in the rate_venue modal (FR-002) and also
+        reachable at the shareable route /rate-venue/[placeId].
+    - id: FR-010
+      description: >
+        Aggregate segregation: recompute-review-aggregates and the private owner
+        aggregate compute VERIFIED_TICKET and COMMUNITY counts/scores SEPARATELY.
+        The "verified attendee" headline number counts VERIFIED_TICKET only;
+        COMMUNITY reviews surface as a clearly-labelled separate line
+        ("community reviews"), never merged into the verified figure. Concrete
+        change points (verified during review): (a) the AggRow projection in
+        adapters/db/prisma/attendee-reviews.ts adds `source`; (b)
+        computeAttendeeReviewAggregates + buildAttendeeReviewSnapshot split by
+        source; (c) attendeeReviewSnapshotSchema gains verified/community
+        sub-shapes — its write-time parse in recompute guards drift; (d) getReviewAggregate
+        consumers + AudienceStatsBlock render both. Each bucket is suppressed
+        INDEPENDENTLY (k-threshold per source) so community volume can never lift
+        the verified bucket over its threshold, and vice-versa. EVENT/OWNER/SERIES
+        subjects naturally exclude COMMUNITY rows (they carry null event/owner/
+        series) — assert this so community never leaks into an organizer aggregate.
+    - id: FR-011
+      description: >
+        Copy: (a) the attendee/community review form states plainly that the
+        feedback (including the words) goes to the venue owner/organizer and is
+        never shown attributed; (b) community reviews are labelled "unverified /
+        community" everywhere they appear (owner surface + any public display) so
+        the verified signal stays legible.
+    - id: FR-012
+      description: >
+        Extensibility for later gates (user: "add more gates over time"): the
+        COMMUNITY source tag + existing hidden/flagged moderation columns are the
+        seam. Future gates (email magic-link confirm, owner/staff approval queue)
+        can be layered on the COMMUNITY path with NO schema change and NO
+        re-tagging of existing rows. v1 ships ONE cheap throttle only (FR-013).
+    - id: FR-013
+      description: >
+        v1 anti-flood throttle (NOT a gate — a real person is never blocked): a
+        per-email + per-IP rate limit on submitCommunityVenueReview (reuse the
+        `rateLimit` helper already applied to placeReviews.submit in
+        transport/trpc/src/routers/place-reviews.ts). Scripted flooding is
+        bounded; a human leaving one honest review is unaffected. Email is
+        collected REQUIRED-but-unverified so a magic-link confirm can later
+        upgrade it (FR-012) with no schema change.
+    - id: FR-014
+      description: >
+        Community-review moderation path. The existing flag-event-feedback use
+        case is EVENT-owner-scoped, but COMMUNITY reviews have no event, so the
+        venue owner needs a PLACE-scoped way to flag/report a community review on
+        their venue (sets the existing `flagged`/`flagReason` columns). Staff
+        hide-attendee-review already operates by review id and needs no change.
+        The owner private feedback panel (FR-006) exposes the flag action per
+        community entry.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Behaviour changes are intentional and called out: audience_stats
+        public→opt-in (FR-005); AttendeeReview eventId/humanId required→optional
+        (FR-009); attendee text owner-private→owner-readable words (FR-006).
+        PRE-PRODUCTION: there is no real review data, so NO backfill or
+        data-preservation is required — author a normal Prisma migration (multi-
+        file schema; regenerate via `pnpm -F @th/db run generate`) applied through
+        the dev seed-wipe flow (drop schema + migrate deploy). The nullability
+        relax and new columns/enum are a plain schema change, not a data
+        migration. The `@default(VERIFIED_TICKET)` on source keeps the column
+        non-null for any seed rows without a backfill step.
+    - id: NFR-002
+      description: >
+        block-kinds parametrized tests pass with `rate_venue` in PLACE counts;
+        template registry validation (findTemplateKindViolations) stays green.
+    - id: NFR-003
+      description: >
+        No public read exposes reviewer identity (humanId/anonymousName/
+        anonymousEmail) or per-event slices for attendee reviews. The private
+        owner surface shows text but not reviewer identity. Postgres treats NULL
+        as distinct, so the existing @@unique([eventId, humanId]) still enforces
+        one-verified-review-per-(event,human) while allowing many
+        (null,*)/(*,null) community rows — confirmed this holds; if per-email
+        community dedup is later wanted it is a separate partial-index migration.
+    - id: NFR-004
+      description: >
+        The new AttendeeReview.anonymousEmail is PII. It MUST be covered by the
+        same subject-access-request / deletion path that already handles
+        PlaceReview.anonymousEmail (do not create a new orphaned PII surface).
+        Confirm the SAR export + deletion sweeps include AttendeeReview
+        anonymous fields before ship.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: set-place-attendee-reviews-public
+        description: >
+          Toggle Place.attendeeReviewsPublic. Requires Place ownership (mirror
+          set-place-booking-acceptance).
+        input: "{ placeId, actorHumanId, isPublic: boolean }"
+        output: "{ attendeeReviewsPublic: boolean }"
+        idempotent: true
+        money: false
+      - name: submit-community-venue-review (new)
+        description: >
+          Create an UNVERIFIED, venue-direct AttendeeReview (source=COMMUNITY,
+          eventId null, placeId set, humanId optional, anonymousName/email for
+          guests). Fully open v1 — no verification. Mirror submit-place-review's
+          anonymous branch. reportError on any swallow.
+        input: "{ placeId, humanId?, anonymousName?, anonymousEmail?, overallRating, facets?, text? }"
+        output: "{ reviewId }"
+        idempotent: false
+        money: false
+      - name: get-place-attendee-review-options (new)
+        description: >
+          Signed-in viewer + placeId → the events at this place they are eligible
+          to review (verified upsell). Reuses get-attendee-review-eligibility,
+          place-scoped. Never gates the community floor.
+        input: "{ placeId, viewerHumanId }"
+        output: "{ eligibleEvents: [{ eventId, title, date }] }"
+        idempotent: true
+        money: false
+      - name: get-place-attendee-feedback (new)
+        description: >
+          Owner-only: private attendee feedback for a Place — aggregate (VERIFIED
+          + COMMUNITY split, no suppression delay) AND raw unattributed text per
+          review, source-labelled.
+        input: "{ placeId, actorHumanId }"
+        output: "{ verified: Aggregate, community: Aggregate, entries: [{ source, rating, text?, createdAt }] }"
+        idempotent: true
+        money: false
+      - name: recompute-review-aggregates (modified)
+        description: >
+          Compute VERIFIED_TICKET and COMMUNITY slices separately for the PLACE
+          subject; community never merged into the verified headline (FR-010).
+        input: clock, batch
+        output: recomputed count
+        idempotent: true
+        money: false
+      - name: get-public-page (modified)
+        description: >
+          loadAudienceStatsData gates on Place.attendeeReviewsPublic (omit when
+          false) and returns the verified/community split. loadVenueStatsData
+          (performer) UNCHANGED.
+        input: page + place
+        output: page blocks (audience_stats gated)
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - PlacesRepo (attendeeReviewsPublic read/update)
+      - AttendeeReviewsRepo (create COMMUNITY rows; place-scoped list/aggregate
+        by source; eligibility-by-place)
+      - ReviewAggregatesRepo (verified/community split snapshot)
+      - EntityPagesRepo (block CRUD exists)
+
+  adapters:
+    new: []
+    existing:
+      - packages/adapters/src/db/prisma/places.ts (new column)
+      - packages/adapters/src/db/prisma/attendee-reviews.ts (source, nullable
+        eventId/humanId, anonymous fields, place-scoped reads)
+
+  transport:
+    trpc_procedures:
+      - "places.setAttendeeReviewsPublic (owner-only, new)"
+      - "attendeeReviews.submitCommunityVenueReview (public, rate-limited, new)"
+      - "attendeeReviews.getPlaceReviewOptions (authed, new)"
+      - "attendeeReviews.getPlaceOwnerFeedback (owner-only, new)"
+    webhooks: []
+
+  ui:
+    pages:
+      - apps/web/src/app/admin/[slug]/places/[placeId]/page
+        (publish toggle + private attendee-feedback view w/ raw text)
+      - apps/web/src/app/rate-venue/[placeId] (shareable/noindex deep-link that
+        hosts the same community AttendeeReviewForm as the modal)
+    components:
+      - RateVenueBlock (public renderer: opens the modal; editor placeholder)
+      - RateVenueModal (role fork + hosts the embedded orchestrator inline;
+        focus-trap/Esc/scroll-lock/mobile full-height sheet; reuse the DS modal
+        primitive)
+      - AttendeeReviewForm embedded/venue-direct mode + name/email screen
+      - PlaceReviewForm embedded variant (already exists — reuse in the modal)
+      - Attendee "which show?" upsell picker
+      - AudienceStatsBlock (attendeeReviewsPublic gate + verified/community split)
+      - Owner private attendee-feedback panel (aggregate + text, source-labelled)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models:
+    - "Place: + attendeeReviewsPublic Boolean @default(false)"
+    - "AttendeeReview: eventId String? (was required); humanId String? (was
+       required); + anonymousName String?; + anonymousEmail String?;
+       + source AttendeeReviewSource @default(VERIFIED_TICKET)"
+    - "enums: + AttendeeReviewSource { VERIFIED_TICKET, COMMUNITY }"
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Fully-open community reviews are an astroturf/hit-job channel: a venue can
+      seed fake praise; a rival can seed fake pans.
+    severity: MEDIUM
+    mitigation: >
+      Accepted for v1 by product decision (cold-start > purity). Bounded because
+      community aggregates are PRIVATE until the owner opts in (FR-004), are
+      provenance-tagged COMMUNITY and never counted as verified (FR-010), and are
+      labelled unverified wherever shown (FR-011). hidden/flagged moderation
+      already exists. FR-012 keeps email-confirm / rate-limit / approval-queue
+      gates addable later with no migration. Recommend at least a per-email/IP
+      rate limit on the public mutation even in v1 (cheap, not a submission gate).
+  - risk: >
+      Making eventId/humanId nullable weakens the one-review-per-attendee
+      invariant and the denormalized rollup assumptions. (No production data at
+      stake — pre-prod — so this is a logic-invariant concern, not a data-safety
+      one.)
+    severity: LOW
+    mitigation: >
+      Verified path keeps both non-null → @@unique still binds it (NULL distinct
+      in PG). Community rows are PLACE-only (no owner/series rollup); recompute
+      must branch on source, not assume eventId. Cover with tests at n verified /
+      m community.
+  - risk: >
+      Per-event EventRatingLine (public, event-owner's surface) still shows
+      verified attendee ratings even when the venue owner hasn't published.
+    severity: LOW
+    mitigation: >
+      EventRatingLine is the EVENT organizer's surface, per-event, not the
+      cross-event PLACE reputation the venue owner controls. Deliberate boundary;
+      document it. Community reviews never appear there (they have no eventId).
+  - risk: >
+      Showing raw attendee text to the venue owner when the text was authored as
+      organizer feedback (attendee-reviews FR-002) could surprise reviewers.
+    severity: LOW
+    mitigation: >
+      FR-011 copy states up front that the words go to the venue owner/organizer;
+      text stays unattributed. Recorded as an amendment to attendee-reviews FR-002.
+
+open_questions:
+  # ── Resolved 2026-07-23 (kept for traceability) ──
+  # - v1 per-email/IP rate limit on community submit → YES (FR-013).
+  # - Community email → REQUIRED-but-unverified (FR-009/FR-013).
+  # - On-page UX → MODAL on the venue page (FR-002); /rate-venue/[placeId] kept
+  #   only as a shareable/noindex deep-link fallback, not the primary entry.
+  - >
+    Does the AttendeeReviewForm embedded mode need visual/UX changes to sit in a
+    modal (it was built as a full-page flow)? UI skill to confirm during build;
+    PlaceReviewForm's existing embedded variant is the reference.
+
+# ── Out of Scope ──────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Any change to performer→venue reviews, venue_stats, the anonymization policy,
+    the Request-to-Play line, or trusted-venues-near (FR-007).
+  - Email-confirm, rate-limit-beyond-basic, or approval-queue gates on community
+    reviews (FR-012 makes them addable later; not built now).
+  - Reviewing humans or organizations (human-reviews-and-vouching draft, separate).
+  - Surfacing the computed OWNER/SERIES ReviewAggregate snapshots (no render site;
+    separate follow-up).
+  - Owner responses to attendee/community reviews (separate decision).
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - The PLACE:venue template seeds a `rate_venue` block; an existing seeded venue
+    page gains it exactly once on next editor load (sinceRevision).
+  - On a public venue page, clicking `rate_venue` opens a MODAL (no page nav)
+    with a performer/attendee fork; the chosen conversational form runs inside
+    the modal (embedded variant), submits to the same use cases as the deep-link
+    routes, and is keyboard-accessible (focus trap + Esc). The attendee side
+    always offers the community review and additionally shows a verified-review
+    upsell when the signed-in viewer has an eligible event here.
+  - A per-email/IP rate limit throttles community submissions; a single honest
+    review is never blocked.
+  - A not-signed-in visitor can submit a venue-direct COMMUNITY review with
+    name/email + rating; it persists with source=COMMUNITY, eventId null.
+  - A verified Place owner can flip attendeeReviewsPublic (non-owner rejected);
+    default false. With it false the public audience_stats block renders nothing;
+    the owner still sees the private aggregate AND raw text on their admin page.
+    Flipping true shows the public aggregate with verified/community split.
+  - Community reviews never count toward the verified headline and are labelled
+    unverified wherever shown.
+  - Performer surfaces (venue_stats, get-place-public-stats, Request-to-Play
+    line, trusted-venues-near) are unchanged and never read attendeeReviewsPublic
+    (regression test).
+  - Migration adds the columns/enum with existing attendee rows defaulting to
+    VERIFIED_TICKET; @@unique still binds the verified path; block-kinds +
+    template-registry tests pass.

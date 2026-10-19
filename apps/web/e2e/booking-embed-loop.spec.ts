@@ -19,6 +19,7 @@ import {
   type BookingLoopSeed,
   type EmbedHostServer,
 } from "./helpers/booking-loop";
+import { submitSignInForm } from "./helpers/sign-in";
 
 /**
  * Booking loop — anonymous EMBED path + claim:
@@ -195,7 +196,7 @@ test.describe("Booking loop — embed + claim", () => {
     await fillAndSubmitInquiry(frame2, { name: anonName, email: anonEmail });
     await expect(
       frame2.getByText(
-        "You already have an open request with this venue. They can reply to that one.",
+        "You already have an open request with this place. They can reply to that one.",
       ),
     ).toBeVisible({ timeout: 20_000 });
   });
@@ -317,27 +318,15 @@ test.describe("Booking loop — embed + claim", () => {
       await claimSignInCta.click();
     }
     await expect(form).toBeVisible({ timeout: 20_000 });
-    // Passkey-first layout keeps the password form collapsed (inert) behind
-    // the "Use password instead" expander, which lives OUTSIDE the <form>.
-    // Interactions that land before Next dev hydration can no-op — so
-    // expand + fill + check as one retried unit until the controlled form
-    // holds the values (submit enables). The aria-expanded guard keeps the
-    // retry from toggling the section closed again.
-    const expander = performerPage.getByRole("button", {
-      name: /use password instead/i,
+    // The two-step credential flow, and its hydration-race handling, now live
+    // in `helpers/sign-in.ts`. The expander this block used to open is gone:
+    // step 1 shows the identifier field directly, and the password field only
+    // mounts on step 2.
+    await submitSignInForm(performerPage, {
+      email: seed.performer.email,
+      password: seed.performer.password,
+      timeout: 45_000,
     });
-    const emailInput = form.getByLabel(/email or username/i);
-    const submit = form.getByTestId("auth-sign-in-submit");
-    await expect(expander).toBeVisible({ timeout: 20_000 });
-    await expect(async () => {
-      if ((await expander.getAttribute("aria-expanded")) !== "true") {
-        await expander.click();
-      }
-      await emailInput.fill(seed.performer.email);
-      await form.getByLabel(/^password$/i).fill(seed.performer.password);
-      await expect(submit).toBeEnabled({ timeout: 2_000 });
-    }).toPass({ timeout: 45_000 });
-    await submit.click();
 
     // Back on the claim page → one-click performer-mode gate → claim form.
     await performerPage.waitForURL((url) =>

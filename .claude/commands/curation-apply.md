@@ -12,6 +12,7 @@ Optional scope: **$ARGUMENTS** (a date `YYYY-MM-DD` or a specific artifact path;
 2. **Never write with raw SQL.** Apply only through the sanctioned entry points below (tRPC mutation as an authed prod user, or a `tsx` script wiring the core use-case with real adapters — same pattern as `apps/api/src/scripts/*.ts`).
 3. **One item at a time**, most-overdue / highest-404-risk first.
 4. Mark every handled item **resolved in its source artifact** (`[ ]` → `[x]` with `— applied <what> on <date>` or `— skipped: <reason>`), and append an apply-log at `docs/curation/<today>/apply-log.md`.
+5. **Never act on a local-DB sweep.** Before collecting items from an artifact, read its `DB:` marker (first line under the H1). Items from an artifact marked `DB: local` are never applied — report them as skipped (`— skipped: swept the local DB`). An artifact with no `DB:` marker predates it: check its Notes for which DB was used, and treat it as local unless the Notes say prod.
 
 ## 1. Gather pending items
 Scan `docs/curation/**/*.md` (scoped by `$ARGUMENTS` if given). Collect every unresolved checklist item / flagged row. Group by action type:

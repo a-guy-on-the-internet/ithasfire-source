@@ -846,3 +846,160 @@ describe("stripe webhook — structural failure-policy guard", () => {
     expect(source.match(/webhookDlq\.push\(/g) ?? []).toHaveLength(1);
   });
 });
+
+describe("stripe webhook — payment_intent.processing never resurrects a cancelled order", () => {
+  // createCheckout links its PaymentIntent AFTER the order commits, so the
+  // webhook's link and PENDING → PROCESSING are CASes. Belt-and-braces (the
+  // client secret is only issued after checkout's own link wins), but a stale
+  // PENDING read must not flip a CANCELLED order — whose credit and seats were
+  // already handed back — to PROCESSING.
+  const ORDER = "11111111-2222-4333-8444-555555555555";
+  const PI = "pi_processing_1";
+
+  // An order row with CAS-honest link / transition fakes. `cancelAfterRead`
+  // makes a retire / reaper commit CANCELLED right after the webhook's read.
+  const processingOrders = (opts: {
+    status?: string;
+    stripePaymentIntentId?: string | null;
+    cancelAfterRead?: boolean;
+    /** Another path for the same payment commits right after the read. */
+    advanceAfterRead?: { status: string; stripePaymentIntentId: string };
+  }) => {
+    const row = {
+      id: ORDER,
+      status: opts.status ?? "PENDING",
+      stripePaymentIntentId: opts.stripePaymentIntentId ?? null,
+    };
+    let reads = 0;
+    const orders = {
+      getById: vi.fn(async (id: string) => {
+        if (id !== ORDER) return null;
+        reads++;
+        const snapshot = { ...row };
+        if (opts.cancelAfterRead && reads === 1) row.status = "CANCELLED";
+        if (opts.advanceAfterRead && reads === 1) {
+          Object.assign(row, opts.advanceAfterRead);
+        }
+        return snapshot;
+      }),
+      linkPaymentIntent: vi.fn(async () => undefined),
+      markProcessing: vi.fn(async () => undefined),
+      linkPaymentIntentIfPending: vi.fn(async (_id: string, pi: string) => {
+        if (
+          row.status !== "PENDING" ||
+          (row.stripePaymentIntentId && row.stripePaymentIntentId !== pi)
+        ) {
+          return false;
+        }
+        row.stripePaymentIntentId = pi;
+        return true;
+      }),
+      markProcessingIfPending: vi.fn(async () => {
+        if (row.status !== "PENDING") return false;
+        row.status = "PROCESSING";
+        return true;
+      }),
+      setPaymentMethodType: vi.fn(async () => undefined),
+    };
+    return { row, orders };
+  };
+
+  const processingEvent = (id: string) => ({
+    id,
+    type: "payment_intent.processing",
+    created: 1_785_000_000,
+    data: { object: { id: PI, metadata: { orderId: ORDER } } },
+  });
+
+  it("links and marks a PENDING order PROCESSING", async () => {
+    const { row, orders } = processingOrders({});
+    const { app, pushed } = await makeApp({ orders });
+
+    const res = await post(app, processingEvent("evt_proc_ok"));
+
+    expect(res.statusCode).toBe(200);
+    expect(row).toMatchObject({
+      status: "PROCESSING",
+      stripePaymentIntentId: PI,
+    });
+    expect(orders.linkPaymentIntent).not.toHaveBeenCalled();
+    expect(orders.markProcessing).not.toHaveBeenCalled();
+    expect(pushed).toHaveLength(0);
+    await app.close();
+  });
+
+  it("a stale PENDING read: the order stays CANCELLED, and the event is DLQ'd and error-logged", async () => {
+    const { row, orders } = processingOrders({ cancelAfterRead: true });
+    const { app, pushed } = await makeApp({ orders });
+
+    await post(app, processingEvent("evt_proc_stale"));
+
+    expect(row).toMatchObject({
+      status: "CANCELLED",
+      stripePaymentIntentId: null,
+    });
+    expect(orders.linkPaymentIntentIfPending).toHaveBeenCalledTimes(1);
+    expect(orders.markProcessingIfPending).not.toHaveBeenCalled();
+    expect(orders.markProcessing).not.toHaveBeenCalled();
+    // Loud: the failure reaches the DLQ (the same path reports it to Sentry
+    // via `reportStripeWebhookFailure`), carrying the root cause.
+    expect(pushed).toHaveLength(1);
+    expect(JSON.stringify(pushed[0])).toContain(
+      "stripe_webhook_processing_order_not_pending:CANCELLED",
+    );
+    await app.close();
+  });
+
+  it("an already-linked order cancelled after the read is not flipped to PROCESSING", async () => {
+    const { row, orders } = processingOrders({
+      stripePaymentIntentId: PI,
+      cancelAfterRead: true,
+    });
+    const { app, pushed } = await makeApp({ orders });
+
+    await post(app, processingEvent("evt_proc_stale_linked"));
+
+    expect(row.status).toBe("CANCELLED");
+    expect(orders.linkPaymentIntentIfPending).not.toHaveBeenCalled();
+    expect(orders.markProcessingIfPending).toHaveBeenCalledTimes(1);
+    expect(pushed).toHaveLength(1);
+    await app.close();
+  });
+
+  it.each(["PROCESSING", "SUCCEEDED"])(
+    "a lost CAS because another path already took the order to %s for THIS PaymentIntent is a no-op, not a DLQ",
+    async (status) => {
+      // The client confirm or the succeeded webhook got there between the
+      // read and the CAS. Payment is in hand; nothing to refuse.
+      const { row, orders } = processingOrders({
+        advanceAfterRead: { status, stripePaymentIntentId: PI },
+      });
+      const { app, pushed } = await makeApp({ orders });
+
+      const res = await post(app, processingEvent(`evt_proc_raced_${status}`));
+
+      expect(res.statusCode).toBe(200);
+      expect(row).toMatchObject({ status, stripePaymentIntentId: PI });
+      expect(pushed).toHaveLength(0);
+      await app.close();
+    },
+  );
+
+  it("a lost CAS to an order advanced under a DIFFERENT PaymentIntent is DLQ'd", async () => {
+    const { orders } = processingOrders({
+      advanceAfterRead: {
+        status: "PROCESSING",
+        stripePaymentIntentId: "pi_someone_else",
+      },
+    });
+    const { app, pushed } = await makeApp({ orders });
+
+    await post(app, processingEvent("evt_proc_raced_other_pi"));
+
+    expect(pushed).toHaveLength(1);
+    expect(JSON.stringify(pushed[0])).toContain(
+      "stripe_webhook_processing_order_not_pending:PROCESSING",
+    );
+    await app.close();
+  });
+});

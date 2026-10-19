@@ -30,6 +30,7 @@
       "env": {
         "EXPO_PUBLIC_API_BASE_URL": "https://api-dev.ithasfire.com",
         "EXPO_PUBLIC_WEB_BASE_URL": "https://web-dev.ithasfire.com",
+        "EXPO_PUBLIC_AUTH_ORIGIN": "https://web-dev.ithasfire.com",
         "EXPO_PUBLIC_APP_ENV": "preview",
         "EXPO_PUBLIC_STRIPE_PUBLISHABLE_KEY": "pk_test_51TFMBTAY7Crkzix4zBv9OsdpO330nm0v9yhV3Np1p8wVehfYA7lHxIK8vUZdetwaWYcN1Nsoy4dpHfKWeWEA0QUU00fkuJKRY2",
         "EXPO_PUBLIC_WALLET_PAYMENTS_ENABLED": "false"
@@ -50,6 +51,7 @@
       "env": {
         "EXPO_PUBLIC_API_BASE_URL": "https://api.ithasfire.com",
         "EXPO_PUBLIC_WEB_BASE_URL": "https://ithasfire.com",
+        "EXPO_PUBLIC_AUTH_ORIGIN": "https://ithasfire.com",
         "EXPO_PUBLIC_APP_ENV": "production",
         "EXPO_PUBLIC_SENTRY_DSN": "https://3ac5479451cb9cfcdac0018d01cad6c7@o4511120392454144.ingest.us.sentry.io/4511289359335424",
         "EXPO_PUBLIC_STRIPE_PUBLISHABLE_KEY": "",

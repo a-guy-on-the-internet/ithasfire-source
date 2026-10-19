@@ -1,0 +1,164 @@
+# Spec: Admin Place Layout Editor Flow
+meta:
+  owner: apps-web
+  status: draft
+  reviewers:
+    - product
+    - core
+    - design
+    - ops
+  last_updated: 2025-11-14
+summary: |
+  Define the organizer-facing place layout editor inside the web admin app. Covers the
+  end-to-end workflow for importing, validating, reviewing, annotating, and
+  publishing layouts (and rolling back when needed). Specifies UI states,
+  data dependencies, RBAC requirements, and integration points with place layout
+  pipeline workers.
+scope:
+  in_scope:
+    - Admin route `/admin/place-layouts` and nested views for venue + event overrides.
+    - Upload wizard for SVG/CAD/CSV files and manual edits.
+    - Diff viewer for comparing draft vs published layouts.
+    - Validation issue triage, annotations, and approvals.
+    - Publish/rollback controls with audit messaging.
+    - Activity timeline + status indicators for imports.
+  out_of_scope:
+    - Buyer-facing layout rendering (covered in PlaceLayoutView component spec).
+    - Scanner/mobile tooling (separate spec).
+    - Global pricing configuration or ticket holds (existing admin flows).
+
+personas:
+  - venue_ops: primary user running imports and resolving validation issues.
+  - organizer_admin: approves publish/rollback for events/venues.
+  - support_agent: read-only access to review import history when triaging tickets.
+
+rbac:
+  roles:
+    - manage_layouts: full read/write, can publish/rollback.
+    - edit_layouts: can upload, annotate, request publish.
+    - view_layouts: read-only dashboard and diff viewer.
+  enforcement:
+    - Gate route entry via `authz.ensureOrgRole` before rendering.
+    - Feature flag `feature.placeLayout` must be true for org.
+
+route_map:
+  - /admin/place-layouts
+    - landing dashboard showing venues with latest layout status + alerts.
+  - /admin/place-layouts/[venueId]
+    - tabs: Overview | Drafts | Activity | Settings
+  - /admin/place-layouts/[venueId]/drafts/[layoutVersionId]
+    - editor workspace (canvas, diff inspector, issues panel).
+  - /admin/place-layouts/[venueId]/events/[eventId]
+    - event-specific overrides and publish history.
+
+ui_structure:
+  dashboard:
+    hero_metrics:
+      - Current published version (timestamp, actor).
+      - Pending drafts count.
+      - Last import duration + issues.
+      - Layout discrepancy indicator (from reconcile job).
+    tables:
+      - Venues table with columns: Venue, Layout Version, Status, Issues, Last Activity, Actions.
+      - Recent activity feed (import/job timeline).
+    actions:
+      - "Import layout" button → opens upload wizard.
+      - Filter by venue/event, status (Draft, Pending Review, Failed, Published).
+  upload_wizard:
+    steps:
+      1. Upload: choose file(s), optional section map JSON, notes.
+      2. Metadata: confirm venue + optional event override, set default viewport hints.
+      3. Review issues: display real-time validation progress (polling worker status).
+      4. Confirmation: show summary + preview; allow submit or cancel.
+    states:
+      - uploading, queued, parsing, validating, completed, failed.
+      - Provide progress poller using ImportJob API (`placeLayouts.import.status`).
+      - On failure, display ParserIssue list with download of raw report.
+  editor_workspace:
+    layout:
+      - Left rail: version selector, diff summary, action buttons (Publish, Request Changes, Rollback, Delete Draft).
+      - Main canvas: embedded PlaceLayoutView in "review" mode (readonly but with toggles to overlay differences).
+      - Right panel: Issues list (grouped by severity), Comments/Annotations thread, Metadata (default viewport, sections list).
+      - Bottom bar: zoom controls, seat counts, staging/published toggle.
+    interactions:
+      - Diff toggles: show moved/added/removed seats with color coding; click seat to focus.
+      - Issue triage: mark issue as resolved (requires note), assign to teammate.
+      - Comments: rich text (markdown subset), @mention (phase 2), attaches to seat/section.
+      - Manual edits: Phase 2; current scope read-only preview + metadata adjustments (default viewport, legend colors).
+    publish_flow:
+      - Publish button surfaces modal with summary (checksum, seat deltas, issues left).
+      - Modal requires confirmation + optional release notes; warns if unresolved errors remain.
+  activity_view:
+    timeline entries:
+      - Import queued → parsing → validated → draft created → publish/rollback.
+      - Include actor, timestamps, issue counts, links to diff.
+    filters: severity, actor, time range.
+  settings:
+    - Configure notifications (Slack/email) for import success/failure.
+    - Manage default access roles.
+    - Toggle feature flag (if allowed for super-admin).
+
+data_dependencies:
+  queries:
+    - `placeLayouts.admin.listVenues` → { venueId, name, currentVersion, draftCount, lastImportStatus }.
+    - `placeLayouts.admin.getVenue` → metadata, published/draft versions, default viewport.
+    - `placeLayouts.admin.getDraft(layoutVersionId)` → glyph blob ref, diff summary, issues, notes.
+    - `placeLayouts.admin.getImportJobs(venueId)` → paginated job history.
+    - `placeLayouts.admin.getActivity(venueId|eventId)` → timeline entries.
+  mutations:
+    - `placeLayouts.admin.enqueueImport(input)` → triggers pipeline.
+    - `placeLayouts.admin.annotateIssue({ layoutVersionId, issueId, state, note })`.
+    - `placeLayouts.admin.publishDraft({ layoutVersionId, notes, scope })`.
+    - `placeLayouts.admin.rollback({ layoutVersionId })`.
+    - `placeLayouts.admin.ackDiscrepancy({ venueId, discrepancyId })`.
+
+integrations:
+  - Uses PlaceLayoutView component in review mode (no selection, diff overlays).
+  - Polls import job status via jobs API or websockets (future streaming).
+  - Writes annotations to `place_layout_review_notes` table.
+  - Logs actions via audit service (publish, rollback, annotation, issue status changes).
+
+states_and_errors:
+  empty_state:
+    - No venues with place layout feature → show guidance + "Request enable" CTA.
+    - Venue with no imports → encourage uploading template, show doc links.
+  loading_state:
+    - Skeleton loaders for tables and canvas preview.
+  error_states:
+    - Failing to fetch glyph blob → show inline error with retry + builder command to recompute.
+    - Permission denied → explain required role + contact admin.
+    - Feature flag disabled → show support link.
+  alerts:
+    - Banner when reconcile job reports discrepancies (with CTA to review).
+    - Toasts for import successes/failures, publish completion, rollback executed.
+
+analytics_metrics:
+  - placeLayout.admin.upload_started / upload_completed
+  - placeLayout.admin.publish_clicked / publish_confirmed / publish_failed
+  - placeLayout.admin.issue_marked_resolved
+  - placeLayout.admin.diff_toggled (counts usage per view mode)
+  - placeLayout.admin.rollback_executed
+  - placeLayout.admin.discrepancy_acknowledged
+
+accessibility:
+  - Keyboard navigation between issue list and canvas focus ring.
+  - Ensure diff color palette passes contrast guidelines.
+  - Provide textual descriptions for issue overlays (announce seat/section and severity).
+  - Support screen reader friendly toggle for canvas alt view (table of seats with deltas).
+
+performance:
+  - Lazy-load glyph preview only when draft selected; reuse cached blob between sessions.
+  - Batch issue list updates to avoid re-render storms.
+  - Debounce polling interval (2s → 10s) once job enters completed/failed state.
+
+open_questions:
+  - Do we need collaborative editing indicators (presence cursors) in Phase 1?
+  - Should manual geometry adjustments be part of MVP or follow-up?
+  - Where to surface import cost estimates / quotas?
+  - Should event overrides allow partial publish (per section)?
+
+next_steps:
+  - Partner with design for wireframes covering upload wizard + diff viewer.
+  - Align with jobs team on ImportJob API shape + polling cadence.
+  - Implement tRPC routers per `placeLayouts.admin.*` entries with corresponding auth guards.
+  - Plan Chromatic story for editor workspace using mock glyphs/diffs.

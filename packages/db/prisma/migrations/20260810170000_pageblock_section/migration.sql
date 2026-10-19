@@ -1,0 +1,18 @@
+-- PageBlock.section (recurring-memberships spec, docs/specs/2026-08-05 —
+-- "Member" UI/Flow). Entity pages grow a member-gated Membership TAB; blocks
+-- are grouped into a page surface ("main" | "memberships") at BLOCK level so
+-- the same page serves both the public pitch and the member content — no
+-- separate members-only page.
+--
+-- `section` is TEXT rather than a Postgres enum, matching `kind`'s documented
+-- convention on this model: core (manage-page-blocks / block sections) is the
+-- authority on allowed values, so growing the vocabulary needs no migration.
+--
+-- Additive only. NO backfill script, by design: every existing block belongs
+-- to the main page body, which is exactly what the column default says —
+--   section = 'main'  ⇒ every existing page renders identically.
+--
+-- Instant on this table (ADD COLUMN with a non-volatile default does not
+-- rewrite on PG 11+). Reversible by dropping the column; the existing
+-- (pageId, orderIndex) index is untouched.
+ALTER TABLE "PageBlock" ADD COLUMN "section" TEXT NOT NULL DEFAULT 'main';

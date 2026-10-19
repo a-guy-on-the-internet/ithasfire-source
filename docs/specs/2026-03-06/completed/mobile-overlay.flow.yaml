@@ -1,0 +1,101 @@
+# Spec: Mobile Navigation Overlay Flow
+meta:
+  owner: apps-mobile
+  status: draft
+  reviewers:
+    - apps-web
+    - design-system
+    - platform
+    - ops
+  last_updated: 2025-11-26
+summary: |
+  Describe the shared mobile overlay that powers navigation for both consumer discovery and organizer
+  tasks when viewed on phones (mobile web + hybrid apps). The overlay presents simplified tabs for
+  attendees, while authenticated organizers gain quick access to admin actions without duplicating the
+  full desktop UI. Ensures consistent motion, accessibility, and state management across surfaces.
+scope:
+  in_scope:
+    - Overlay sheet presentation, gestures, and transition timings.
+    - Tab definitions (Discover, Saved, Tickets, Profile vs Admin quick actions).
+    - Conditional controls when user has organizer permissions.
+    - Offline/low-bandwidth handling.
+  out_of_scope:
+    - Page-specific content (covered by respective flow/component specs).
+    - Super-admin mobile tooling.
+    - Native platform auth flows.
+personas:
+  - attendee_mobile: wants quick access to search, saved events, and tickets while on the go.
+  - organizer_mobile: needs to triage alerts, open scanner, or jump into admin hub from phone.
+  - staff_scanner: primarily uses scanner app but may open overlay for support links.
+entry_points:
+  - Mobile web: hamburger menu button or bottom tab icons open overlay sections.
+  - Native apps: gesture from bottom arrow, or tapping nav icons.
+  - Deep links from notifications open overlay in correct tab with highlight state.
+overlay_structure:
+  container:
+    - Tamagui `Sheet` occupying full height on small phones, 80% height on tablets.
+    - Drag handle at top, close button (X) with accessible label.
+  header:
+    - Dynamic title based on active tab.
+    - Search field (Discover tab) or context switcher (Admin tab) shown inline.
+  tab_bar:
+    - Primary tabs: Discover, Saved, Tickets, Profile.
+    - When user has organizer role, an additional Admin pill appears and opens second-level shortcuts.
+    - Provide `aria-controls` linking to tab panels.
+  admin_shortcuts:
+    - Within Admin tab, show grid of actions: Hub, Events, Orders, Scan, Support.
+    - Optional quick metrics chips (alerts count, payouts issues) with badge.
+  floating_cta:
+    - "Scan" button anchored bottom-right for organizer contexts; suppressed for attendees.
+responsive_behavior:
+  - Phones ≤480px: overlay becomes full-screen; bottom tab bar remains visible below overlay header.
+  - Tablets: overlay anchored to right 416px sheet, allowing peek at content.
+  - Desktop (for parity testing): overlay opens as modal width 480px.
+interactions:
+  gestures:
+    - Swipe down closes overlay; progress indicator shows at 20% drag.
+    - Horizontal swipes cycle between tabs (optional, test behind flag).
+  transitions:
+    - 240ms ease-out for open, 200ms ease-in for close.
+  context_switch:
+    - If user selects Admin tab without organizer role, show promo state linking to "Become an organizer" flow.
+  notifications:
+    - Bell icon inside overlay header shows unread alerts + deep links to Admin tab list.
+states:
+  loading:
+    - Skeleton lines inside each tab content; maintain nav chrome.
+  offline:
+    - Show banner with retry action; disable search + admin actions requiring network.
+  unauthorized_admin:
+    - Display illustrated card explaining requirement with CTA to request access.
+  multi_org:
+    - Context switcher dropdown at top of Admin tab; selection persists.
+  simplified_consumer:
+    - When session flagged as consumer-only, hide Admin tab entirely and show minimal overlay (tabs only).
+a11y:
+  - `role="dialog"` with `aria-modal=true`; focus trap implemented via `FocusScope`.
+  - Announce tab changes via `aria-live="polite"`.
+  - Ensure drag handle is keyboard operable (close button accessible).
+  - Provide `skip overlay` link for screen readers to jump back to content.
+analytics:
+  - mobileOverlay.open (source: button, gesture, notification)
+  - mobileOverlay.tab_change (tabId)
+  - mobileOverlay.admin_shortcut (destination)
+  - mobileOverlay.context_switch (from, to)
+  - mobileOverlay.dismiss (durationOpenMs)
+data_dependencies:
+  - `navigationShell.mobileSummary` for admin badge counts + shortcuts.
+  - `consumer.saves.list` / `consumer.tickets.list` for tab data.
+  - `alerts.mobileFeed` for notification counts.
+performance:
+  - Preload overlay bundle after first interaction using `requestIdleCallback`.
+  - Cache last tab state in localStorage to restore quickly.
+  - Keep main content mounted underneath to allow instant dismiss without reflow.
+open_questions:
+  - Should Saved + Tickets tabs be accessible when offline (cached data) or show placeholders?
+  - Do we allow customizing tab order per persona?
+  - How to expose scanner entry for staff-only accounts without rest of Admin tab?
+next_steps:
+  - Pair with design to finalize motion spec + token usage.
+  - Implement React Native + web versions reusing Tamagui sheet.
+  - Write Cypress/Detox tests for gesture + focus behavior.

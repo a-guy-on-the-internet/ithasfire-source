@@ -64,6 +64,7 @@ describe("better-auth rate-limit rules", () => {
       "/sign-in/username",
       "/sign-in/email-otp",
       "/email-otp/verify-email",
+      "/email-otp/change-email",
       "/two-factor/verify-totp",
       "/two-factor/verify-otp",
       "/two-factor/verify-backup-code",
@@ -106,6 +107,92 @@ describe("better-auth rate-limit rules", () => {
       const rule = AUTH_RATE_LIMIT_CUSTOM_RULES["/token"];
       if (!isRule(rule!)) throw new Error("unreachable");
       expect(Number.isFinite(rule.max)).toBe(true);
+    });
+  });
+
+  describe("/sign-up/email", () => {
+    // 2026-09-29: 29 accounts in 35 minutes against the 100/60s global floor.
+    it("has its own per-IP rule: 3 per the largest window the storage TTL allows", () => {
+      expect(AUTH_RATE_LIMIT_CUSTOM_RULES["/sign-up/email"]).toEqual({
+        window: AUTH_RATE_LIMIT_MAX_WINDOW_SECONDS,
+        max: 3,
+      });
+    });
+
+    it("stays out of the atomic guess-space set (no account identifier to bucket on)", () => {
+      expect(AUTH_GUESS_SPACE_PATH_SET.has("/sign-up/email")).toBe(false);
+    });
+  });
+
+  describe("/email-otp/change-email (2026-09-29 review)", () => {
+    it("is an atomic GUESS path (6-digit code), not a send path", () => {
+      expect(AUTH_GUESS_SPACE_PATH_SET.has("/email-otp/change-email")).toBe(
+        true,
+      );
+      expect(resolveAccountCap("/email-otp/change-email")).toEqual({
+        window: 60,
+        max: 5 * AUTH_ACCOUNT_BUCKET_MULTIPLIER,
+      });
+    });
+  });
+
+  describe("outbound-mail/SMS senders (2026-09-29 review, F8)", () => {
+    /**
+     * Each of these sends a message to an address the CALLER chooses. On the
+     * 100/60s global floor any of them was a mail cannon aimed at a victim.
+     */
+    const SENDERS = [
+      "/sign-in/magic-link",
+      "/request-password-reset",
+      "/email-otp/request-password-reset",
+      "/forget-password/email-otp",
+      "/phone-number/request-password-reset",
+      "/change-email",
+      "/email-otp/send-verification-otp",
+      "/phone-number/send-otp",
+      // Spends the shared 2FA text budget (otp-sms-budget.ts).
+      "/two-factor/send-otp",
+    ] as const;
+
+    it.each(SENDERS)("%s is capped at 3 per window", (path) => {
+      const rule = AUTH_RATE_LIMIT_CUSTOM_RULES[path];
+      expect(rule, `${path} lost its rule`).toBeDefined();
+      if (!isRule(rule)) throw new Error(`${path} must not be exempted`);
+      expect(rule.max).toBe(3);
+      expect(rule.window).toBeLessThanOrEqual(
+        AUTH_RATE_LIMIT_MAX_WINDOW_SECONDS,
+      );
+    });
+
+    // Better Auth's own limiter leaks under concurrency; the atomic
+    // pre-limiter is what makes 3 a ceiling, and only for set members.
+    it.each(SENDERS)("%s is enforced atomically", (path) => {
+      expect(AUTH_GUESS_SPACE_PATH_SET.has(path)).toBe(true);
+    });
+
+    it.each(SENDERS)(
+      "%s uses the SEND account multiplier, not the guess one",
+      (path) => {
+        expect(resolveAccountCap(path)).toEqual({
+          window: resolveGuessSpaceRule(path)!.window,
+          max: 3 * AUTH_ACCOUNT_BUCKET_MULTIPLIER_SEND,
+        });
+      },
+    );
+  });
+
+  describe("/two-factor/send-otp (2FA text budget drain)", () => {
+    // Without its own rule one account could drain the shared hourly 2FA
+    // text pool under the 100/60s global floor.
+    it("is 3 per 60s, below the global floor", () => {
+      expect(AUTH_RATE_LIMIT_CUSTOM_RULES["/two-factor/send-otp"]).toEqual({
+        window: 60,
+        max: 3,
+      });
+      expect(resolveGuessSpaceRule("/two-factor/send-otp")).toEqual({
+        window: 60,
+        max: 3,
+      });
     });
   });
 

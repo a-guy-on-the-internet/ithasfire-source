@@ -1,0 +1,716 @@
+# time-based-ticket-pricing.spec.yaml
+#
+# Two related capabilities the organizer asked for in one sentence:
+#   (1) "a ticket type that changes from one price to another after a
+#       specific point"  → scheduled price change, ONE row, ONE capacity pool
+#   (2) "a ticket type that unlocks at a certain point in time"
+#       → sales windows, N rows, N capacity pools
+#
+# REALITY CHECK ENCODED UP FRONT. These are NOT the same feature and this
+# spec does not pretend otherwise:
+#
+#   * (2) is ALREADY FULLY SPECIFIED and unbuilt —
+#     docs/specs/2026-08-04/completed/ticket-type-packs.spec.yaml Phase B, FR-014/015/016
+#     (salesOpenAt/salesCloseAt, the relative {anchor, offsetMinutes} template
+#     encoding, materialize-at-apply). This spec ADOPTS those three FRs by
+#     reference and does not re-specify them. Deviating from FR-016 means
+#     re-litigating a decision that spec already made.
+#
+#   * (1) is EXPLICITLY OUT OF SCOPE in that same spec:
+#     "Scheduled price changes on live TicketType rows (auto price flip at a
+#     timestamp) — Phase B stops at sales windows; tier flips remain
+#     capacity-based or manual."
+#     This spec is the document that reverses that exclusion, and states the
+#     cost of doing so.
+#
+#   * The motivating context: ticket-type TEMPLATES and the preset catalogue
+#     (both shipped 2026-07-23 / 2026-07-30) are thin without this. An
+#     "Early Bird" preset is only a name until it can stop being early.
+#
+# PREREQUISITE, NOT A NICE-TO-HAVE: the resale path re-reads the LIVE ticket
+# type as "face value" and that number drives the seller/venue markup split.
+# It is already wrong today whenever an organizer manually edits a price.
+# Scheduling a price turns a rare accident into a guaranteed one. Phase 0
+# fixes it FIRST. See FR-001.
+
+version: "1.0"
+updated: "2026-08-10"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    A TicketType has exactly one price. The advance/door and early-bird
+    patterns that every grassroots venue runs are currently modelled by
+    creating two ticket types with two separate capacity pools — which is the
+    wrong shape when the organizer means "the same 100 tickets, cheaper until
+    Friday". There is no way to say "this tier opens at noon on Tuesday"
+    either: no on-sale concept exists in the schema at all. Meanwhile the
+    ticket-type template and preset catalogues shipped in July encode
+    "Advance / Early Bird" and "Door" as separate presets precisely because
+    the model cannot express the thing they are named after.
+  solution: >
+    Resolve a ticket's price through ONE shared, time-aware resolver instead
+    of reading TicketType.priceCents directly at 27 call sites. The resolver
+    extends the already-shipped resolveUnitPriceCentsForMode (door pricing),
+    which exists for exactly this hazard — its own doc comment says "a surface
+    that resolved this differently would quote the operator one discount and
+    charge the buyer another. Hence one helper." Add a two-step schedule
+    (scheduledPriceCents / scheduledPriceAt) to TicketType for the shared-pool
+    case, evaluated at READ TIME against clock.now(), matching how every other
+    money-affecting gate in this codebase works. Adopt Phase B FR-014/015/016
+    unchanged for the separate-pool windowed case. Fix the resale face-value
+    recompute before either.
+  non_goals: >
+    Not building a general pricing-rules engine, demand-based pricing, or
+    price A/B testing. Not more than two price steps on one row — three-step
+    early/advance/day-of is already served by three rows with windows, and the
+    packs spec ships it that way deliberately.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+
+    # ── Phase 0 — prerequisite correctness fix ────────────────────────────
+
+    - id: FR-001
+      phase: "0"
+      title: Resale face value must come from the buyer's OrderItem, not the live type
+      description: >
+        create-resale-listing.ts:139 sets faceValueCents = ticketType.priceCents,
+        and create-resale-checkout.ts:230 and get-resale-listing.ts:87 do the
+        same. That number drives computeResalePricing's positive-markup split
+        between seller and venue.
+        CORRECTED 2026-08-11 during implementation — an earlier draft of this FR
+        also claimed face value drives resaleCapCents enforcement. IT DOES NOT.
+        The cap check is `input.askPriceCents > resaleCapCents`: an absolute
+        cents ceiling compared directly against the ask, never derived from face
+        value. Cap and face value were independent before this fix and remain so,
+        which also means "cap-as-historical" is not a coherent option — there is
+        no snapshotted cap to read (OrderItem has no cap column; the
+        resaleCapCents on platform.prisma is an analytics snapshot, not a ledger).
+        SUPERSEDED 2026-10-10 by seat-price-overrides.spec.yaml Q-001 (owner
+        ruling), for the cap sentences above only: a ticket's cap is never
+        below its own price, so cap and face value are no longer independent.
+        The face-value fix in this FR stands.
+        Concrete misrouting that exists TODAY: a ticket bought at early-bird
+        $12 and listed after the organizer raises the price to $20 has its face
+        value re-read as $20, so a $20 ask records $0 markup and the venue's
+        markup share silently vanishes. Fix: read the snapshotted price the
+        buyer actually paid — OrderItem.unitPriceCents, reachable via
+        Ticket.orderItemId — for face value and the markup split. The live
+        ticket type stays the source for POLICY (resaleAllowed, the current cap
+        as a forward-looking ceiling, the markup-share override), never for
+        historical value.
+        A FOURTH site not in the original draft: the adapter browse enrichment
+        at packages/adapters/src/db/prisma/resale-listings.ts (listByEvent's
+        EnrichedResaleListingRecord.facePriceCents) had the identical bug and
+        would have left the buyer-facing list disagreeing with the corrected
+        detail page for the same listing.
+      rationale: >
+        Ships independently of everything else in this spec and is worth doing
+        on its own merits. Every later phase makes this bug systematic rather
+        than incidental, so it lands first.
+      acceptance: >
+        A ticket purchased at price A, listed after the type's price becomes B,
+        computes face value and the markup split from A. Regression test pins
+        the seller/venue split amounts explicitly. A cap below the historical
+        face value still permits an ask under the cap and rejects one over it —
+        pinning that cap stays live policy and is independent of face value.
+        SUPERSEDED 2026-10-10 by seat-price-overrides.spec.yaml Q-001 (owner
+        ruling), for the last sentence only ("rejects one over it"): a
+        ticket's cap is never below its own price. The rest of this acceptance
+        stands.
+
+    - id: FR-002
+      phase: "0"
+      title: Wallet passes show the price paid
+      description: >
+        generate-wallet-pass.ts:116 does priceCents: ticketType?.priceCents ?? 0
+        — re-reading the type rather than the order item, so re-issuing a pass
+        after any price change rewrites the number on the buyer's phone. Same
+        fix, same source: OrderItem.unitPriceCents.
+      acceptance: >
+        Re-generating a pass after a price change reproduces the original
+        purchase price.
+
+    # ── Phase 1 — the shared time-aware resolver + scheduled price ────────
+
+    - id: FR-003
+      phase: "1"
+      title: One resolver, and `now` is required
+      description: >
+        Extend packages/core/src/lib/orders/door-pricing.ts's
+        resolveUnitPriceCentsForMode(ticketType, mode) into
+        resolveUnitPriceCents(ticketType, { mode, now }). `now` is a REQUIRED
+        parameter, not optional-defaulting-to-Date.now(): the compiler is the
+        only thing that will reliably find all 27 sites that currently read
+        .priceCents directly, and a default would let a site silently keep
+        today's behaviour while looking migrated. All clock reads come from the
+        injected ClockPort, never Date.now() inside the resolver.
+      rationale: >
+        27 of 31 server-side price-read sites bypass the existing helper today,
+        including the canonical charge site (checkout-helpers.ts:260). A
+        time-varying price is only safe if every site agrees; a required
+        parameter makes disagreement a build failure rather than a support
+        ticket.
+
+    - id: FR-004
+      phase: "1"
+      title: Migrate every price-read site to the resolver
+      description: >
+        Route all money-authoritative and quote/preview sites through FR-003's
+        resolver. Money-authoritative (buyer is charged): checkout-helpers.ts:260,
+        create-checkout.ts:321 and :430, update-order-items.ts:160,
+        claim-free-tickets.ts:121, start-pos-sale.ts:267, record-cash-sale.ts:282,
+        create-resale-checkout.ts:230. Quote/preview: get-event-fee-preview.ts,
+        estimate-buyer-ticket-pricing.ts, estimate-checkout-tax.ts,
+        preview-promos.ts. Listing/display: list-event-ticket-types.ts,
+        list-event-ticket-types-for-edit.ts (CORRECTED 2026-08-11 — this one
+        must NOT resolve. Its priceCents is the value bound to the admin Price
+        input, which updateTicketType writes straight back; resolving it would
+        mean that after a flip the form shows the post-flip price and the
+        organizer's next save of ANY field persists it as the new list price,
+        collapsing the schedule and destroying the prior price with no history.
+        It instead GAINS effectivePriceCents plus the scheduledPrice pair, so
+        admin surfaces can show what it is selling for while the input stays
+        raw — which is what Q-002's mandatory read-back consumes),
+        ticket-tiers-for-card.ts,
+        event-pricing.ts, build-event-seo.ts, list-organizer-events.ts,
+        list-sellable-items.ts. Embeds: get-embed-event-detail.ts,
+        get-embed-for-widget.ts, list-embed-available-seats.ts.
+        issue-comp-tickets.ts is exempt — it hardcodes 0 and never reads the
+        type. duplicate-event.ts and generate-events-from-series.ts copy the
+        schedule fields along with the price rather than resolving.
+      acceptance: >
+        A grep for `.priceCents` outside the resolver, the adapters' row
+        mapping, and the snapshot writers returns only exempt sites, and that
+        invariant is pinned by a test so a new direct read fails CI.
+
+    - id: FR-005
+      phase: "1"
+      title: Two-step schedule on TicketType
+      description: >
+        TicketType gains scheduledPriceCents (Int?) and scheduledPriceAt
+        (DateTime?), both null by default and null for every existing row (no
+        backfill). Semantics: before scheduledPriceAt the effective price is
+        priceCents; at or after it, scheduledPriceCents. Both null or both set —
+        one without the other is a validation error at the write boundary, not
+        a silently-ignored half-configuration. Deliberately two steps and
+        scalar, mirroring doorPriceCents' shape rather than introducing a child
+        table: three-step early/advance/day-of is already served by three rows
+        with windows (Phase B), and a child table would buy a generality the
+        packs spec explicitly decided against.
+      acceptance: >
+        Round-trip through upsertTicketType; a row with one field set is
+        rejected with a named error code.
+
+    - id: FR-006
+      phase: "1"
+      title: Precedence with door price is explicit
+      description: >
+        Both doorPriceCents and the schedule override priceCents, so ordering
+        must be stated rather than emergent. Rule: resolve the time-scheduled
+        ONLINE price first (priceCents or scheduledPriceCents per `now`); then,
+        when mode is DOOR, doorPriceCents — if set — overrides that result
+        wholesale. Rationale: door price is a surface-level override the
+        operator sets deliberately; it should not silently move because an
+        online deadline passed. A venue wanting a door price that also changes
+        over time is out of scope for this spec.
+      acceptance: >
+        Matrix test over {before, after} x {STANDARD, DOOR} x {doorPrice set,
+        unset} with all eight expectations written out.
+
+    - id: FR-007
+      phase: "1"
+      title: Timezone — organizer picks a moment in the EVENT's timezone
+      description: >
+        scheduledPriceAt is stored as an absolute UTC instant. The admin UI
+        collects a wall-clock date/time and resolves it against Event.timezone,
+        previewing the resolved moment back to the organizer before save.
+        Never browser-local arithmetic — the volunteer FR-006 lesson.
+        AMENDED 2026-08-11 during implementation: an earlier draft specified
+        luxon. apps/web has NO date library (no luxon, date-fns, dayjs or
+        moment) and Phase 1c correctly added none — it reuses
+        `zonedWallClockToInstant` (apps/web/src/lib/template-shift-offset.ts),
+        which resolves via Intl and BRACKETS the DST transition (probes ±1 day
+        and filters candidates by reading each back in the zone). Do not "fix"
+        this by adding luxon. Note the builder's own `toIsoInTimeZone`
+        (event-builder-helpers.ts) probes the zone ONCE at the naive-UTC
+        instant and is an hour wrong around transitions in both hemispheres —
+        a confirmed pre-existing bug being fixed separately; never adopt that
+        single-probe pattern here.
+        Two DST edges are decided and pinned, not accidental: the spring-forward
+        GAP hour resolves via the pre-transition offset, and the fall-back
+        AMBIGUOUS hour resolves to the FIRST occurrence. Explicitly DO NOT copy
+        PAYOUT_TZ / REFUND_TZ, which hardcode America/Chicago; a price flip on
+        that shortcut fires at the wrong hour for a Pacific event.
+        Known edge, documented not solved: editing Event.timezone or startsAt
+        after a schedule is set does not re-resolve the stored instant. The
+        admin surfaces the resolved local time so the drift is visible.
+      acceptance: >
+        A 2026-10-01T20:00 America/New_York input stores the correct UTC
+        instant; a DST-boundary case is pinned in both directions.
+
+    - id: FR-008
+      phase: "1"
+      title: Search index freshness
+      description: >
+        build-search-index.ts materializes minPaidPriceCents into the search
+        index. A scheduled price that flips at read time would leave the index
+        stale indefinitely, since nothing writes to the row at flip time.
+        Either the indexer computes the price at index time AND the event is
+        re-indexed on a schedule that brackets pending flips, or index entries
+        for events with a pending flip carry the post-flip price. Pick one and
+        state it; do not leave the index reading a price nobody can buy.
+      rationale: >
+        This is the one place where read-time evaluation genuinely costs
+        something a job-materialised design would not, and it must be answered
+        rather than discovered in production.
+
+    # ── Phase 2 — sales windows (ADOPTED, not redefined) ──────────────────
+
+    - id: FR-009
+      phase: "2"
+      title: Adopt Phase B FR-014/015/016 unchanged
+      description: >
+        Sales windows (salesOpenAt/salesCloseAt on TicketType), the relative
+        { anchor: EVENT_START | EVENT_PUBLISH, offsetMinutes } encoding on
+        template entries, and materialize-at-apply are specified in
+        docs/specs/2026-08-04/completed/ticket-type-packs.spec.yaml FR-014/015/016 and
+        are adopted here verbatim. Note their standing warning, which this spec
+        endorses: enforcement lands WITH the columns — create-checkout and the
+        POS path reject purchases outside the window — because "a stored window
+        with no checkout guard is UI theatre."
+      acceptance: >
+        As stated in FR-014/015/016, including the -20160 / 2026-10-01T20:00
+        New York worked example.
+
+    - id: FR-010
+      phase: "2"
+      title: Sellability becomes per-ticket-type
+      description: >
+        THE LARGEST STRUCTURAL PIECE, and the reason windows are Phase 2 rather
+        than Phase 1. list-event-ticket-types.ts today returns ONE event-level
+        sellability { available, reason } with five reasons (ok | free |
+        no_payee | stripe_not_connected | sales_closed). "This tier is not on
+        sale yet" is meaningless at event level when a sibling tier is open, so
+        availability must move to the per-type entries, with the event-level
+        flag retained for the genuinely event-wide reasons. New reasons:
+        not_yet_on_sale (with the open time) and sales_ended.
+        Embeds are a second, incompatible representation — get-embed-event-detail
+        exposes salesClosed as a plain BOOLEAN, not the reason enum — and must
+        gain the per-type shape too. The public page's deriveEventDetailMode and
+        its tests move with it. Sold-out remains separately derived client-side
+        (capacity <= 0) and is not folded in by this spec.
+      acceptance: >
+        An event with one open and one not-yet-open tier renders correct,
+        distinct states on the public page AND in an embed, with the open time
+        shown in the event's timezone.
+
+    # ── Phase 3 — templates and presets ───────────────────────────────────
+
+    - id: FR-013
+      phase: "2c"
+      title: Admin UI for setting a sales window
+      description: >
+        ADDED 2026-08-12 — this FR was MISSING from the original spec and the
+        omission was only caught after 2a and 2b had shipped. Phase 1 correctly
+        had a dedicated admin-UI phase (1c) for the scheduled price; the window
+        half never got its equivalent, so the columns exist, checkout enforces
+        them, and buyers see per-tier states — but `grep -rn
+        "salesOpenAt|salesCloseAt" apps/web apps/scanner apps/mobile` returns
+        ZERO hits. An organizer cannot set a window at all. The feature is
+        enforceable and visible but not settable, which means the "unlocks at a
+        certain point in time" half of the original request is not yet
+        deliverable to a user.
+        Consequence worth stating: until this ships, a window is only reachable
+        by a direct API call or by duplicating an event that already has one —
+        so the buyer-facing checkout dead-end 2b fixed was real but not yet
+        reachable in the product.
+        BUILD: the same shape as Phase 1c's scheduled-price control, in the same
+        ticket-type add and edit forms — collapsed by default, wall-clock inputs
+        resolved against Event.timezone with a read-back, refusing rather than
+        degrading on an unknown zone, and reusing zonedWallClockToInstant (NOT
+        luxon, NOT the single-probe toIsoInTimeZone). Must respect the write
+        boundary's rules: both bounds independent (either may be set alone),
+        open < close when both are set, and zero-width rejected — surfacing
+        TICKET_TYPE_SALES_WINDOW_INVALID inline but making it unreachable.
+        The half-open boundary must be explained in the UI, not just enforced:
+        "closes at 18:00" means the last sale is 17:59:59, and a sibling tier
+        opening at 18:00 picks up with no gap.
+      acceptance: >
+        An organizer can set, read back, edit and clear a window on both the add
+        and edit paths, desktop and mobile sheet; the read-back renders in the
+        event's timezone with an abbreviation; and the help-centre section
+        deferred in 2b (FR-010's warning 7) ships with it, since it can only be
+        written once the setting exists.
+
+    - id: FR-011
+      phase: "3"
+      title: Template entries carry relative schedule and window
+      description: >
+        TicketTypeTemplateEntry gains the FR-015 salesOpen/salesClose relative
+        encoding, plus — for the FR-005 schedule — a relative
+        scheduledPriceChange { at: { anchor, offsetMinutes }, priceCents }.
+        Absolute timestamps in a template are meaningless: templates are
+        org-scoped and reused across events, so "early bird until March 3rd"
+        cannot be reused. Resolution happens at apply time per FR-016, with the
+        same inverted/already-past fallback — null the schedule, warn per entry,
+        never create a silently mispriced or unsellable type.
+      acceptance: >
+        Applying a template with a relative schedule to two events on different
+        dates produces correctly different absolute instants.
+
+    - id: FR-012
+      phase: "3"
+      title: Preset catalogue gains the fields it is named after
+      description: >
+        apps/web/.../ticket-type-presets.ts currently ships "Advance / Early
+        Bird" and "Door" as two separate presets with separate capacity pools —
+        the exact pattern this feature exists to model properly. Presets gain
+        doorPriceDollars (absent entirely today) and the relative schedule.
+        SEQUENCING CONSTRAINT, stated because it is easy to miss: presets are
+        pure form pre-fill and run BEFORE the event's date is necessarily
+        settled, so a relative offset has nothing to resolve against at pick
+        time. Either the preset defers resolution to save time, or the
+        ticket-type step must be gated behind a known event date. Decide in
+        Phase 3; do not paper over it.
+      acceptance: >
+        Picking "Advance / Early Bird" pre-fills a schedule that resolves
+        correctly once the event date is known.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Zero behaviour change for rows with no schedule and no window — the
+        overwhelming majority, forever. Every existing test that asserts a
+        price must pass untouched.
+    - id: NFR-002
+      description: >
+        Money-affecting gates are evaluated at READ TIME against the injected
+        clock, matching the codebase's unbroken convention (promo windows are
+        read-time SQL; sales close, refund cutoffs, waitlist publish and
+        address reveal are all read-time). Jobs remain reserved for side
+        effects — notify, expire-and-release, settle — and MUST NOT be used to
+        flip a price or make a tier purchasable.
+    - id: NFR-003
+      description: >
+        The purchased price stays snapshotted on OrderItem.unitPriceCents.
+        Nothing in this spec may introduce a post-purchase recompute; FR-001
+        and FR-002 remove the two that exist.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  read_time_vs_job: >
+    Read-time evaluation is chosen despite the larger diff. The alternative — a
+    cron job that rewrites priceCents at the flip moment — needs zero changes to
+    the 27 direct read sites and keeps the search index fresh through the normal
+    update path, which is genuinely tempting. It is rejected because it violates
+    the codebase's convention for money-affecting state, has cron-drift exposure
+    (a missed run means selling at the wrong price with no signal), and destroys
+    the prior price with no history. The one real cost of read-time — search
+    index staleness — is confronted explicitly in FR-008 rather than discovered.
+  shared_resolver: >
+    resolveUnitPriceCents(ticketType, { mode, now }) in
+    packages/core/src/lib/orders/door-pricing.ts (renamed module or kept, but
+    ONE resolver). doorPriceCents is adopted, not deprecated: it is a shipped,
+    correctly-designed precedent for two-prices-on-one-row keyed on surface,
+    and this feature is the same shape keyed on time. They compose per FR-006.
+  layering: >
+    Resolver is a pure function in packages/core/src/lib — no repo access, no
+    clock of its own. Callers pass deps.clock.now(). Transport and UI never
+    compute a price; they display what core resolved.
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  ticket_type_additions:
+    - "scheduledPriceCents Int?   — the post-flip price; null when unscheduled"
+    - "scheduledPriceAt DateTime? — UTC instant of the flip; null when unscheduled"
+    - "salesOpenAt DateTime?      — Phase 2, per FR-014"
+    - "salesCloseAt DateTime?     — Phase 2, per FR-014"
+  migration_notes: >
+    All four columns nullable with no backfill; every existing row keeps
+    today's behaviour by construction. Follow the repo convention of a
+    hand-written migration reviewed against the model, and do NOT apply it to
+    any remote database as part of the build.
+  enum_additions:
+    - "TicketSalesAnchor (EVENT_START | EVENT_PUBLISH) — Phase 2, declared in the packs spec"
+
+# ── Risks ────────────────────────────────────────────────────────────────────
+
+risks:
+  - id: R-001
+    severity: HIGH
+    description: >
+      A price-read site missed during FR-004 keeps charging the pre-flip price
+      after the flip — the exact "quote one price, charge another" failure the
+      door-pricing helper was written to prevent.
+    mitigation: >
+      `now` is a required parameter (FR-003) so misses are compile errors, plus
+      the grep-invariant test in FR-004.
+  - id: R-002
+    severity: HIGH
+    description: >
+      Resale markup misrouting (FR-001) shipped before it is fixed would become
+      systematic rather than incidental, moving real money to the wrong party
+      on every early-bird resale.
+    mitigation: >
+      Phase 0 is a hard prerequisite; Phase 1 does not start until it lands.
+  - id: R-003
+    severity: MEDIUM
+    description: >
+      Search index serves a price nobody can buy (FR-008).
+    mitigation: >
+      Answered in FR-008 before Phase 1 completes; not deferred.
+  - id: R-004
+    severity: MEDIUM
+    description: >
+      DST and timezone edits. A schedule resolved against Event.timezone does
+      not re-resolve if the organizer later edits the timezone or start date.
+    mitigation: >
+      Store the absolute instant, always display the resolved local time so
+      drift is visible, and pin DST-boundary tests in both directions.
+  - id: R-005
+    severity: MEDIUM
+    description: >
+      Phase 2's per-type sellability is a transport + public-page + embed
+      change; embeds model sales state as a boolean and will need a
+      breaking-shaped addition.
+    mitigation: >
+      Sequenced as its own phase; embed representation changes with it, not
+      after.
+
+# ── Open questions ───────────────────────────────────────────────────────────
+
+open_questions:
+  - id: Q-001
+    question: >
+      FR-008 — recompute price at index time with bracketing re-index, or index
+      the post-flip price for events with a pending flip?
+    owner: RESOLVED 2026-08-11
+    decision: >
+      Index the CURRENT effective price (resolved through FR-003 at index time),
+      and refresh events whose flip has crossed. This does NOT violate NFR-002:
+      that rule forbids a job from making something purchasable or setting a
+      price. Here the price remains read-time truth and the job only refreshes a
+      derived cache — a side effect, exactly what apps/jobs is for. Indexing the
+      post-flip price early was rejected: it makes search advertise a price that
+      is not yet purchasable, the same quote-one-charge-another failure in a
+      different surface.
+      CORRECTED 2026-08-11 during implementation. An earlier draft said "enqueue
+      a re-index job scheduled for scheduledPriceAt". THAT MECHANISM DOES NOT
+      EXIST in this repo: the queue is Google Pub/Sub, which has no delayed
+      delivery, and JobQueuePort.delayMs is honoured by exactly one adapter —
+      the in-memory test queue. There is no durable timer to enqueue against.
+      The shipped design is a WINDOW SCAN (search.reindex-scheduled-price-flips,
+      */15, scanning (now-6h, now]), which is also the true shape of the
+      precedent this question already named: events.address-reveal-notify is a
+      scan, not a per-row enqueue. A scan is strictly better here anyway — a
+      dropped delayed enqueue is lost silently and forever, whereas a scan
+      self-heals, and it needs no cursor column because re-indexing is
+      idempotent. The scan passes only event IDs to buildSearchIndex, which
+      re-reads and re-resolves: it decides WHICH, never WHAT.
+      If the job never runs: browse/search cards show the pre-flip price until
+      something else reindexes the event — any ticket-type edit, or the nightly
+      full reindex, which bounds staleness at ~24h even with this job disabled.
+      Checkout, the public ticket list, POS and embeds all resolve at read time
+      and charge correctly throughout.
+  - id: Q-002
+    question: >
+      Does the organizer need to see what a ticket WILL cost after the flip on
+      the public page ("$12 until Friday, then $20")? It is good conversion copy
+      and the data is present, but it widens Phase 1's UI surface.
+    owner: RESOLVED 2026-08-11
+    decision: >
+      Split by audience. ADMIN gets it in Phase 1c and it is not optional: an
+      organizer setting a schedule must be able to read back what they set,
+      resolved into the event's timezone, or FR-007's timezone correctness is
+      unverifiable by the only person who can catch a mistake. PUBLIC-facing
+      "then $20" copy is deferred to Phase 2, where the ticket list is already
+      being reshaped for per-type availability (FR-010) — adding a second
+      price-related string to that component twice would be wasted work, and
+      urgency copy belongs next to the not-yet-on-sale / sales-ended states it
+      reads alongside, not bolted on ahead of them.
+  - id: Q-003
+    question: >
+      FR-012 sequencing — defer preset schedule resolution to save time, or gate
+      the ticket step behind a known event date?
+    owner: RESOLVED 2026-08-11
+    decision: >
+      Defer to save time; no gating needed, because the constraint that looked
+      like a problem does not exist. TicketTypeEditor only renders in
+      isEditMode with an eventId (EventBuilder.tsx ~:3290), so by the time any
+      ticket type can be created the event — and therefore its start date and
+      timezone — is already persisted. A preset carries the RELATIVE offset as
+      form state and it materializes to an absolute instant on Add, through the
+      same resolution path FR-016 uses for templates. Gating the ticket step
+      behind a date would add a blocker for a case that cannot occur.
+  - id: Q-004
+    question: >
+      SURFACED DURING PHASE 0 REVIEW, same bug class, different cause, NOT fixed.
+      OrderItem.unitPriceCents is the ticket's LIST price at purchase, not the
+      net the buyer paid: promo discounts are written as SEPARATE order items
+      (create-checkout.ts:668) and credits reduce only the buyer's charge (:543).
+      So a 50%-off $20 ticket snapshots 2000, not 1000 — and a 100%-off promo
+      ticket resold at $20 records ZERO markup, so the venue gets nothing. That
+      is the same shape as the bug FR-001 fixes, arriving by a different route.
+      Phase 0 does not regress it (the old code read the live price, which was
+      equally wrong or worse), and re-deriving net-of-promo per ticket is a
+      distinct piece of work: the discount is an order-level line that must be
+      apportioned across ticket items before it can be a per-ticket basis.
+      DECISION NEEDED: is face value the list price at purchase (current, simple,
+      defensible — "what this ticket was sold at") or the net the buyer actually
+      paid (fairer to the venue on discounted resales, requires apportionment)?
+    owner: RESOLVED 2026-08-11 (provisionally — revisit if promo-heavy resale appears)
+    decision: >
+      Face value stays the LIST PRICE AT PURCHASE. Phase 0 ships that, the doc
+      comment and user copy now say it plainly, and it is a defensible meaning:
+      "what this ticket was sold at". Net-of-promo is deliberately NOT adopted
+      here because it is a different piece of work, not a smaller one — the
+      discount is an order-level line item that would have to be apportioned
+      across ticket items (with its own rounding-remainder policy) before it
+      could serve as a per-ticket basis, and that apportionment would then need
+      to agree with refunds, which currently quote off unitPriceCents. Shipping
+      a half-apportioned basis would create a NEW disagreement between resale
+      and refund, which is the exact failure class this whole spec exists to
+      remove. Known consequence, accepted and documented: a 100%-off promo
+      ticket resold at $20 records zero markup and the venue receives nothing.
+      Revisit if discounted resale turns out to be common.
+
+# ── Out of scope ─────────────────────────────────────────────────────────────
+
+  - id: Q-005
+    question: >
+      SURFACED IN PHASE 1a. FR-004 says duplicate-event and
+      generate-events-from-series COPY the schedule alongside priceCents, and
+      that is what shipped. But scheduledPriceAt is an ABSOLUTE instant, so an
+      occurrence generated (or a duplicate made) after the source's flip
+      inherits an already-elapsed schedule and is priced at scheduledPriceCents
+      from the moment it publishes. For a weekly series with "early bird until
+      Jan 1", every event generated in February is silently full-price from
+      birth — which may be right, or may be the opposite of what the organizer
+      meant.
+    owner: RESOLVED 2026-08-11
+    decision: >
+      NULL the schedule on copy when the copied scheduledPriceAt is already in
+      the past at copy time, and surface it to the organizer — the same
+      "never a silently mispriced type" convention FR-016 already establishes
+      for template apply. Copying a live (future) schedule stays as-is. This is
+      an interim correctness guard, not the real answer: the real answer is the
+      relative {anchor, offsetMinutes} encoding in FR-011, at which point a
+      series occurrence resolves its own early-bird deadline against its own
+      date. Both call sites already produce DRAFT types requiring explicit
+      publish, so the current behaviour is reviewable rather than a live
+      mischarge — but "reviewable" is not "correct", and an organizer
+      generating twelve dates will not audit twelve schedules.
+
+  - id: Q-006
+    question: >
+      SURFACED BY PHASE 1b, PRE-EXISTING, NOT FIXED HERE — seat price overrides
+      are quoted to the buyer and never charged. computeOrderAmounts derives
+      unitAmount solely from the TicketTypeSummary and uses item.seatIds only to
+      stamp perTicketMeta.seatId; it never reads seat.priceOverride. Meanwhile
+      SeatMapPicker renders the override as the seat's price in three places.
+      GA tier $30 + seat A1 override $50 ⇒ buyer sees $50, is charged $30, and
+      that wrong number then snapshots into refunds, resale face value (FR-001)
+      and the wallet pass. An override BELOW tier price overcharges instead.
+      This is a live quote-one-charge-another defect with nothing to do with
+      time-based pricing.
+    owner: >
+      FILED 2026-08-12 as docs/specs/2026-08-12/seat-price-overrides.spec.yaml
+      — do not fold into this one. That spec settles the refund/settlement
+      semantics this decision said had to be settled first; the answer is that
+      the order side is already per-ticket and needs no new policy (its D-001).
+    decision: >
+      Out of scope here on purpose. The fix is not a resolver call: per-seat
+      overrides have to become their own lines in AggregatedItem/computeOrderAmounts
+      (each seat at its own unitAmount), with the seat rows re-read FOR UPDATE in
+      the transaction that already locks them so a quoted override cannot be
+      edited between quote and charge — and it needs refund/settlement semantics
+      for per-seat amounts settled first. Phase 1b corrected the misleading
+      exemption text in price-read-invariant.test.ts that implied the charge
+      path was covered.
+  - id: Q-007
+    question: >
+      RELEASE-NOTE ITEM, not a question. isEverPaidTicketType adds a
+      `doorPriceCents > 0` term, which deliberately changes behaviour for
+      PRE-EXISTING rows that have no schedule at all: a "$0 online / $35 at the
+      door" tier now requires a connected payee at upsert and publish, and
+      chargeback-terms acceptance. That hole predates this work — such a tier
+      already took POS money without arming any of those gates — and closing it
+      was the right call, but it is a behaviour change to live data.
+    owner: RESOLVED 2026-08-11 (keep the fix; disclose it)
+    decision: >
+      Keep. Ship it in release notes, and add help-centre copy explaining that a
+      free-online tier with a door price, or a $0-now/paid-later tier, requires
+      Stripe and chargeback terms before publish — nothing in content/help/
+      covers that today.
+
+  - id: Q-008
+    question: >
+      SURFACED BY PHASE 3, and it is the same class of omission as FR-013 —
+      caught by the implementer this time rather than after the fact. The
+      relative {anchor, offsetMinutes} encoding now exists, is validated,
+      materialises at apply time and is fully tested, BUT ORG-SAVED TEMPLATES
+      HAVE NO HUMAN AUTHOR FOR IT. Owned templates are created only by
+      Save-as-Template, which Phase 3 deliberately made DECLINE to infer
+      relative offsets (the anchor is unrecoverable: "on sale when I announced"
+      and "on sale 3 days before doors" produce the SAME stored salesOpenAt, so
+      any inference is a coin flip that silently rewrites reuse semantics). And
+      there is no template editor with anchor/offset controls. So a relative
+      entry is reachable today only via direct API or seed.
+      IMPORTANT — this does NOT block the user-facing value. The PRESET catalogue
+      (FR-012) carries the encoding in code, so "Advance / Early Bird" now closes
+      a day before the show and "Door" opens a day before, sharing one constant
+      so the handover has no gap or overlap. An organiser gets the behaviour
+      immediately. What they cannot yet do is author their OWN relatively-timed
+      template.
+    owner: NEXT STEP — anchor/offset UI in the template editor
+    decision: >
+      Accepted as the boundary of this spec. Phase 3 made the staff pack editor
+      ROUND-TRIP the three fields untouched, so a future seeded catalogue
+      template is not silently stripped when staff fix a typo — the data path is
+      safe, only the authoring UI is missing. Building it means anchor pickers
+      and signed-offset inputs in /platform/ticket-packs and, if org-authored
+      relative templates are wanted, a template editor that does not exist at
+      all today. That is genuinely new UI work, not a finishing touch.
+  - id: Q-009
+    question: >
+      FR-012 specified that the preset catalogue gain doorPriceDollars. Phase 3
+      did NOT build it and reported rather than faking it: the organiser-facing
+      ticket-type editor has NO door-price control at all, and
+      listTicketTypesForEdit does not even project doorPriceCents (the same
+      omission already flagged at EventBuilder.tsx:840). A preset field nothing
+      reads is dead data, and a write-only add-form input would create a value
+      the organiser could never see or edit afterwards.
+    owner: RESOLVED 2026-08-12 — correctly deferred
+    decision: >
+      Right call. Door price is a shipped DB + POS concept with no admin UI, so
+      the missing piece is the door-price CONTROL, not a preset field. Add the
+      projection and the editor control first; the preset field is one line once
+      there is something to fill.
+
+out_of_scope:
+  - "More than two price steps on a single row — use three rows with windows (Phase 2)."
+  - "Demand-based, dynamic, or A/B-tested pricing."
+  - "A door price that itself changes on a schedule."
+  - "Price history / audit table. The prior price is overwritten on edit as today; the schedule is not a ledger."
+  - "Migrating PayoutTermsLine.percent to basis points, or any other adjacent money-model change."
+  - "Re-resolving stored instants when Event.timezone or startsAt changes (documented in FR-007, not solved)."
+  - "Folding sold-out into sellability (FR-010 leaves it client-derived as today)."
+
+# ── Acceptance criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - "A ticket type priced $12 with a schedule of $20 at T sells at $12 at T-1s and $20 at T, through web checkout, POS, embeds, and the public page, with no code path disagreeing."
+  - "The same type at the door, with doorPriceCents set, charges the door price on both sides of T (FR-006)."
+  - "A ticket bought at $12 and resold after the flip computes face value and the seller/venue markup split from $12; the cap remains live policy compared against the ask (FR-001)."
+  - "A wallet pass re-issued after the flip still shows $12 (FR-002)."
+  - "Every existing test asserting a ticket price passes unchanged (NFR-001)."
+  - "A grep-invariant test fails when a new direct .priceCents read is introduced outside the resolver (FR-004)."
+  - "Phase 2: an event with one open and one not-yet-open tier renders distinct, correct states on the public page and in an embed."
+  - "Phase 3: one template applied to two events on different dates yields correctly different absolute flip instants."

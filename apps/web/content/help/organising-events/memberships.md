@@ -11,7 +11,7 @@ related:
     "organising-events/manage-ticket-types",
     "organising-events/embed-widgets",
   ]
-specs: ["2026-08-05/recurring-memberships"]
+specs: ["2026-08-05/completed/recurring-memberships"]
 ---
 
 Memberships let the people who love what you do support you with a recurring payment — billed monthly or yearly — in exchange for perks that apply automatically when they buy tickets. Ithas Fire takes **0%** of membership revenue. Everything lives under **Memberships**, in the **Sales** group of your admin sidebar.
@@ -68,15 +68,15 @@ A few rules worth knowing:
 
 The bottom of the benefits dialog answers the question worth asking before you save: at how many discounted shows does a member cost you more than they pay in dues?
 
-Enter a **Typical ticket price** and how many **shows a member uses this at** per period — per month or per year, following the tier's own billing interval — and it gives you the count at which that member stops being profitable, plus what you clear at the number you typed. It recomputes as you type, and it reads the terms currently in the form, so you can price a change before committing it. The maths is the real checkout's maths, which is why it can tell you two things most organisers don't expect.
+Enter a **Typical ticket price** and how many **shows a member uses this at** per period — per month or per year, following the tier's own billing interval — and it gives you the count at which that member stops being profitable, plus what you clear at the number you typed. It recomputes as you type, and it reads the terms currently in the form, so you can price a change before committing it. The maths is the real checkout's maths.
 
 :::warning
-Platform fees on a discounted ticket are still computed on the **full face price**. A member paying $5 for a $20 ticket still carries the fee on $20, and you absorb both the discount and that fee. A **100% discount is different in kind**: it produces a $0 order with no fees at all, so what you give up is the ticket's face price *minus* the fee you'd otherwise have paid — less than the face value, not more.
+The platform fee on a discounted ticket is still computed on the **full face price**, and the buyer pays it on top. A member paying $5 for a $20 ticket pays the fee on $20, and your event is credited the $5: what you give up is the $15 discount. A **100% discount** produces a $0 order with no fees at all, so what you give up is the ticket's face price. A single ticket follows the same rule: a ticket that a discount brings all the way down to $0 carries no platform fee, and the other tickets in the order keep theirs. A member discount is spread across the whole order, so on its own it frees a ticket only when it frees the order.
 :::
 
 ## What members see and pay
 
-Your public page's **Membership** tab shows each published tier with its price and "Plus applicable sales tax". To join, a member enters their **billing ZIP code** — sales tax on memberships is based on the member's own billing address, not on your location or a venue's. If we can't determine tax for their region, the join is refused with "Memberships aren't available in your region yet." rather than billed at a guessed rate — which is also why joining is US-only for now.
+Your public page's **Membership** tab shows each published tier with its price and "Plus applicable sales tax". To join, a member enters their **billing ZIP code** — sales tax on memberships is based on the member's own billing address, not on your location or a place's. If we can't determine tax for their region, the join is refused with "Memberships aren't available in your region yet." rather than billed at a guessed rate — which is also why joining is US-only for now.
 
 After that, their card is charged automatically each month or year. Before every renewal we email the member the tier, the amount, the charge date, and who's charging them — plus a cancel link. Members manage everything themselves from **Account → Memberships**: **Manage billing** opens Stripe's secure billing portal, where they can cancel or update their card. Cancelling keeps the membership until the end of the period they've already paid for.
 

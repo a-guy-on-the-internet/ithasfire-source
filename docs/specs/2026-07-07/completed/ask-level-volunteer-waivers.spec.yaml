@@ -1,0 +1,269 @@
+# ask-level-volunteer-waivers.spec.yaml
+#
+# Attach real WaiverTemplates to standing VolunteerAsks and make acceptance
+# server-enforced and recorded — closing the gap where `waiverRequired` is a
+# client-side-only checkbox with no text, no enforcement, and no legal record.
+
+version: "1.0"
+updated: "2026-07-07"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Standing asks (PLACE/ORG/HUMAN subjects) expose a `waiverRequired` boolean
+    that renders a checkbox on /v/[askId] reading "I have read and agree to the
+    volunteer waiver" — but there is no waiver text behind it, the server never
+    enforces it (resolveWaiverGate arms only off event.volunteerWaiverRequired +
+    event.waiverTemplateId), and no acceptance is recorded. A venue relying on
+    that toggle for liability protection has nothing. The EVENT-subject path is
+    already rigorous (versioned template, in-tx VolunteerWaiverAcceptance with
+    version snapshot, SHA-256 body hash, IP, user-agent).
+  solution: >
+    Add `waiverTemplateId` to VolunteerAsk and arm the existing waiver gate from
+    the ask for non-EVENT signups: show the template body on the public signup
+    page, reject unaccepted submits server-side (`waiver_required`, already
+    mapped to PRECONDITION_FAILED), and write the same VolunteerWaiverAcceptance
+    record in the signup transaction. Template ownership needs NO new modeling —
+    WaiverTemplate already supports org-owned, human-owned, and platform-default
+    templates. Mirrors assign-waiver-to-event + get-public-volunteer-waiver.
+  users:
+    - Venue / org owners running standing asks
+    - Solo organizers (HUMAN-subject personal asks)
+    - Public volunteers signing up via /v/[askId]
+  surfaces:
+    - web
+    - api
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Schema: add `waiverTemplateId String?` + `waiverTemplate` relation to
+        VolunteerAsk (onDelete: Restrict — deleting a template silently
+        disarming a liability gate is unacceptable) and the `asks` back-relation
+        on WaiverTemplate. Additive migration; no backfill (existing
+        waiverRequired=true asks stay inert until a template is assigned,
+        exactly like the event path's toggle-without-template semantics).
+    - id: FR-002
+      description: >
+        New use case `assign-waiver-to-ask` mirroring assign-waiver-to-event:
+        authz via resolveAskOwnership; validates the template is owned by the
+        ask's owner (org match for ORG/PLACE-with-org, humanId match for
+        HUMAN-subject) or is a platform template (orgId+humanId both null).
+        Supports clearing (null). Rejects EVENT-subject asks — the event stays
+        the single source of truth there (waivers.assignToEvent).
+    - id: FR-003
+      description: >
+        Server gate: submitVolunteerSignup arms resolveWaiverGate for non-EVENT
+        ask signups off `ask.waiverRequired && ask.waiverTemplateId`. Same
+        semantics as the event path: throw `waiver_required` unless
+        `waiverAccepted: true` or an acceptance for (human, template, version)
+        is already on file. Direct API calls can no longer bypass the checkbox.
+    - id: FR-004
+      description: >
+        Record VolunteerWaiverAcceptance in the SAME transaction as the ask
+        signup — waiverVersion snapshot, SHA-256 body hash, ipAddress/userAgent
+        (already server-injected into submit input; reuse the existing write at
+        the event-path call site). No duplicate row when already on file.
+    - id: FR-005
+      description: >
+        New public read `get-public-ask-waiver` mirroring
+        get-public-volunteer-waiver: returns effective gate
+        (waiverRequired AND template resolvable), template {id, name, body,
+        version}, and alreadyOnFile for signed-in humans. Anti-enumeration
+        parity with getPublicVolunteerAsk for non-PUBLISHED asks.
+    - id: FR-006
+      description: >
+        /v/[askId] (PublicAskView): when armed, render the waiver body
+        (scrollable section) above an affirmative checkbox using the existing
+        volunteerWaiver* i18n keys; show the "Waiver already on file" state for
+        signed-in volunteers; submit stays disabled until accepted. When the
+        ask has waiverRequired but no template, render NO checkbox (removes
+        today's text-less theater).
+    - id: FR-007
+      description: >
+        Ask editor (AskManageView / VolunteerAskForm): waiver template picker —
+        list owner templates (waivers.listTemplates), assign/clear via the new
+        procedure, entry point to create/assemble a template (reuse
+        EventWaiverSection's create + clause-library assembly components), and
+        a muted "requirement has no effect until a waiver is assigned" hint
+        mirroring EventVolunteeringSection's hasWaiverAssigned pattern.
+    - id: FR-008
+      description: >
+        Version-exact on-file semantics: editing a template body bumps
+        `version`, so returning volunteers must re-accept on their next ask
+        signup while historical acceptance rows remain immutable and valid.
+        (Existing WaiverTemplate behavior — assert with tests on the ask path.)
+    - id: FR-009
+      description: >
+        Ask roster rows surface waiver acceptance state (parity with the event
+        roster's "Waiver accepted" badge) so owners can see coverage at a
+        glance. Read-only; derived from VolunteerWaiverAcceptance presence.
+    - id: FR-010
+      description: >
+        Platform-default volunteer waiver (DECIDED 2026-07-07): ship ONE
+        platform-provided WaiverTemplate (orgId+humanId null, isDefault true,
+        source FREEFORM, fixed well-known UUID exported as a code constant) with
+        a plain-language volunteer liability body (voluntary participation,
+        no employment relationship, assumption of risk, release with
+        gross-negligence carve-out, medical consent, severability — consistent
+        with the clause library's structural layer and calm-honest tone).
+        Seeded idempotently in the migration (INSERT ... WHERE NOT EXISTS) so
+        dev AND prod get it; the ask picker offers it as a one-click
+        "Use the standard volunteer waiver" option (keyed by the fixed UUID,
+        NOT the isDefault flag — that flag is not unique). Platform templates
+        are editor-readonly (updateWaiverTemplate throws
+        PLATFORM_TEMPLATE_READONLY); body changes require a migration that
+        updates body AND increments version in the same statement, plus the
+        shared body constant.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Server-authoritative enforcement — the client checkbox is UX, never the
+        gate. Negative-path test: direct tRPC submit without waiverAccepted
+        against an armed ask fails with waiver_required.
+    - id: NFR-002
+      description: >
+        NOT gated behind ENABLE_WAIVERS (defaults off). That flag guards the
+        attendee/checkout waiver direction slated for removal; volunteer waiver
+        surfaces (picker, public read, gate) must work with the flag off.
+    - id: NFR-003
+      description: >
+        Anti-oracle error parity: the public ask-waiver read and armed submit
+        must not leak ask existence for DRAFT/ARCHIVED asks (match
+        getPublicVolunteerAsk's not-found behavior).
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: assign-waiver-to-ask
+        description: >
+          Assign/clear a waiver template on a standing ask with ownership
+          validation. Mirrors assign-waiver-to-event.
+        input: askId, waiverTemplateId | null, actor
+        output: updated ask summary
+        idempotent: true
+        money: false
+      - name: get-public-ask-waiver
+        description: >
+          Public effective-gate read for the signup page; alreadyOnFile for
+          signed-in humans. Mirrors get-public-volunteer-waiver.
+        input: askId, optional actor
+        output: waiverRequired, waiver {id,name,body,version} | null, alreadyOnFile
+        idempotent: true
+        money: false
+      - name: submit-volunteer-signup (modified)
+        description: >
+          Arm resolveWaiverGate from the ask for non-EVENT signups; record
+          acceptance in-tx (existing code path, new arming source).
+        input: existing submit input (waiverAccepted already present)
+        output: unchanged
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - VolunteerRepo (ask read/update extended with waiverTemplateId; roster row gains waiver flag)
+      - WaiverTemplatesRepo (getById, list — reuse)
+      - VolunteerWaiverAcceptancesRepo (findCurrentForHuman, create — reuse)
+
+  adapters:
+    new: []
+    existing:
+      - packages/adapters/src/db/prisma/volunteering.ts (ask mapping + setter, roster join)
+
+  transport:
+    trpc_procedures:
+      - volunteer.asks.assignWaiver (authed; resolveAskOwnership inside use case)
+      - volunteer.public.ask.waiver (public/optional actor)
+    webhooks: []
+
+  ui:
+    pages:
+      - /v/[askId] (waiver section)
+      - /admin/[slug]/volunteers/asks/[askId] (picker in AskManageView)
+    components:
+      - AskWaiverSection (new; adapted from EventWaiverSection)
+      - PublicAskView waiver body + checkbox (modified)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models:
+    - VolunteerAsk (+ waiverTemplateId String?, relation, index)
+    - WaiverTemplate (+ asks back-relation)
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Cross-owner template assignment (org A's ask pointing at org B's or a
+      stranger human's template) would show the wrong legal document.
+    severity: HIGH
+    mitigation: >
+      Ownership validation inside assign-waiver-to-ask + negative-path tests
+      (org mismatch, human mismatch, platform-template allowed).
+  - risk: >
+      Template creation dead-end: if create/assemble UI is only reachable via
+      the (flag-gated, removal-slated) event builder, ask owners can't mint
+      templates at all.
+    severity: LOW
+    mitigation: >
+      FR-010's platform default is the zero-effort path; FR-007 additionally
+      gives the ask editor its own create/assemble entry, not gated by
+      ENABLE_WAIVERS. Verify human-owned template creation works (schema
+      supports it; UI may have only exercised org-owned).
+  - risk: >
+      Owners with existing waiverRequired=true asks may believe they're already
+      covered; the gate stays inert until they assign a template.
+    severity: MEDIUM
+    mitigation: >
+      Editor hint (FR-007) + release note. Consider a one-time dashboard nudge
+      (out of scope here).
+
+open_questions:
+  - Unify EVENT-subject asks onto ask-level templates later (single source of
+    truth), or keep event-level assignment forever?
+  - Timing of the attendee/checkout waiver removal — determines whether
+    EventWaiverSection components are shared or lifted-and-owned by the ask
+    editor.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Attendee/checkout waivers and their removal (separate decision — but do not
+    delete the WaiverTemplate substrate; volunteer acceptances FK it)
+  - Per-role waivers within one ask
+  - Acceptance expiry / re-acceptance campaigns
+  - Signature capture, PDF export of acceptance records
+  - EVENT-subject asks overriding their event's waiver
+  - Coordinator-facing acceptance detail views (roster badge only)
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - Direct tRPC submit to an armed ask without waiverAccepted fails
+    waiver_required (PRECONDITION_FAILED); UI checkbox cannot be bypassed.
+  - Accepted ask signup writes exactly one VolunteerWaiverAcceptance in the
+    same transaction with correct waiverVersion + SHA-256 body hash + IP/UA;
+    a failed signup tx leaves no acceptance row.
+  - Returning volunteer with an acceptance for the same template+version sees
+    "already on file", is not re-prompted, and no duplicate row is created.
+  - Editing the template body bumps version; the next signup by a previously
+    covered volunteer re-requires acceptance.
+  - /v/[askId] renders the waiver body when armed and renders no checkbox when
+    waiverRequired is set but no template is assigned.
+  - assign-waiver-to-ask rejects cross-owner templates and EVENT-subject asks;
+    allows platform templates; supports clearing.
+  - Ask roster shows waiver-accepted state per signup.
+  - Existing asks and event-path behavior are unchanged by the migration
+    (typecheck + full volunteering suite green).

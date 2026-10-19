@@ -7,6 +7,10 @@ import {
   extractFirstUrlFromMailpitMessage,
 } from "./helpers/mailpit";
 import { createE2eTrpcClient, signInAndGetToken } from "./helpers/trpc";
+import {
+  signInViaAccountOverlay,
+  signUpWithPassword,
+} from "./helpers/sign-in";
 
 /**
  * E2E tests for the application-gated event flow:
@@ -75,33 +79,14 @@ test.describe("Application Gate – Attendee submission", () => {
     const attendeePassword = "Password123!";
 
     // Sign up
-    await page.goto("/sign-up");
-    const signUpForm = page.getByTestId("auth-sign-up-form");
-    if (!(await signUpForm.isVisible())) {
-      const signInForm = page.getByTestId("auth-sign-in-form");
-      if (!(await signInForm.isVisible())) {
-        await page.getByTestId("navbar-account").click();
-        await expect(signInForm).toBeVisible({ timeout: 10_000 });
-      }
-      await page.getByTestId("auth-sign-in-create-account").click();
-    }
-    await expect(signUpForm).toBeVisible({ timeout: 10_000 });
-
-    await signUpForm.getByPlaceholder("Jane Doe").fill("Application Attendee");
-    await signUpForm.getByPlaceholder("janedoe").fill(`attendeeapp${uid}`);
-    await signUpForm.getByPlaceholder("you@example.com").fill(attendeeEmail);
-    await signUpForm
-      .getByPlaceholder("••••••••")
-      .first()
-      .fill(attendeePassword);
-    await signUpForm.getByPlaceholder("••••••••").nth(1).fill(attendeePassword);
-    await page.getByTestId("auth-sign-up-submit").click();
-
-    await expect(page.getByTestId("auth-sign-up-form")).not.toBeVisible({
-      timeout: 15_000,
-    });
-    await page.waitForURL((url) => !url.pathname.startsWith("/sign-up"), {
-      timeout: 30_000,
+    // Create the account through the UI. The ritual — including the
+    // `auth-sign-up-expand-form` disclosure the email form lives behind —
+    // is in `helpers/sign-in.ts`.
+    await signUpWithPassword(page, {
+      displayName: "Application Attendee",
+      username: `attendeeapp${uid}`,
+      email: attendeeEmail,
+      password: attendeePassword,
     });
 
     // Verify email via Mailpit
@@ -115,13 +100,12 @@ test.describe("Application Gate – Attendee submission", () => {
     // Sign in
     await page.goto("/");
     await page.waitForLoadState("networkidle");
-    await page.getByTestId("navbar-account").click();
-    const signInForm = page.getByTestId("auth-sign-in-form");
-    await expect(signInForm).toBeVisible({ timeout: 10_000 });
-    await signInForm.getByPlaceholder("you@example.com").fill(attendeeEmail);
-    await signInForm.getByPlaceholder("••••••••").fill(attendeePassword);
-    await signInForm.getByRole("button", { name: "Sign in" }).click();
-    await expect(signInForm).not.toBeVisible({ timeout: 15_000 });
+    // Overlay flavour: no navigation, so success is the card closing.
+    // The two-step credential flow lives in `helpers/sign-in.ts`.
+    await signInViaAccountOverlay(page, {
+      email: attendeeEmail,
+      password: attendeePassword,
+    });
 
     // ── Navigate to the gated event ─────────────────────────────────────
     await page.goto(`/events/${seed.eventSlug}`);

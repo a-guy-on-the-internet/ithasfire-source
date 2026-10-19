@@ -1,0 +1,132 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Notification — Feedback requests, digest subscriptions/logs, notifications.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model FeedbackRequest {
+  id          String                    @id @default(uuid())
+  eventId     String
+  orderId     String
+  humanId     String
+  status      FeedbackRequestStatus     @default(PENDING)
+  channel     NotificationDigestChannel @default(EMAIL)
+  sendAfter   DateTime
+  sentAt      DateTime?
+  respondedAt DateTime?
+  payloadHash String?
+  metadata    Json?
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  human Human @relation(fields: [humanId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([orderId, humanId])
+  @@index([status, sendAfter])
+  @@index([humanId, status])
+  @@index([eventId])
+}
+
+model NotificationDigestSubscription {
+  id             String                 @id @default(uuid())
+  humanId        String
+  digestType     NotificationDigestType
+  subscribed     Boolean                @default(true)
+  unsubscribedAt DateTime?
+  reason         String?
+
+  /// SOFT auto-suppression counter (attendee-prompt-delivery-hygiene FR-003/004):
+  /// number of consecutive weekly digests sent with no review submitted since.
+  /// Reset to 0 whenever the human reviews something; at >= 3 the email is
+  /// suppressed (in-app is never suppressed). Distinct from `subscribed=false`,
+  /// which is the HARD, user-chosen opt-out.
+  consecutiveIgnored Int       @default(0)
+  /// When the most recent digest of this type was emailed to the human. Drives
+  /// the "reviewed since last digest?" re-engagement reset (FR-004a).
+  lastDigestSentAt   DateTime?
+
+  human Human @relation(fields: [humanId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([humanId, digestType])
+  @@index([digestType, subscribed])
+}
+
+model NotificationDigestLog {
+  id          String                    @id @default(uuid())
+  humanId     String
+  orgId       String?
+  eventId     String?
+  digestType  NotificationDigestType
+  channel     NotificationDigestChannel
+  payloadHash String
+  templateKey String
+  metadata    Json?
+  sentAt      DateTime                  @default(now())
+
+  human Human         @relation(fields: [humanId], references: [id], onDelete: Cascade)
+  org   Organization? @relation(fields: [orgId], references: [id], onDelete: SetNull)
+  event Event?        @relation(fields: [eventId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@unique([digestType, channel, payloadHash])
+  @@index([humanId, digestType, sentAt])
+  @@index([orgId, digestType, sentAt])
+  @@index([eventId, digestType, sentAt])
+}
+
+model Notification {
+  id                 String           @id @default(uuid())
+  humanId            String
+  title              String?
+  body               String
+  kind               NotificationKind
+  metadata           Json?
+  tags               String[]         @default([])
+  expiresAt          DateTime?
+  readAt             DateTime?
+  actionLabel        String?
+  actionHref         String?
+  actionRoute        String?
+  templateKey        String?
+  templateVersion    String?
+  templateVariables  Json?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  human Human @relation(fields: [humanId], references: [id], onDelete: Cascade)
+
+  @@index([humanId, createdAt])
+  @@index([humanId, readAt])
+  @@index([expiresAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NotificationPreference — Per-human, per-scope channel/category overrides.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model NotificationPreference {
+  id        String                          @id @default(uuid())
+  humanId   String
+  scopeKind NotificationPreferenceScopeKind @default(GLOBAL)
+  /// Empty string for non-ORG scopes; UUID for ORG scope.
+  orgId     String                          @default("")
+  /// Empty string for non-EVENT scopes; UUID for EVENT scope.
+  eventId   String                          @default("")
+
+  /// JSON blob storing the preference delta (categories + channels overrides).
+  /// Shape: { categories?: Record<category, bool>, channels?: { email?: ..., sms?: ..., push?: ..., in_app?: ... } }
+  delta     Json                            @default("{}")
+
+  human Human @relation(fields: [humanId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([humanId, scopeKind, orgId, eventId])
+  @@index([humanId, scopeKind])
+}

@@ -59,23 +59,33 @@ function makeTracker() {
   };
 }
 
+/**
+ * A registry HANDLE, which is what `getJob` returns: eager metadata plus a
+ * `load()` that imports the handler module on dispatch. `input` and `handler`
+ * are also exposed on the handle purely so tests can reach the spies — the
+ * app only ever sees them through `load()`.
+ */
 function makeJob(
   overrides: {
     handler?: (args: { input: unknown; ctx: unknown }) => Promise<unknown>;
+    /** Make the handler module fail to import. */
+    load?: () => Promise<unknown>;
   } = {},
 ) {
+  const input = { parse: vi.fn((value: unknown) => value ?? {}) };
+  const handler = vi.fn(
+    overrides.handler ??
+      (async () => ({
+        ok: true,
+      })),
+  );
+
   return {
     name: "demo.job",
     notify: true,
-    input: {
-      parse: vi.fn((input: unknown) => input ?? {}),
-    },
-    handler: vi.fn(
-      overrides.handler ??
-        (async () => ({
-          ok: true,
-        })),
-    ),
+    input,
+    handler,
+    load: vi.fn(overrides.load ?? (async () => ({ name: "demo.job", input, handler }))),
   };
 }
 
@@ -294,6 +304,126 @@ describe("jobs app lifecycle observability", () => {
     await app.close();
   });
 
+  it("fails only that job — 503 + typed code — when its handler module will not import", async () => {
+    const { AppError } = await import("@th/errors");
+    const cause = new Error("Cannot find module './settlements'");
+    const job = makeJob({
+      load: async () => {
+        throw new AppError("JOB_MODULE_LOAD_FAILED", {
+          message: 'Job "demo.job" could not run: its handler module "demo" failed to import.',
+          meta: { job: "demo.job", module: "demo" },
+          cause,
+        });
+      },
+    });
+
+    const { app, tracker } = await makeApp(job);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/jobs/demo.job",
+      payload: {},
+    });
+
+    // 503, not 400: the request is well-formed and the caller is blameless —
+    // the SERVER cannot service it. Same code as the migration-drift 503, and
+    // distinguishable from a 400 in Cloud Scheduler's job status. It buys no
+    // retry (the generated schedulers set retryCount = 0); `Retry-After` is
+    // parity with the drift 503 for any caller that does honour it.
+    expect(response.statusCode).toBe(503);
+    expect(response.headers["retry-after"]).toBe("60");
+    expect(response.json()).toMatchObject({ error: "JOB_MODULE_LOAD_FAILED" });
+
+    // The handler was never reached, but the run was still recorded and the
+    // failure still reported — it is an incident, not a silent no-op.
+    expect(job.handler).not.toHaveBeenCalled();
+    expect(tracker.record).toHaveBeenCalledWith(
+      expect.objectContaining({ jobName: "demo.job", status: "error" }),
+    );
+    expect(captureExceptionMock).toHaveBeenCalled();
+
+    // The service is still up and the registry is intact: another request
+    // still routes.
+    const stillAlive = await app.inject({ method: "GET", url: "/health" });
+    expect(stillAlive.statusCode).toBe(200);
+
+    await app.close();
+  });
+
+  it("captures a repeating module-load failure ONCE per process, but logs every tick", async () => {
+    // A module that will not import is usually a PERMANENT fault, and the
+    // registry no longer crashes the service at boot over it — so the owning
+    // job just keeps failing on its cron. Without a latch, a job on a
+    // two-minute cron would file ~720 Sentry events a day for one unchanging
+    // fault. Mirrors the `driftReported` latch in the same file.
+    const { AppError } = await import("@th/errors");
+    const job = makeJob({
+      load: async () => {
+        throw new AppError("JOB_MODULE_LOAD_FAILED", {
+          message: "boom",
+          meta: { job: "demo.job", module: "moderation" },
+        });
+      },
+    });
+
+    const { app, logger, tracker } = await makeApp(job);
+
+    for (let tick = 0; tick < 5; tick++) {
+      const response = await app.inject({
+        method: "POST",
+        url: "/jobs/demo.job",
+        payload: {},
+      });
+      expect(response.statusCode).toBe(503);
+    }
+
+    // ONE Sentry event for five ticks.
+    expect(captureExceptionMock).toHaveBeenCalledTimes(1);
+
+    // Every tick still logs and still records a run — the fault stays visible
+    // in Cloud Logging and in run history, it just stops paging.
+    // `logAndReport` logs via `logger.log(level, message, extra)`.
+    const errorLogs = logger.log.mock.calls
+      .filter(([, message]) => message === "job_error")
+      .map(([, , extra]) => ["job_error", extra] as const);
+    expect(errorLogs).toHaveLength(5);
+    expect(tracker.record).toHaveBeenCalledTimes(5);
+
+    // The suppressed ticks say so, so a reader is not left wondering why
+    // Sentry has one event and Cloud Logging has five lines.
+    expect(errorLogs[0]![1]).not.toMatchObject({ captureSuppressed: true });
+    for (const [, extra] of errorLogs.slice(1)) {
+      expect(extra).toMatchObject({ captureSuppressed: true });
+    }
+
+    await app.close();
+  });
+
+  it("latches the capture per MODULE, so a second broken module still reports", async () => {
+    const { AppError } = await import("@th/errors");
+    const failing = (module: string) => async () => {
+      throw new AppError("JOB_MODULE_LOAD_FAILED", {
+        message: "boom",
+        meta: { job: "demo.job", module },
+      });
+    };
+
+    const job = makeJob({ load: failing("moderation") });
+    const { app } = await makeApp(job);
+
+    await app.inject({ method: "POST", url: "/jobs/demo.job", payload: {} });
+    await app.inject({ method: "POST", url: "/jobs/demo.job", payload: {} });
+    expect(captureExceptionMock).toHaveBeenCalledTimes(1);
+
+    // A DIFFERENT broken module is a different fault and must not be masked by
+    // the first one's latch.
+    job.load.mockImplementation(failing("settlements"));
+    await app.inject({ method: "POST", url: "/jobs/demo.job", payload: {} });
+    expect(captureExceptionMock).toHaveBeenCalledTimes(2);
+
+    await app.close();
+  });
+
   it("does NOT capture a ZodError (invalid input, not an incident)", async () => {
     const job = makeJob();
     // Force input validation to fail with a ZodError.
@@ -312,6 +442,110 @@ describe("jobs app lifecycle observability", () => {
     expect(response.statusCode).toBe(400);
     expect(response.json()).toMatchObject({ error: "invalid_input" });
     expect(captureExceptionMock).not.toHaveBeenCalled();
+
+    await app.close();
+  });
+});
+
+/**
+ * `lineup-notices.continue-sweep` refuses to run without the API's ledger or
+ * without a mailer, and a refusal is only useful if Cloud Tasks RETRIES it.
+ * That depends entirely on the HTTP status, which no handler-level test can
+ * see: app.ts answers `{ success: true, result }` with a 200 for ANY value a
+ * handler returns, so a refusal that returns `{ success: false }` is read as
+ * delivered, the hop is consumed, and the chain ends with nothing queued.
+ * These two drive the real handler through the real route for the status code.
+ */
+describe("a job that refuses by throwing answers non-2xx (Cloud Tasks retries)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    delete process.env.GCP_PROJECT_ID;
+  });
+
+  afterEach(async () => {
+    vi.resetModules();
+  });
+
+  async function makeLineupSweepApp(ctxOverrides: Record<string, unknown>) {
+    const { continueLineupNoticeSweepJob } = await import(
+      "../jobs/lineup-notices"
+    );
+    // The registry handle shape, with the REAL input schema and handler.
+    const job = {
+      name: continueLineupNoticeSweepJob.name,
+      notify: true,
+      input: continueLineupNoticeSweepJob.input,
+      handler: continueLineupNoticeSweepJob.handler,
+      load: vi.fn(async () => continueLineupNoticeSweepJob),
+    };
+    const logger = makeLogger();
+    const reportError = vi.fn();
+
+    buildContainerMock.mockResolvedValue({
+      logger,
+      runTracker: makeTracker(),
+      diagnostics: null,
+      env: {},
+      close: vi.fn(async () => undefined),
+      reportError,
+      ...ctxOverrides,
+    });
+    getJobMock.mockReturnValue(job);
+
+    const { createApp } = await import("../app");
+    const { app } = await createApp();
+    // createApp's migration-drift probe reports once here: this container has
+    // no prisma, which is an INDETERMINATE outcome (reported, resolves
+    // healthy). Clear it so the assertions below see only the handler's own
+    // report.
+    reportError.mockClear();
+    return { app, reportError, jobName: job.name };
+  }
+
+  it("500s with no lineupNoticeLedger, instead of a 200 that ends the chain", async () => {
+    const { app, reportError, jobName } = await makeLineupSweepApp({
+      // Absent on purpose. mailer is irrelevant: the ledger is checked first.
+      mailer: { send: vi.fn() },
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/jobs/${jobName}`,
+      payload: { eventId: "11111111-1111-4111-8111-111111111111", attempt: 1 },
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toMatchObject({ error: "internal_error" });
+    expect(reportError).toHaveBeenCalledTimes(1);
+    expect(reportError.mock.calls[0]![1]).toMatchObject({
+      tags: { job: "lineup-notices.continue-sweep", reason: "no_ledger" },
+    });
+
+    await app.close();
+  });
+
+  it("500s with no mailer, instead of a 200 that would commit in-app-only notices for 10 years", async () => {
+    const { app, reportError, jobName } = await makeLineupSweepApp({
+      lineupNoticeLedger: {
+        begin: vi.fn(),
+        commit: vi.fn(),
+        get: vi.fn(),
+      },
+      mailer: null,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/jobs/${jobName}`,
+      payload: { eventId: "11111111-1111-4111-8111-111111111111", attempt: 1 },
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toMatchObject({ error: "internal_error" });
+    expect(reportError).toHaveBeenCalledTimes(1);
+    expect(reportError.mock.calls[0]![1]).toMatchObject({
+      tags: { job: "lineup-notices.continue-sweep", reason: "no_mailer" },
+    });
 
     await app.close();
   });

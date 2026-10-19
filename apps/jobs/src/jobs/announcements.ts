@@ -7,6 +7,7 @@
 import { defineJob } from "../lib/define-job";
 import { notify as notifyUseCase } from "@th/core/use-cases/comms/notify";
 import { announcementNotifyJobInputSchema } from "@th/core/use-cases/announcements";
+import { eventPublicPath } from "@th/core/lib/public-urls";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // announcements.dispatch-notifications
@@ -29,6 +30,27 @@ export const dispatchNotifications = defineJob({
       humanCount: humanIds.length,
     });
 
+    // ONE lookup per batch: the action must route by SLUG — the public event
+    // route resolves by slug / slug history only, so an id route 404s.
+    // Best-effort; a failure costs the button, not the notification.
+    let eventRoute: string | null = null;
+    if (eventId) {
+      try {
+        const event = await ctx.repos.events.getById(eventId);
+        eventRoute = eventPublicPath(event?.slug);
+      } catch (error) {
+        ctx.logger.error("announcements.dispatch-notifications.route_failed", {
+          announcementId,
+          eventId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        ctx.reportError?.(error, {
+          tags: { area: "announcements", reason: "event-route-failed" },
+          extra: { announcementId, eventId },
+        });
+      }
+    }
+
     let notifiedCount = 0;
     let failedCount = 0;
 
@@ -41,6 +63,7 @@ export const dispatchNotifications = defineJob({
             idempotency: ctx.idempotency,
             push: ctx.push ?? undefined,
             logger: ctx.logger,
+            reportError: ctx.reportError,
           },
           {
             humanId,
@@ -49,8 +72,8 @@ export const dispatchNotifications = defineJob({
               category: "organizerMessages",
               body: subject,
               kind: "INFO",
-              action: eventId
-                ? { label: "View event", route: `/events/${eventId}` }
+              action: eventRoute
+                ? { label: "View event", route: eventRoute }
                 : undefined,
               metadata: {
                 announcementId,

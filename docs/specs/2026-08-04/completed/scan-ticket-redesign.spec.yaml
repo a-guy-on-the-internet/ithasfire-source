@@ -1,0 +1,835 @@
+# scan-ticket-redesign.spec.yaml
+#
+# Redesign of the ticket-scanning surfaces: the native scanner app's unified
+# scan flow (apps/scanner) and the existing web admin scan page
+# (apps/web/src/app/admin/[slug]/scan). Door-operator UX under door-operator
+# conditions: dark room, loud PA, one hand, flaky venue wifi.
+#
+# REALITY CHECK ENCODED UP FRONT: the current scanner is far more complete
+# than institutional memory says. Project memory claims "SCANNER NOT migrated
+# to @th/ui-native" — that is STALE: unified-scan-screen.tsx:48-61 imports
+# ScreenSurface/SquareCard/TopBar/useThemedSheet from @th/ui-native, App.tsx:160
+# mounts NativeThemeProvider, and DEFAULT_NATIVE_THEME is already "stub"
+# (packages/ui-native/src/palette.ts:416). Likewise, most features a scan
+# redesign would naively propose ALREADY EXIST: torch toggle
+# (src/ui/torch-button.tsx), brightness boost (src/lib/use-brightness-boost.ts),
+# manual code entry + unified person search (unified-scan-screen.tsx:429-472,
+# unified-search-screen.tsx), recent-scans strip with a 30s undo
+# (src/screens/recent-scans-strip.tsx:17), offline admit queue with exponential
+# backoff (src/lib/use-scan-queue.ts), a synced SQLite ticket/people manifest
+# (src/lib/local-db.ts, src/lib/use-local-sync.ts), scanned/total capacity
+# counter (src/screens/home-screen.tsx:50-63,144-212), event-selector
+# persistence in SecureStore (src/lib/storage.ts:3-24,
+# src/scanner-app.tsx:198), haptic+sound outcome feedback (src/lib/feedback.ts),
+# and a11y result announcements (unified-result-view.tsx:157-215).
+#
+# This spec therefore does NOT re-specify what shipped. It closes the gaps a
+# code audit actually found — the biggest being that the RESOLVE step is
+# online-only while everything around it (manifest, admit queue) is
+# offline-first — and finishes the last mile of visual/feedback design for
+# dark-venue, one-handed operation.
+#
+# Companion doc: docs/decisions/scanner-distribution-native-internal-tracks.md owns
+# HOW operators get the scanner (store listings, onboarding email, install
+# URLs, the dead /invitations/accept link). This spec owns what the scan
+# surfaces look like and do. The ONE overlap — the web page's missing
+# fallback QR decoder on iOS Safari (that memo's "actually broken" item 4) —
+# is specified here as FR-012 because it is a scan-surface capability;
+# the memo references it as a prerequisite for its Option B.
+
+version: "1.0"
+updated: "2026-08-04"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Three findings from auditing the scan surfaces in code. (1) The offline
+    story has a hole in the middle: the scanner syncs a full local ticket
+    manifest and queues admits offline, but the resolve step — camera decode
+    to "who is this / can they come in" — is a server-only
+    utils.scan.resolvePayload.fetch (unified-scan-screen.tsx:138-141), so
+    with no connectivity the camera path dies with an error banner while the
+    answer sits in SQLite on the device. Undo and volunteer check-in are
+    likewise online-only mutations. (2) Throughput and feedback are tuned for
+    a desk, not a door: every admission costs two taps and three server round
+    trips (resolve, admit, re-resolve — unified-scan-screen.tsx:200-204), the
+    result renders as a bordered card in a scroll region rather than an
+    unmissable full-screen state, and the audio cues are one ~40-byte
+    embedded WAV click replayed at three playback rates
+    (src/lib/feedback.ts:57-63) — indistinguishable over a PA, atop the
+    deprecated expo-av. Already-scanned and wrong-event share one "warning"
+    haptic (unified-scan-screen.tsx:119-130), so in the dark the operator
+    must read to tell "seen this ticket" from "wrong show". (3) The web scan
+    page is TWO implementations behind a feature gate
+    (apps/web/src/app/admin/[slug]/scan/page.tsx:207-222): the legacy branch
+    admits a camera-decoded ticket IMMEDIATELY with no confirmation step
+    (page.tsx:333-342 — decode calls scanTicket directly), relies on
+    BarcodeDetector with no fallback (page.tsx:910-912; iOS Safari cannot
+    camera-scan), and drifts from the unified branch's status copy — the
+    scanner handles VOID but not LISTED (unified-result-view.tsx:482-491),
+    the web unified view handles LISTED but not VOID and mislabels INVALID
+    as "Voided" (UnifiedScanView.tsx:1205-1219).
+  solution: >
+    Local-first resolve: when the device is offline (or the resolver fails
+    network-classified), resolve ticket codes against the already-synced
+    manifest and render an explicitly-labelled offline result that can admit
+    through the existing queue — never a dead end, never a fabricated pass.
+    Door-mode presentation: full-screen tone result states (colour + icon +
+    text + distinct haptic + distinct tone per outcome, reduced-motion-safe),
+    an opt-in express auto-admit for VALID scans that collapses admission to
+    zero taps with the undo strip as the safety net, and a persistent stats
+    strip (admitted/total, queue depth, offline state) on the scan screen
+    itself. Reach: scan-screen controls consolidated into a bottom rail
+    inside one-handed thumb reach. One status-copy source shared by both
+    surfaces, covering all six ticket statuses. On the web: delete the
+    legacy branch (and with it the confirm-less camera admit), make
+    UnifiedScanView the only implementation, and add a WASM fallback decoder
+    so iPhone browsers can actually scan. Design-system position: the
+    scanner is ALREADY on @th/ui-native + Stub default — the FR here is to
+    finish the residual hybrid (Tamagui YStack/@th/ui Text islands), not to
+    migrate.
+  users:
+    - Door operators (org OWNER / ADMIN / EDITOR / SCANNER) scanning tickets
+      and volunteer passes at entry, often in the dark, one-handed, offline
+    - Organizers using the web admin scan page as a no-install fallback
+    - Volunteers presenting signed QR passes (scanned, not scanning)
+  surfaces:
+    - mobile (apps/scanner — primary)
+    - web (/admin/[slug]/scan — secondary, exists today)
+    - api (touched, not extended — see architecture)
+
+# ── Current-state inventory (all claims cite file:line) ──────────────────────
+#
+# Kept in the spec because the redesign's scope is defined by what already
+# exists; reviewers should diff FRs against this, not against assumptions.
+
+current_state:
+  scanner_app:
+    - surface: unified scan screen
+      file: apps/scanner/src/screens/unified-scan-screen.tsx
+      notes: >
+        Three modes (camera | search | code-entry, :73). expo-camera
+        CameraView, QR-only barcode settings (:350-357). Camera hard-pauses
+        while a result/error is showing (:310-314). Torch overlay top-right
+        (:365-369 via ui/torch-button.tsx; 44x44 per styles.cameraControl,
+        packages/ui-native/src/styles.ts:345). 220x220 fixed viewfinder
+        centered in a flex camera frame, minHeight 320
+        (packages/ui-native/src/styles.ts:53-76). Manual code entry is a
+        52px keyboard-icon button + uppercase-transformed input
+        (:429-493). Bulk "admit all N from this order" from local order
+        lookup (:260-300). Session context typed inline because the scanner
+        tsconfig cannot follow transitive @th/trpc types (:31-47 — same
+        duplication in unified-result-view.tsx:25-94).
+    - surface: result view
+      file: apps/scanner/src/screens/unified-result-view.tsx
+      notes: >
+        Discriminated union volunteer | ticket | wrong_event | unknown
+        (:90-94), unknown differentiates malformed / ticket_not_found /
+        signature_failed (:96-100). Four redundant signals per result
+        (border, badge, header icon, label — :127-136). VoiceOver/TalkBack
+        announcement on entry (:157-215). VIP ticket-type call-out by name
+        regex (:436-438). No auto-dismiss by design (spec
+        docs/specs/2026-04-25/unified-scan-resolver.spec.yaml FR-009).
+        GAP: no LISTED copy — only REFUNDED and VOID (:482-491).
+    - surface: feedback
+      files:
+        - apps/scanner/src/lib/feedback.ts
+        - apps/scanner/src/lib/haptics.ts
+      notes: >
+        Three kinds (success | warning | error) mapping to expo-haptics
+        notification types and one data-URI WAV click pitched by playback
+        rate 1.5/1.0/0.6 (feedback.ts:57-63) via require("expo-av")
+        (deprecated upstream). Prefs (sound/haptics) live in SecureStore and
+        are pushed into a module singleton (scanner-app.tsx:165-172).
+    - surface: offline
+      files:
+        - apps/scanner/src/lib/local-db.ts
+        - apps/scanner/src/lib/use-scan-queue.ts
+        - apps/scanner/src/lib/use-local-sync.ts
+      notes: >
+        SQLite manifest of events/tickets/people (FTS5 with LIKE fallback),
+        60s sync loop + focus kick (use-local-sync.ts:18,
+        scanner-app.tsx:173-179). Admit queue: FIFO, 15s flush, 8 attempts,
+        5s→30m backoff, permanent-error rows dropped so one bad scan never
+        stalls the queue (use-scan-queue.ts:13-29,117-156). Terminal drops
+        are SILENT (use-scan-queue.ts:118-124). markTicketScannedLocally
+        gives optimistic local state (local-db.ts:232-238). GAP: resolve is
+        never served from this manifest.
+    - surface: home / stats
+      file: apps/scanner/src/screens/home-screen.tsx
+      notes: >
+        Admitted counter scanned/total with 90%/100% capacity alerts and
+        reduced-motion-aware pulse (:50-88,144-212), queue badge (:105-113).
+        GAP: none of this is visible on the scan screen itself.
+    - surface: undo
+      file: apps/scanner/src/screens/recent-scans-strip.tsx
+      notes: >
+        Last 5 scans, 30s countdown undo via tickets.revertTicketScan
+        (:17,:38-54). Online-only; hidden while a result is displayed
+        (unified-scan-screen.tsx:397-399).
+    - surface: design system
+      files:
+        - apps/scanner/App.tsx
+        - packages/ui-native/src/palette.ts
+      notes: >
+        NativeThemeProvider mounted (App.tsx:160), default theme "stub"
+        (palette.ts:416), camera chrome deliberately FIXED dark
+        (styles.ts:53-76, torch-button.tsx:15-25). Residual hybrid: Text
+        from @th/ui and raw tamagui YStack in home-screen.tsx:10-12 and
+        others. The off-palette colour gate is a WEB lint
+        (apps/web/scripts/lint-color-fallbacks.mjs) — apps/scanner has no
+        equivalent gate.
+  web_scan_page:
+    - file: apps/web/src/app/admin/[slug]/scan/page.tsx
+      notes: >
+        Feature-gated fork (:207-222): gates.unifiedScanResolver →
+        UnifiedScanView, else LegacyScanView. Legacy camera decode calls
+        tickets.scanTicket with NO confirm step (:333-342); legacy search
+        path does confirm (:545-696). BarcodeDetector-only decode with an
+        honest but weak fallback message (:910-912). CAB links exist at
+        bar-configs.ts:1666,1870-1876 (the admin bottom-bar "Scan" item
+        routes to /admin/:slug/scan).
+    - file: apps/web/src/app/admin/[slug]/scan/_components/UnifiedScanView.tsx
+      notes: >
+        Near-parity port of the native flow: event auto-select (soonest
+        upcoming, :273-285), camera/search toggle, paste-a-code fallback
+        (:804-835), volunteer rows resolve via mintScanToken (:400-445).
+        Raw <select> with inline styles for the event picker (:580-610).
+        No torch, no sound/haptic, no offline, session scan counter only
+        (:303). Status copy drift vs native (LISTED present, VOID absent,
+        INVALID labelled "Voided", :1205-1219).
+  server:
+    - file: packages/transport/trpc/src/routers/scan.ts
+      notes: >
+        scan.resolvePayload (authed, read-only, :96-116) and
+        scan.searchUnified (:125-180); both delegate to core use cases that
+        enforce ORG_SCAN_ROLES.
+    - file: packages/core/src/use-cases/tickets/scan-ticket.ts
+      notes: >
+        tickets.scanTicket: ORG_SCAN_ROLES = OWNER|ADMIN|EDITOR|SCANNER
+        (packages/core/src/lib/rbac.ts:39-44) via requireScannerAccessOnOrg;
+        idempotency key event+code+clientKey, TTL 10s, 2s time bucket
+        (:23-24); ±60min event-window grace (:29-31); >1km haversine
+        location-suspicion note (:32); outcomes ACCEPTED | REPLAY |
+        REJECTED(reason) (:72-102). No device binding — authz is the
+        operator's session; volunteer check-in additionally requires
+        OWNER|ADMIN|EDITOR (src/lib/role-gates.ts via
+        unified-scan-screen.tsx:113), so the SCANNER role sees a locked
+        check-in button by design.
+    - security_posture: >
+        Ticket codes are bearer credentials: held in SecureStore-backed
+        local state, purged on sign-out (local-db clearAll + auth store),
+        always selected by exact code/ID — never enumerated by index
+        (project memory: mobile offline QR pass). The manifest an offline
+        resolve would read is the same data scanner.getEventManifest
+        already authorizes per ORG_SCAN_ROLES.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+#
+# Phasing: FR-001..FR-010 are PHASE A (scanner app — the primary surface).
+# FR-011..FR-014 are PHASE B (web scan page alignment). Phase A ships alone;
+# Phase B is small and can trail. Every FR is a delta against current_state.
+
+requirements:
+  functional:
+    # ── Phase A — scanner app ────────────────────────────────────────────
+    - id: FR-001
+      phase: A
+      title: Offline-first resolve against the local manifest
+      description: >
+        When the network state is offline OR scan.resolvePayload fails with
+        a network-classified error, resolve ticket-code payloads locally:
+        parseTicketQrPayload (src/lib/qr.ts:6-31) → lookupTicketByCode
+        (local-db.ts:208-230) → a TicketResult-shaped outcome rendered
+        through the SAME UnifiedResultView, carrying a mandatory
+        provenance flag rendered as an "OFFLINE — local manifest as of
+        <synced_at>" badge. Status mapping is conservative: local VALID →
+        admittable (admit = markTicketScannedLocally + enqueueScan, the
+        existing optimistic path); local SCANNED → already-scanned state
+        with local scannedAt; any other local status or a code absent from
+        the manifest → "Can't verify offline" (danger), never a synthesized
+        VALID and never a synthesized "invalid ticket" claim — absence
+        offline is unknown, not invalid. An event mismatch against the
+        embedded hf:// eventId → wrong_event locally. Volunteer JWT
+        payloads are NOT verifiable offline (signature verification is
+        server-side, scan.ts:53-66): show an explicit "Volunteer passes
+        need a connection — use Lookup" state rather than the generic error
+        banner. Online behaviour is byte-identical to today; the server
+        remains the source of truth and the queue reconciles.
+    - id: FR-002
+      phase: A
+      title: Four distinct feedback signatures, real audio, expo-audio
+      description: >
+        Expand FeedbackKind from 3 to 4 outcome signatures — admit/valid
+        (success), already-scanned (distinct double-pulse haptic + its own
+        tone), wrong-event (distinct from already-scanned), rejected/unknown
+        (error) — ending the current collapse where already-scanned and
+        wrong-event share one "warning" (unified-scan-screen.tsx:119-130).
+        Replace the pitched single-click WAV (feedback.ts:57-63) with four
+        short bundled tones distinguishable over venue noise, and migrate
+        playback off deprecated expo-av onto expo-audio. Existing
+        sound/haptics preference toggles keep working unchanged; OS mute
+        switch still wins. Haptic fallback on devices without rich haptics
+        degrades to the current notification types.
+    - id: FR-003
+      phase: A
+      title: Full-screen door-mode result states
+      description: >
+        On resolve, the result presents as a full-bleed tone state over the
+        camera area — background fill in the outcome tone (token-derived
+        tint, not raw hex), oversized icon, holder name + ticket type at
+        glanceable size, status badge — replacing the current
+        bordered-card-in-a-scroll-region as the FIRST signal (detail
+        content, bulk-admit, also-volunteering sections remain below the
+        fold of the state, scrollable). Colour is never the only channel
+        (icon + text + badge retained — DS rule already honoured at
+        unified-result-view.tsx:127-136). Reduced-motion: static fill, no
+        flash/strobe animation ever (capacity-pulse precedent,
+        home-screen.tsx:67-88). Contrast: text on tone fills ≥4.5:1, icons
+        ≥3:1, measured against BOTH Ember and Stub palettes (the
+        surfaceStrong-on-Stub 1.00:1 collapse is the known failure class).
+        Dismiss remains explicit (tap anywhere on the state or the sticky
+        button) EXCEPT under FR-004 express mode.
+    - id: FR-004
+      phase: A
+      title: Express mode — zero-tap admit for VALID scans (opt-in)
+      description: >
+        A per-device "Auto-admit valid tickets" toggle (default OFF, lives
+        with sound/haptics in ScannerPreferences + settings screen). When
+        ON: a VALID ticket resolve immediately admits through the existing
+        optimistic path (markTicketScannedLocally + scanTicket mutation
+        with the standing queue fallback), shows the FR-003 green state for
+        ~1.2s with holder name, then auto-dismisses and re-arms the camera
+        — zero taps, one round trip. Every non-VALID outcome (SCANNED,
+        wrong_event, unknown, volunteer, REFUNDED/VOID/LISTED) halts
+        exactly as in manual mode — sticky state, explicit dismiss.
+        Same-order bulk admit does not auto-fire. The RecentScansStrip's
+        30s undo is the correction path and MUST remain reachable while
+        express mode cycles (strip stays visible between scans). Auto-admit
+        NEVER applies to a result resolved offline via FR-001 unless the
+        local status is VALID from a manifest synced within the last 10
+        minutes — staler than that, drop to manual confirm.
+    - id: FR-005
+      phase: A
+      title: Stats strip on the scan screen
+      description: >
+        A persistent single-line strip on the scan surface: admitted/total
+        for the selected event (getEventCounts, local-db.ts:285-295, same
+        source as Home), queue depth when >0 (reusing the Home badge
+        semantics, home-screen.tsx:105-113), and an offline indicator bound
+        to useNetworkState. Live-region polite; tapping it opens the Home
+        counter detail. The Home screen counter stays; this closes the
+        "operator must leave the scan screen to know the count" gap.
+    - id: FR-006
+      phase: A
+      title: Undo hardening
+      description: >
+        (a) Undoing a scan that is still queued (never server-acknowledged)
+        must cancel the queue row locally (removeQueuedScan) + revert local
+        status — no network needed, no server mutation for a scan the
+        server never saw. (b) Undo of server-acknowledged scans stays an
+        online-only tickets.revertTicketScan (deliberate: an offline-queued
+        revert racing the queued admit is a correctness trap — out of
+        scope). Offline, the undo button on acknowledged rows renders
+        disabled with an offline hint instead of failing with a generic
+        error haptic (recent-scans-strip.tsx:49-51). (c) The strip remains
+        visible during express-mode cycling per FR-004.
+    - id: FR-007
+      phase: A
+      title: One-handed control rail
+      description: >
+        Consolidate scan-screen controls into a bottom rail within thumb
+        reach: torch moves from the camera frame's top-right overlay
+        (torch-button.tsx:21-22 positioning note) down alongside the
+        existing Manual search / code-entry footer controls
+        (unified-scan-screen.tsx:474-494). All touch targets ≥44pt (torch
+        is 44x44 today, code-entry 52px — keep). Torch keeps its FIXED
+        camera-chrome colours and switch semantics. Nothing interactive
+        remains overlaid on the camera other than the (pointer-events:
+        none) viewfinder.
+    - id: FR-008
+      phase: A
+      title: Single status-copy source, all six statuses
+      description: >
+        One shared module (extend @th/ui-native or a small shared package
+        consumable by both apps/scanner and apps/web) mapping ticket status
+        → { label, tone, guidance copy } for VALID, SCANNED, INVALID,
+        REFUNDED, LISTED, VOID — fixing the scanner's missing LISTED
+        (unified-result-view.tsx:482-491), the web's missing VOID and its
+        INVALID-labelled-"Voided" (UnifiedScanView.tsx:1210-1214), and the
+        unknown-reason copy triplet duplicated in both files
+        (unified-result-view.tsx:96-100, UnifiedScanView.tsx:154-161).
+        LISTED guidance: "Listed for resale — do not admit." The
+        no-ticket-type-status-UI convention is untouched (these are TICKET
+        lifecycle statuses shown to operators, not DRAFT/ACTIVE
+        ticket-TYPE status).
+    - id: FR-009
+      phase: A
+      title: Design-system completion (not migration) + native colour gate
+      description: >
+        The scanner already runs @th/ui-native with Stub as the default
+        theme (App.tsx:160, palette.ts:416) — this FR finishes the
+        residue, not the migration: replace remaining raw tamagui
+        layout/typography islands in scan-flow screens (YStack in
+        home-screen.tsx:10, @th/ui Text imports across
+        screens/) with @th/ui-native primitives where an equivalent exists,
+        so the scan surfaces stop straddling two systems. Camera chrome
+        stays deliberately FIXED (styles.ts:53-76 rationale). Extend the
+        off-palette colour gate to the native side: a lint equivalent to
+        apps/web/scripts/lint-color-fallbacks.mjs covering apps/scanner +
+        packages/ui-native (raw-hex literals outside palette.ts/FIXED fail
+        CI). Per the no-grandfathering rule, existing raw hexes in scan-flow
+        files are migrated in this FR, then the gate lands.
+    - id: FR-010
+      phase: A
+      title: Queue terminal-drop visibility
+      description: >
+        A queued scan that exhausts MAX_ATTEMPTS is currently deleted
+        silently (use-scan-queue.ts:118-124) — an admitted-at-the-door
+        ticket the server never recorded, invisible to everyone. Surface
+        terminal drops: capture to Sentry via the scanner's existing client
+        (src/lib/sentry.ts) with event/ticket tags, and show a
+        non-blocking "N scans failed to sync" state on the FR-005 strip +
+        Home, with the failed rows listed in settings for manual retry.
+        Per the CLAUDE.md reporting convention this is a deliberate swallow
+        gaining a report — never a bare warn.
+
+    # ── Phase B — web scan page ──────────────────────────────────────────
+    - id: FR-011
+      phase: B
+      title: Kill the legacy web scan branch
+      description: >
+        Remove LegacyScanView and the gates.unifiedScanResolver fork
+        (page.tsx:207-222): UnifiedScanView becomes the only
+        implementation. This deletes the legacy camera path's
+        admit-without-confirmation (page.tsx:333-342) — after this FR, no
+        surface anywhere admits a ticket without either an explicit
+        operator tap or the operator having opted into FR-004 express mode
+        (which the web does not get). Unused legacy i18n keys are removed
+        from BOTH en/es catalogs (dual-catalog rule).
+    - id: FR-012
+      phase: B
+      title: Fallback QR decoder for browsers without BarcodeDetector
+      description: >
+        use-browser-camera falls back to a bundled WASM/JS QR decoder
+        (zxing-wasm or jsQR over rVFC frame grabs) when BarcodeDetector is
+        absent — primarily iOS Safari, which today silently degrades to
+        name lookup (page.tsx:910-912). This is the scanner-distribution
+        memo's broken-item 4; that memo depends on this FR for its Option
+        B ("web scanning works on iPhones") and does not re-specify it.
+        Decode loop throttled (≤10fps analysis) to keep laptop/phone CPU
+        sane; camera keeps the existing enabled-gate semantics
+        (UnifiedScanView.tsx:331-336).
+    - id: FR-013
+      phase: B
+      title: Web door-mode parity where the platform allows
+      description: >
+        UnifiedScanView adopts the FR-003 full-bleed result state and the
+        FR-008 shared status copy; adds visual flash always, vibration via
+        navigator.vibrate where available (Android Chrome), no audio
+        autoplay hacks. The raw inline-styled <select> event picker
+        (UnifiedScanView.tsx:580-610) is replaced with the DS select. The
+        web page remains deliberately thinner than the app — no offline
+        manifest, no queue, no torch — and the page states this in a
+        one-line hint linking organizers to the scanner app (install links
+        per the distribution memo, referenced not duplicated).
+    - id: FR-014
+      phase: B
+      title: Session stats parity
+      description: >
+        Replace the web "resolved this session" counter (UnifiedScanView
+        scanCount, :303,:522-542) with admitted-this-session +
+        already-scanned-this-session tallies fed by actual scanTicket
+        outcomes (ACCEPTED vs REPLAY), so the number an organizer quotes at
+        the door means admissions, not resolver calls.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Latency budgets. Feedback (haptic + visual state change) begins
+        ≤150ms after barcode decode when resolution is local (FR-001
+        offline path and FR-004's optimistic admit), and ≤200ms after
+        server response otherwise. Server resolve p95 ≤1.5s on venue-grade
+        LTE is the assumed envelope; the UI must show the in-flight scrim
+        (existing cameraLoadingOverlay) within 100ms of dispatch. Express
+        mode returns the camera to armed ≤2s after a VALID scan. Measured
+        via the existing metrics hooks (ticket.scan.duration_ms,
+        scan-ticket.ts records) plus a client-side decode→feedback mark in
+        dev builds.
+    - id: NFR-002
+      description: >
+        Accessibility of result states. Every outcome keeps its
+        announceForAccessibility message (unified-result-view.tsx:157-215
+        pattern extended to offline/express outcomes); tone fills meet
+        4.5:1 text / 3:1 graphics on BOTH palettes; reduced-motion disables
+        all pulse/flash animation (static fills only); no outcome is
+        conveyed by colour alone (icon + label + badge redundancy
+        preserved); express-mode auto-dismiss is paused while VoiceOver/
+        TalkBack focus is inside the result state.
+    - id: NFR-003
+      description: >
+        Battery and thermals. Keep-awake stays scoped to authed sessions
+        (scanner-app.tsx:156-162); brightness boost stays scoped to the
+        scan screen mount (use-brightness-boost.ts) and must restore on
+        unmount even through express-mode cycling; the camera stays
+        hard-paused (active={false}) while any full-screen result state is
+        up, exactly as the current cameraPaused contract
+        (unified-scan-screen.tsx:310-314,353); the FR-012 web decode loop
+        is throttled. No new polling faster than the existing 1s strip /
+        5s counter / 15s queue / 60s manifest intervals.
+    - id: NFR-004
+      description: >
+        Offline correctness invariants (preserved and extended). Queue
+        stays FIFO with per-scan clientKey idempotency (server key =
+        event+code+clientKey, scan-ticket.ts); optimistic local marks
+        reconcile from the server manifest on sync; FR-001 offline results
+        never fabricate a status the manifest does not hold and always
+        carry provenance + manifest age; FR-006(a) local-cancel of a queued
+        scan must be atomic with the local status revert; FR-010 makes
+        every terminal drop observable. A device that scans offline all
+        night and syncs at close must converge to the same server state as
+        an always-online device (existing REPLAY semantics absorb the
+        double-admit case).
+    - id: NFR-005
+      description: >
+        Security posture unchanged. No new tRPC procedures and no widened
+        authz: ORG_SCAN_ROLES gates every read/mutation exactly as today;
+        volunteer check-in keeps its OWNER|ADMIN|EDITOR gate with the
+        locked-button affordance. Ticket codes remain bearer credentials:
+        offline resolve reads only the SecureStore/SQLite manifest the
+        session was already authorized to sync, lookups are exact-match by
+        code, nothing lists or enumerates codes in any new UI (the FR-010
+        failed-rows list shows codes the operator already scanned —
+        acceptable, same exposure as the recent-scans strip), and
+        sign-out purge (clearAll + credential purge) covers every new
+        local artifact this spec introduces (express pref, failed-row
+        list). Volunteer JWT verification never moves client-side.
+    - id: NFR-006
+      description: >
+        Reporting convention. Every new catch-and-degrade branch (offline
+        resolve fallback, express auto-admit failure fallback to manual,
+        terminal-drop handling, WASM decoder init failure falling back to
+        the lookup hint) reports through the appropriate channel — client
+        Sentry capture on the apps, ReporterPort if any server-side swallow
+        appears — never a silent catch or bare warn (Neon-outage lesson).
+    - id: NFR-007
+      description: >
+        Type honesty. The scanner's inline duplicates of router output
+        types exist because its tsconfig cannot follow transitive type deps
+        (unified-scan-screen.tsx:31-47, unified-result-view.tsx:25-94,
+        local-db.ts:501-513). This spec does not fix the tsconfig, but
+        FR-008's shared status module must be a REAL shared import in both
+        apps — not a fourth hand-copied enum — and each remaining inline
+        duplicate gains a pointer comment to its source of truth.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases: []
+    # Deliberately empty: this is a client-surface redesign. scanTicket,
+    # resolveScanPayload, revertTicketScan, searchOrgTickets,
+    # getScannerEventManifest are consumed as-is. If FR-010's manual retry
+    # needs anything, it is the existing scanTicket with the original
+    # clientKey (idempotent replay), not a new use case.
+  ports:
+    new: []
+    existing:
+      - none touched
+  adapters:
+    new: []
+    existing:
+      - none touched
+  transport:
+    trpc_procedures: []
+    webhooks: []
+  ui:
+    mobile:
+      - apps/scanner/src/screens/unified-scan-screen.tsx (MODIFIED — offline
+        resolve branch, express mode, stats strip, control rail, full-screen
+        state host)
+      - apps/scanner/src/screens/unified-result-view.tsx (MODIFIED —
+        full-bleed presentation, shared status copy, offline provenance
+        badge, LISTED)
+      - apps/scanner/src/screens/recent-scans-strip.tsx (MODIFIED — FR-006)
+      - apps/scanner/src/screens/settings-screen.tsx (MODIFIED — express
+        toggle, failed-sync list)
+      - apps/scanner/src/lib/feedback.ts (REWRITTEN — 4 signatures,
+        expo-audio)
+      - apps/scanner/src/lib/offline-resolve.ts (NEW — pure function from
+        parsed payload + manifest row + network state to a result union;
+        unit-tested in node, no expo imports, mirroring the
+        people-search-tokens testability split)
+      - apps/scanner/src/lib/use-scan-queue.ts (MODIFIED — FR-006a cancel,
+        FR-010 terminal-drop surfacing)
+    web:
+      - apps/web/src/app/admin/[slug]/scan/page.tsx (MODIFIED — legacy
+        branch deleted)
+      - apps/web/src/app/admin/[slug]/scan/_components/UnifiedScanView.tsx
+        (MODIFIED — FR-013/FR-014)
+      - apps/web/src/app/admin/[slug]/scan/_components/use-browser-camera.ts
+        (MODIFIED — FR-012 fallback decoder)
+    shared:
+      - packages/ui-native (EXTENDED — full-bleed result-state primitive,
+        shared scan-status copy map per FR-008; web imports the copy map
+        only, not RN components)
+      - native colour-gate lint (NEW script, sibling of
+        apps/web/scripts/lint-color-fallbacks.mjs, wired into CI — verify
+        the CI step actually fails on a planted violation before trusting
+        it, per the gates-that-look-real doctrine)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  new_enums: []
+  modified_models: []
+  migrations_needed: false
+  migration_notes: >
+    Server schema untouched. Client-side: ScannerPreferences gains
+    expressModeEnabled (storage.ts — additive JSON field, defaults false,
+    old payloads parse fine per the existing tolerant loader); scanner
+    SQLite gains a dropped_scans table (or a status column on scan_queue)
+    for FR-010 — idempotent CREATE/ALTER in migrate() following the
+    next_attempt_at precedent (local-db.ts:100-109).
+
+# ── Build order ──────────────────────────────────────────────────────────────
+#
+# Routing per repo rules: scan screens are Expo/RN → design direction comes
+# from the ui skill, build goes to `mobile`, engineering review by `reviewer`,
+# then the ui skill runs the design-review pass; web FRs route to `ui`.
+# TASTE STAYS WITH CLAUDE throughout; visual-critique (Gemini) may be used
+# for objective-defect passes on simulator screenshots only.
+
+build_order:
+  - step: 1
+    what: >
+      Design pass (ui skill, no code): full-bleed result-state spec for all
+      outcomes on both palettes (tone tokens, type scale, icon sizes,
+      offline badge, express countdown), control-rail layout at small
+      (SE-class) and large phones, stats-strip layout. Output: annotated
+      spec the mobile agent builds from.
+    route: ui (design only)
+  - step: 2
+    what: >
+      FR-008 shared status copy + FR-002 feedback rewrite + FR-001
+      offline-resolve pure module with exhaustive unit tests (status
+      mapping, manifest-age gate, volunteer-offline, absent-code) — the
+      logic layer before any screen changes.
+    route: mobile → reviewer
+  - step: 3
+    what: >
+      FR-003/FR-005/FR-007 scan-screen rebuild + FR-006 undo hardening,
+      wiring step-2 modules. FR-009 residue sweep + native colour gate in
+      the same pass (touching every scan-flow file anyway —
+      no-grandfathering).
+    route: mobile → reviewer → ui design-review
+  - step: 4
+    what: >
+      FR-004 express mode + FR-010 terminal-drop surfacing (both depend on
+      the rebuilt screen and hardened queue).
+    route: mobile → reviewer (bump adversarial re-review — auto-admit is
+      admission-integrity-adjacent)
+  - step: 5
+    what: >
+      Phase B web: FR-011 legacy deletion, FR-012 fallback decoder,
+      FR-013/FR-014 parity.
+    route: ui → reviewer
+  - step: 6
+    what: >
+      RUN IT: scanner via eas preview build on a physical device (simulator
+      does not exercise camera/haptics/brightness honestly) — dark room,
+      airplane-mode pass covering FR-001/FR-004/FR-006/FR-010 end-to-end,
+      then reconnect and verify convergence; web via live-stack playwright
+      + manual iOS Safari camera check for FR-012. Zero new console
+      errors; 320px-equivalent narrow check on web.
+    route: orchestrator (with browser-driver for web mechanics)
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Express mode admits someone the operator would have stopped (VIP
+      routing, suspicious holder, capacity call at the door).
+    severity: HIGH
+    mitigation: >
+      Default OFF, per-device, buried in settings not the scan screen;
+      only VALID auto-admits and every other outcome halts; undo strip
+      stays on screen; the FR-003 state still shows name + type for the
+      1.2s window; acceptance criterion pins that SCANNED/wrong_event/
+      REFUNDED/VOID/LISTED/unknown never auto-dismiss.
+  - risk: >
+      Offline resolve trusts a stale manifest — a ticket refunded after
+      the last sync scans as VALID offline.
+    severity: MEDIUM
+    mitigation: >
+      Accepted and bounded: identical exposure to every offline-capable
+      scanner on the market; manifest age is displayed on the result,
+      sync loop runs every 60s while online, express-mode auto-admit
+      refuses manifests older than 10 minutes, and the server remains
+      authoritative at queue-flush (REPLAY/REJECTED reconciliation).
+  - risk: >
+      The full-bleed redesign regresses the four-signal redundancy or
+      collapses contrast on one palette (the Stub 1.00:1 class of bug).
+    severity: MEDIUM
+    mitigation: >
+      NFR-002 measured contrast on both palettes is an acceptance
+      criterion; guard tests on the tone-token mapping; ui design-review
+      pass explicitly checks Ember AND Stub renders.
+  - risk: >
+      Deleting LegacyScanView while some org still has
+      gates.unifiedScanResolver OFF strands them.
+    severity: LOW
+    mitigation: >
+      FR-011 flips the gate default/backfills before deletion; the gate
+      read (page.tsx:218) is removed in the same change so there is no
+      half-state. Verify no other consumer reads unifiedScanResolver.
+  - risk: >
+      expo-audio migration changes feedback timing or breaks the silent
+      degrade on web preview/CI shells.
+    severity: LOW
+    mitigation: >
+      Keep the lazy-require + null-degrade contract (feedback.ts pattern);
+      device pass in build-order step 6 includes mute-switch and
+      no-native-module paths.
+  - risk: >
+      The WASM decoder bloats the admin bundle or burns laptop CPU.
+    severity: LOW
+    mitigation: >
+      Dynamic import only when BarcodeDetector is absent; throttled
+      analysis loop (NFR-003); bundle-size check in review.
+
+open_questions:
+  - >
+      Express-mode dwell: is 1.2s the right green-state duration, or should
+      it be configurable (1s/2s)? Decide in the step-1 design pass; not
+      configurable in v1 unless the design pass demands it.
+  - >
+      Should FR-005's strip show capacity-alert states (90%/100%) like the
+      Home counter, or stay neutral to avoid alarming attendees who can see
+      the screen? Lean: mirror Home's alert colours — the operator is the
+      audience — but the design pass owns the call.
+  - >
+      FR-010 manual retry UX: per-row retry vs one "retry all failed"
+      action. Lean retry-all; failed rows are rare and operators are not
+      queue admins.
+  - >
+      Does the volunteer-offline gap deserve its own follow-up (offline
+      check-in queue with server-side conflict rules)? Out of scope here
+      (NFR-004 keeps volunteer verification server-side); flag for the
+      volunteer-management-unification spec if operators hit it.
+  - >
+      i18n: the scanner app is English-only today (no dual-catalog wiring
+      in apps/scanner). FR-008's shared copy module should be structured so
+      keys can later route through the catalog, but translating the scanner
+      is not in this spec.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Scanner distribution, store listings, TestFlight/Play tracks, install
+    URLs, onboarding email, and the dead /invitations/accept link — owned
+    end-to-end by docs/decisions/scanner-distribution-native-internal-tracks.md.
+  - Device binding / per-device scanner credentials — authz remains the
+    operator's session + ORG_SCAN_ROLES; no change proposed.
+  - Offline volunteer check-in and offline undo of server-acknowledged
+    scans (deliberate exclusions — see FR-001/FR-006 rationale).
+  - Seated-event scanning UX (seat map on result) — seating is gated
+    pre-launch; seatLabel already renders where present.
+  - Multi-event "scan across the whole org night" mode — event selection
+    stays single-select with persistence.
+  - Fixing the scanner tsconfig's transitive-type limitation (NFR-007
+    documents the containment, not the cure).
+  - Any change to scanTicket/resolvePayload server semantics, grace
+    windows, idempotency, or the location-suspicion note.
+  - Attendee-facing my-tickets QR display surfaces (apps/web
+    /tickets/qr/[code], mobile pass display) — scanning side only.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  # FR-001
+  - In airplane mode with a synced manifest, scanning a locally-VALID
+    ticket QR renders an offline-tagged VALID state with manifest age and
+    an enabled admit action that enqueues; scanning a locally-SCANNED code
+    renders already-scanned with the local scannedAt; scanning a code
+    absent from the manifest renders "Can't verify offline" (danger) and
+    NEVER "invalid ticket"; scanning a volunteer JWT renders the
+    volunteer-needs-connection state; an hf:// payload whose embedded
+    eventId mismatches the selected event renders wrong_event with no
+    network. Reconnecting flushes the queue and the server manifest
+    re-sync converges local status (unit tests on offline-resolve.ts per
+    branch + the step-6 device pass).
+  # FR-002
+  - Already-scanned and wrong-event produce measurably different haptic
+    patterns and different tones from each other and from success/error
+    (unit test on the outcome→signature mapping; device verification in
+    step 6). expo-av no longer appears in apps/scanner's dependency graph.
+  # FR-003 / NFR-002
+  - Every result outcome renders a full-bleed state whose text measures
+    ≥4.5:1 and icons ≥3:1 against its tone fill on BOTH ember and stub
+    palettes (guard test computing contrast from palette tokens, the
+    Button-AA-ladder pattern); with reduced motion enabled no animation
+    plays; VoiceOver focus inside a result state blocks express
+    auto-dismiss.
+  # FR-004
+  - With express mode ON — a VALID scan admits with zero taps, shows the
+    green state ~1.2s, re-arms the camera, and appears in the recent strip
+    with a live undo; a SCANNED / wrong_event / unknown / REFUNDED / VOID /
+    LISTED / volunteer result never auto-dismisses; an offline-resolved
+    VALID from a manifest older than 10 minutes falls back to manual
+    confirm; the toggle defaults OFF and survives app restart via
+    ScannerPreferences.
+  # FR-005
+  - The scan screen shows admitted/total matching getEventCounts, a queue
+    badge when depth >0, and an offline indicator when disconnected,
+    without leaving the camera view.
+  # FR-006
+  - Undoing a scan whose row is still in scan_queue removes the row and
+    reverts local status with the network cable pulled (no server call);
+    an acknowledged scan's undo button renders disabled offline with a
+    hint; both paths keep the 30s window semantics.
+  # FR-008
+  - Scanner and web render identical label/tone/guidance for all six
+    statuses from the shared map (snapshot test both consumers); LISTED on
+    the scanner and VOID on the web now render dedicated guidance; the
+    scanner shows "Listed for resale — do not admit." for LISTED.
+  # FR-009
+  - No file under apps/scanner/src/screens or src/ui imports tamagui
+    layout primitives directly for scan-flow surfaces; the native colour
+    gate fails CI on a planted raw-hex literal in apps/scanner (verify the
+    failure actually fires before merging the gate — plant, observe red,
+    remove).
+  # FR-010
+  # NOTE — "event/ticket tags" was written before NFR-005 settled. A ticket
+  # code is a BEARER CREDENTIAL and must never reach Sentry (it is the whole
+  # reason lib/sentry-scrub.ts exists, to strip codes back out of the
+  # transport layer's own URLs). The correlator is `queueId`, which joins a
+  # Sentry issue to the local dropped_scans row and to the clientKey the
+  # server saw — every join the original wording was reaching for, with no
+  # credential. Do NOT "fix" the implementation by adding the code back.
+  - Forcing MAX_ATTEMPTS exhaustion on a queued scan produces a Sentry
+    event tagged with the eventId and the queueId (never the ticket code),
+    a visible failed-sync count on strip + Home, and a retry affordance in
+    settings that replays with the ORIGINAL clientKey (server replays
+    idempotently). A row the server permanently rejected can also be
+    DISMISSED per-row — which writes its own Sentry event first, so the
+    only record that an admission went unreconciled outlives the row.
+  # FR-011 / FR-012 (Phase B)
+  - /admin/[slug]/scan renders UnifiedScanView unconditionally; the string
+    "LegacyScanView" and the unifiedScanResolver gate read are gone from
+    the repo; on a browser with BarcodeDetector deleted
+    (delete window.BarcodeDetector in a test shim), the camera still
+    decodes a QR via the fallback decoder; removed legacy i18n keys are
+    absent from both en and es catalogs.
+  # FR-013 / FR-014
+  - The web event picker is the DS select (no inline-styled <select>);
+    web result states use the shared status map; the session counter
+    splits admitted vs already-scanned driven by ACCEPTED vs REPLAY
+    outcomes.
+  # NFR-005
+  - Sign-out purges every artifact this spec adds (express pref via the
+    existing preferences purge, failed-row list, offline-resolve caches if
+    any) — asserted by the existing sign-out purge test extended to the
+    new stores; no new tRPC procedure exists in the diff.

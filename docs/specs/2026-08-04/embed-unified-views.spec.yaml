@@ -1,0 +1,671 @@
+# embed-unified-views.spec.yaml
+#
+# Make the calendar embed and the tickets embed alternative VIEWS of ONE embed
+# rather than separate embed products: one embed config per subject, a `view`
+# that is a config-time default plus an optional viewer-side toggle, and an
+# admin page that collapses the Tickets/Calendar tab split into a single
+# subject-picker + view choice. The booking inline-form embed stays a separate
+# product (place subject, no commerce) — see FR-012 for the justification.
+#
+# REALITY CHECK ENCODED UP FRONT: the data layer is ALREADY unified. The Embed
+# row (packages/db/prisma/profile.prisma:9-29) has NO type or view column —
+# subjectType/subjectId/domain/status/requireAuth/linkOut only, unique on
+# (subjectType, subjectId, domain). "Tickets vs calendar" exists ONLY in which
+# ROUTE the pasted snippet points at: /embed/[embedId] renders
+# EmbedWidget browseView="grid" (apps/web/src/app/embed/[embedId]/page.tsx:12)
+# and /embed/calendar/[embedId] renders the SAME EmbedWidget with
+# browseView="calendar" (apps/web/src/app/embed/calendar/[embedId]/page.tsx:17),
+# both resolving the SAME embedId through the same allowlist. So this spec is
+# NOT a data-model merge; it is (a) an additive per-embed view default +
+# viewer-toggle flag, (b) an admin-UX collapse, and (c) a snippet/URL contract
+# that formalizes what the runtime already half-does — while freezing every
+# URL already pasted into third-party sites.
+#
+# Ground truth (verified 2026-08-04, all paths repo-absolute):
+# - Admin page: apps/web/src/app/admin/[slug]/embeds/page.tsx renders
+#   EmbedsView; _components/EmbedsView.tsx:158-162 declares the THREE page
+#   tabs — "Tickets", "Calendar", "Booking button" — deep-linked via
+#   ?tab=calendar / ?tab=booking (:224-229). Tickets and calendar SHARE the
+#   subject picker and state (:285-298 — "an organiser configures the event
+#   once and flips the tab"); the active tab alone decides the variant
+#   (:305-310). Booking uses a PlacePicker (:714-737). Snippet formats:
+#   tickets = HTML/React/SDK/Modal (:97-102), calendar = HTML/React iframe
+#   only (:104-112), booking = one snippet per display mode (:1311-1322).
+# - Runtime: EmbedWidget (apps/web/src/app/embed/[embedId]/_components/
+#   EmbedWidget.tsx) hosts the whole state machine; browseView="grid" fetches
+#   trpc.embeds.getForWidget (:130), browseView="calendar" fetches
+#   trpc.embeds.getCalendarEvents (:143). The calendar route file carries an
+#   explicit frozen-contract comment: "The route URL is a live-embed contract
+#   (snippets on third-party sites reference it) — do not move or rename it"
+#   (embed/calendar/[embedId]/page.tsx:12-13).
+# - Subject resolution: getEmbedForWidget (packages/core/src/use-cases/embeds/
+#   get-embed-for-widget.ts:139-149) loads the row by id, requires ACTIVE,
+#   then forks on the STORED subjectType (organization/human → events grid
+#   data, event → single event + ticket types). getEmbedCalendarEvents mirrors
+#   it for the calendar. Booking rides getBookingWidget on /embed/book/[embedId].
+# - Hardening posture: assertEmbedOriginAllowed (packages/core/src/use-cases/
+#   embeds/_shared/assert-embed-origin-allowed.ts) — fail closed, "there is no
+#   lenient tier" (:15), null/unparseable hostOrigin rejected (:81-90), exact
+#   www-equivalent hostname match (:106), own web origin allowed (:109-110).
+#   Every public embed procedure passes through it (embeds router:
+#   packages/transport/trpc/src/routers/embeds.ts — getForWidget :147,
+#   getBookingWidget :171, getEventDetail :190, createGuestCheckout :215,
+#   getCalendarEvents :378). CSP: global "frame-ancestors 'self'"
+#   (apps/web/next.config.ts:51) with an /embed/* override to
+#   "frame-ancestors *" (:58-60 applied at :197-202) — tightening that to
+#   per-embed domains is the standing OPEN follow-up and stays out of scope.
+# - Calendar implementation: commit dd08b9ec ("feat(embeds): calendar embed
+#   with in-iframe checkout + theming") — EmbedWidget(browseView) extraction,
+#   per-event checkoutEligible mirroring assertEventAllowedForEmbed, clamped
+#   upcoming-or-ongoing (get-embed-calendar-events.ts:205-218 +
+#   isUpcomingOrOngoing :260-270), EMBED_LINK_OUT_ONLY fail-closed checkout
+#   guard, calendar admin tab + snippets.
+# - Snippet/URL builders: apps/web/src/lib/embed-snippets.ts —
+#   buildEmbedWidgetUrl forks basePath /embed/ vs /embed/calendar/ vs
+#   /embed/book/ (:85-96); calendar iframe snippet (:211-236); hf-resize.js
+#   matches iframe[src*="/embed/"] so all three paths auto-resize (:207-210).
+#   SDK: apps/web/public/embed/hf-embed.js v1.6.1 knows only widget:"booking"
+#   vs tickets (basePath fork :578-580) — there is NO calendar SDK/modal mode.
+# - External test bench: https://ithasfire-embed-test.netlify.app — configured
+#   in-repo by apps/api/src/scripts/qa/seed-embed-bench.ts (BENCH_DOMAIN :39,
+#   fixed IDs :41-46: ORG_EMBED_ID serves BOTH the grid and calendar sections
+#   from ONE row — living proof of the one-row-many-views model; the bench
+#   page itself lives in the separate ~/Projects/ithasfire-embed-test repo,
+#   "keep in sync with … index.html" :43-44).
+# - Known findings from memory, CHECKED: (1) "modal-shell height issue" —
+#   FIXED in hf-embed.js v1.6.0/v1.6.1 (header changelog, hf-embed.js:17-24:
+#   panel tracks iframe content height, scrolls at the viewport cap).
+#   (2) "past-event checkout behaviour" — FIXED by dd08b9ec's clamp: past
+#   events stay visible for month context but are checkout-INELIGIBLE and
+#   link out to the canonical event page (get-embed-calendar-events.ts:205-218).
+#   Neither is a live defect this spec must fix; both are contracts it must
+#   not regress.
+
+version: "1.0"
+updated: "2026-08-04"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Organizers experience "tickets embed" and "calendar embed" as two separate
+    products — two admin tabs, two snippet sets, two preview flows — when the
+    backend already treats them as one: a single Embed row (no type column)
+    that either route can render, differing only in browse view. The split
+    costs real UX: an organiser who wants both views pastes two snippets and
+    can't let visitors flip between list and calendar; the admin page carries
+    a three-tab surface for what is one subject-scoped config plus one
+    place-scoped config; and the calendar is locked out of the SDK/modal
+    distribution because it is modelled as a different product instead of a
+    view parameter. Meanwhile every already-pasted snippet URL is a live
+    contract on third-party sites that must never break.
+  solution: >
+    Formalize "view" as a first-class, additive property of the ONE events
+    embed. The Embed row gains defaultView ("list" | "calendar", default
+    "list") and viewToggle (Boolean, default false) — both meaningless and
+    ignored for place subjects. The widget resolves its browse view by fixed
+    precedence: explicit URL signal (the frozen /embed/calendar/ route, or a
+    new ?view= param on /embed/) > embed.defaultView > "list". When
+    viewToggle is on, the widget renders a List/Calendar switcher and flips
+    browse view client-side inside the same iframe (both data queries already
+    exist). The admin page collapses Tickets + Calendar into one "Events"
+    tab: subject picker + a View control that drives the default, the
+    snippet, and the preview; "Booking button" remains its own tab and its
+    own product. Every existing URL keeps working byte-for-byte: embedId
+    semantics are frozen, /embed/[id] without params renders the grid exactly
+    as today (defaultView backfills to "list" via column default — no data
+    migration), and /embed/calendar/[id] remains a permanent alias that pins
+    the calendar view.
+  users:
+    - Organizers embedding their events on their own websites (org / human /
+      event subjects)
+    - Visitors on those third-party sites (browse + in-iframe checkout)
+    - Venue owners using the booking-button embed (unchanged, explicitly)
+    - Platform developers maintaining the embed surface and test bench
+  surfaces:
+    - web
+    - api
+
+# ── Decisions (committed, not open) ─────────────────────────────────────────
+
+decisions:
+  - id: D-001
+    decision: >
+      View switching model: CONFIG-TIME DEFAULT + OPTIONAL VIEWER TOGGLE
+      (both). `defaultView` picks what loads; `viewToggle` (off by default)
+      additionally renders an in-widget List/Calendar switcher. A pure
+      config-time view would forbid the "let visitors choose" use case; a
+      pure viewer-side toggle would force calendar-first organisers (venues
+      with dense monthly programming) to make every visitor click once.
+      Defaulting the toggle OFF keeps every existing embed pixel-identical.
+  - id: D-002
+    decision: >
+      URL precedence: explicit URL signal > stored default > "list".
+      /embed/calendar/[embedId] (frozen contract, see its route comment) and
+      /embed/[embedId]?view=calendar|list pin the view regardless of
+      defaultView; a bare /embed/[embedId] follows defaultView. Rationale: a
+      pasted snippet is a promise about what renders on the host page — a
+      later admin config change must not silently swap the view under a
+      snippet that named one, but SHOULD retarget the bare canonical URL
+      (that is exactly what a config-time default is for).
+  - id: D-003
+    decision: >
+      embedId semantics are FROZEN. An embedId remains a bearer-ish
+      identifier for (subjectType, subjectId, domain) enforceable only
+      through the fail-closed origin allowlist. No new embed rows are minted
+      for views, no id namespaces, no re-keying. The migration is one
+      additive ALTER (two columns with defaults) — zero backfill script,
+      because there are no per-type rows to backfill FROM: the current schema
+      has no type column, so every existing row uniformly gets
+      defaultView="list" / viewToggle=false via column defaults, which
+      reproduces today's behaviour exactly.
+  - id: D-004
+    decision: >
+      The booking inline-form embed STAYS SEPARATE. Different subject
+      semantics: booking is place-scoped (WHERE can be booked) while the
+      events embed is org/human/event-scoped (WHOSE events are on sale);
+      different consumer action (an inquiry form with no payment — its
+      iframe snippet deliberately omits allow="payment",
+      embed-snippets.ts:309-314 — vs. commerce with guest checkout); scope
+      is "meaningless for a place subject" (embed-snippets.ts:284-286); and
+      the runtime is a different route + procedure (/embed/book/[embedId] →
+      getBookingWidget), not a browse view of EmbedWidget. Forcing it into
+      the view model would make "view" mean "product" again — the exact
+      confusion this spec removes. The admin page keeps its "Booking button"
+      tab; upsert ignores/rejects view fields for place subjects (FR-002).
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Schema — Embed gains defaultView (String, default "list") and
+        viewToggle (Boolean, default false). defaultView is a bare String,
+        NOT a DB enum, following the model's own documented convention for
+        subjectType ("a bare String, NOT a DB enum, so new subject types
+        need no migration", profile.prisma:11-14) — upsert-embed.ts is the
+        authority on allowed values ("list" | "calendar"). Additive-only:
+        no column drops, no row rewrites, no change to the
+        (subjectType, subjectId, domain) unique key. Existing rows read
+        defaultView="list" / viewToggle=false via defaults — i.e. exactly
+        today's behaviour (D-003).
+    - id: FR-002
+      description: >
+        upsertEmbed accepts optional defaultView / viewToggle, validated
+        against the allowed set, and REJECTS them (VALIDATION error, not
+        silent drop) when subjectType is "place" — a booking embed has no
+        views (D-004). Omitted fields preserve the stored values on the
+        upsert-by-(subject, domain) path, mirroring how linkOut updates work
+        from the admin page today (EmbedsView.tsx:370-399). listEmbeds
+        returns both fields so the admin page can render current state.
+    - id: FR-003
+      description: >
+        View resolution in the widget, by fixed precedence (D-002):
+        (1) route/URL — /embed/calendar/[embedId] pins "calendar";
+        /embed/[embedId]?view=calendar|list pins the named view (unknown
+        values ignored, falling through); (2) embed.defaultView from the
+        widget payload; (3) "list". The two existing routes keep their exact
+        rendering for URLs in the wild: a bare /embed/[embedId] on a row
+        with defaultView="list" is byte-identical to today's grid, and
+        /embed/calendar/[embedId] is a permanent alias that never consults
+        defaultView. No redirects — aliasing is internal (both routes render
+        EmbedWidget), so no extra navigation, no referrer changes.
+    - id: FR-004
+      description: >
+        Viewer toggle. When embed.viewToggle is true AND the subject is
+        org/human (an event-subject embed has a single event; a calendar of
+        one is noise — toggle is not rendered for event subjects even if
+        set), the widget's browse screen shows a List/Calendar segmented
+        switcher. Switching flips browseView CLIENT-SIDE inside the same
+        iframe — no navigation, no iframe reload; the inactive view's query
+        (getForWidget or getCalendarEvents) is enabled lazily on first
+        switch and cached thereafter. The toggle appears ONLY on the browse
+        screen — never over detail/checkout/confirmation screens — and the
+        current in-iframe screen stack is preserved when returning. The
+        toggle's initial position is the FR-003 resolved view.
+    - id: FR-005
+      description: >
+        Widget payloads carry the view config. getEmbedForWidget and
+        getEmbedCalendarEvents output embed objects gain defaultView +
+        viewToggle (both output schemas are .strict() —
+        get-embed-for-widget.ts:58-98, get-embed-calendar-events.ts:63-82 —
+        so the additions are explicit schema edits, not passthrough).
+        Inputs are UNCHANGED: view is resolved client-side from URL + these
+        payload fields, so no new input params exist to trip the .strict()
+        input schemas on either procedure (the tRPC-400 footgun class).
+    - id: FR-006
+      description: >
+        Admin collapse — 3 tabs become 2: "Events" (absorbing Tickets +
+        Calendar) and "Booking button" (unchanged). The Events tab keeps the
+        existing shared subject picker (owner | event, EventPicker, scope
+        control — EmbedsView.tsx:655-712) and gains a VIEW control:
+        a "Default view" SegmentedControl (List | Calendar) that (a) writes
+        defaultView via upsert for the selected subject+domain rows, (b)
+        drives the preview, and (c) drives the snippet URL; plus a "Let
+        visitors switch views" checkbox writing viewToggle. Editing is
+        ORG_EDIT_ROLES-gated exactly like the linkOut control
+        (EmbedsView.tsx:1455). The linkOut, theme-override, preview-bg,
+        width, and display (inline/modal) controls are untouched.
+    - id: FR-007
+      description: >
+        Legacy deep links keep working: ?tab=calendar (deep-linked today,
+        EmbedsView.tsx:224-229) maps to the Events tab with the View control
+        preselected to Calendar (URL rewritten via router.replace to the new
+        param shape); ?tab=booking is unchanged. No inbound admin link 404s
+        or lands on a dead tab value.
+    - id: FR-008
+      description: >
+        Snippets unify. The Events tab emits ONE snippet set
+        (HTML/React/SDK/Modal — the current tickets set,
+        EmbedsView.tsx:97-102) where the iframe/React URLs come from
+        buildEmbedWidgetUrl carrying ?view=calendar when the admin's View
+        control says calendar and NO param when it says list (server-default
+        omission, same convention as scope: "own is the server default —
+        emitting it would be noise", embed-snippets.ts:41-43). The
+        /embed/calendar/ basePath fork and buildCalendarIframeSnippet /
+        buildCalendarReactSnippet stop being emitted but their OUTPUT URLS
+        remain live contracts (FR-003). Height defaults per view are kept
+        (CALENDAR_DEFAULT_HEIGHT 760 vs the tickets slider) since
+        hf-resize.js normalizes on the host either way. The SDK gains an
+        optional view: "calendar" option (appended as ?view=) — additive to
+        hf-embed.js, version-bumped, fully backward compatible with every
+        already-pasted stub/snippet; this is what finally gives the calendar
+        the SDK + modal distribution it lacks today (hf-embed.js:578-580
+        knows only booking vs tickets).
+    - id: FR-009
+      description: >
+        checkoutEligible / linkOut semantics are VIEW-INDEPENDENT and must
+        not fork on view: the calendar's per-event eligibility rules
+        (own-leg org events only, human subjects never, upcoming-or-ongoing
+        clamp — get-embed-calendar-events.ts:198-218) and the
+        EMBED_LINK_OUT_ONLY fail-closed checkout guard (dd08b9ec) apply
+        identically when the calendar is reached via toggle, ?view=, or the
+        legacy route. Past events keep rendering for month context and keep
+        linking out (the verified dd08b9ec behaviour — regression-pinned,
+        not rebuilt).
+    - id: FR-010
+      description: >
+        Test-bench update (bench page lives in the separate
+        ~/Projects/ithasfire-embed-test repo; this repo owns the seed).
+        Steps: (1) seed-embed-bench.ts is UNCHANGED in ids and rows —
+        ORG_EMBED_ID / EVENT_EMBED_ID / BOOKING_EMBED_ID are frozen bench
+        contracts (seed-embed-bench.ts:41-46); (2) the bench index.html
+        gains two sections: "/embed/<org-id>?view=calendar" (new URL form)
+        and an org-subject iframe with viewToggle exercised end-to-end
+        (requires flipping viewToggle=true on the ORG_EMBED_ID row — extend
+        the seed's embed upsert to set it, still idempotent); (3) the
+        EXISTING "/embed/calendar/<org-id>" section is RETAINED, relabelled
+        "legacy calendar route (frozen contract)" — it is the regression
+        canary for FR-003; (4) re-run the seed against the target DB, then
+        redeploy the Netlify page. Bench QA checklist: grid loads, calendar
+        loads via all three URL forms, toggle flips without reload, checkout
+        opens from an eligible calendar event, past event links out.
+    - id: FR-011
+      description: >
+        e2e coverage on the live surface (per repo posture — the widget
+        mocks nothing in unit tests worth trusting): a spec drives
+        /embed/[id] (grid default), /embed/[id]?view=calendar,
+        /embed/calendar/[id] (legacy), and the viewToggle flip, asserting
+        zero new console errors and the 320px viewport, using the existing
+        embed e2e patterns (embed-sdk-smoke.spec.ts, embed-iframe-framing.spec.ts).
+    - id: FR-012
+      description: >
+        Booking non-participation is enforced, not just documented: the
+        booking route, getBookingWidget, its snippets, and the admin Booking
+        tab are byte-untouched by this feature; FR-002's place-subject
+        rejection plus an acceptance test pin it. Any future "booking joins
+        the view model" idea is a new spec (out_of_scope).
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Zero behaviour change for every URL in the wild. embedId semantics
+        frozen (D-003); /embed/[id] bare, /embed/calendar/[id], and
+        /embed/book/[id] each render exactly today's output for rows with
+        default column values. hf-resize.js needs no change — its matcher
+        iframe[src*="/embed/"] (embed-snippets.ts:207-210) already covers
+        every URL form including ?view=.
+    - id: NFR-002
+      description: >
+        Embed weight / perf budget. The widget loads ONE view's data at
+        initial render — resolving to calendar must not also fire
+        getForWidget, and vice versa (today the calendar route already
+        lazy-gates the grid query; keep that discipline under the toggle:
+        inactive view fetched on first switch only). hf-embed.js stays
+        dependency-free vanilla JS; the FR-008 SDK addition is ≤ a few
+        hundred bytes (one option → one query param). No new JS is required
+        on host pages for existing snippets to keep working.
+    - id: NFR-003
+      description: >
+        Allowlist fail-closed PRESERVED on every path to every view: both
+        data procedures already run assertEmbedOriginAllowed with
+        null-rejected hostOrigin; the toggle's lazily-enabled second query
+        passes the same hostOrigin and enjoys the same enforcement. No new
+        public procedure is introduced; no procedure loses the check.
+        Negative test: a toggled-to view on a non-allowlisted host origin is
+        rejected (EMBED_ORIGIN_NOT_ALLOWED), not served.
+    - id: NFR-004
+      description: >
+        No new external calls. The widget talks only to the platform API
+        (tRPC) and existing Stripe/Turnstile surfaces already allowed in the
+        embed CSP (next.config.ts:35-43); view unification adds no
+        third-party script, font, or beacon, on either the widget or the
+        host-page SDK.
+    - id: NFR-005
+      description: >
+        Frame-ancestors posture unchanged: /embed/* keeps its current
+        "frame-ancestors *" override (next.config.ts:58-60, 197-202).
+        Tightening it per embed domain is the standing hardening follow-up
+        and is explicitly NOT smuggled into this feature (out_of_scope).
+    - id: NFR-006
+      description: >
+        Any new catch-and-fallback branch (e.g. degraded toggle rendering if
+        the second view's query errors while the first is healthy) declares
+        reportError?: ReporterPort per the CLAUDE.md convention — never a
+        swallowed logger.warn.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: upsert-embed (MODIFIED)
+        description: >
+          Accepts optional defaultView/viewToggle; validates the view value;
+          rejects both for place subjects (FR-002); omitted fields preserve
+          stored values.
+        input: existing + defaultView?, viewToggle?
+        output: embed DTO + defaultView, viewToggle
+        idempotent: true
+        money: false
+        authz: existing subject-owner checks, unchanged
+      - name: list-embeds (MODIFIED)
+        description: Rows carry defaultView + viewToggle for the admin UI.
+        input: unchanged
+        output: embeds[] + the two fields
+        idempotent: true
+        money: false
+        authz: unchanged (ORG_EDIT_ROLES read gate stands, EmbedsView.tsx:210-215)
+      - name: get-embed-for-widget (MODIFIED)
+        description: embedBase gains defaultView + viewToggle (FR-005).
+        input: unchanged (embedId, hostOrigin, scope)
+        output: embed.{defaultView, viewToggle} added to the .strict() schema
+        idempotent: true
+        money: false
+        authz: public + assertEmbedOriginAllowed (fail closed, unchanged)
+      - name: get-embed-calendar-events (MODIFIED)
+        description: >
+          Same embedBase widening. Eligibility/linkOut logic untouched
+          (FR-009).
+        input: unchanged
+        output: embed.{defaultView, viewToggle} added
+        idempotent: true
+        money: false
+        authz: public + assertEmbedOriginAllowed (fail closed, unchanged)
+      - name: get-booking-widget (UNTOUCHED — FR-012)
+        description: Booking stays outside the view model.
+        input: unchanged
+        output: unchanged
+        idempotent: true
+        money: false
+        authz: unchanged
+
+  ports:
+    new: []
+    existing:
+      - EmbedsRepo (record type gains defaultView + viewToggle; getById/list
+        surface them; upsert persists them)
+      - ReporterPort (NFR-006)
+
+  adapters:
+    new: []
+    existing:
+      - packages/adapters/src/db/prisma embeds repo — additive column mapping
+        only
+
+  transport:
+    trpc_procedures:
+      - embeds.upsert (MODIFIED input/output — additive optional fields)
+      - embeds.list (MODIFIED output)
+      - embeds.getForWidget (MODIFIED output only; input frozen)
+      - embeds.getCalendarEvents (MODIFIED output only; input frozen)
+    webhooks: []
+
+  ui:
+    pages:
+      - apps/web/src/app/embed/[embedId]/page.tsx (MODIFIED — passes the
+        FR-003 resolved initial view; still the canonical route)
+      - apps/web/src/app/embed/calendar/[embedId]/page.tsx (KEPT FOREVER —
+        thin permanent alias pinning view=calendar; comment updated to say
+        "legacy alias, frozen contract")
+      - apps/web/src/app/embed/book/[embedId]/ (untouched)
+      - apps/web/src/app/admin/[slug]/embeds/ (MODIFIED — FR-006/FR-007 tab
+        collapse; embeds-tab-nav.helpers.ts tab set shrinks to
+        events | booking with legacy-param mapping)
+    components:
+      - EmbedWidget (MODIFIED — initialView prop replaces the route-fixed
+        browseView; internal view state + FR-004 toggle; lazy second query)
+      - EmbedViewToggle (NEW — segmented List/Calendar switcher on the
+        browse screen only)
+      - EmbedsView (MODIFIED — Events tab absorbs calendar; View control +
+        visitor-toggle checkbox; single snippet set via FR-008)
+      - apps/web/src/lib/embed-snippets.ts (MODIFIED — optional view option
+        on buildEmbedWidgetUrl / tickets snippet builders emitting ?view=;
+        calendar-specific builders retired from EMISSION, deleted only after
+        the admin page no longer references them)
+      - apps/web/public/embed/hf-embed.js (MODIFIED — optional view option,
+        version bump, changelog entry; booking path untouched)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  new_enums: []
+  modified_models:
+    - Embed (+ defaultView String @default("list"), + viewToggle Boolean
+      @default(false))
+  migrations_needed: true
+  migration_notes: >
+    One additive migration, two columns with defaults; instant on the small
+    Embed table, no lock concerns, no backfill script (D-003 — there is no
+    per-type row split to backfill from; defaults reproduce current behaviour
+    for every existing row, including the bench rows and all wild embeds).
+    Reversible by dropping the columns. Dev DB via real migration, never db
+    push (P2022 precedent).
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      An organiser flips defaultView to calendar and a host page's iframe
+      keeps the tickets-height (e.g. 600px) attribute, clipping the 760px
+      month grid until hf-resize.js kicks in — or forever, if the host never
+      included the resize script line.
+    severity: MEDIUM
+    mitigation: >
+      hf-resize.js is emitted with every iframe snippet and matches all
+      /embed/ URLs; the admin View control shows the live preview at the new
+      view's height before saving, and the FR-006 UI notes the resize-script
+      dependency (reusing the existing embedAutoResizeNote copy).
+  - risk: >
+      The FR-005 .strict() output widening lands in transport before the
+      core schema (or vice versa), making one of the two packages reject the
+      other's payload — the classic strict-schema deploy-skew bug.
+    severity: MEDIUM
+    mitigation: >
+      Output schemas live in core and are imported by transport (single
+      source); ship schema + procedure changes in one deploy unit as the
+      repo already does; e2e (FR-011) drives the real stack.
+  - risk: >
+      The viewer toggle multiplies surface area for the eligibility rules —
+      a calendar reached by toggle might skip a guard the route-mounted
+      calendar enforced.
+    severity: HIGH
+    mitigation: >
+      There is nothing route-mounted to skip: ALL enforcement is in the
+      public procedures behind assertEmbedOriginAllowed and
+      assertEventAllowedForEmbed / EMBED_LINK_OUT_ONLY (FR-009, NFR-003),
+      which the toggled view calls identically. Acceptance pins a
+      non-allowlisted-origin rejection on the toggled query.
+  - risk: >
+      Retiring the calendar snippet builders breaks organisers' muscle
+      memory / docs that reference the calendar-route snippet.
+    severity: LOW
+    mitigation: >
+      Old URLs stay live forever (FR-003); help-center sweep is in the build
+      order; the admin page's single snippet set is strictly simpler.
+  - risk: >
+      Admin tab collapse orphans ?tab=calendar deep links from anywhere else
+      in the product (e.g. place settings' planned deep links,
+      EmbedsView.tsx:235 comment).
+    severity: LOW
+    mitigation: FR-007 legacy-param mapping + a repo-wide grep for ?tab=calendar.
+
+open_questions:
+  - >
+      Should the viewer toggle's flip be reflected in the iframe URL (via
+      history.replaceState) so a host-page reload preserves the visitor's
+      choice? Lean no for v1 — iframes reload to the snippet URL anyway and
+      the extra state is not worth it — but confirm with UX.
+  - >
+      Event-subject embeds: FR-004 hides the toggle for them. Is a
+      single-event "calendar entry" view (today reachable via
+      /embed/calendar/<event-embed-id>, rendering the one pinned event —
+      get-embed-calendar-events.ts:225-247) worth keeping in the ADMIN
+      picker's View control, or admin-hidden (URL stays live regardless)?
+      Lean admin-hidden: a calendar of one event is a curiosity the legacy
+      route can keep serving.
+  - >
+      Does the SDK modal mode want a calendar trigger label ("View
+      calendar" vs "Get Tickets") when view: "calendar" is set? Cosmetic;
+      decide at build time with the ui skill.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Tightening the /embed/* "frame-ancestors *" CSP to per-embed domains —
+    the standing embed-hardening follow-up remains its OWN work item
+    (NFR-005); this feature must not change framing headers at all.
+  - Any change to the booking embed (route, procedure, snippets, admin tab)
+    beyond FR-002's place-subject validation — and any future unification of
+    booking into the view model (D-004).
+  - New browse views (week/day calendar on the embed, map view, etc.) — the
+    view vocabulary ships as exactly list | calendar.
+  - Widening checkout eligibility (human-subject checkout, venue-leg org
+    events) — FR-009 freezes today's rules.
+  - Removing the /embed/calendar/[embedId] route — it is a frozen contract,
+    permanently.
+  - The embed-hardening memory's "orphaned secret" cleanup — unrelated.
+  - Bench-page redesign beyond FR-010's additive sections (separate repo).
+
+# ── Build Order ──────────────────────────────────────────────────────────────
+
+build_order:
+  - step: 1
+    layer: db
+    work: >
+      Additive migration (Embed.defaultView, Embed.viewToggle); regenerate
+      client via pnpm -F @th/db run generate (bare-generate footgun).
+  - step: 2
+    layer: core
+    work: >
+      Repo record + upsert-embed validation (FR-002, place rejection) +
+      list-embeds/getForWidget/getCalendarEvents output widening (FR-005).
+      Tests: place-subject rejection, defaults on legacy rows, .strict()
+      round-trips.
+  - step: 3
+    layer: transport
+    work: >
+      embeds router: upsert/list input-output threading. Negative test:
+      getForWidget/getCalendarEvents inputs unchanged (extra ?view= never
+      reaches tRPC).
+  - step: 4
+    layer: web-runtime
+    work: >
+      EmbedWidget initialView + FR-003 precedence resolution in both routes;
+      FR-004 toggle with lazy second query; calendar route becomes the
+      pinned alias. Unit tests for the precedence helper (pure function).
+  - step: 5
+    layer: web-admin
+    work: >
+      FR-006 tab collapse + View control + visitor-toggle checkbox; FR-007
+      legacy ?tab=calendar mapping; FR-008 snippet unification in
+      embed-snippets.ts + SDK view option (hf-embed.js version bump).
+  - step: 6
+    layer: validation
+    work: >
+      FR-011 e2e on the live stack (E2E_USE_LIVE_STACK=1, spec cleans up
+      after itself); drive the REAL admin page and widget at 320px; zero new
+      console errors.
+  - step: 7
+    layer: bench + docs
+    work: >
+      FR-010 bench: seed viewToggle on ORG_EMBED_ID, update
+      ithasfire-embed-test index.html (new-URL + toggle sections, legacy
+      section relabelled), redeploy, run the QA checklist. Help-center sweep
+      for calendar-embed articles.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  # NFR-001 / FR-003 — frozen contracts
+  - A pre-migration Embed row (no explicit view fields ever set) renders
+    /embed/<id> as the grid and /embed/calendar/<id> as the calendar,
+    byte-identical to pre-feature output; /embed/book/<id> is untouched.
+  - With defaultView="calendar" stored, a bare /embed/<id> renders the
+    calendar, /embed/<id>?view=list renders the grid, and
+    /embed/calendar/<id> still renders the calendar — URL beats config,
+    config beats the "list" fallback.
+  - An unknown ?view= value (e.g. ?view=map) falls through to defaultView
+    without error.
+  # FR-002 / FR-012 — booking stays out
+  - upsertEmbed with subjectType "place" and any view field fails validation;
+    the booking route, getBookingWidget output, and booking snippets are
+    diff-clean for this feature.
+  # FR-004 — toggle
+  - With viewToggle=true on an org-subject embed, the browse screen shows the
+    switcher; flipping it swaps grid↔calendar with no iframe navigation and
+    fires the second data query exactly once across repeated flips; with
+    viewToggle=false (and for event subjects regardless), no switcher renders.
+  - The switcher never renders on detail, checkout, or confirmation screens.
+  # NFR-003 — fail-closed preserved
+  - getCalendarEvents (reached via toggle) from a host origin not on the
+    embed's allowlist is rejected with EMBED_ORIGIN_NOT_ALLOWED; a null
+    hostOrigin is rejected on both view queries.
+  # FR-009 — view-independent commerce rules
+  - A past event on the calendar (via any entry path — legacy route, ?view=,
+    toggle) is rendered but checkout-ineligible and links out; a linkOut
+    embed's calendar clicks all link out; EMBED_LINK_OUT_ONLY still rejects
+    a forged guest-checkout call.
+  # FR-006 / FR-007 — admin
+  # AMENDED 2026-08-07 during implementation (commit 02193a89). The original
+  # criterion read "...lands on Events with the View control on Calendar".
+  # Preselecting the control from the URL made it display a value that was
+  # never stored: arriving via a bookmarked ?tab=calendar on a row whose
+  # defaultView is "list" showed "Calendar" with nothing written, and ticking
+  # "Let visitors switch views" then persisted ONLY viewToggle — leaving a
+  # control labelled "Default view" reading Calendar over a list row, with no
+  # signal to the organiser. A control that names a stored setting must never
+  # show an unstored value, so the URL now selects the TAB only and the
+  # control always reflects stored state. FR-007's actual requirement (no
+  # inbound admin link 404s or lands on a dead tab value) is unaffected.
+  - The admin embeds page shows exactly two tabs (Events, Booking button);
+    visiting ?tab=calendar lands on the Events tab with the legacy param
+    stripped from the URL, and the View control reflects the STORED
+    defaultView (not the URL); changing Default view persists via upsert,
+    updates the preview height, and the copied HTML snippet carries
+    ?view=calendar iff the control says calendar (no param for list).
+  # FR-008 — SDK
+  - >
+    HF.createWidget with view "calendar" renders the calendar in inline and
+    modal modes; an already-pasted pre-bump snippet with no view option
+    behaves exactly as before against the new hf-embed.js.
+  # NFR-002 / NFR-004
+  - Initial widget load fires exactly one of getForWidget/getCalendarEvents;
+    the page makes zero requests to hosts outside the existing embed CSP
+    allowance.
+  # FR-010 — bench
+  - After seed re-run + bench redeploy, the bench shows grid, ?view=calendar,
+    legacy-route calendar, and a working visitor toggle against the SAME
+    ORG_EMBED_ID, with checkout reachable from an eligible calendar event.

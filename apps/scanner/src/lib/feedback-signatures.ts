@@ -1,6 +1,6 @@
 /**
  * Scan-outcome feedback SIGNATURES — the pure, node-testable half of
- * FR-002 (docs/specs/2026-08-04/scan-ticket-redesign.spec.yaml).
+ * FR-002 (docs/specs/2026-08-04/completed/scan-ticket-redesign.spec.yaml).
  *
  * This module is deliberately free of `expo-*` imports (same testability
  * split as `people-search-tokens.ts` vs `local-db.ts`) so the
@@ -12,13 +12,29 @@
  *
  * The scanner previously had THREE kinds (success | warning | error), so
  * "already scanned" and "wrong event" both fired the same `warning`
- * notification haptic and the same click-at-1.0x-rate
- * (unified-scan-screen.tsx:119-130, feedback.ts:57-63). In a dark room, over
- * a PA, the operator could not tell "I've already seen this ticket" from
- * "this is a ticket for a different show" without reading the screen. Those
- * are opposite recoveries — one is "let them in, they're already admitted",
- * the other is "this person is at the wrong venue" — so collapsing them was
- * the bug. There are now four.
+ * notification haptic and the same click-at-1.0x-rate. In a dark room, over a
+ * PA, the operator could not tell "I've already seen this ticket" from "this is
+ * a ticket for a different show" without reading the screen. Those are opposite
+ * recoveries — one is "they're already in", the other is "this person is at the
+ * wrong venue" — so collapsing them was the bug. There are now four.
+ *
+ * ## Why there are still FOUR signatures under a TWO-tone visual system
+ *
+ * The verdict fills collapsed from four families to the Design System's `pass`
+ * and `fail`. These did not, and the reason is written down here because it is
+ * the whole argument:
+ *
+ * **In a dark room an operator must be able to tell "seen this ticket" from
+ * "wrong show" without reading** — and the visual system no longer carries that
+ * distinction, because both are now `fail`. The haptic and the tone are the
+ * only channel left that separates them. Collapsing to two signatures would
+ * delete it.
+ *
+ * RECORDED DEVIATION from the DS: `ScanResult.prompt.md` specifies a pass/fail
+ * pair — a single tone for pass and a double pulse for fail. Four signatures
+ * ship, kept by owner ruling on 2026-10-06, because the haptic is the only
+ * channel left that separates "already used" from "wrong event" (both are the
+ * `fail` tone). The deviation is logged in the DS DECISIONS.md.
  *
  * ## Haptics: why patterns and not just notification types
  *
@@ -27,21 +43,20 @@
  * sequences for at least one of them. See {@link HapticPattern}.
  */
 
-import type { ToneFamily } from "@th/ui-native/tone";
+import {
+  SCAN_FEEDBACK_KINDS,
+  VERDICT_FEEDBACK,
+  type ScanFeedbackKind,
+} from "@th/types";
 
-/** The four outcome signatures. */
-export type FeedbackKind =
-  | "valid"
-  | "already_scanned"
-  | "wrong_event"
-  | "rejected";
+/**
+ * The four outcome signatures — the SHARED names from `@th/types`, so the web
+ * page's vibration patterns and this app's haptics + tones are keyed by one
+ * vocabulary.
+ */
+export type FeedbackKind = ScanFeedbackKind;
 
-export const FEEDBACK_KINDS: readonly FeedbackKind[] = [
-  "valid",
-  "already_scanned",
-  "wrong_event",
-  "rejected",
-] as const;
+export const FEEDBACK_KINDS: readonly FeedbackKind[] = SCAN_FEEDBACK_KINDS;
 
 /** Identifier for a bundled tone asset (see `./feedback-tones`). */
 export type ToneId = FeedbackKind;
@@ -147,25 +162,20 @@ export function feedbackSignature(kind: FeedbackKind): FeedbackSignature {
 }
 
 /**
- * The design's central premise, written down: the four TONE FAMILIES and the
- * four FEEDBACK SIGNATURES are the same four things (design §0). Colour, fill
- * lightness, glyph, verdict word, haptic and audio all say the same one of
- * four at the same moment; an operator learns four responses, not eight.
+ * Verdict key → signature. **The canonical mapping**, and it lives in
+ * `@th/types` (`VERDICT_FEEDBACK`) beside `SCAN_VERDICTS`, so the web scan page
+ * and this app read ONE table instead of two hand-copied ones. Re-exported here
+ * so existing imports keep working.
  *
- * This constant is NOT consulted by {@link feedbackKindForOutcome} — that
- * would make the guard test tautological. It exists so
- * `__tests__/tone-feedback-bijection.test.ts` can assert that the two
- * independently-authored tables (`presentScanResult`'s tone column and
- * `feedbackKindForOutcome`'s signature column) still agree across EVERY
- * descriptor. They drifted once already: `volunteer_needs_connection`
- * rendered REDIRECT while buzzing `rejected`.
+ * This constant is NOT consulted by {@link feedbackKindForOutcome} — that would
+ * make the guard tautological. The descriptor → signature switch below stays
+ * independently authored so `__tests__/verdict-feedback-agreement.test.ts` has
+ * something to compare it against (total; stable for every descriptor the app
+ * can produce; `valid` if and only if the tone is `pass`). They drifted once
+ * already: `volunteer_needs_connection` rendered a "reconnect" screen while
+ * buzzing `rejected`, which told the operator "do not admit".
  */
-export const TONE_FAMILY_FEEDBACK: Record<ToneFamily, FeedbackKind> = {
-  admit: "valid",
-  alreadyIn: "already_scanned",
-  redirect: "wrong_event",
-  stop: "rejected",
-};
+export { VERDICT_FEEDBACK };
 
 // ── Outcome → signature ─────────────────────────────────────────────────────
 
@@ -181,19 +191,36 @@ export type ScanOutcomeDescriptor =
       kind: "ticket";
       status: string;
       /**
-       * FR-004's re-admit guard fired (this device admitted this ticket
-       * minutes ago). `presentScanResult` renders that as the ALREADY IN
-       * family, so the signature has to follow — design §0's premise is that
-       * colour, glyph, word, haptic and audio say the SAME one of four, and an
-       * operator who acts on the buzz before reading would otherwise hear
-       * "admit" on the one outcome the guard exists to interrupt.
+       * THIS operator just admitted this ticket. Honoured ONLY on `SCANNED` —
+       * the status the server-confirmed admission produces — exactly as
+       * `presentScanResult` (and the web) honour it. On any other status the
+       * flag is evidence of a TAP, not of an admission: an admit the server
+       * answered REJECTED or REPLAY must not buzz "admit".
+       */
+      admitted?: boolean;
+      /**
+       * The re-admit guard fired (this device admitted this ticket minutes
+       * ago). Honoured ONLY on `VALID`, where it is the halt the guard exists
+       * to raise; on any other status the real status is the stronger fact and
+       * its signature stands (`presentScanResult` agrees).
        */
       admittedHereRecently?: boolean;
     }
   | { kind: "wrong_event" }
   | { kind: "unknown" }
   | { kind: "offline_unverifiable" }
-  | { kind: "volunteer_needs_connection" };
+  | { kind: "volunteer_needs_connection" }
+  /**
+   * A settled `scanTicket` that the screen shows in place of the result —
+   * REJECTED with a reason, or REPLAY. Mirrors `presentScanResult`'s
+   * `admit_settled`.
+   */
+  | {
+      kind: "admit_settled";
+      outcome: { outcome: string; reason?: string | null };
+    }
+  /** A round trip that threw — lookup or record. Never a pass. */
+  | { kind: "failure" };
 
 /**
  * The single place an outcome becomes a signature. Screens must call this
@@ -201,11 +228,11 @@ export type ScanOutcomeDescriptor =
  * duplication is how already-scanned and wrong-event ended up sharing a
  * haptic in the first place.
  *
- * Note `admittable` is NOT consulted here: only a literal `VALID` gets the
- * success signature, and every non-VALID / unrecognised status gets
- * `rejected`. Failing closed on an unknown status matters more in the
- * feedback channel than anywhere else, because the operator may act on the
- * buzz before reading the screen.
+ * Note `admittable` is NOT consulted here: only a literal `VALID` (or a `SCANNED` ticket whose admit this operator
+ * just had accepted) gets the success signature, and every other /
+ * unrecognised status gets `rejected`. Failing closed on an unknown status
+ * matters more in the feedback channel than anywhere else, because the operator
+ * may act on the buzz before reading the screen.
  */
 export function feedbackKindForOutcome(
   outcome: ScanOutcomeDescriptor,
@@ -214,23 +241,47 @@ export function feedbackKindForOutcome(
     case "volunteer":
       return "valid";
     case "ticket":
+      // Order mirrors `presentScanResult`. On VALID a PRIOR admission this
+      // status does not corroborate outranks the pass; on SCANNED only a
+      // fresh, server-accepted admission turns "again" into "done".
       if (outcome.status === "VALID") {
         return outcome.admittedHereRecently ? "already_scanned" : "valid";
       }
-      if (outcome.status === "SCANNED") return "already_scanned";
+      if (outcome.status === "SCANNED") {
+        return outcome.admitted ? "valid" : "already_scanned";
+      }
       return "rejected";
     case "wrong_event":
       return "wrong_event";
     case "volunteer_needs_connection":
-      // REDIRECT, not STOP — and the signature must agree with the pixels.
-      // `scan-result-presentation.ts` renders this state as NEEDS SIGNAL on
-      // the `redirect` fill; mapping it to `rejected` made the haptic and the
-      // tone say "do not admit" while the screen said "reconnect". A volunteer
-      // JWT offline is a known capability gap of OURS with a clear next
-      // action, not a verdict about the person at the door.
+      // "Nothing is wrong with the pass; you need a different path" — and the
+      // signature must agree with the pixels. The screen says NEEDS SIGNAL /
+      // USE SEARCH; mapping this to `rejected` made the haptic and the tone say
+      // "do not admit" while the screen said "reconnect". A volunteer JWT
+      // offline is a known capability gap of OURS with a clear next action, not
+      // a verdict about the person at the door.
       return "wrong_event";
+    case "admit_settled":
+      // Authored independently of the shared reason → key table on purpose
+      // (see `VERDICT_FEEDBACK`); the agreement test compares the two.
+      switch (outcome.outcome.outcome) {
+        case "ACCEPTED":
+          return "valid";
+        case "REPLAY":
+          // Someone else already let this person in — the tactile "again".
+          return "already_scanned";
+        case "REJECTED":
+          // Nothing wrong with the pass, wrong path: wrong show, doors shut.
+          return outcome.outcome.reason === "event_mismatch" ||
+            outcome.outcome.reason === "event_not_active"
+            ? "wrong_event"
+            : "rejected";
+        default:
+          return "rejected";
+      }
     case "unknown":
     case "offline_unverifiable":
+    case "failure":
       return "rejected";
     default: {
       // Exhaustiveness guard — a new outcome kind must choose a signature.

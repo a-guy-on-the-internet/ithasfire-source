@@ -1,6 +1,6 @@
 ---
 name: security-review
-description: 'AI-powered codebase security scanner that reasons about code like a security researcher — tracing data flows, understanding component interactions, and catching vulnerabilities that pattern-matching tools miss. Use this skill when asked to scan code for security vulnerabilities, find bugs, check for SQL injection, XSS, command injection, exposed API keys, hardcoded secrets, insecure dependencies, access control issues, or any request like "is my code secure?", "review for security issues", "audit this codebase", or "check for vulnerabilities". Covers injection flaws, authentication and access control bugs, secrets exposure, weak cryptography, insecure dependencies, and business logic issues across JavaScript, TypeScript, Python, Java, PHP, Go, Ruby, and Rust.'
+description: "Security review of named commits or paths, or a full audit from the trust boundaries, in this TypeScript monorepo: traces data flow to find injection, broken access control (cross-org IDOR, place tiers), auth and session bugs, secrets exposure, money manipulation and risky dependency changes. Use when asked for a security review or audit, or whether code is secure."
 ---
 
 # Security Review
@@ -37,7 +37,7 @@ Unlike traditional static analysis tools that match patterns, this skill:
 ## Project Context — Ithas Fire (read this FIRST)
 
 This is a **TypeScript-only** hexagonal monorepo. Use this to focus the scan and
-avoid false positives; do NOT scan for Python/Java/PHP/Go/Ruby/Rust patterns.
+avoid false positives.
 
 **Stack & entry points (start tracing from these trust boundaries, not from repo root):**
 - User input enters through **tRPC routers** (`packages/transport/trpc/src/routers`),
@@ -45,7 +45,7 @@ avoid false positives; do NOT scan for Python/Java/PHP/Go/Ruby/Rust patterns.
   and **Stripe webhook** handlers (`apps/api`), and uploaded-file metadata.
 - Persistence: **Prisma → Postgres**. SQL-injection surface is therefore ONLY
   `$queryRaw*` / `$executeRaw*` with interpolation — plain Prisma calls are
-  parameterized. Defer deep SQL/RLS analysis to the `postgresql-code-review` skill.
+  parameterized. Defer deep SQL and migration analysis to the `postgresql-code-review` skill.
 - Auth: **Better Auth** (`apps/api/src/auth/better-auth.ts`). Storage: **Cloudflare R2**.
   Payments: **Stripe Connect**. Rate limiting: **Redis** (tRPC floor 240/min/actor + Better-Auth custom rules).
 
@@ -57,14 +57,14 @@ avoid false positives; do NOT scan for Python/Java/PHP/Go/Ruby/Rust patterns.
   `sanitizeAnnouncementHtml`; the rich-text pipeline (`packages/service/rich-text-html`,
   `packages/ui-email/src/lib/prose-to-html.ts`). React auto-escapes JSX.
 - Stripe webhooks verified via the adapter (signature check), not raw body parsing.
-- RBAC via `repos.authz.ensureOrgRole` inside use cases. Email header CR/LF stripping.
+- RBAC via `repos.authz` (`AuthZPort`, `packages/ports/src/authz.ts`: `requireOrgRole`/`hasOrgRole`, `canEditEvent`, `canManagePlace`, `canFinanceOrg`, `hasStaffRole`) inside use cases; public event reads also pass `ensureFullEventReadAccess*` at the transport. Email header CR/LF stripping.
 - A finding on any of these MUST show the defense is absent/bypassed on a concrete
   field or path (e.g. a free-text field that skips `plainText*`, a `dangerouslySetInnerHTML`
   on un-sanitized data, the one `$queryRaw`) — not merely that a sink exists.
 
 **Threat model — LEAD with these priority bug classes (highest value for a payments marketplace):**
 1. **Cross-org IDOR / tenant isolation** — can org A read or mutate org B's events, orders,
-   settlements, payouts? Every mutation must scope by org and pass `ensureOrgRole`.
+   settlements, payouts? Every mutation must scope by org and pass a `repos.authz` check.
 2. **Money manipulation** — fee/refund/settlement math, negative or overflowing quantities,
    price-override abuse, the `sum(splits) === basis` invariant (see `docs/hot-paths.md`).
 3. **Payout redirection** — tampering with Connect account / payee destination.
@@ -73,8 +73,23 @@ avoid false positives; do NOT scan for Python/Java/PHP/Go/Ruby/Rust patterns.
 6. **Stored XSS** via rich-text/HTML sinks (emails, announcements, entity-page blocks).
 7. **Secrets exposure** and **SSRF** on user-supplied URLs (website / image / embed fields).
 
+8. **Membership and identity by side door** (the 2026-09-29 probe: curl, 29 accounts, an AI
+   walking the tRPC surface). Org membership and delegation come only from an accepted,
+   email-bound invite; any new procedure that adds a member, looks a human up by email,
+   or creates a human/account publicly is CRITICAL. Also: invite and reset tokens leaking to
+   analytics, Sentry or `Referer`; bans checked at session creation, not just sign-in;
+   presigned uploads that don't sign `Content-Length`; a 500 body that echoes internals.
+9. **Place authz tiers.** Navigate = any org member (`getPlaceTitle`, no location);
+   read/edit = `canManagePlace` (OWNER/ADMIN/EDITOR); the consent switches (booking
+   acceptance, community listings, public attendee reviews, community reviews) go
+   through `requirePlaceSwitchAuthority` (a direct owner of the place, or OWNER/ADMIN
+   in any owning org); a switch write that skips it is a finding. A rich place read
+   (address, street) reachable by a SCANNER or VIEWER role is a leak; the two that were got
+   fixed in 2026-09.
+
 **Repo hand-offs:** read `docs/hot-paths.md` + `docs/engineering-standards.md` for the money/auth
-invariants, and check the `project_security_audit_2026_07_05` memory for known-open items.
+invariants, and check the `project_security_audit_2026_07_05` and
+`project_scanner_attack_2026_09_29` memories for known-open items.
 
 ## Execution Workflow
 
@@ -83,19 +98,19 @@ Follow these steps **in order** every time:
 ### Step 1 — Scope Resolution
 Determine what to scan:
 - If a path was provided (`/security-review src/auth/`), scan only that scope
-- If reviewing a change/PR, scan the **diff** (`git diff` against the base branch) plus the
-  files it touches and their immediate callers/sinks — prefer this for iterative reviews
+- If reviewing a change, scan the **named commits or paths** (`git show <sha>`,
+  `git diff <base>..<sha> -- <paths>`) plus the files they touch and their immediate
+  callers/sinks. Everything lands on `main` and the working tree carries other sessions'
+  WIP, so a bare `git diff` reviews strangers' work
 - If no path/diff given and a full audit is requested, start from the **trust boundaries**
   in Project Context above (tRPC routers, auth, webhooks, storage/email adapters), not from repo root
-- This is a TS/JS monorepo — only the JavaScript/TypeScript section of
-  `references/language-patterns.md` applies; ignore the other languages
+- This is a TypeScript monorepo; `references/language-patterns.md` covers only TS
 
-### Step 2 — Dependency Audit
-Before scanning source code, audit dependencies (fast wins):
-- Run `pnpm audit` (this repo uses pnpm) against the real lockfile — it's authoritative,
-  unlike a static watchlist. Flag High/Critical advisories and any deprecated crypto libs.
-- `references/vulnerable-packages.md` is a fallback watchlist only; the live `pnpm audit`
-  takes precedence. Skip the non-npm ecosystems entirely.
+### Step 2 — Dependency Changes
+Check only dependencies the scope adds or bumps (`package.json` / `pnpm-lock.yaml` hunks)
+against `references/vulnerable-packages.md` and the patterns there. No CI job scans advisories
+(Dependabot only opens weekly version bumps). A full-lockfile check is `pnpm audit`, a
+network call: run it only when the prompt asks for it.
 
 ### Step 3 — Secrets & Exposure Scan
 Scan ALL files (including config, env, CI/CD, Dockerfiles, IaC) for:
@@ -198,6 +213,6 @@ For detailed detection guidance, load the following reference files as needed:
 
 - `references/vuln-categories.md` — Deep reference for every vulnerability category with detection signals, safe patterns, and escalation checkers
 - `references/secret-patterns.md` — Regex patterns, entropy-based detection, and CI/CD secret risks
-- `references/language-patterns.md` — Framework-specific vulnerability patterns for JavaScript, Python, Java, PHP, Go, Ruby, and Rust
-- `references/vulnerable-packages.md` — Curated CVE watchlist for npm, pip, Maven, Rubygems, Cargo, and Go modules
+- `references/language-patterns.md` — TypeScript, React and Next.js vulnerability patterns
+- `references/vulnerable-packages.md` — npm watchlist and ecosystem-independent red flags
 - `references/report-format.md` — Structured output template for security reports with finding cards, dependency audit, secrets scan, and patch proposal formatting

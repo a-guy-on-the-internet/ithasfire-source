@@ -194,6 +194,7 @@ describe("refresh convergence", () => {
         {
           id: "row-1",
           name: desired.name,
+          purpose: desired.purpose,
           description: desired.description,
           introText: desired.introText,
           questions: reordered as never,
@@ -213,6 +214,7 @@ describe("refresh convergence", () => {
         {
           id: "row-1",
           name: desired.name,
+          purpose: desired.purpose,
           description: "something else",
           introText: desired.introText,
           questions: desired.questions as never,
@@ -232,10 +234,48 @@ describe("refresh convergence", () => {
         {
           id: "row-1",
           name: desired.name,
+          purpose: desired.purpose,
           description: desired.description,
           introText: desired.introText,
           questions: desired.questions as never,
           archivedAt: new Date("2026-08-01T00:00:00Z"),
+        },
+        desired,
+      ),
+    ).toBe(true);
+  });
+
+  it("seeds the performer template as PERFORM and every other as ATTEND", () => {
+    const purposes = LAUNCH_APPLICATION_FORM_TEMPLATES.map((t) => {
+      const encoded = encodeApplicationFormTemplate(t);
+      return [encoded.name, encoded.purpose] as const;
+    });
+    expect(purposes).toContainEqual([
+      "Performer / artist application",
+      "PERFORM",
+    ]);
+    expect(
+      purposes.filter(([name]) => name !== "Performer / artist application"),
+    ).toSatisfy((rows: ReadonlyArray<readonly [string, string]>) =>
+      rows.every(([, purpose]) => purpose === "ATTEND"),
+    );
+  });
+
+  it("reports a difference when only the purpose changed (refresh re-keys it)", () => {
+    const performer = LAUNCH_APPLICATION_FORM_TEMPLATES.find(
+      (t) => t.name === "Performer / artist application",
+    )!;
+    const desired = encodeApplicationFormTemplate(performer);
+    expect(
+      applicationTemplateContentDiffers(
+        {
+          id: "row-1",
+          name: desired.name,
+          purpose: "ATTEND",
+          description: desired.description,
+          introText: desired.introText,
+          questions: desired.questions as never,
+          archivedAt: null,
         },
         desired,
       ),

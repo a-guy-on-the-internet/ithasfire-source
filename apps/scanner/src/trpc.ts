@@ -1,5 +1,5 @@
 import { createElement, useCallback, useState, type ReactNode } from "react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { createTRPCReact } from "@trpc/react-query";
 import { httpBatchLink, loggerLink } from "@trpc/client";
 import type { inferRouterInputs, inferRouterOutputs } from "@trpc/server";
@@ -9,6 +9,7 @@ import * as Sentry from "@sentry/react-native";
 import type { AppRouter } from "@th/trpc";
 
 import { getTrpcHttpUrl } from "./config/api";
+import { createQueryClient } from "./query-client";
 import { getAuthToken } from "./features/auth/auth-token-store";
 import { notifyAuthInvalidated } from "./features/auth/auth-invalidation-bus";
 
@@ -56,7 +57,14 @@ const trpcFetchWithDynamicBase: typeof fetch = async (input, init) => {
   return fetchWithInstrumentation(input, init);
 };
 
-const fetchWithInstrumentation: typeof fetch = async (input, init) => {
+/**
+ * Exported for its test only; the app reaches it through the tRPC link.
+ *
+ * A request the app aborted on purpose (a send or a session ask past its time
+ * limit, `lib/with-timeout.ts`) is not a network failure: it gets a
+ * breadcrumb, not a Sentry issue.
+ */
+export const fetchWithInstrumentation: typeof fetch = async (input, init) => {
   const url =
     typeof input === "string"
       ? input
@@ -91,6 +99,19 @@ const fetchWithInstrumentation: typeof fetch = async (input, init) => {
     }
     return response;
   } catch (err) {
+    const abortedHere =
+      !!init?.signal?.aborted ||
+      (err instanceof Error && err.name === "AbortError");
+    if (abortedHere) {
+      Sentry.addBreadcrumb({
+        category: "fetch",
+        type: "http",
+        level: "info",
+        message: `${method} ${url} aborted`,
+        data: { url, method, elapsedMs: Date.now() - startedAt },
+      });
+      throw err;
+    }
     Sentry.captureException(err, {
       tags: { fetch_failure: "network" },
       extra: {
@@ -126,20 +147,6 @@ export const trpc = createTRPCReact<AppRouter>();
  */
 export type RouterInputs = inferRouterInputs<AppRouter>;
 export type RouterOutputs = inferRouterOutputs<AppRouter>;
-
-const createQueryClient = () =>
-  new QueryClient({
-    defaultOptions: {
-      queries: {
-        staleTime: 30_000,
-        retry: 1,
-        refetchOnWindowFocus: false,
-      },
-      mutations: {
-        retry: 1,
-      },
-    },
-  });
 
 type AuthTokenResolver = () => Promise<string | null>;
 

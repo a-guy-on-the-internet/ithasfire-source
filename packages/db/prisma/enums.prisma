@@ -1,0 +1,1477 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared enums — referenced across multiple domain models.
+// Keep all enums here to avoid "which file owns this?" placement debates.
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum AgreementType {
+  PERFORMANCE     // artist plays at a place
+  VENUE_RENTAL    // org rents a place for an event
+  SERVICES        // sound, lighting, etc.
+  REVENUE_SHARE   // ongoing revenue split
+  CUSTOM
+}
+
+enum AgreementStatus {
+  DRAFT           // creator is still editing
+  PROPOSED        // sent to counterparty
+  COUNTERED       // counterparty modified terms, sent back
+  ACCEPTED        // both parties agreed
+  DECLINED        // counterparty rejected
+  CANCELLED       // creator withdrew
+  FULFILLED       // event happened, settlements complete
+  EXPIRED         // expiresAt passed without acceptance
+  DISPUTED        // post-event disagreement (links to Claim)
+}
+
+enum BookingRequestStatus {
+  PENDING         // artist sent the pitch
+  VIEWED          // place owner opened it
+  ACCEPTED        // place owner wants to proceed -> creates Agreement
+  DECLINED        // not interested
+  WITHDRAWN       // artist pulled back
+  EXPIRED         // no response within TTL
+}
+
+enum BookingRequestSource {
+  PLATFORM        // signed-in performer via ithasfire.com (/p/[slug] form)
+  EMBED           // venue-website embed widget (anonymous-first)
+}
+
+enum BookingRequestDirection {
+  TO_VENUE        // performer pitches a venue (the original flow)
+  TO_PERFORMER    // organizer org requests an act (organizer-booking-requests, 2026-07-21)
+}
+
+/// Where an act on a booking request's bill came from (lineup-booking-
+/// requests v2, FR-001, docs/specs/2026-09-25).
+enum BookingRequestActSource {
+  SELF            // the sender's own act ("I'm on the bill"); the sender pair, human OR org
+  TAGGED          // a platform artist the sender tagged (a human); notified, confirms or declines
+  EXTERNAL        // a free-text act with no platform identity
+}
+
+/// Consent state of an act on a bill. SELF and EXTERNAL rows are CONFIRMED
+/// at insert (SQL CHECK); only TAGGED rows ever sit PENDING.
+enum BookingRequestActConfirmation {
+  PENDING         // tagged, not yet answered
+  CONFIRMED       // on the bill
+  DECLINED        // the tagged artist said no; terminal on that request
+}
+
+enum BookingFeeType {
+  GUARANTEE       // fixed guaranteed fee ask
+  DOOR_SPLIT      // a split of the door
+  NEGOTIABLE      // open to discussion (no amount)
+}
+
+/// What a booking request asks the venue for (venue-confirmation-and-
+/// booking-intents spec, docs/specs/2026-08-27). Picks the form variant and
+/// the default event owner: PERFORM → venue owns the minted event (today's
+/// flow); RENT / USE → the requester owns it. USE is non-transactional (a
+/// meeting, a reading, a movie night) and always produces an event.
+enum BookingIntent {
+  PERFORM         // pitch a show (existing rows backfill here)
+  RENT            // hire a space for a window; space REQUIRED
+  USE             // non-transactional use of a space; space REQUIRED
+}
+
+/// Per-Calendar rental posture (venue-confirmation-and-booking-intents spec).
+/// INSTANT is RESERVED — it gets its own spec, is NOT selectable in any UI,
+/// and is mutually exclusive with rental REQUESTS on that calendar
+/// (performance requests are unaffected by it).
+enum RentalMode {
+  REQUEST         // this spec: RENT requests go through the inbox
+  INSTANT         // RESERVED — own spec, not selectable in UI
+}
+
+/// Who authored a set of booking standards (venue-booking-standards spec,
+/// docs/specs/2026-09-25, D1). A CALENDAR's own rows win for that intent; a
+/// PLACE's rows are the default every calendar without its own inherits.
+enum BookingStandardOwnerType {
+  PLACE
+  CALENDAR
+}
+
+/// The pitch field a booking-standard item points at (FR-001). Every member
+/// except CUSTOM is a field the request form HAS and the server can CHECK —
+/// the satisfied-predicate per member lives in core
+/// (packages/core/src/use-cases/booking-standards/standard-fields.ts), which
+/// also says which intents each field applies to. CUSTOM is a free-text line
+/// the venue writes ("send a stage plot"): guidance only, never REQUIRED
+/// (D2a, SQL CHECK on BookingStandardItem).
+enum BookingStandardField {
+  MESSAGE
+  PREFERRED_DATES
+  EXPECTED_DRAW
+  GENRE
+  LINEUP_SIZE
+  SET_LENGTH
+  TECH_NEEDS
+  FEE
+  LINK_MUSIC
+  LINK_VIDEO
+  LINK_SOCIAL
+  LINK_EPK
+  BILL
+  PURPOSE
+  EXPECTED_ATTENDANCE
+  REQUESTED_WINDOW
+  CUSTOM
+}
+
+/// D2: REQUIRED blocks submit (client AND server, STANDARDS_UNMET) using the
+/// venue's own label; SUGGESTED is a prompt only.
+enum BookingStandardRequirement {
+  REQUIRED
+  SUGGESTED
+}
+
+enum HumanStatus {
+  INVITED
+  ACTIVE
+  SUSPENDED
+  BANNED
+}
+
+enum OrgStatus {
+  ACTIVE
+  SUSPENDED
+  ARCHIVED
+}
+
+enum OrgRole {
+  OWNER
+  ADMIN
+  EDITOR
+  FINANCE
+  SCANNER
+  VIEWER
+}
+
+enum PlaceStatus {
+  ACTIVE
+  SUSPENDED
+  ARCHIVED
+}
+
+enum PayeeSubjectType {
+  HUMAN
+  ORGANIZATION
+}
+
+enum PayeeStatus {
+  PENDING
+  ACTIVE
+  RESTRICTED
+}
+
+enum PayeeLedgerEntryType {
+  SETTLEMENT_CREDIT
+  REFUND_DEBIT
+  DISPUTE_HOLD
+  DISPUTE_DEBIT
+  DISPUTE_RELEASE
+  PAYOUT
+  RESERVE_HOLD
+  RESERVE_RELEASE
+  MANUAL_ADJUSTMENT
+  /// Written when a post-payout refund successfully reverses a Stripe
+  /// transfer: the money came back to the platform externally, so the payee's
+  /// balance owes nothing net. +effect on `ledgerBalanceCents`;
+  /// `relatedEntryId` links to the REFUND_DEBIT it compensates.
+  TRANSFER_REVERSAL_CREDIT
+  /// A cash sale at the door: the organiser holds the cash, and the platform
+  /// fee + tax in it are owed to the platform. −effect on the payable and on
+  /// `ledgerBalanceCents`; the next payout is reduced by it, and a cash-only
+  /// payee carries the negative balance forward (owner ruling R6, 2026-10-07).
+  CASH_SALE_DEBIT
+  /// Reverses a CASH_SALE_DEBIT when the cash sale is refunded at the gate.
+  /// +effect; `relatedEntryId` links to the debit it reverses.
+  CASH_SALE_DEBIT_REVERSAL
+}
+
+/// Billing cadence we offer for a membership tier. Ours, not Stripe's — we
+/// choose what to expose, so a closed enum is right here even though
+/// Membership.status mirrors Stripe with a plain string.
+enum MembershipInterval {
+  MONTH
+  YEAR
+}
+
+enum MembershipTierStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+/// What a benefit DOES.
+///
+/// One value today, deliberately. The previous `PRESALE_ACCESS` slot was
+/// dropped rather than kept "free": it was named after a MECHANISM someone
+/// guessed at, and a reserved name constrains the design when the real
+/// requirement arrives (you either bend the feature to the name or rename the
+/// enum anyway). The enum stays because the next perks — merch discounts,
+/// event access — are real and near; the VALUE gets named when it has
+/// semantics.
+enum MembershipBenefitKind {
+  DISCOUNT
+}
+
+/// Discount maths for a `DISCOUNT` benefit. Deliberately a SEPARATE enum from
+/// `PromoKind` even though the values coincide: a benefit is an entitlement,
+/// not a campaign, and coupling the two enums would re-create the Promo
+/// dependency this model exists to remove.
+enum MembershipDiscountKind {
+  AMOUNT
+  PERCENT
+}
+
+/// Who absorbs Stripe's per-dispute fee.
+///
+/// PLATFORM for ticketing: we take the hit rather than clawing it back from a
+/// venue for a buyer's action. PAYEE for memberships, where the owner sold a
+/// recurring subscription and the chargeback risk is theirs — stated at
+/// membership setup, never buried in terms.
+enum DisputeFeeBearer {
+  PLATFORM
+  PAYEE
+}
+
+enum DisputeStatus {
+  NEEDS_TRIAGE
+  OPEN
+  UNDER_REVIEW
+  WON
+  LOST
+  WARNING_OPEN
+  WARNING_UNDER_REVIEW
+  WARNING_CLOSED
+}
+
+/// Lifecycle of the staff-assembled chargeback evidence package (one per
+/// dispute). DRAFT = machine-assembled / ops-edited, not yet signed off;
+/// APPROVED = an ops reviewer signed it off; SUBMITTED = sent to the
+/// processor (terminal — re-assembly is refused); SUBMIT_FAILED = the
+/// processor call failed, `submitError` carries the sanitised reason and ops
+/// re-approve + retry.
+enum DisputeEvidenceStatus {
+  DRAFT
+  APPROVED
+  SUBMITTED
+  SUBMIT_FAILED
+}
+
+/// How a Radar early fraud warning stopped being actionable. REFUNDED = the
+/// charge was fully refunded (ops acted, or Stripe reports it); DISPUTED = the
+/// chargeback landed anyway; IGNORED = ops reviewed and chose not to refund.
+enum EarlyFraudWarningResolution {
+  REFUNDED
+  DISPUTED
+  IGNORED
+}
+
+enum PaymentFeeType {
+  ABSORB
+  PASS_THROUGH
+}
+
+enum FeePolicyScopeType {
+  GLOBAL
+  ORG
+  EVENT
+}
+
+enum FeePolicyStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+/// Who a fee waiver is granted to. A waiver is keyed by subject + side, so the
+/// same human can hold both an organiser-side and a buyer-side allowance.
+enum FeeWaiverSubjectType {
+  HUMAN
+  ORG
+}
+
+/// Which side of the transaction the allowance applies to.
+/// ORGANIZER — waives the platform fee on tickets SOLD under this subject.
+/// BUYER     — waives the platform fee on tickets BOUGHT by this subject.
+enum FeeWaiverSide {
+  ORGANIZER
+  BUYER
+}
+
+enum FeeWaiverStatus {
+  ACTIVE
+  EXHAUSTED
+  REVOKED
+}
+
+/// RESERVED — allowance held at checkout, payment not yet settled.
+/// SETTLED  — payment succeeded; the waived ticket is spent for good.
+/// RELEASED — checkout failed/expired or the order was refunded; allowance returned.
+enum FeeWaiverRedemptionStatus {
+  RESERVED
+  SETTLED
+  RELEASED
+}
+
+enum PayoutTermsKind {
+  PRIMARY
+  RESALE
+  /// Merchandise revenue split (POS-driven). Schema-only in v1; UI deferred
+  /// until the POS feature lands.
+  MERCH
+}
+
+enum PayoutTermsStatus {
+  PENDING
+  ACTIVE
+  ARCHIVED
+}
+
+// Payout schedule determines when funds are released to payees.
+// Dates are computed by `computePayoutDate`
+// (packages/core/src/lib/payout-scheduling), at midnight America/Chicago.
+//
+// CORRECTED 2026-09: the previous comment here claimed "all schedules respect
+// a 2-day post-event floor for refund handling". No such floor was ever
+// implemented, and ASAP is event end + 1 day, not 2. What DOES clamp maturity
+// is the Stripe balance-availability floor applied when the ledger credit is
+// written (`applyAvailabilityFloor`): a flat 2 business days from the charge,
+// every payment method. That is a funds-availability guard, not a refund
+// window. See `settlement-availability.ts` for why there is no ACH branch.
+enum PayoutSchedule {
+  ASAP               // The day after the event ends (fastest possible)
+  WEEK_OF_EVENT      // Sunday of the event's week, rolled to the FOLLOWING Sunday when that Sunday is < 2 days after the event (Sat/Sun events)
+  ONE_WEEK_AFTER     // Sunday of the following week
+  TWO_WEEKS_AFTER    // Sunday 2 weeks after event week (DEFAULT for new payout terms)
+  FOUR_WEEKS_AFTER   // Sunday 4 weeks after event week (~1 month)
+}
+
+enum PayoutTermsLineRounding {
+  FLOOR
+  NEAREST
+}
+
+enum EventStatus {
+  DRAFT
+  PUBLISHED
+  CANCELLED
+  COMPLETED
+  ARCHIVED
+}
+
+enum EventHumanRole {
+  PERFORMER
+  HOST
+  DJ
+  INSTRUCTOR
+  SPEAKER
+  VENDOR
+  VOLUNTEER
+  OTHER
+}
+
+enum EventVisibility {
+  PUBLIC
+  PRIVATE
+}
+
+enum EventGateType {
+  NONE
+  APPLICATION
+  PASSWORD
+}
+
+// Two-value model (location-visibility-reveal spec, 2026-06-23):
+//   EXACT    — full public address + coordinates.
+//   OBSCURED — public pre-reveal view is governed by locationRadiusMeters
+//              (non-null = deterministic obfuscated circle, null = FULLY HIDDEN
+//              with no public map); the exact address is always revealed to
+//              ticket holders at the mandatory addressRevealAt.
+// Deliberately NOT named "PRIVATE" — that value exists on EventVisibility
+// (a different axis: who can find the event vs how exact the location is).
+// Legacy APPROXIMATE/HIDDEN were collapsed into OBSCURED
+// (migrations 20260707100000 + 20260707100001).
+enum EventLocationMode {
+  EXACT
+  OBSCURED
+}
+
+// Reveal schedules for an OBSCURED event's exact address.
+//
+// Every member except NEVER resolves a NON-NULL `addressRevealAt`. NEVER is
+// the one member that deliberately resolves `addressRevealAt = null`, and it
+// is what makes a null reveal date READABLE: before it existed, a null on an
+// OBSCURED event could only be an invariant violation, so the redactors
+// fail-close on it and every reader had to guess whether the row was broken.
+// With NEVER stored alongside, `(OBSCURED, preset = NEVER, at = null)` says
+// "the organizer chose this" and `(OBSCURED, preset = null, at = null)` still
+// says "this row is broken". Both stay LOCKED FOREVER at read time — the
+// redaction behaviour is identical, only the intent is now legible.
+enum AddressRevealPreset {
+  IMMEDIATELY       // addressRevealAt = save time (reveal right away)
+  ONE_HOUR_BEFORE   // addressRevealAt = startsAt - 1h
+  DAY_BEFORE        // addressRevealAt = startsAt - 24h (default for OBSCURED)
+  WEEK_BEFORE       // addressRevealAt = startsAt - 7d
+  CUSTOM            // organizer picked a specific datetime
+  NEVER             // addressRevealAt = null BY CHOICE — never revealed, to anyone
+}
+
+enum EventUnlockSource {
+  PASSWORD        // User entered the correct event password
+  APPLICATION     // Application was approved
+  ADMIN           // Admin manually unlocked
+  INVITE_LIST     // Auto-unlocked via invite/allowlist match
+  MAGIC_LINK      // Unlocked via an invite link (EventInvite, SHARED or PERSONAL); EventUnlock.inviteId set
+}
+
+/// What an EventInvite is (gated-event invite links, 2026-10-02).
+enum EventInviteKind {
+  SHARED   // one link per event, anyone holding it; reset revokes and re-mints
+  PERSONAL // one per invitee email, emailed to that guest; revocable
+}
+
+// ── Community-managed event listings ────────────────────────────────────────
+// See docs/specs/2026-07-01/completed/community-managed-event-listings.spec.yaml.
+
+enum EventAttendanceMode {
+  TICKETED // Default — full ticketing/checkout/tax/payout pipeline
+  RSVP     // Free — attendance is a personal "I'm going"; no money paths
+}
+
+enum EventStewardship {
+  OWNED     // Default — owned by a human or org (today's behavior)
+  COMMUNITY // Ownerless — maintained via the edit-suggestion queue
+}
+
+enum EventEditSuggestionStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum CommunityModeratorApplicationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/// Which public listing an EntityReport points at (polymorphic with subjectId).
+enum EntityReportSubjectType {
+  PLACE
+  HUMAN
+  ORGANIZATION
+  /// arrival-areas FR-011: subjectId is an ArrivalArea id; the report keeps a snapshot.
+  ARRIVAL_AREA
+}
+
+/// Report reasons across ALL subject types. The per-subject allowed subsets
+/// (PLACE excludes IMPERSONATION; HUMAN/ORGANIZATION exclude CLOSED_OR_GONE
+/// and DUPLICATE — spec FR-002) are enforced in core (submit-entity-report),
+/// NOT in the schema.
+enum EntityReportReason {
+  CLOSED_OR_GONE
+  INCORRECT_INFO
+  DUPLICATE
+  INAPPROPRIATE
+  SPAM
+  IMPERSONATION
+  OTHER
+}
+
+enum EntityReportStatus {
+  PENDING
+  RESOLVED
+  DISMISSED
+}
+
+/// Kind of change captured by an EventChangeNotice outbox row. Drives the
+/// watcher-notification copy (cancelled vs rescheduled vs venue moved, etc.).
+enum EventChangeType {
+  CANCELLED
+  RESCHEDULED
+  VENUE_CHANGED
+  ARCHIVED
+  UNPUBLISHED
+}
+
+enum WaitlistStatus {
+  DISABLED
+  SCHEDULED
+  OPEN
+}
+
+enum WaitlistEntrySource {
+  PUBLIC
+  INVITE
+  APPLICATION
+}
+
+enum WaitlistEntryStatus {
+  PENDING
+  NOTIFIED
+  PURCHASED
+  DROPPED
+}
+
+enum ApplicationQuestionType {
+  SHORT_TEXT
+  LONG_TEXT
+  MULTI_CHOICE
+  SINGLE_CHOICE
+}
+
+enum ApplicationSubmissionStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  /// Applicant pulled back their own PENDING submission (spec Phase 2).
+  WITHDRAWN
+  /// Nightly sweep: PENDING past the form's closesAt + grace window.
+  EXPIRED
+  /// Reviewer parked the application on the event waitlist (writes an
+  /// EventWaitlistEntry with source: APPLICATION).
+  WAITLISTED
+}
+
+/// What an EventApplicationForm is for (open calls v1,
+/// docs/specs/2026-10-05/open-calls.spec.yaml). ATTEND = the attendee gate
+/// form (Event.gateType APPLICATION reads this one only). PERFORM = an open
+/// call for performers. One form per (event, purpose) / (series, purpose);
+/// series forms are always PERFORM (SQL CHECK).
+enum ApplicationFormPurpose {
+  ATTEND
+  PERFORM
+}
+
+/// Pay terms posted on an open call (spec FR-002). Details text is required
+/// for FIXED, DOOR_SPLIT, TICKET_SHARE and TICKET_QUOTA — enforced in core.
+enum OpenCallPayKind {
+  FIXED
+  DOOR_SPLIT
+  TICKET_SHARE
+  TICKET_QUOTA
+  UNPAID
+  DISCUSSED_AFTER
+}
+
+/// One organizer-side member's vote on an application (spec FR-014).
+enum ApplicationVoteValue {
+  YES
+  MAYBE
+  NO
+}
+
+/// Who wrote an ApplicationMessage (spec FR-015). Mirrors
+/// BookingMessageAuthorSide minus SYSTEM, which v1 does not need.
+enum ApplicationMessageAuthorSide {
+  ORGANIZER
+  APPLICANT
+}
+
+enum InviteListOwnerType {
+  HUMAN
+  ORGANIZATION
+}
+
+enum ContactImportFileFormat {
+  CSV
+  XLSX
+}
+
+enum TicketTypeStatus {
+  ACTIVE
+  INACTIVE
+  ARCHIVED
+}
+
+enum TicketTypePricingMode {
+  FIXED
+  ADJUSTABLE
+}
+
+enum SeatStatus {
+  AVAILABLE
+  HELD
+  SOLD
+  BLOCKED
+}
+
+enum SeatSectionType {
+  GA
+  RESERVED
+}
+
+enum PlaceOwnerType {
+  HUMAN
+  ORGANIZATION
+}
+
+enum TemplateOwnerScope {
+  HUMAN
+  ORGANIZATION
+}
+
+enum EventSeriesOwnerScope {
+  HUMAN
+  ORGANIZATION
+}
+
+enum EventSeriesOccurrenceStatus {
+  PLANNED
+  SKIPPED
+  GENERATED
+  PUBLISHED
+  CANCELLED
+  DETACHED
+}
+
+/// Lifecycle of a single expanded occurrence (EventDate) of a recurring event.
+/// Deliberately minimal: a date is either happening (SCHEDULED) or called off
+/// (CANCELLED). CANCELLED rows are preserved on re-expansion to keep history
+/// and any per-date RSVPs intact.
+enum EventDateStatus {
+  SCHEDULED
+  CANCELLED
+}
+
+/// What a RsvpNotice outbox row is FOR. The table started life as a
+/// confirmation-only outbox, so CONFIRMATION is the default and every
+/// pre-existing row carries it.
+///
+///   - CONFIRMATION  - "you're going": enqueued by rsvp-to-event(-date) right
+///     after a NEWLY-created RSVP row.
+///   - DATE_CANCELLED - "that night is off": enqueued by `cancelEventDate`,
+///     one row per LIVE per-date RSVP, inside the SAME transaction as the
+///     SCHEDULED -> CANCELLED flip. `eventDateId` is always set for this kind.
+///
+/// One table, two kinds, on purpose: the drain, the retry/dead-letter
+/// bookkeeping and the retention purge are identical for both, and a second
+/// outbox would be a second thing to forget to drain.
+enum RsvpNoticeKind {
+  CONFIRMATION
+  DATE_CANCELLED
+}
+
+enum PlaceVerificationStatus {
+  UNVERIFIED
+  VERIFIED
+  PENDING
+  REJECTED
+}
+
+enum PlaceVerificationRequestStatus {
+  PENDING
+  IN_REVIEW
+  APPROVED
+  REJECTED
+  WITHDRAWN
+}
+
+/// What opened a PlaceVerificationRequest. Org verifications are the legacy
+/// path (an org that already has place access proving the venue is theirs).
+/// Ownership claims + disputes come from the self-serve claim-venue flow
+/// (docs/specs/2026-07-05/completed/claim-venue-flow.spec.yaml).
+enum PlaceVerificationRequestSource {
+  ORG_SUBMISSION    // Legacy: org with existing place access submits proof.
+  OWNERSHIP_CLAIM   // A human/org claims an unclaimed venue (provisional ownership).
+  OWNERSHIP_DISPUTE // A challenger contests an already-verified owner.
+}
+
+/// Provenance of a Place.website value, so the claim fast-track (FR-010) can
+/// tell a trusted-import domain from an attacker-influenced stub domain.
+/// TRUSTED_IMPORT is set ONLY by verified bulk-import paths; USER_STUB by the
+/// review-stub + freeform user paths; existing rows default UNKNOWN (no
+/// fast-track).
+enum PlaceWebsiteSource {
+  TRUSTED_IMPORT
+  USER_STUB
+  UNKNOWN
+}
+
+// Roles local to Ithas Fire (not org roles)
+enum HumanRole {
+  USER
+  REVIEWER
+  ADMIN
+  DEVELOPER
+  SUPPORT
+  COMMUNITY_MODERATOR // Verified community-listing moderator (appended — Postgres enum value addition)
+}
+
+enum HumanJob {
+  MUSICIAN
+  DJ
+  COMEDIAN
+  DANCER
+  VISUAL_ARTIST
+  POET
+  MAGICIAN
+  SOUND_ENGINEER
+  LIGHTING_ENGINEER
+  PHOTOGRAPHER
+  VIDEOGRAPHER
+  PROMOTER
+  EVENT_ORGANIZER
+  BOOKING_AGENT
+  OTHER
+}
+
+enum OrderStatus {
+  PENDING
+  PROCESSING
+  SUCCEEDED
+  PART_REFUNDED
+  REFUNDED
+  DISPUTED
+  CANCELLED
+}
+
+enum OrderSource {
+  PRIMARY
+  RESALE
+  COMP
+}
+
+/// What an Order actually IS, as opposed to how it was sold (OrderSource).
+/// Exists so every consumer that assumes an event can be narrowed positively
+/// on `kind = TICKETING` rather than relying on `eventId` being non-null —
+/// membership invoices are Orders with no event.
+enum OrderKind {
+  TICKETING
+  MEMBERSHIP
+}
+
+enum PaymentChannel {
+  WEB
+  POS
+  CASH
+}
+
+enum HumanSource {
+  WEB
+  POS_WALKUP
+  IMPORT
+}
+
+enum TicketStatus {
+  VALID
+  SCANNED
+  INVALID
+  REFUNDED
+  LISTED
+}
+
+enum TicketScanOutcome {
+  ACCEPTED
+  REJECTED
+  REPLAY
+}
+
+/// Post-event prompt outbox audience discriminator (shared pipeline for the
+/// performer post-gig review prompt and the attendee review prompt — see
+/// post-event-prompt.prisma).
+enum PostEventPromptAudience {
+  PERFORMER
+  ATTENDEE
+}
+
+enum PostEventPromptStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum ResaleListingStatus {
+  ACTIVE
+  HELD
+  SOLD
+  CANCELLED
+  EXPIRED
+
+  @@map("ListingStatus")
+}
+
+enum ResaleOrderItemPayoutStatus {
+  PENDING
+  HELD
+  READY
+  PAID
+  BLOCKED
+}
+
+enum ProfileVisibility {
+  PUBLIC
+  PRIVATE
+}
+
+enum EmbedStatus {
+  ACTIVE
+  REVOKED
+}
+
+enum PromoStatus {
+  ACTIVE
+  ARCHIVED
+
+  @@map("CouponStatus")
+}
+
+enum PromoKind {
+  PERCENT
+  AMOUNT
+
+  @@map("CouponKind")
+}
+
+enum PromoScope {
+  GLOBAL
+  ORG
+  EVENT
+  TICKET_TYPE
+  // Owner-wide scope for direct/personal sellers (event.orgId = null,
+  // event.humanId = seller). scopeId = the Human id. Mirrors ORG, which is
+  // owner-wide for organizations. Appended last to match the DB enum order
+  // (ALTER TYPE ... ADD VALUE appends).
+  HUMAN
+
+  @@map("CouponScope")
+}
+
+enum PromoHoldStatus {
+  PENDING
+  CONFIRMED
+  RELEASED
+
+  @@map("CouponHoldStatus")
+}
+
+enum PushProvider {
+  expo
+  fcm
+  apns
+  web
+}
+
+enum PushPlatform {
+  ios
+  android
+  web
+  unknown
+}
+
+enum NotificationDigestType {
+  ORGANIZER_WEEKLY
+  ATTENDEE_FEEDBACK
+}
+
+enum NotificationDigestChannel {
+  EMAIL
+  IN_APP
+}
+
+enum NotificationKind {
+  INFO
+  SUCCESS
+  WARNING
+  ERROR
+}
+
+enum FeedbackRequestStatus {
+  PENDING
+  SCHEDULED
+  SENT
+  COMPLETED
+  SKIPPED
+}
+
+enum OrgInvitationStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
+  REVOKED
+}
+
+/// Platform-assigned trust tier for organizations.
+/// Computed from track record or overridden by super-admin.
+enum OrgTrustTier {
+  NEW         // Default — no earned reputation yet
+  ESTABLISHED // ≥ 3 completed events, low dispute rate, 60+ days old
+  TRUSTED     // ≥ 10 completed events, 500+ tickets sold, < 2% disputes
+  TOP         // ≥ 50 completed events, 5 000+ tickets sold, < 1% disputes
+  CUSTOM      // Platform override — uses trustBadgeLabel for display
+}
+
+enum ImageOwnerType {
+  EVENT
+  ORG
+}
+
+enum AudioUploadStatus {
+  PENDING     // Created, awaiting upload
+  UPLOADED    // Source file uploaded, awaiting transcoding
+  TRANSCODING // Currently being transcoded
+  READY       // Transcoded and ready for playback
+  FAILED      // Transcoding failed
+}
+
+enum PendingTicketTransferStatus {
+  PENDING
+  CLAIMED
+  CANCELLED
+  EXPIRED
+}
+
+enum WaiverTemplateSource {
+  FREEFORM
+  ASSEMBLED
+  PLATFORM
+}
+
+/// Who a waiver template is presented to. Distinguishes the platform default
+/// attendee waiver from the platform default volunteer waiver so `isDefault`
+/// is unambiguous per audience (partial unique index in migration
+/// 20260804120000_waiver_template_kind: one platform default per kind).
+enum WaiverTemplateKind {
+  ATTENDEE
+  VOLUNTEER
+}
+
+enum WaiverClauseCategory {
+  STRUCTURAL
+  VENUE
+  ACTIVITY
+  SUBSTANCE
+  LEGAL
+  GENERAL
+}
+
+enum WaiverClauseLayer {
+  STRUCTURAL
+  RISK_SPECIFIC
+}
+
+enum AnnouncementAudienceType {
+  ALL_TICKET_HOLDERS
+  EVENT_TICKET_HOLDERS
+  MULTIPLE_EVENTS
+  EVENT_TICKET_TIER
+  CONTACT_LIST
+  WAITLIST_SUBSCRIBERS
+}
+
+// ── Resource quotas & expansion requests ────────────────────────────────────
+
+/// Category of platform resource that can be quota-limited.
+enum ResourceLimitKind {
+  ORGS_OWNED            // Max orgs a human can create (subject=HUMAN)
+  ORGS_JOINED           // Max orgs a human can belong to (subject=HUMAN)
+  STORAGE_BYTES_ORG     // Cumulative upload storage per org (subject=ORG)
+  STORAGE_BYTES_HUMAN   // Cumulative upload storage per human (subject=HUMAN)
+  STORAGE_BYTES_PLACE   // Community page uploads on an unowned place (subject=PLACE)
+  EVENTS_PER_ORG        // Max active events per org (subject=ORG)
+  MEMBERS_PER_ORG       // Max members per org (subject=ORG)
+  ANNOUNCEMENTS_PER_DAY // Max announcements an org can send per day (subject=ORG)
+}
+
+/// Who holds a quota: a human, an organization, or a place (PLACE holds only
+/// STORAGE_BYTES_PLACE, community page uploads on an unowned place).
+enum QuotaSubjectType {
+  HUMAN
+  ORG
+  PLACE
+}
+
+/// Lifecycle status of an expansion request.
+enum ExpansionRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// ── Entity-page enums ───────────────────────────────────────────────────────
+
+enum PageOwnerType {
+  HUMAN
+  ORGANIZATION
+  PLACE
+}
+
+enum PageVisibility {
+  PUBLIC
+  PRIVATE
+  UNLISTED
+}
+
+// ── Notification preference enums ───────────────────────────────────────────
+
+enum NotificationPreferenceScopeKind {
+  GLOBAL
+  ORG
+  EVENT
+}
+
+// ── Volunteering enums ──────────────────────────────────────────────────────
+
+/// What a generic VolunteerAsk is posted against. Polymorphic
+/// (subjectType, subjectId) pair — no hard FK, matching the
+/// BookingRequest.performerOwnerType/OwnerId precedent in agreement.prisma.
+enum VolunteerSubjectType {
+  PLACE
+  ORG
+  HUMAN
+  EVENT
+}
+
+/// Lifecycle of a VolunteerAsk. OPEN accepts signups; PAUSED/CLOSED stop
+/// new signups but preserve the roster; ARCHIVED hides it from dashboards.
+enum VolunteerAskStatus {
+  DRAFT
+  OPEN
+  PAUSED
+  CLOSED
+  ARCHIVED
+}
+
+/// Scheduling flavor of an ask. v1 is a label + optional startsAt/endsAt
+/// window — no generic shift model, no occurrence generation.
+enum VolunteerAskCadence {
+  ONE_TIME
+  ONGOING
+  RECURRING
+}
+
+enum VolunteerSignupStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  WITHDRAWN
+  CHECKED_IN
+  NO_SHOW
+}
+
+/// Pre-shift reminder dispatch tracking. Two cron windows: 24h ahead
+/// (`*/15 * * * *`, fires once per signup in the 23h45m–24h15m band)
+/// and 1h ahead (`*/5 * * * *`, 55m–65m band). The reminder dispatcher
+/// idempotency table keys on this enum + the channel, so adding a new
+/// kind here automatically gets a clean dispatch ledger.
+enum VolunteerReminderKind {
+  REMINDER_24H
+  REMINDER_1H
+}
+
+/// When a volunteer comp-ticket reward fires for a signup. Per the
+/// 2026-06-29 volunteer-comp-tickets spec (+ 2026-07-01 resolutions):
+/// ON_APPROVAL incentivizes commitment, ON_CHECK_IN incentivizes actually
+/// showing up — the default and the safer money posture.
+enum VolunteerRewardTrigger {
+  ON_APPROVAL
+  ON_CHECK_IN
+}
+
+/// Publication state of a platform-curated VolunteerPack. DRAFT is
+/// staff-only — its roles must not appear in ANY organizer-facing response
+/// (list, apply, fork); LIVE surfaces them inline in every org's template
+/// list. Deliberately just two states: scheduled windows (curatedAt /
+/// curatedUntil, as FeaturedItem has) are out of scope.
+enum VolunteerPackStatus {
+  DRAFT
+  LIVE
+}
+
+/// Publication state of a platform-curated TicketPack. Mirrors
+/// VolunteerPackStatus exactly (and deliberately stays a separate enum so the
+/// two catalogues can diverge later without a shared-enum migration): DRAFT
+/// is staff-only — its templates must not appear in ANY organizer-facing
+/// response (list, apply, fork); LIVE surfaces them inline in every owner's
+/// template list.
+enum TicketPackStatus {
+  DRAFT
+  LIVE
+}
+
+/// What a VolunteerRoleTemplateShift's start time is measured from.
+/// WALL_CLOCK reproduces the pre-2026-07 behaviour exactly: use
+/// `startMinuteOfDay` as a time of day and ignore `offsetMinutes`.
+/// EVENT_START / EVENT_END resolve against Event.startsAt / Event.endsAt
+/// plus the signed `offsetMinutes` (e.g. −180 = "three hours before
+/// doors-ish"). `startDayOffset` still applies in all cases. There is no
+/// DOORS anchor — Event has no doorsAt column.
+enum VolunteerShiftAnchor {
+  WALL_CLOCK
+  EVENT_START
+  EVENT_END
+}
+
+/// Lifecycle of one issued reward grant. GRANTED = comp issued and live;
+/// REDEEMED = the comp ticket was scanned; REVOKED = voided before
+/// redemption (signup WITHDRAWN or manual revoke — nothing else
+/// auto-revokes) and the budget slot returned.
+enum VolunteerRewardGrantStatus {
+  GRANTED
+  REDEEMED
+  REVOKED
+}
+
+/// Lifecycle of a concrete dated volunteer slot on a standing ask
+/// (generic-volunteer-shifts-occurrences FR-001). CANCELLED rows are kept
+/// (never deleted) so claimants' history and cancellation notifications
+/// stay auditable.
+enum VolunteerOccurrenceStatus {
+  SCHEDULED
+  CANCELLED
+}
+
+/// Lifecycle of one volunteer's commitment to one occurrence. Withdrawn
+/// rows are kept (unique per (occurrence, signup)) and flip back to
+/// CLAIMED on a re-claim.
+enum VolunteerOccurrenceClaimStatus {
+  CLAIMED
+  WITHDRAWN
+}
+
+/// How a claim came to exist: the volunteer clicked (SELF) or an
+/// owner/coordinator placed them (ASSIGNED). Shadow (no-account)
+/// volunteers can only ever be ASSIGNED.
+enum VolunteerOccurrenceClaimSource {
+  SELF
+  ASSIGNED
+}
+
+// ── Place review enums ──────────────────────────────────────────────────────
+
+enum PlaceReviewPaymentMethod {
+  GUARANTEE
+  DOOR_SPLIT
+  TICKET_SALES
+  BAR_PERCENTAGE
+  TIPS_ONLY
+  PAY_TO_PLAY
+  UNPAID
+  OTHER
+}
+
+enum PlaceReviewPromotionLevel {
+  ACTIVELY_PROMOTED
+  POSTED_ONCE
+  NO_PROMOTION
+}
+
+enum PlaceReviewSoundQuality {
+  GREAT
+  ADEQUATE
+  BAD
+  NONEXISTENT
+}
+
+enum PlaceReviewStageEquipment {
+  FULL
+  PARTIAL
+  NONE
+}
+
+enum PlaceReviewAudienceFit {
+  PERFECT_FIT
+  OKAY
+  WRONG_CROWD
+}
+
+enum PlaceReviewPlayAgain {
+  YES
+  MAYBE
+  NO
+}
+
+enum PlaceReviewParking {
+  DEDICATED_LOT
+  STREET_NEARBY
+  DIFFICULT
+  NIGHTMARE
+}
+
+enum PlaceReviewBookerRating {
+  EXCELLENT
+  GOOD
+  OKAY
+  POOR
+  TERRIBLE
+}
+
+enum PlaceReviewSource {
+  SURVEY
+  PLATFORM
+  IMPORTED
+}
+
+/// Provenance of an AttendeeReview (venue-rating-block-and-owner-optin FR-009).
+/// VERIFIED_TICKET = scanned-ticket-only verified attendee path; COMMUNITY =
+/// unverified, venue-direct cold-start path (no event, name/unverified email).
+/// The two are aggregated + suppressed SEPARATELY (FR-010) — community volume
+/// never lifts the verified headline.
+enum AttendeeReviewSource {
+  VERIFIED_TICKET
+  COMMUNITY
+}
+
+enum PlaceReviewMerchPolicy {
+  ALLOWED_FREELY
+  ALLOWED_WITH_CUT
+  NOT_ALLOWED
+}
+
+enum PlaceReviewStaffSupport {
+  YES
+  SOMEWHAT
+  NO
+}
+
+enum PlaceReviewIndependentVenue {
+  YES
+  NO
+  NOT_SURE
+}
+
+enum PlaceReviewTimeOfDay {
+  MORNING      // 9am–12pm
+  AFTERNOON    // 12pm–5pm
+  EVENING      // 5pm–9pm
+  NIGHT        // 9pm+
+}
+
+enum FeaturedItemType {
+  EVENT
+  HUMAN
+  ORGANIZATION
+  PLACE
+}
+
+enum TicketAttributionSource {
+  REF_LINK
+  CHECKOUT_SELECT
+  NONE
+}
+
+enum AttributionConsentStatus {
+  GRANTED
+  DENIED
+  UNKNOWN
+}
+
+enum ConsentChoice {
+  ALL
+  ESSENTIAL
+  RESET
+}
+
+enum ConsentSource {
+  BANNER
+  FOOTER_MANAGE
+}
+
+// ── AcceptanceRecord — platform-wide, human-keyed, version-gated documents ──
+// See docs/specs/2026-05-17/completed/acceptance-records.spec.md.
+enum AcceptanceDocumentType {
+  CHARGEBACK_TERMS_ORGANIZER // Migration target for current chargeback fields
+  BUYER_TERMS                // Registered; dual-written at checkout (Order stamp + GLOBAL ledger row)
+  REFUND_POLICY              // Registered; dual-written at checkout (Order stamp + GLOBAL ledger row)
+  ORGANIZER_TERMS            // Future master Organizer ToS
+  PRIVACY_POLICY             // Future
+  AGE_VERIFICATION           // Future
+}
+
+enum AcceptanceScope {
+  GLOBAL
+  ORGANIZATION
+  EVENT
+}
+
+// ── SmsConsent — phone-level SMS opt-out / opt-in state ─────────────────────
+// See docs/specs/2026-05-18/completed/sms-opt-out-sns.spec.yaml.
+enum SmsConsentStatus {
+  OPTED_OUT // STOP-family / suppressed: no reminder or announcement SMS
+  OPTED_IN  // Explicit re-consent recorded
+  UNKNOWN   // No signal yet; treated as deliverable for transactional sends
+}
+
+// ── UserCredit — platform-funded account credit ─────────────────────────────
+// See docs/specs/2026-05-16/user-credit.spec.md. Credits come out of platform
+// margin, never organiser payout. Models live in credit.prisma.
+enum UserCreditStatus {
+  ACTIVE   // Has positive balance, not expired
+  REDEEMED // Fully consumed
+  EXPIRED  // Past expiresAt; balance forfeit
+  REVOKED  // Platform staff clawback
+}
+
+enum UserCreditSourceType {
+  SIGNUP_BONUS
+  REFERRAL
+  REFUND_GOODWILL
+  PLATFORM_CAMPAIGN
+  PARTNER_SPIFF
+  MANUAL_STAFF_GRANT
+}
+
+// ── Support chat widget ─────────────────────────────────────────────────────
+// See docs/specs/2026-06-23/completed/support-chat-widget.spec.yaml. Models live in
+// support.prisma. authorType includes AI_CLERK + SYSTEM up front so the AI
+// clerk spec (ai-clerk-and-tool-registry) needs no later migration.
+// NOTE: enum value *declaration order* is significant. Postgres sorts enum
+// columns by declaration order, and the operator inbox relies on that to
+// surface escalated threads first (AWAITING_HUMAN, then OPEN, then RESOLVED)
+// via a plain `ORDER BY status ASC`. The OPEN default is set explicitly on the
+// model and is independent of this ordering.
+enum SupportThreadStatus {
+  AWAITING_HUMAN // escalated — a human operator needs to reply (inbox top)
+  OPEN           // active conversation; AI clerk / self-serve may still suffice
+  RESOLVED       // closed out; resolvedAt set
+}
+
+enum SupportThreadSource {
+  WIDGET // opened from the bottom-right chat widget
+  ADMIN  // opened/seeded by an operator
+  SYSTEM // opened programmatically (e.g. AI clerk, automation)
+}
+
+enum SupportAuthorType {
+  USER        // the signed-in attendee
+  HUMAN_AGENT // a platform support operator
+  AI_CLERK    // the AI clerk (future; thread model is AI-ready)
+  SYSTEM      // automated / system-generated message
+}
+
+/// Tax-form paperwork FLAG on a booking request (venue-hierarchy FR-008).
+/// A workflow marker ONLY — the platform never stores TINs or identity
+/// documents; identity collection stays deferred to Stripe Connect onboarding.
+enum BookingTaxFormStatus {
+  NONE            // no tax form in play
+  REQUESTED       // venue asked the performer for a form (off-platform)
+  RECEIVED        // venue marked the form received (off-platform)
+}
+
+/// Which side of a booking-request thread authored a message
+/// (booking-conversation-and-event-step FR-001).
+enum BookingMessageAuthorSide {
+  VENUE
+  PERFORMER
+  SYSTEM
+}
+
+/// Lifecycle of a physical Space within a Place (venue-hierarchy FR-001).
+/// RETIRED spaces are hidden from scheduling but kept for history — a Place
+/// can never reach zero ACTIVE spaces (use-case invariant).
+enum SpaceStatus {
+  ACTIVE
+  RETIRED
+}
+
+/// Lifecycle of a BookingHold (booking-holds spec 2026-08-25, FR-001).
+/// NOT the POS/promo/resale "hold" (short-TTL inventory reservation) — this
+/// is a venue calendar hold with a days-long lifecycle.
+enum BookingHoldStatus {
+  ACTIVE          // in the line for its calendar+date
+  CHALLENGED      // staff challenged position 1; act must keep/release by respondBy
+  CONFIRMED       // confirmed → draft Event minted; terminal
+  RELEASED        // out of the line (see BookingHoldReleaseReason); terminal
+}
+
+/// Why a BookingHold left its line. Null while ACTIVE/CHALLENGED/CONFIRMED.
+enum BookingHoldReleaseReason {
+  MANUAL            // staff released, or the act answered a challenge with "release"
+  EXPIRED           // CHALLENGED and respondBy lapsed (FR-007, lazy write-on-read)
+  CONFIRMED_OTHER   // another act's hold on the same calendar+date was confirmed
+  REQUEST_CLOSED    // the owning request was DECLINED / WITHDRAWN / EXPIRED (FR-009)
+  SIBLING_CONFIRMED // another hold on the same request was confirmed (FR-008)
+  PAST_DATE         // the date passed without confirmation (FR-010, no notifications)
+  EVENT_SCHEDULED   // an event on the same calendar+date became PUBLISHED (FR-018)
+  BOOKING_CANCELLED // the booked night was cancelled (booking-the-night FR-009): the ONE path from CONFIRMED to RELEASED
+  GRANT_ENDED       // a BOOKER hold whose booking grant was revoked or expired (holds-without-a-request FR-003 / FR-004)
+}
+
+/// Whose hold a BookingHold is (holds-without-a-request spec 2026-09-30,
+/// rulings H1 / H5 / H6, FR-001). The column shape per kind is a SQL-only
+/// CHECK, "BookingHold_owner_kind_shape" (see BookingHold).
+enum BookingHoldOwnerKind {
+  REQUEST // held for a booking request (every hold before this spec)
+  BOOKER  // placed by a booking grantee on its own behalf; carries the grant and exactly one holder
+  PLACE   // the place's own hold; optionally names one party (org or person), else unassigned
+}
+
+/// Whose list a SavedSnippet is in (booking-the-night FR-013). Same members
+/// as the other owner enums (TemplateOwnerScope, PlaceOwnerType).
+enum SavedSnippetOwnerType {
+  HUMAN
+  ORGANIZATION
+}
+
+/// What a SavedSnippet is for (booking-the-night FR-013, N18).
+enum SavedSnippetKind {
+  DECLINE_REASON // a reason given when a booking is declined, closed, cancelled or passed on
+  ASK            // reserved for the deferred ask templates; no writer yet
+}
+
+/// How a NetworkSighting was recorded (ban-that-sticks, 2026-09-29).
+enum NetworkSightingKind {
+  SIGN_UP // an AuthUser was created (user.create.after)
+  SIGN_IN // a session was created (session.create.after)
+}
+
+/// What a BannedIdentity row's `valueHash` is a keyed hash OF.
+enum BannedIdentityKind {
+  EMAIL   // HMAC of the banned human's canonical (as-delivered) email
+  NETWORK // HMAC of a network prefix the banned human signed in from
+}
+
+/// What an API key covers (scoped-api-keys spec 2026-10-08, R1 / R18, "Key
+/// scopes" table). A key request and the key collected from it carry exactly
+/// one subject. Who may request and who approves differs per subject; that
+/// rule lives in core, not here.
+enum ApiKeySubject {
+  ORG           // one organisation, capped at the holder's live OWNER/ADMIN role there
+  PERSONAL      // the holder's own account
+  STAFF         // the holder's platform staff surfaces, capped at their live staff role
+  PLATFORM_WIDE // public data only: calls run as a signed-out visitor (FR-007); READ only (R19)
+}
+
+/// The access level of a key scope (scoped-api-keys spec R3). A mutation
+/// needs READ_WRITE; READ reaches only queries.
+enum ApiKeyAccess {
+  READ
+  READ_WRITE
+}
+
+/// How a key request was decided (scoped-api-keys spec FR-003 / FR-004).
+/// Undecided, withdrawn, lapsed and uncollected are derived from the request's
+/// timestamps, never stored.
+enum ApiKeyRequestDecision {
+  APPROVED
+  DENIED // requires a denialReason (SQL-only CHECK on api_key_requests)
+}
+
+/// Why a key request was withdrawn (scoped-api-keys spec FR-004, R31).
+/// REQUESTER: the requester withdrew a pending request. ACCOUNT_SECURITY: a
+/// password reset or a ban closed it (pending or approved-but-uncollected),
+/// so the holder is shown why and never reads it as "you withdrew".
+enum ApiKeyRequestWithdrawal {
+  REQUESTER
+  ACCOUNT_SECURITY
+}
+
+/// What an arrival area is for (arrival-areas FR-001). LOAD_IN is shown only
+/// to acts on the bill and the managing staff (FR-008).
+enum ArrivalAreaKind {
+  PARKING
+  ACCESSIBLE_DROP_OFF
+  LOAD_IN
+}
+
+/// What parking in an arrival area costs (arrival-areas FR-001). UNKNOWN is
+/// the honest default: a manager who has not said is never shown as FREE.
+enum ArrivalAreaCost {
+  FREE
+  PAID
+  UNKNOWN
+}

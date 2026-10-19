@@ -1,0 +1,213 @@
+# Not built yet (2026-10-08 docs consolidation): Event.walletImageId column and migration; event-builder "Wallet image" crop field; generate-wallet-pass still passes null
+# wallet-pass-image.spec.yaml
+#
+# Organiser-controlled artwork on the Apple/Google wallet pass, cropped in the
+# event builder with the crop dialog that already ships.
+
+version: "1.0"
+updated: "2026-09-07"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Wallet passes carry only `icon.png` and `logo.png` — no event artwork — so
+    every Ithas Fire ticket in a holder's Wallet looks identical. Deriving the
+    image from the event hero automatically is not safe: hero posters are
+    portrait, Apple's thumbnail is square and its strip is ~3:1, and no
+    focal-point data exists, so a machine crop decapitates people. Poster
+    focal-point cropping is a known-unbuilt backlog item.
+  solution: >
+    Add an OPTIONAL per-event wallet image the organiser crops themselves in
+    the event builder, reusing `ImageCropDialog` at `aspect: 1` (the same
+    component behind avatar and entity-page crops). The pass embeds it as
+    `thumbnail.png`; Google's class takes it as `heroImage`. When unset, both
+    passes render exactly as they do today — no fallback crop.
+  users:
+    - organiser (sets and crops the image in the event builder)
+    - attendee (sees it on the pass in Apple/Google Wallet)
+  surfaces:
+    - web
+    - api
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        The event builder's Essentials section gains an OPTIONAL "Wallet image"
+        field beside the existing hero-image field, rendered by `HeroImageField`'s
+        sibling pattern and cropped through `ImageCropDialog` with `aspect: 1`.
+    - id: FR-002
+      description: >
+        The cropped file uploads through the SAME path as the hero image
+        (`Image` row, `attached` lifecycle, moderation queue) — no second
+        upload mechanism, so storage GC and moderation keep working unchanged.
+    - id: FR-003
+      description: >
+        `WalletPassTicketData` gains `walletImageUrl: string | null`, populated
+        by `generate-wallet-pass` from the event's wallet image.
+    - id: FR-004
+      description: >
+        The Apple adapter fetches the image and embeds it as `thumbnail.png`
+        (plus @2x/@3x per OQ-1). The Google adapter sets the class `heroImage`
+        to the URI — no fetch needed, Google pulls it at save time.
+    - id: FR-005
+      description: >
+        When the event has no wallet image, or the fetch fails, the pass is
+        generated WITHOUT artwork and still succeeds. A failed fetch is a
+        degraded-path swallow and MUST call `reportError` per CLAUDE.md.
+    - id: FR-006
+      description: >
+        Removing the wallet image detaches the Image row and returns subsequent
+        passes to the artwork-free layout. Already-issued passes are not
+        retroactively updated (no pass-update web service in scope).
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Pass generation must not regress noticeably. The image fetch is bounded
+        by an explicit timeout and never blocks past it; on timeout FR-005
+        applies.
+    - id: NFR-002
+      description: >
+        A wallet image is user-supplied content on a surface shown outside the
+        app, so it MUST pass the same moderation gate as other event imagery.
+        A FLAGGED image is terminal and must never reach a pass.
+    - id: NFR-003
+      description: >
+        The builder control follows strict-Swiss content rules (radius 0,
+        uppercase mono label) and matches the adjacent hero-image field.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: generate-wallet-pass
+        description: >
+          MODIFIED. Resolves the event's wallet image URL onto the ticket data.
+          Ownership check (`ticket.ownerHumanId !== actorHumanId`) is unchanged.
+        input: ticketId, passType, actorHumanId
+        output: passType, saveUrl | passBase64, filename
+        idempotent: true
+        money: false
+      - name: save-event (builder persistence)
+        description: >
+          MODIFIED. Accepts and attaches the wallet image the same way it
+          already attaches the hero image.
+        input: eventId, walletImageId
+        output: event
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - WalletPassPort          # WalletPassTicketData gains walletImageUrl
+      - StoragePort             # existing upload path, unchanged
+      - ReporterPort            # FR-005 degraded-path report
+
+  adapters:
+    new: []
+    existing:
+      - apple-wallet-adapter    # fetch + embed thumbnail.png
+      - google-wallet-adapter   # class heroImage URI
+
+  transport:
+    trpc_procedures: []         # rides the existing event save + image upload
+    webhooks: []
+
+  ui:
+    pages: []
+    components:
+      - BuilderEssentialsSection   # add the optional field
+      - HeroImageField             # reuse or generalise to an aspect prop
+      - ImageCropDialog            # reused as-is, aspect: 1
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models:
+    - Event                     # + walletImageId String? @unique, walletImage relation
+    - Image                     # + heroForEvent-style back-relation for wallet
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Pass generation gains a network fetch it never had. A slow or dead image
+      host turns a fast local operation into a timeout.
+    severity: MEDIUM
+    mitigation: >
+      Hard timeout, degrade to the artwork-free pass (FR-005), report via
+      ReporterPort so the degradation is visible rather than silent.
+  - risk: >
+      There is NO server-side image library in the repo (no sharp, no
+      image-size, no adapters/images module), so the API cannot resize. The
+      crop dialog emits ONE size from a client canvas.
+    severity: MEDIUM
+    mitigation: >
+      Settle OQ-1 before build. Either emit multiple sizes client-side at crop
+      time, or ship a single variant and confirm Wallet accepts it.
+  - risk: >
+      Moderation is asynchronous. An image could reach a pass before it is
+      reviewed.
+    severity: HIGH
+    mitigation: >
+      Gate on moderation state at pass-generation time, not upload time — treat
+      un-reviewed the same as absent rather than embedding optimistically.
+  - risk: >
+      Organisers ignore an optional field, so most passes stay unchanged and the
+      feature reads as not shipped.
+    severity: LOW
+    mitigation: >
+      Accepted. A blank pass is the current state; this never makes it worse.
+
+open_questions:
+  - >
+    OQ-1: which thumbnail variants to embed. Apple wants 90/180/270px for
+    1x/2x/3x. With no server-side resize, do we emit three canvases at crop
+    time, or embed one and let Wallet scale? Needs a real-device check — a
+    dimension mismatch may be rejected outright.
+  - >
+    OQ-2: default from the hero image, or leave blank? Offering "use my poster"
+    with a square crop pre-centred is friendlier, but re-introduces the bad-crop
+    risk this spec exists to avoid unless the organiser confirms the framing.
+  - >
+    OQ-3: is `thumbnail.png` the right slot at all, or should this eventually be
+    `strip.png` for a full-bleed look? Strip is ~3:1 and changes Apple's field
+    layout; this spec assumes thumbnail and defers strip.
+  - >
+    OQ-4: one image for both wallets, or separate crops? Google's heroImage is
+    wide (~3:1), Apple's thumbnail is square. A single square asset will
+    letterbox on Google.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Focal-point cropping as a general system (would serve event cards + og:image; separate spec).
+  - "`strip.png` full-bleed Apple artwork."
+  - Regenerating or updating passes already in a holder's Wallet (needs the Apple pass-update web service).
+  - >-
+    The Safari `.pkpass` delivery fix — serving the pass from a GET route with
+    an `application/vnd.apple.pkpass` content type instead of a `blob:` URL
+    plus `<a download>`, which iOS ignores. Real bug, contained, tracked
+    separately.
+  - Per-ticket-type or per-attendee artwork.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - An organiser can add, crop (square), replace and remove a wallet image in the event builder.
+  - A ticket for an event WITH a wallet image mints a `.pkpass` containing `thumbnail.png`, and the PKCS#7 signature still verifies against Apple's root CA.
+  - A ticket for an event WITHOUT one mints a pass byte-comparable to today's output.
+  - A dead or slow image URL yields a valid artwork-free pass AND a Sentry event — never a failed request.
+  - An image that is FLAGGED or not yet moderated never reaches a pass.
+  - The Google save URL for the same ticket carries the image as the class `heroImage`.
+  - >-
+    Verified on a real device, not only by unzipping — the pass renders in
+    Apple Wallet with the artwork visible.

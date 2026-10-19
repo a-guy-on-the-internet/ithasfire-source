@@ -1,0 +1,485 @@
+# Not built yet (2026-10-08 docs consolidation): the backend is built (editBill, billsYoureOn notices); no web caller yet for FR-009 / L5 editing the bill after sending (bookingRequests.editBill), FR-011 the agreement showing the bill with "Joined the bill" payee suggestions
+# lineup-booking-requests-v3.spec.yaml
+#
+# A PERFORM request to a venue carries a BILL: the ordered acts the sender
+# proposes for the night. Tagged acts join or pass; the sender can change the
+# bill until the event exists; the bill rides onto the agreement (read-only)
+# and becomes the event's lineup when the night is booked, with late joiners
+# landing on the lineup by themselves.
+#
+# v3 fits v2 (built backend, uncommitted, 2026-09-25) into the booking flow as
+# it runs: request → thread → agreement → hold → event. The night-booking
+# changes it depends on live in docs/specs/2026-09-25/booking-the-night.spec.yaml
+# and are only referenced here. v2's decisions D3/D3a/D3b stand unless a
+# decision below changes them; its open questions are closed by L10/L11.
+
+version: "3.0"
+updated: "2026-09-25"
+status: partial  # 2026-10-08 docs consolidation; was: draft (owner-locked 2026-09-25; backend partly built as v2, UI not started)
+supersedes: docs/specs/2026-09-25/completed/lineup-booking-requests-v2.spec.yaml
+depends_on:
+  - docs/specs/2026-09-25/booking-the-night.spec.yaml (N1 agree-mints, N3 book without terms, N9 request-responded)
+  - docs/specs/2026-09-25/venue-booking-standards.spec.yaml (v1.1; the BILL standard)
+  - docs/specs/2026-08-27/venue-confirmation-and-booking-intents.spec.md (2026-09-25 amendment: no requests to unclaimed venues)
+design: https://claude.ai/artifact/QVdGnAjDwxNyTPa5L5LnMz (boards F, I, N, A, B, Q, X)
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    v2 gave a request a bill, but only the two ends of the flow knew about it:
+    the form wrote it and the mint read it. In between, the agreement had no
+    idea who was playing, the bill could not change after send, a hold confirm
+    minted the event before tagged acts could answer, anyone who joined late
+    attached nothing, and nobody heard about anything (act answers, the venue's
+    reply, the request closing). The invite email linked to a page that does
+    not exist.
+  solution: >
+    The request is a sketch of the event, not a contract: it saves re-typing,
+    and the event stays fluid. The sender owns the bill until the event exists.
+    The agreement shows the bill and offers joined acts as payees; money and
+    lineup stay separate consents. When the terms are agreed the event is
+    created with the joined acts; acts that join later land on the lineup by
+    themselves while the event is upcoming. Each close, answer and change
+    reaches the one person who needs it, and act-facing notices can be
+    switched off.
+
+# ── Vocabulary (CONTEXT.md, updated 2026-09-25) ─────────────────────────────
+
+vocabulary:
+  - "Sender: the human or org that sent the request. Not the event's Organiser (for a PERFORM booking that is the venue). v2's D3 'the sender is the organizer' is re-worded, not reversed: the sender organises the ask."
+  - "Bill: the ordered acts a PERFORM request proposes for the night; it becomes the event's lineup when the night is booked. Before that it is never called the lineup."
+  - "A tagged act joins the bill or passes. On screen: 'Count me in' / 'I'll pass'; states Joined, Invited, By name. Code keeps the BookingRequestAct.confirmation column and its CONFIRMED/DECLINED values; procedure and copy names move to join/pass."
+
+# ── Decisions (owner, 2026-09-25) ────────────────────────────────────────────
+
+decisions:
+  - id: L1
+    stage: request
+    text: The request's author is the sender everywhere; tagged acts join or pass; "Bill" is a glossary term (see vocabulary).
+  - id: L2
+    stage: agreement
+    text: >
+      The agreement stays two-party (sender ↔ venue side) and shows the bill
+      read-only. Adding a payout line offers the acts that JOINED the bill as
+      payee suggestions; invited acts are not offered (no consent yet); by-name
+      acts cannot be payees. Bill consent ("will you play") and payout-line
+      confirmation ("do you agree to this money") stay separate: a joined act
+      only gets money terms if someone adds a line for them.
+  - id: L3
+    stage: hold → event
+    text: >
+      Nothing waits for the bill to finish forming. The venue says yes to the
+      sender and to the bill as it was shown, invited acts visibly marked. The
+      event is created with the joined acts; invited acts appear as suggestions
+      on the event's lineup step.
+  - id: L4
+    stage: event
+    text: >
+      An act that joins after the event exists lands on the event's lineup by
+      itself, in its bill slot, while the event has not happened; a ledger entry
+      records it. Anyone on the event can still adjust the lineup by hand.
+  - id: L5
+    stage: request
+    text: >
+      The sender can add, remove and reorder acts while the request is open or
+      accepted and until an event exists. After that the event lineup is the
+      record. The venue cannot edit the bill; it asks on the thread. Each change
+      writes one booking_request.bill_changed ledger entry. A newly tagged act
+      gets the normal invite. A joined act that is removed gets one notice.
+      Limits unchanged: 12 acts, 30 tags a day, an act that passed cannot be
+      re-added to that request.
+  - id: L6
+    stage: request
+    text: >
+      When a tagged act answers, the sender hears it in-app only (no email:
+      answers come in bursts). The venue hears nothing beyond the ledger lines it
+      can already see, and never learns about a pass.
+  - id: L7
+    stage: request
+    text: >
+      When the request closes (declined, withdrawn, expired), acts that JOINED
+      get one notice (in-app + email): the request to {venue} for {dates} isn't
+      going ahead. Invited acts get nothing; their invite page shows the request
+      as closed. The venue's decline reason never reaches the acts.
+  - id: L8
+    stage: all
+    text: >
+      Act-facing notices after the invite (L4 late-join note, L5 removal notice,
+      L7 close notice) sit in a new notification category, "Bills you're on",
+      with per-channel toggles. The invite itself stays transactional and cannot
+      be switched off: it is the consent ask.
+  - id: L9
+    stage: request
+    text: >
+      No request of any kind reaches an unclaimed venue (owner: it's parasitic
+      and diverts traffic from a real source). Tagging on such a request is
+      therefore impossible. See the 08-27 amendment.
+  - id: L10
+    stage: request
+    text: >
+      D3a confirmed: "I'm on the bill" defaults ON when the sender has performer
+      mode on, OFF otherwise.
+  - id: L11
+    stage: request
+    text: >
+      A joined act's spot does not appear on their public profile until the
+      night is booked. Only a booked event shows publicly.
+
+  # ── Round 2 (owner, 2026-09-25, after auditing the boards against the code) ──
+  - id: L12
+    stage: request
+    text: >
+      The bill is optional. A request can name only the sender, with no acts;
+      the event is then created with an empty lineup. LINEUP_REQUIRED goes. A
+      venue that requires the BILL standard still blocks such a pitch.
+  - id: L13
+    stage: request
+    text: >
+      No billing slots. Each act on the bill carries what an event lineup row
+      carries: a role (the lineup editor's picker, PERFORMER by default) and a
+      position. Position 1 is shown as "Headlining"; the rest by number. This
+      matches EventHuman (event.prisma:199-227) and flows onto the lineup as is.
+  - id: L14
+    stage: request
+    text: >
+      A pass is final (ACT_ALREADY_DECLINED, answer-booking-request-act.ts
+      :52-53). A joined act can leave the bill until the night is booked; after
+      that they are on the event lineup and leaving is the event's business
+      (bill-event.ts:55-75 already draws that line).
+  - id: L15
+    stage: request
+    text: >
+      A request lives in the admin of whoever sent it: sent as a band (org), it
+      is under /admin/{band}/bookings; sent as the person, under
+      /admin/@{person}/bookings. Each gets a "Sent" tab with the expandable row
+      the venue inbox uses; the sender's thread and the bill edit live in that
+      row. Account settings keeps only booking defaults. Shared roles on an
+      org's sends wait on the parties decision
+      (docs/decisions/events-have-parties-not-one-owner.md).
+  - id: L17
+    stage: request
+    text: >
+      (Owner, 2026-09-28.) Bands are groups, and groups can be tagged. A TAGGED
+      act is a human OR an organisation (a group). A group's invite is answered
+      by any member with an org edit role (ORG_EDIT_ROLES), and notices go to
+      those members, as the hold notices already do for org senders
+      (notify-booking-hold-intents.ts:619-647). Taggable groups = the same
+      eligibility search.autocompleteAdmin already surfaces for orgs. Changes:
+      bill-schema.ts:33-38 (tagged { humanId } → { ownerType, ownerId }), the
+      migration's "TAGGED ⇒ human" CHECK, answer-booking-request-act.ts actor
+      check, get-booking-request-act-invite.ts, the invite and answer
+      notifications' recipient resolution, the 30-tags-a-day budget (counts
+      groups too), and the invite page (the viewer answers "as {group}"). How a
+      joined group lands on the event lineup: see L18 (EventHuman gains orgId).
+  - id: L18
+    stage: event
+    text: >
+      (Owner, 2026-09-28.) A lineup row can be an organisation. EventHuman gains
+      orgId, so a joined group lands on the event lineup linked, and the event
+      builder's LineupEditor can add a group directly (its search includes
+      groups). Resolves the L17 open question.
+  - id: L19
+    stage: thread
+    text: >
+      (Owner, 2026-09-28.) An act's pass reason goes into the conversation:
+      the existing booking_request.act_declined ledger entry (sender-only,
+      system-entries.ts:535-538) carries the reason, so the sender reads it in
+      the thread. The venue never sees it.
+  - id: L20
+    stage: event
+    text: >
+      (Owner, 2026-09-28.) An event created from a bill is titled "{first act
+      that joined} at {calendar}", falling back to the sender's name when no
+      act has joined; never an invited act. Replaces "{act} at {calendar}"
+      (create-event-from-agreement.ts:1492-1522).
+  - id: L16
+    stage: request
+    text: >
+      The saved personal pitch template (PerformerBookingDefaults.messageTemplate)
+      keeps prefilling the message. Several named templates, and performer /
+      organizer setup flows, are a separate spec.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+#
+# Status per FR: BUILT (v2 backend exists), CHANGE (built, must change), NEW.
+
+requirements:
+  functional:
+    - id: FR-001
+      status: CHANGE
+      description: >
+        (Built 2026-09-30, migration 20261001120000_lineup_v3: removedAt, and
+        customRoleLabel ≤ 60, set only when role is OTHER.)
+        BookingRequestAct (packages/db/prisma/agreement.prisma:352-393, migration
+        20260925120000_booking_request_acts) as built: source SELF | TAGGED |
+        EXTERNAL, actOwnerType/Id, externalName/Url, role, sortOrder, confirmation
+        PENDING | CONFIRMED | DECLINED, invitedAt, respondedAt, declineReason;
+        unique (bookingRequestId, actOwnerType, actOwnerId). CHANGE: rows gain
+        removedAt (nullable). L5's remove is a soft delete so the unique key
+        still blocks re-adding an act that passed and the ledger can name what
+        was removed; every reader filters removedAt IS NULL.
+    - id: FR-002
+      status: CHANGE
+      description: >
+        createBookingRequest (PERFORM, TO_VENUE) accepts `bill` { includeSelf,
+        acts[] ≤ 12, the 12 counting self } and writes the rows in-tx
+        (create-booking-request.ts :1204-1218, :1109; bill-schema.ts:21,69-80).
+        PERFORMER_MODE_REQUIRED on the SELF row, BILL_NOT_ALLOWED on RENT/USE,
+        taggable = search.autocompleteAdmin eligibility, 30 distinct tags per
+        sender per rolling day (:111). CHANGE: LINEUP_REQUIRED is removed (L12);
+        each act in `acts[]` may carry `role` (EventHumanRole, default
+        PERFORMER; customRoleLabel when OTHER) instead of the hard-coded
+        PERFORMER (:1266,1278,1285) (L13); SELF stays at position 1 on create.
+        The parked-venue branch goes away with L9.
+    - id: FR-003
+      status: CHANGE
+      description: >
+        Invite and answer. booking.lineup-invited (renderers.ts:3967, template
+        BookingLineupInvited.tsx) links to /bookings/acts/{requestId}. CHANGE:
+        procedures bookingRequests.confirmAct / declineAct become joinAct /
+        passAct (aliases may stay one release); answering is allowed while the
+        request is PENDING, VIEWED or ACCEPTED (answer-booking-request-act.ts
+        :93-97, unchanged). Joining after the event exists runs FR-010.
+    - id: FR-004
+      status: CHANGE
+      description: >
+        Rendering. The venue inbox row (board N1), thread header, sender's sent
+        views, the invite page and the agreement (FR-011) show the ordered bill:
+        Joined plain, Invited marked, By name unlinked and marked, Passed struck
+        for the sender only and absent from everything venue-facing
+        (server-side filter). CHANGE from v2: user-facing words are Joined /
+        Invited / By name / Passed; never "confirmed".
+    - id: FR-005
+      status: BUILT
+      description: >
+        Embed: signed-in mode gets the picker; anonymous mode takes EXTERNAL acts
+        only and a smuggled humanId is a strict-schema 400
+        (embeds/create-booking-inquiry.ts:482-487).
+    - id: FR-006
+      status: CHANGE
+      description: >
+        Flow-through at mint. The bill attaches under the bill lock in every mint
+        path (create-event-from-agreement.ts:1014-1031, planBookingLineup
+        :1649-1727): joined SELF/TAGGED rows → EventHuman {humanId}; org SELF →
+        {externalName, externalUrl}; EXTERNAL → {externalName, externalUrl}; in
+        sortOrder with role. CHANGE: the mint moment is booking-the-night N1 (the
+        sender agrees the terms) or N3 (book without terms), not hold confirm.
+        Invited rows appear in the event builder's Lineup section (the builder
+        is one scrolling page, EventBuilder.tsx:4390-4500; LineupEditor.tsx) as
+        "Suggested from the booking" through the existing
+        event-humans.bookingSuggestions procedure (event-humans.ts:139), which
+        gains its first client there. A request with no bill mints an event with
+        an empty lineup (L12); the pre-bill fallback that puts the sender on as
+        headliner (create-event-from-agreement.ts:1654-1668) applies only to
+        requests created before bills existed.
+    - id: FR-007
+      status: BUILT
+      description: >
+        Anti-abuse: daily tag budget, passed acts cannot be re-tagged on the
+        request, per (request, human) idempotency keys on invites, 30 answers an
+        hour per actor.
+    - id: FR-008
+      status: BUILT
+      description: >
+        A joined act reads the thread (ACT side, read-only: thread-access.ts:134,
+        146-162); no posting, no attachments, no composer menu.
+    - id: FR-009
+      status: NEW
+      description: >
+        Bill editing (L5). New use case editBookingRequestBill(requestId, ops[]):
+        actor = the sender pair (same authority as withdraw); request PENDING,
+        VIEWED or ACCEPTED and no event yet (bill-event.ts:37-51 answers that);
+        runs under lockBill. Ops: add {tagged humanId | external name/url},
+        remove {actId}, move {actId, toIndex}; SELF can be removed and re-added
+        (built as restoreAct on the soft-removed row, because the unique key
+        still holds it; a restored TAGGED act goes back to PENDING and is asked
+        again; a DECLINED act is never restored).
+        Same gates as create (≤ 12 live rows, budget, taggable, no re-add after a
+        pass). One booking_request.bill_changed ledger entry per call with
+        params {added[], removed[], reordered: boolean}; the venue-facing render
+        names added acts with their state (Invited, By name), names removed acts
+        only if they had joined or were by name, and never names a removed act
+        that was still invited or had passed ("the bill changed" covers it). Post-commit: invites to new tagged acts;
+        booking.lineup-removed (category "Bills you're on") to a removed JOINED
+        act. Refused with BILL_LOCKED once an event exists. Ops also include
+        setRole {actId, role, customRoleLabel?} (L13). UI: the bill in the
+        expanded row of the sender's "Sent to venues" tab (FR-014), edited in
+        place (board B1). Removing a JOINED act says so before saving
+        ("Paper Moth will be told"). A request started from an existing event
+        (originEventId) is locked from the start, since its bill already points
+        at that event (bill-event.ts:40-42).
+    - id: FR-010
+      status: NEW
+      description: >
+        Late join (L4). When joinAct lands and the request's bill has already
+        flowed into an event that has not started, attach that act to the
+        event's lineup in its bill slot (after the last joined act with a lower
+        sortOrder), in the same lock, unless it is already on the lineup. Ledger
+        booking_request.act_joined_lineup; the act is told through the lineup
+        consent notice event.lineup-added (owner ruling 2026-09-30, "option A":
+        transactional, cannot be muted — built by the lineup-notices work in
+        attach-event-human.ts), not a second booking-specific notice. If the event has
+        started or been cancelled, attach nothing (today's behaviour).
+    - id: FR-011
+      status: NEW
+      description: >
+        The agreement shows the bill (L2; design board A1). The agreement read
+        (agreement editor, admin agreement page, the event payout section per
+        booking-the-night N7) includes the linked request's venue-facing bill.
+        The add-line payee picker lists joined TAGGED humans and a joined human
+        SELF row first, labelled "Joined the bill", above the existing human
+        search. No automatic lines. Once the event exists the bill is not
+        repeated in the event builder's Revenue splits section: the Lineup
+        section above it is the record (L5); the standalone agreement page keeps
+        showing it.
+    - id: FR-012
+      status: NEW
+      description: >
+        Notifications (L6–L8). (a) Act answers → sender: booking.lineup-answered,
+        in-app only, transactional. (b) Request closes → JOINED acts:
+        booking.lineup-request-closed, in-app + email, category "Bills you're
+        on", from respondToBookingRequest decline, withdraw and the expiry job;
+        no decline reason. (c) booking.lineup-removed from FR-009 (FR-010 reuses event.lineup-added,
+        see above). (d) New preference category billsYoureOn in
+        comms/categories.ts, default on for in-app/email/push, user-suppressible
+        per channel, rendered as its own card in NotificationsSection (board
+        X1). Every notify swallow follows the ReporterPort convention with
+        regression tests.
+    - id: FR-013
+      status: NEW
+      description: >
+        The invite page /bookings/acts/[requestId] (board I1): signed-in; shows
+        who asked, the venue, the dates, the act's position and role
+        ("Headlining" at position 1, else e.g. "2nd · Performer"), the bill so
+        far (joined and by-name acts only, the viewer's own row marked). The
+        position is counted among the acts this viewer can see, renumbered
+        without gaps, and no total is shown: get-booking-request-act-invite.ts
+        :59-67,113-114 hides invited acts, so a total or a raw sortOrder would
+        reveal how many are still pending. The page shows "Count
+        me in" / "I'll pass" (with an optional reason, ≤ 240), and a link to
+        notification settings. States: waiting on you; you joined (with "Leave
+        the bill" until the night is booked, L14 — leaving records a pass and is
+        just as final; the button says so); you passed (final); request
+        closed; night booked (you're on the lineup). Data comes from
+        get-booking-request-act-invite.ts (status, eventMinted, canConfirm /
+        canDecline, *BlockedReason, :68-120); it has no sent-at time, so the
+        page shows none. Must ship before or with the first invite email that
+        links to it.
+    - id: FR-015
+      status: NEW
+      description: >
+        A lineup row can be a group (L17, L18). Schema: EventHuman.orgId
+        (nullable, FK Organization, onDelete Cascade), a CHECK that a row is a
+        person or a group, never both (num_nonnulls(humanId, orgId) <= 1 — built
+        2026-09-30; "exactly one of humanId/orgId/externalName" would break real
+        rows, because a linked person keeps externalName as their stage name), and @@unique([eventId, orgId])
+        beside the human one. planBookingLineup attaches a joined TAGGED or SELF
+        org row as {orgId} (no more externalName fallback). LineupEditor's add
+        search includes groups; the row shows the group's name linked to its
+        page with the "Group" label. Every EventHuman reader (public event page,
+        lineup cards, search indexing, performer pages, notifications) handles
+        the org case. Its own migration; can ship before the bill UI.
+    - id: FR-014
+      status: NEW
+      description: >
+        Sent requests live under the sending entity's admin (L15).
+        BookingsWorkspace (admin/[slug]/bookings) gains a "Sent to venues" tab
+        (named against the existing "Sent to acts", en.ts:8269) for
+        requests TO_VENUE whose sender pair is the workspace's subject — the org
+        for /admin/{org}, the human for /admin/@{person}. Rows reuse the inbox
+        row (BookingInbox.tsx) mirrored for the sender: venue, dates, stage,
+        bill; expanding shows the sender's thread (BookingThread
+        side="PERFORMER"), the bill with "Edit the bill" (FR-009), and the
+        agreement card. The existing "Sent to acts" (TO_PERFORMER) tab stays.
+        The account-settings SentBookingRequestsList and ReceivedBookingRequests
+        move the same way (received-as-performer → a "Received" tab); account
+        settings keeps BookingDefaultsEditor and a link. The human workspace's
+        pointer copy (bkHubHumanInboxHint, en.ts:8281-8283) goes. Authz: the
+        workspace's existing gate (org edit roles; the person themselves). In
+        the thread, the sender side's author label is the sender's name, never
+        the fallback "Performer" (en.ts:1040-1060), since a promoter sends too.
+  non_functional:
+    - id: NFR-001
+      description: Free-text act names pass plainTextRequired (≤ 120); externalUrl is http(s)-only through optionalHttpUrl.
+    - id: NFR-002
+      description: >
+        Consent invariants: an invited act is never shown to a venue as joined;
+        an invited act's name never becomes the request's display name; a passed
+        act never appears on anything venue-facing; a by-name act never looks
+        like a linked platform identity. Every render, email and ledger entry in
+        this spec is tested against these four.
+    - id: NFR-003
+      description: Inbox lists fetch the bill as one batched child read per page (cap 12 per request).
+    - id: NFR-004
+      description: TO_PERFORMER requests carry no bill; the create path strict-rejects `bill`.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    new: [editBookingRequestBill, attach-on-late-join (inside joinAct), notify-booking-lineup-answered / -request-closed / -removed / -added]
+    changed: [answerBookingRequestAct (join/pass naming, FR-010), respondToBookingRequest (FR-012b), withdrawBookingRequest, expireBookingRequests, getBookingAgreement (FR-011), planBookingLineup (removedAt filter)]
+  data: [BookingRequestAct.removedAt, ledger kinds booking_request.bill_changed and booking_request.act_joined_lineup, notification category billsYoureOn]
+  transport:
+    - bookingRequests.editBill
+    - bookingRequests.joinAct / passAct
+    - "agreement get output gains bill[]"
+  ui:
+    pages: ["/bookings/acts/[requestId]"]
+    components:
+      - RequestToPlayForm + SignedInBookingPanel: bill in the "Your act" section, role + position per act (board F1)
+      - BookingInbox row + expanded detail: bill (board N1)
+      - BookingsWorkspace "Sent to venues" / "Received" tabs; bill edit in the expanded row (FR-014, board B1)
+      - Agreement editor: bill section between the header card and payout lines + payee suggestions (board A1)
+      - Event builder Lineup section: "Suggested from the booking"
+      - "NotificationsSection: \"Bills you're on\" card (board X1)"
+
+# ── Punch list (pre-existing defects found 2026-09-25; recorded, not fixed) ──
+
+punch_list:
+  - "1. An event-first request can be accepted, and 'Create event from this booking' then mints a SECOND event beside the origin event: createEventFromAgreement never checks originEventId (create-event-from-agreement.ts:411-514). Not a duplicate agreement (agreementId is @unique, agreement.prisma:226). booking-the-night N11 closes this for the new mint paths; the manual button still needs the check."
+  - "2. An act's agreement DECLINE is terminal: reopen needs ACCEPTED (reopen-booking-agreement.ts:83), pull-back needs PROPOSED, cancel refuses DECLINED, and the request can never get a second agreement. With agree-mints, a mistaken decline ends the booking."
+  - "3. (Closed by design: booking-the-night N8.) A hold can sit on a date the pitch never asked for (place-hold-on-line.ts:126-138)."
+  - "4. toTrpcError forwards raw Prisma messages and meta to the wire (packages/transport/trpc/src/utils.ts:861-950; errorFormatter trpc.ts:21-27). Known trigger: the RENT/USE window CHECK surfaces as raw P2010/23514."
+  - "5. The daily expiry job drops the hold move-up notification intents it gets back (apps/jobs/src/jobs/booking-requests.ts:23-31)."
+  - "6. A booking grantee with canPlaceHolds + canCreateEvents can accept a request by confirming a hold (confirm-booking-hold.ts:776 under requirePlaceBookingAuthority), bypassing accept's ownership rule (respond-to-booking-request.ts:293-298). booking-the-night FR-005 removes that path for request-linked holds."
+  - "7. Hold-confirm mints on DRAFT/PROPOSED agreements while the manual mint needs ACCEPTED (create-event-from-agreement.ts:200-205 vs :513-514). Resolved by booking-the-night FR-001/FR-005 once built."
+  - "8. The lineup invite email links to /bookings/acts/{id}, which does not exist (notify-booking-lineup-invited.ts:132). FR-013 must ship first."
+  - "9. The venue-claim invite never sends: Place has no email column, so resolveNoPlaceContactEmail returns null (notify-booking-request-intents.ts:47-60,175). Moot once parking is removed (08-27 amendment)."
+  - "10. RENT/USE agreement seeds lose the requested window (time comes from the calendar default; requestedEndsAt ignored; create-booking-request.ts:646-653) and every agreement is type PERFORMANCE (accept-agreement.ts:149)."
+  - "11. A venue can respond as an unverified direct owner (place-access.ts:50-51) but cannot post on the thread as one (thread-access.ts:213-254, ensurePlaceOwnerAccess)."
+  - "12. A payee named on a payout line is never notified (booking-agreements router upsertLine passes no notify, routers/booking-agreements.ts:159-178)."
+  - "13. The notification settings UI renders email/push toggles for Transactional that the server refuses (NotificationsSection.tsx:61-64 vs update-notification-preferences.ts:550-567)."
+  - "14. PayoutLinesSection's docblock says either party edits; the server allows the editor side only (PayoutLinesSection.tsx:65 vs agreement-editor-side.ts:102-103)."
+  - "15. Venue inbox copy says \"Artist's estimate\" (en.ts:8075) and labels the pitch's free-text lineup \"Lineup\" (en.ts:8171) — CONTEXT.md says act, and bill before booking. PayoutLinesSection labels any org payee \"Group\" (:400-405), so a venue's own line reads \"Group\"."
+  - "16. Transactional-card copy promises email/push toggles work for booking notices; the server refuses (see 13). Separately, the sender side of a thread falls back to the author label \"Performer\" (en.ts:1040-1060), wrong for a promoter."
+
+# ── Out of scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Per-act agreements or automatic payout lines from the bill. Deal terms, deductions and settlement (guarantees, versus, expenses) move to their own spec (owner, 2026-09-28: the full settlement plan).
+  - Bills on TO_PERFORMER requests.
+  - A "requests I'm tagged on" list for acts (the invite page and notifications are the way in; left open on purpose).
+  - Retrofitting consent onto direct lineup edits in the event builder.
+  - Billing slots (headline / support / opener) on the bill or the lineup (L13).
+  - Several named pitch templates; performer and organizer setup flows (L16).
+
+open_questions: []
+
+# ── Acceptance criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A promoter with no performer mode sends a PERFORM request with 2 tagged acts and 1 by-name act, "I'm on the bill" off → the venue sees the ordered bill with two Invited rows; each tagged act is notified once and the link opens the invite page.
+  - A solo act with performer mode opens the form → "I'm on the bill" is already on; sending with no other acts works as today.
+  - Della joins → the sender gets one in-app note; the venue's thread shows "Della & the Wire joined the bill"; Della passes instead → the sender sees her struck; the venue sees nothing about her.
+  - The sender adds Maren Sky and moves Junco up while the request is ACCEPTED → one ledger entry; Maren gets an invite; the venue's line names Junco (by name) and says the bill changed; after the event exists the same edit returns BILL_LOCKED.
+  - The sender agrees the terms with Della still invited → the event is created with Hollow Bones and Junco; Della appears under "Suggested from the booking"; Della joins two days later → she is on the event lineup in slot 2 and gets a "you're on the lineup" note.
+  - The agreement editor shows the bill; "Add a line" offers Hollow Bones (joined) and not Della (invited).
+  - The venue declines → Hollow Bones (joined) gets "isn't going ahead" without the reason; Della (invited) gets nothing and her invite page says the request closed.
+  - Turning off "Bills you're on" email stops the close notice email and leaves the invite email untouched.
+  - A request to an unclaimed venue is refused before any act is tagged.
+  - A band sends a request with no acts and "I'm on the bill" off → accepted (no LINEUP_REQUIRED); agreeing the terms creates the event with an empty lineup.
+  - A tagged DJ added with role DJ lands on the event lineup as a DJ at its position.
+  - Della joins, then leaves the bill before the terms are agreed → allowed; after the night is booked, leaving is refused with on_lineup; after a pass, "Count me in" is refused.
+  - The band's request appears under /admin/{band}/bookings → Sent, not in anyone's account settings; a request the person sent as themselves appears under /admin/@them/bookings → Sent.

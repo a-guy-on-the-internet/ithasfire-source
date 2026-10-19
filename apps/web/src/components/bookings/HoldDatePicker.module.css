@@ -1,0 +1,809 @@
+/* ───────────────────────────────────────────────────────────────────────────
+   HOLD DATE PICKER — the month a booker clicks across (booking-holds FR-002).
+
+   CONTENT, so strict Swiss: radius 0 throughout, 2px ink frame, hairline
+   cell rules, decisive inversion on hover. No shadows anywhere.
+
+   COLOUR IS NEVER THE ONLY CUE. Every state also carries a shape or a glyph:
+   a taken night is an ink FILL plus a lock, a dark night is a HATCH plus the
+   word "Dark", a selected night is the accent fill plus `aria-pressed` and a
+   check, an asked-for night is a corner NOTCH, and a line's depth is a row of
+   TICKS. Read this file in greyscale and it still works.
+
+   CONTAINER queries, not media queries. The picker mounts inside an expanded
+   booking-inbox row, which lives inside the admin shell — whose 256px rail
+   appears at >= 960px of VIEWPORT and takes that width away from this
+   component. A viewport rule therefore inverts across that boundary (the
+   panel getting narrower as the window gets wider), the exact trap documented
+   on `.th-suggestion-inbox` in globals.css. `container-type` sits on `.root`,
+   a PARENT of everything queried — an element cannot match a query it
+   establishes itself.
+
+   ACCENT BUDGET. The accent appears on selected cells (at most 12, usually
+   two or three), on the corner notch of the act's asked-for dates, and on the
+   offered-position text. It is never the resting colour of a day.
+   ─────────────────────────────────────────────────────────────────────────── */
+
+.root {
+	container-type: inline-size;
+	width: 100%;
+	min-width: 0;
+}
+
+.picker {
+	display: flex;
+	flex-direction: column;
+	border: 2px solid var(--borderColor, #211c16);
+	border-radius: 0;
+	background: var(--surface, #fdfaf3);
+	min-width: 0;
+}
+
+/* ── Head: who and where ─────────────────────────────────────────────────── */
+
+.head {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 12px;
+	padding: 12px 14px;
+	border-bottom: 2px solid var(--borderColor, #211c16);
+	background: var(--surfaceMuted, #efe7d6);
+}
+
+.headText {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+	flex: 1 1 200px;
+}
+
+.headCal {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	align-items: flex-start;
+	min-width: 0;
+}
+
+/* Segmented calendar switch — content, so hard edges and a shared 2px frame. */
+.calSwitch {
+	display: flex;
+	flex-wrap: wrap;
+	border: 2px solid var(--borderColor, #211c16);
+	background: var(--surface, #fdfaf3);
+}
+
+.calBtn {
+	appearance: none;
+	min-height: 34px;
+	padding: 6px 11px;
+	border: 0;
+	border-right: 1px solid var(--borderColor, #211c16);
+	border-radius: 0;
+	background: transparent;
+	color: var(--color, #211c16);
+	font-family: inherit;
+	font-size: 12px;
+	font-weight: 600;
+	cursor: pointer;
+}
+
+.calBtn:last-child {
+	border-right: 0;
+}
+
+.calBtn:hover {
+	background: var(--surfaceMuted, #efe7d6);
+}
+
+.calBtn[aria-pressed="true"] {
+	background: var(--structure, #211c16);
+	color: var(--onStructure, #fdfaf3);
+}
+
+/* ── Body: grid + rail ───────────────────────────────────────────────────── */
+
+.body {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr);
+	align-items: start;
+}
+
+.body > * {
+	min-width: 0;
+}
+
+.gridCol {
+	padding: 12px 14px 14px;
+	min-width: 0;
+}
+
+.railCol {
+	padding: 12px 14px 14px;
+	min-width: 0;
+	border-top: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+	background: var(--surfaceMuted, #efe7d6);
+}
+
+@container (min-width: 660px) {
+	.body {
+		grid-template-columns: minmax(0, 1fr) 236px;
+	}
+
+	.railCol {
+		border-top: 0;
+		border-left: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+		align-self: stretch;
+	}
+}
+
+/* ── Month bar ───────────────────────────────────────────────────────────── */
+
+/* Wraps: the month name plus two 44px nav buttons is ~184px, which does not
+   fit the ~170px this panel gets inside the admin table's expanded row at a
+   320px viewport. Without the wrap the next-month chevron hangs outside. */
+.monthBar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	margin-bottom: 10px;
+	min-width: 0;
+}
+
+.navBtn {
+	appearance: none;
+	display: grid;
+	place-items: center;
+	width: 32px;
+	height: 32px;
+	flex: none;
+	padding: 0;
+	border: 1px solid var(--borderColor, #211c16);
+	border-radius: 0;
+	background: var(--surface, #fdfaf3);
+	color: var(--color, #211c16);
+	cursor: pointer;
+}
+
+.navBtn:hover {
+	background: var(--structure, #211c16);
+	color: var(--onStructure, #fdfaf3);
+}
+
+.quick {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	margin-bottom: 10px;
+}
+
+.quickBtn {
+	appearance: none;
+	min-height: 32px;
+	padding: 5px 9px;
+	border: 1px dashed var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+	border-radius: 0;
+	background: var(--surface, #fdfaf3);
+	color: var(--color, #211c16);
+	font-family: var(--font-mono);
+	font-size: var(--fs-mono-2xs, 9.5px);
+	letter-spacing: var(--tr-mono-2xs, 2.5px);
+	text-transform: uppercase;
+	font-weight: 600;
+	cursor: pointer;
+}
+
+.quickBtn:hover {
+	border-style: solid;
+	border-color: var(--borderColor, #211c16);
+}
+
+.quickBtn:disabled {
+	opacity: 0.4;
+	cursor: not-allowed;
+}
+
+/* The venue-never-set-hours explanation above the grid (FR-006). One line of
+   prose plus its link; wraps as text rather than reserving a band. */
+.setupNote {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 4px 8px;
+	margin-bottom: 8px;
+}
+
+/* ── The grid ────────────────────────────────────────────────────────────── */
+
+/* Each week is its own 7-track grid rather than one 42-cell grid with
+   `display: contents` rows: the columns still align (identical templates) and
+   `role="row"` keeps a body of its own in the accessibility tree. */
+.weeks {
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+}
+
+.week,
+.dowRow {
+	display: grid;
+	grid-template-columns: repeat(7, minmax(0, 1fr));
+	gap: 3px;
+}
+
+.dowRow {
+	margin-bottom: 4px;
+}
+
+.dow {
+	font-family: var(--font-mono);
+	font-size: var(--fs-mono-2xs, 9.5px);
+	letter-spacing: var(--tr-mono-2xs, 2.5px);
+	text-transform: uppercase;
+	font-weight: 600;
+	color: var(--colorMuted, #5c544a);
+	text-align: center;
+	padding-bottom: 2px;
+}
+
+.cell {
+	display: flex;
+	min-width: 0;
+}
+
+.pad {
+	display: block;
+}
+
+.cell > .day {
+	flex: 1 1 auto;
+}
+
+.day {
+	position: relative;
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 1px;
+	min-width: 0;
+	min-height: 58px;
+	padding: 4px 5px 5px;
+	border: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+	border-radius: 0;
+	background: var(--surface, #fdfaf3);
+	color: var(--color, #211c16);
+	font-family: inherit;
+	text-align: left;
+	overflow: hidden;
+	cursor: pointer;
+}
+
+.day:hover {
+	border-color: var(--borderColor, #211c16);
+}
+
+/* The ring sits OUTSIDE the cell, in the 3px gutter, so it stays visible on
+   the two filled states (accent selection, ink "taken") where an inset ring
+   would vanish into the fill. */
+.day:focus-visible {
+	outline: 2px solid var(--color, #211c16);
+	outline-offset: 1px;
+	z-index: 1;
+}
+
+.dayNum {
+	font-family: var(--font-mono);
+	font-size: 13px;
+	font-weight: 500;
+	font-variant-numeric: tabular-nums;
+	line-height: 1.15;
+	letter-spacing: var(--tr-mono-lg, 0.4px);
+}
+
+.dayState {
+	font-family: var(--font-mono);
+	font-size: var(--fs-mono-2xs, 9.5px);
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	font-weight: 600;
+	line-height: 1.2;
+	color: var(--colorMuted, #5c544a);
+	max-width: 100%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+/* The offered position is the one thing the grid exists to say early. */
+.dayOffer {
+	color: var(--accentText, #a8300f);
+}
+
+.ticks {
+	display: flex;
+	gap: 2px;
+	margin-top: auto;
+	padding-top: 2px;
+}
+
+.tick {
+	display: block;
+	width: 8px;
+	height: 3px;
+	flex: none;
+	background: var(--structure, #211c16);
+}
+
+/* A hold with the reply clock running is TALLER as well as accent-coloured. */
+.tickChallenged {
+	height: 6px;
+	margin-top: -3px;
+	background: var(--accent, #e2481d);
+}
+
+.dayGlyph {
+	position: absolute;
+	right: 4px;
+	bottom: 4px;
+	line-height: 0;
+	opacity: 0.9;
+}
+
+/* ── Day states ──────────────────────────────────────────────────────────── */
+
+/* The act named this date on its request: a corner notch, never colour alone. */
+.day[data-preferred="true"]::before {
+	content: "";
+	position: absolute;
+	top: 0;
+	right: 0;
+	border-top: 11px solid var(--accent, #e2481d);
+	border-left: 11px solid transparent;
+}
+
+.day[data-preferred="true"] .dayNum {
+	font-weight: 700;
+}
+
+.day[data-status="past"] {
+	border-style: dotted;
+	color: var(--colorMuted, #5c544a);
+	opacity: 0.5;
+	cursor: default;
+}
+
+/* Dark is a WARNING, not a wall (owner ruling 2026-08-31): the server allows
+   a hold here, so the cell stays pressable and keeps a pointer cursor. */
+.day[data-status="dark"] {
+	background-color: var(--surfaceMuted, #efe7d6);
+	background-image: repeating-linear-gradient(
+		-45deg,
+		rgba(33, 28, 22, 0.22) 0 1.5px,
+		transparent 1.5px 5px
+	);
+	color: var(--colorMuted, #5c544a);
+}
+
+/* Over, not "unavailable for now" — grey would say the wrong thing. */
+.day[data-status="taken"] {
+	background: var(--structure, #211c16);
+	border-color: var(--structure, #211c16);
+	color: var(--onStructure, #fdfaf3);
+	cursor: not-allowed;
+}
+
+.day[data-status="taken"] .dayState,
+.day[data-status="taken"] .dayNum {
+	color: var(--onStructure, #fdfaf3);
+}
+
+.day[data-status="taken"][data-preferred="true"]::before {
+	border-top-color: var(--onStructure, #fdfaf3);
+}
+
+/* Already in this line for this request. */
+.day[data-held="true"] {
+	border-width: 2px;
+	border-color: var(--structure, #211c16);
+	cursor: not-allowed;
+}
+
+.day[data-held="true"] .dayState {
+	color: var(--color, #211c16);
+}
+
+.day[data-selected="true"] {
+	background: var(--brandSecondaryHover, #b93312);
+	border-color: var(--brandSecondaryHover, #b93312);
+	color: var(--onBrandSecondary, #ffffff);
+}
+
+.day[data-selected="true"] .dayNum,
+.day[data-selected="true"] .dayState,
+.day[data-selected="true"] .dayOffer {
+	color: var(--onBrandSecondary, #ffffff);
+}
+
+.day[data-selected="true"] .tick {
+	background: var(--onBrandSecondary, #ffffff);
+	opacity: 0.7;
+}
+
+.day[data-selected="true"][data-preferred="true"]::before {
+	border-top-color: var(--onBrandSecondary, #ffffff);
+}
+
+/* A SELECTED dark night keeps its hatch, in the accent fill's own foreground,
+   so the one unusual pick among five never stops looking unusual. */
+.day[data-status="dark"][data-selected="true"] {
+	background-image: repeating-linear-gradient(
+		-45deg,
+		color-mix(in srgb, var(--onBrandSecondary, #ffffff) 34%, transparent) 0 1.5px,
+		transparent 1.5px 5px
+	);
+}
+
+/* ── Legend ──────────────────────────────────────────────────────────────── */
+
+.legend {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 5px 14px;
+	margin-top: 12px;
+	padding-top: 10px;
+	border-top: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+.legendItem {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	font-family: var(--font-mono);
+	font-size: var(--fs-mono-2xs, 9.5px);
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	font-weight: 600;
+	color: var(--colorMuted, #5c544a);
+}
+
+.swatch {
+	position: relative;
+	display: block;
+	width: 14px;
+	height: 14px;
+	flex: none;
+	border: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+	background: var(--surface, #fdfaf3);
+}
+
+.swatchLine::after {
+	content: "";
+	position: absolute;
+	left: 2px;
+	bottom: 2px;
+	width: 8px;
+	height: 3px;
+	background: var(--structure, #211c16);
+}
+
+.swatchAsked::after {
+	content: "";
+	position: absolute;
+	top: 0;
+	right: 0;
+	border-top: 9px solid var(--accent, #e2481d);
+	border-left: 9px solid transparent;
+}
+
+.swatchDark {
+	background-color: var(--surfaceMuted, #efe7d6);
+	background-image: repeating-linear-gradient(
+		-45deg,
+		rgba(33, 28, 22, 0.22) 0 1.5px,
+		transparent 1.5px 5px
+	);
+}
+
+.swatchTaken {
+	background: var(--structure, #211c16);
+	border-color: var(--structure, #211c16);
+}
+
+.swatchSelected {
+	background: var(--brandSecondaryHover, #b93312);
+	border-color: var(--brandSecondaryHover, #b93312);
+}
+
+/* ── Rail ────────────────────────────────────────────────────────────────── */
+
+.rail {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	min-width: 0;
+}
+
+.railSection {
+	display: flex;
+	flex-direction: column;
+	gap: 5px;
+	margin-top: 12px;
+	min-width: 0;
+}
+
+.lineRow {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	min-width: 0;
+	padding-bottom: 5px;
+	border-bottom: 1px dashed var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+}
+
+.lineRow:last-child {
+	border-bottom: 0;
+	padding-bottom: 0;
+}
+
+.lineClock {
+	flex: none;
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+
+/* ── Tray ────────────────────────────────────────────────────────────────── */
+
+.tray {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 10px;
+	padding: 10px 14px;
+	border-top: 2px solid var(--borderColor, #211c16);
+	background: var(--surface, #fdfaf3);
+}
+
+.chips {
+	display: flex;
+	flex-wrap: wrap;
+	align-content: flex-start;
+	gap: 5px;
+	/* Basis 0, not 200px: a 200px basis in a 146px tray makes every chip
+	   compute against a box wider than the one it is in. */
+	flex: 1 1 0;
+	min-width: 0;
+}
+
+/* TWO COLUMNS, not a flat row. The label block takes whatever is left and
+   wraps inside it; the 44px drop target is a fixed column that can never push
+   the chip past its parent. Measured at 146px of container (the admin table's
+   expanded row at a 320px viewport) the old inline-flex chip ran 276px wide
+   and spilled 130px out of the tray. `minmax(0, 1fr)` is the load-bearing
+   part: a bare `1fr` floors at min-content and overflows anyway. */
+.chip {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	align-items: center;
+	gap: 4px;
+	max-width: 100%;
+	min-width: 0;
+	padding: 3px 3px 3px 8px;
+	border: 1px solid var(--borderColor, #211c16);
+	background: var(--surface, #fdfaf3);
+	color: var(--color, #211c16);
+	font-size: 12px;
+	font-weight: 600;
+}
+
+.chipBody {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 1px 6px;
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+
+.chipDate {
+	font-variant-numeric: tabular-nums;
+}
+
+/* The dark mark, in the grid's own language: the same hatch, plus the word.
+   Five picks and one of them outside normal hours must read at a glance. */
+.chip[data-dark="true"] {
+	background-color: var(--surfaceMuted, #efe7d6);
+	background-image: repeating-linear-gradient(
+		-45deg,
+		rgba(33, 28, 22, 0.22) 0 1.5px,
+		transparent 1.5px 5px
+	);
+}
+
+.chipMark {
+	font-family: var(--font-mono);
+	font-size: var(--fs-mono-2xs, 9.5px);
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	font-weight: 600;
+	color: var(--colorMuted, #5c544a);
+}
+
+.chipFailed {
+	border-color: var(--dangerFill, #b91c1c);
+	color: var(--dangerSoft, #b91c1c);
+}
+
+/* A retryable refusal (nothing was written) is not the dead end a taken night
+   is — amber, and the word says "try again" rather than naming a cause. */
+.chipRetry {
+	border-color: var(--warning, #92400e);
+	color: var(--warning, #92400e);
+}
+
+.chipRetry .chipPos {
+	color: var(--warning, #92400e);
+}
+
+.chipPos {
+	font-family: var(--font-mono);
+	font-size: var(--fs-mono-2xs, 9.5px);
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	font-weight: 600;
+	font-variant-numeric: tabular-nums;
+	color: var(--accentText, #a8300f);
+}
+
+.chipFailed .chipPos {
+	color: var(--dangerSoft, #b91c1c);
+}
+
+.chipDrop {
+	appearance: none;
+	display: grid;
+	place-items: center;
+	width: 22px;
+	height: 22px;
+	flex: none;
+	padding: 0;
+	border: 0;
+	border-radius: 0;
+	background: transparent;
+	color: var(--colorMuted, #5c544a);
+	cursor: pointer;
+}
+
+.chipDrop:hover {
+	color: var(--dangerSoft, #b91c1c);
+}
+
+.trayActions {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px;
+	margin-left: auto;
+}
+
+/* ── Result banner ───────────────────────────────────────────────────────── */
+
+.banner {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 8px;
+	padding: 8px 14px;
+	border-bottom: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+	background: var(--surfaceMuted, #efe7d6);
+}
+
+/* ── Loading / empty ─────────────────────────────────────────────────────── */
+
+/* The skeleton holds the real grid's height so the tray never jumps under
+   the pointer when the month arrives. */
+.skeletonWeek {
+	display: grid;
+	grid-template-columns: repeat(7, minmax(0, 1fr));
+	gap: 3px;
+}
+
+.skeletonCell {
+	min-height: 58px;
+	border: 1px solid var(--borderColorSoft, rgba(33, 28, 22, 0.3));
+	background: var(--surfaceMuted, #efe7d6);
+}
+
+.state {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	align-items: flex-start;
+	padding: 18px 14px;
+}
+
+/* ── Touch ───────────────────────────────────────────────────────────────── */
+
+/* Seven columns cannot each be 44px wide under ~330px of container — no
+   month grid can. Height takes the floor and the cells sit at ~38px wide,
+   which is the same compromise every platform date picker makes; the tray,
+   the quick actions and the nav buttons all take the full 44. */
+@container (max-width: 560px) {
+	.day {
+		min-height: 46px;
+		padding: 3px 2px 4px;
+	}
+
+	/* Seven tracks under ~330px leave a 35px content box. The offered
+	   position is the one thing that must survive it, so the label idiom's
+	   tracking is spent rather than the word: measured "→ 12th" fits at 9px
+	   with tracking off, and ellipsises at 9.5px/0.06em. */
+	.dayState {
+		font-size: 9px;
+		letter-spacing: 0;
+	}
+
+	/* A 22px hit target is a pointer target. Under $sm a thumb removes chips. */
+	.chipDrop {
+		width: 44px;
+		height: 44px;
+	}
+
+	.chip {
+		padding: 3px 3px 3px 10px;
+	}
+
+	.gridCol,
+	.railCol,
+	.head,
+	.tray {
+		padding-left: 10px;
+		padding-right: 10px;
+	}
+
+	.week,
+	.dowRow,
+	.weeks,
+	.skeletonWeek {
+		gap: 2px;
+	}
+
+	.navBtn,
+	.quickBtn,
+	.calBtn {
+		min-height: 44px;
+	}
+
+	.navBtn {
+		width: 44px;
+		height: 44px;
+	}
+
+	.tray,
+	.trayActions {
+		align-items: stretch;
+	}
+
+	.trayActions {
+		margin-left: 0;
+		width: 100%;
+	}
+}
+
+@media (prefers-reduced-motion: no-preference) {
+	.day,
+	.calBtn,
+	.navBtn,
+	.quickBtn,
+	.chip {
+		transition:
+			background-color 150ms ease,
+			border-color 150ms ease,
+			color 150ms ease;
+	}
+}

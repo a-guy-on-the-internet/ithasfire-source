@@ -7,6 +7,7 @@ import { Text, useColors } from "@th/ui-native";
 import { useNetworkState } from "../features/network/use-network-state";
 import { listQueuedScans, listRecentScans, type RecentScan } from "../lib/local-db";
 import { triggerFeedback } from "../lib/feedback";
+import { refusedRowLabel } from "../lib/admit-settlement";
 import { useScanUndo } from "../lib/use-scan-undo";
 
 const UNDO_WINDOW_MS = 30_000;
@@ -173,8 +174,16 @@ export const RecentScansStrip = ({
           // all — the row never left the device. Requiring `ticketId` made
           // FR-006a unreachable for every bulk admit (which records none) and
           // for every admit driven from the search screen.
+          // A refused admit (server said REJECTED / REPLAY) stays listed —
+          // the screen tells the operator to look for it here — but is never
+          // undoable: there is no admission of ours to revert, and on a
+          // REPLAY UNDO would revert someone else's.
+          const refusedLabel = refusedRowLabel(scan.refusedKey);
           const undoable =
-            scan.kind === "ticket" && inWindow && (isQueued || !!scan.ticketId);
+            !refusedLabel &&
+            scan.kind === "ticket" &&
+            inWindow &&
+            (isQueued || !!scan.ticketId);
           // Queued scans undo with no network at all; acknowledged ones need one.
           const blockedOffline = !isQueued && network === "offline";
           const secondsLeft = Math.max(
@@ -194,6 +203,16 @@ export const RecentScansStrip = ({
                     {Math.floor(elapsed / 1000)}s ago
                     {isQueued ? " · queued" : ""}
                   </Text>
+                  {refusedLabel ? (
+                    <Text
+                      variant="caption"
+                      weight="bold"
+                      tone="warning"
+                      testID={`refused-scan-${scan.scanId}`}
+                    >
+                      {refusedLabel}
+                    </Text>
+                  ) : null}
                 </View>
                 {undoable ? (
                   <Pressable

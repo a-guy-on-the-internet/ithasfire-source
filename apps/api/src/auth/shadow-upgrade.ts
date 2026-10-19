@@ -6,15 +6,28 @@
  * row (email, emailVerified=false) but NO AuthAccount.
  *
  * If they later try to sign up with email/password, Better Auth finds the
- * existing email and fires `onExistingUserSignUp`. We detect shadow users (no
- * credential account) and upgrade them by creating a credential AuthAccount
- * with their chosen password.
+ * existing email and fires `onExistingUserSignUp`. We detect shadow users and
+ * upgrade them by creating a credential AuthAccount with their chosen
+ * password.
+ *
+ * A shadow user is STRICTLY: `emailVerified = false` AND zero AuthAccount rows
+ * of ANY provider AND zero passkeys. Anything else is a real account, and
+ * attaching a password the caller just typed to it would be an account
+ * takeover: every Google/Apple, passkey-only, email-code or magic-link user
+ * is already `emailVerified = true`, so the attacker's password sign-in
+ * would succeed immediately (2026-09-29 security review, F7). The old check
+ * ("no `credential` account") let exactly those users through.
+ *
+ * `onExistingUserSignUp` only fires while `requireEmailVerification` is true
+ * (better-auth 1.6.9 `api/routes/sign-up.mjs`), so this is dormant today; the
+ * guard has to be right BEFORE that flag is flipped.
  *
  * This module is extracted from the main Better Auth config so the core logic
  * can be unit-tested without requiring the full Better Auth or Prisma setup.
  */
 
 import type { LoggerPort } from "@th/ports";
+import type { ReporterPort } from "@th/ports/reporter";
 import { sanitizePlainText } from "@th/core/lib/sanitize-plain-text";
 
 // ── Dependency interfaces (keeps the handler testable) ─────────────────────
@@ -22,8 +35,20 @@ import { sanitizePlainText } from "@th/core/lib/sanitize-plain-text";
 export interface ShadowUpgradeDeps {
   logger: LoggerPort;
 
-  /** Look up an existing credential AuthAccount for the user. */
-  findCredentialAccount(userId: string): Promise<{ id: string } | null>;
+  /** Best-effort Sentry reporter for the swallowed failure branches. */
+  reportError?: ReporterPort;
+
+  /**
+   * Everything needed to decide whether the user is a shadow: the CURRENT
+   * `emailVerified` (read from the DB, not the hook's user object) and how
+   * many AuthAccount rows (any provider) and passkeys it has. `null` when the
+   * AuthUser no longer exists.
+   */
+  loadUpgradeEligibility(userId: string): Promise<{
+    emailVerified: boolean;
+    accountCount: number;
+    passkeyCount: number;
+  } | null>;
 
   /** Hash a plaintext password. */
   hashPassword(password: string): Promise<string>;
@@ -51,6 +76,18 @@ export interface ShadowUpgradeUser {
   humanId?: string;
 }
 
+function reportSafely(
+  reportError: ReporterPort | undefined,
+  err: unknown,
+  context: Parameters<ReporterPort>[1],
+): void {
+  try {
+    reportError?.(err, context);
+  } catch {
+    // Best-effort by contract (see `@th/ports/reporter`).
+  }
+}
+
 // ── Core handler ───────────────────────────────────────────────────────────
 
 /**
@@ -63,7 +100,7 @@ export async function handleShadowUpgrade(
   user: ShadowUpgradeUser,
   request: Request | undefined,
 ): Promise<
-  | { outcome: "skipped_has_credential" }
+  | { outcome: "skipped_not_shadow" }
   | { outcome: "skipped_no_request" }
   | { outcome: "skipped_body_parse_failed" }
   | { outcome: "skipped_no_password" }
@@ -73,17 +110,26 @@ export async function handleShadowUpgrade(
   const { logger } = deps;
 
   try {
-    // Check if this user already has a credential account (real user,
-    // not a shadow). If so, this is a genuine duplicate signup — let
-    // Better Auth's default anti-enumeration behavior handle it.
-    const existingCredential = await deps.findCredentialAccount(user.id);
+    // Refuse unless this is a TRUE shadow (see the module comment). The
+    // caller gets Better Auth's normal duplicate-sign-up response either way,
+    // so a refusal reveals nothing about the account — and no password is
+    // attached to it.
+    const eligibility = await deps.loadUpgradeEligibility(user.id);
+    const isShadow =
+      eligibility !== null &&
+      !eligibility.emailVerified &&
+      eligibility.accountCount === 0 &&
+      eligibility.passkeyCount === 0;
 
-    if (existingCredential) {
-      logger.info("shadow_upgrade_skipped_has_credential", {
+    if (!isShadow) {
+      logger.info("shadow_upgrade_skipped_not_shadow", {
         authUserId: user.id,
-        email: user.email,
+        userFound: eligibility !== null,
+        emailVerified: eligibility?.emailVerified ?? null,
+        accountCount: eligibility?.accountCount ?? null,
+        passkeyCount: eligibility?.passkeyCount ?? null,
       });
-      return { outcome: "skipped_has_credential" };
+      return { outcome: "skipped_not_shadow" };
     }
 
     // ── This is a shadow user — upgrade it ──
@@ -134,8 +180,12 @@ export async function handleShadowUpgrade(
     if (name && user.humanId) {
       try {
         await deps.updateHumanName(user.humanId, name);
-      } catch {
+      } catch (nameErr) {
         // Non-critical — the Human name can be updated later.
+        reportSafely(deps.reportError, nameErr, {
+          tags: { area: "auth", op: "shadow_upgrade_human_name" },
+          extra: { authUserId: user.id, humanId: user.humanId },
+        });
       }
     }
 
@@ -147,6 +197,10 @@ export async function handleShadowUpgrade(
       logger.warn("shadow_upgrade_verification_email_failed", {
         authUserId: user.id,
         error: verifyErr,
+      });
+      reportSafely(deps.reportError, verifyErr, {
+        tags: { area: "auth", op: "shadow_upgrade_verification_email" },
+        extra: { authUserId: user.id },
       });
     }
 
@@ -161,6 +215,10 @@ export async function handleShadowUpgrade(
     logger.error("shadow_upgrade_failed", {
       authUserId: user.id,
       error,
+    });
+    reportSafely(deps.reportError, error, {
+      tags: { area: "auth", op: "shadow_upgrade" },
+      extra: { authUserId: user.id },
     });
     return { outcome: "error", error };
   }

@@ -1,0 +1,261 @@
+# support-chat-widget.spec.yaml
+#
+# A bottom-right chat widget on the web app where attendees can ask for help and
+# get a reply "when we can". Near-real-time via POLLING (not websockets — those
+# break Cloud Run scale-to-zero). Messages persist to Postgres; a new message /
+# human-needed fires a best-effort Discord alert via the existing alert adapter.
+# Operators reply from /admin/support. The thread model is designed so the AI
+# clerk (ai-clerk-and-tool-registry.spec.yaml) can later post into the same
+# threads and escalate to a human in-place.
+
+version: "1.0"
+updated: "2026-06-23"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    There's no way for a user who needs a human "right now" to reach one. The
+    /support hub handles self-serve and refunds, but a live question ("I can't
+    find my ticket", "is this event still on?") has no capture surface — and as
+    a near-solo operator we need those to queue, ping us, and be answerable
+    asynchronously without losing them.
+  solution: >
+    A persistent chat bubble in the bottom-right. Users send messages that
+    persist to Postgres; the widget polls for replies only while open. Each new
+    thread / human-needed event posts a Discord alert (best-effort, never fails
+    the request). We reply from an /admin/support inbox. Threads are order-aware
+    (who, which event/order) and message authorship is typed so the AI clerk can
+    deflect the easy ones and escalate the rest into the same thread.
+  users:
+    - attendee (signed-in or anonymous)
+    - platform support operator / admin
+  surfaces:
+    - web    # bottom-right widget + /admin/support inbox
+
+# ── Decisions (from scoping conversation) ─────────────────────────────────────
+
+decisions:
+  polling_not_websockets: >
+    A persistent WebSocket would pin a Cloud Run instance up and break
+    scale-to-zero — the core cost model. Support latency of a few seconds is
+    invisible, so POLL: ~3-5s while the chat window is OPEN, pause on tab
+    background (visibilitychange), slow/no poll when collapsed (unread-badge
+    only). Instances are consumed only while a user is actively chatting — when
+    they'd be scaled up anyway. SSE (httpSubscriptionLink) would be a future
+    upgrade if 3-5s ever feels laggy, but that transport was removed on
+    2026-06-23 (notifications moved to polling), so it would need re-adding
+    first; not now.
+  reuse_discord_adapter: >
+    Reuse createDiscordWebhookAlertSender (packages/adapters/src/infra/
+    discord-alerts.ts). No new infra. New DEDICATED env var
+    DISCORD_SUPPORT_WEBHOOK (resolved 2026-06-23) so support pings get their own
+    channel, separate from agent/ops noise. Alert send is best-effort: a Discord
+    outage MUST NOT fail support.sendMessage.
+  sign_in_required: >
+    RESOLVED 2026-06-23 — the chat widget is SIGNED-IN ONLY. A signed-out user
+    who opens it sees a prompt to sign in (so their orders/tickets are linked and
+    things can be handled smoothly) plus a fallback "email us" link to the
+    support address. No anonymous threads, no anon email capture. This shrinks
+    the abuse surface and guarantees every thread has a humanId + order context.
+  thread_model_serves_both: >
+    Message.authorType ∈ {USER, HUMAN_AGENT, AI_CLERK, SYSTEM} so the AI clerk
+    can post into the same threads and a human handoff is just more messages on
+    the same thread — one inbox, no second data model.
+  order_aware: >
+    A thread captures who the user is (humanId when signed in, else a contact
+    email) and optional eventId/orderId context. This is the capture half of the
+    long-pending "order-aware support" gap flagged on the /support hub.
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Bottom-right chat widget present across the web app: collapsed bubble
+        with unread badge; expands to a thread view with message history and a
+        composer.
+    - id: FR-002
+      description: >
+        Sending a message persists it to the signed-in user's open thread
+        (creating one if none), then returns immediately; the thread always
+        carries the user's humanId. A signed-out user who opens the widget sees a
+        sign-in prompt plus a fallback "email us" link to the support address —
+        no anonymous threads.
+    - id: FR-003
+      description: >
+        Order-aware context: when the widget is opened from an event/order page
+        (or the user references one), the thread records eventId/orderId so the
+        operator sees context without asking.
+    - id: FR-004
+      description: >
+        Polling reads new messages via support.getMessages on an interval ONLY
+        while the window is open; paused when the tab is hidden; collapsed state
+        polls slowly (or not at all) just to refresh the unread badge.
+    - id: FR-005
+      description: >
+        On a new thread (and on an explicit "talk to a human" / clerk
+        escalation), POST a Discord alert with thread id, who, event/order
+        context, and the message preview. Best-effort — swallow failures.
+    - id: FR-006
+      description: >
+        /admin/support inbox: operators list threads (newest/awaiting-human
+        first), open a thread, read history, reply (authorType HUMAN_AGENT), and
+        mark resolved. Replies appear to the user on their next poll.
+    - id: FR-007
+      description: >
+        Thread status lifecycle: OPEN → AWAITING_HUMAN (escalated) → RESOLVED.
+        Status drives inbox ordering and which events fire a Discord alert.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Polling respects scale-to-zero: no open connection when no one is
+        actively chatting. visibilitychange pauses polling; closing/collapsing
+        the widget stops the fast poll.
+    - id: NFR-002
+      description: >
+        Abuse control: even though the widget is sign-in only, rate-limit sends
+        per human, and only alert Discord on first message + escalation (not
+        every message), so a single account can't flood the channel or DB.
+    - id: NFR-003
+      description: >
+        Discord alert is fire-and-forget and isolated: any error (timeout,
+        non-2xx, missing webhook) is logged and dropped — never propagated to the
+        user's send.
+    - id: NFR-004
+      description: >
+        Admin views require a platform support/admin role (reuse existing
+        platform RBAC, e.g. the staff-access check used by platform procedures).
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+# core → ports → adapters → transport → UI
+
+architecture:
+  core:
+    use_cases:
+      - name: send-support-message
+        description: Append a message to the caller's open thread (create if none); return thread + message.
+        input: actorHumanId? | anonContact, body, eventId?, orderId?
+        output: thread, message
+        idempotent: false
+        money: false
+      - name: get-support-messages
+        description: Return messages for a thread the caller owns (poll target).
+        input: threadId, actor (owner or staff)
+        output: messages, thread status
+        idempotent: true
+        money: false
+      - name: list-support-threads (admin)
+        description: Paginated thread list for operators, ordered by status + recency.
+        input: filters (status), staff actor
+        output: threads
+        idempotent: true
+        money: false
+      - name: reply-to-support-thread (admin)
+        description: Operator posts a HUMAN_AGENT message to a thread.
+        input: threadId, body, staff actor
+        output: message
+        idempotent: false
+        money: false
+      - name: set-support-thread-status
+        description: Move a thread OPEN/AWAITING_HUMAN/RESOLVED; AWAITING_HUMAN triggers the alert.
+        input: threadId, status, actor
+        output: thread
+        idempotent: true
+        money: false
+
+  ports:
+    new:
+      - SupportThreadRepository   # persistence for threads + messages
+    existing:
+      - DiscordAlertFn            # createDiscordWebhookAlertSender (reused as-is)
+      - (platform RBAC / staff-access check)
+
+  adapters:
+    new:
+      - PrismaSupportThreadAdapter
+    existing:
+      - Discord webhook alert sender (packages/adapters/src/infra/discord-alerts.ts)
+
+  transport:
+    trpc_procedures:
+      - support.sendMessage        # authenticated (signed-in only); rate-limited per human
+      - support.getMessages        # poll; owner or staff
+      - support.listThreads        # admin only
+      - support.replyToThread      # admin only
+      - support.setThreadStatus    # admin (resolve) / escalation
+    webhooks: []
+
+  ui:
+    pages:
+      - /admin/support             # operator inbox + thread view
+    components:
+      - SupportWidget              # bubble + panel, mounted app-wide
+      - SupportThreadView          # message list + composer (shared widget/admin)
+      - useSupportPolling          # open/visibility/collapsed-aware poll hook
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - SupportThread   # id, humanId (required), eventId?, orderId?, status (enum), source, createdAt, lastMessageAt, resolvedAt?
+    - SupportMessage  # id, threadId, authorType (USER|HUMAN_AGENT|AI_CLERK|SYSTEM), authorHumanId?, body, createdAt, readAt?
+  modified_models: []
+  migrations_needed: true
+  notes: >
+    New packages/db/prisma/support.prisma (multi-file schema). authorType enum
+    includes AI_CLERK + SYSTEM up front so the AI clerk spec needs no schema
+    change. status enum: OPEN, AWAITING_HUMAN, RESOLVED.
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Public widget abused to spam Discord / the DB.
+    severity: MEDIUM
+    mitigation: >
+      Rate-limit per IP/session, validate anon email, cap thread/message
+      creation; alert only on first message + escalation, not every message (NFR-002).
+  - risk: >
+      Polling keeps instances warm and erodes scale-to-zero savings.
+    severity: LOW
+    mitigation: >
+      Poll only while open + tab visible; pause on background; collapsed = badge
+      only (NFR-001). Active-chat windows coincide with already-warm instances.
+  - risk: >
+      Discord outage blocks users from sending.
+    severity: MEDIUM
+    mitigation: >
+      Best-effort fire-and-forget alert; failures logged and dropped (NFR-003).
+  - risk: >
+      Operator never sees a thread (notification missed).
+    severity: LOW
+    mitigation: >
+      Discord ping is the push; /admin/support inbox is the durable pull. Both
+      exist so a missed ping doesn't lose the thread.
+
+open_questions:
+  - Email follow-up when a reply lands and the user has left (closes the rest of the order-aware-support gap) — in this spec or a fast-follow? (Spec assumes fast-follow.)
+  # RESOLVED 2026-06-23: dedicated DISCORD_SUPPORT_WEBHOOK env var (not shared with agents/ops).
+  # RESOLVED 2026-06-23: sign-in required; signed-out users get a sign-in prompt + "email us" fallback, no anonymous threads.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - The AI clerk behavior itself (see ai-clerk-and-tool-registry.spec.yaml) — this spec only makes the thread model AI-ready.
+  - WebSockets / true server push (polling now; SSE is the documented upgrade path).
+  - File/image attachments, typing indicators, read receipts beyond a simple readAt.
+  - Replacing the existing /support hub page (self-serve + refunds, SUPPORT_URL target) — the widget complements it.
+  - Outbound email follow-up on reply (fast-follow; see open questions).
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A signed-in user can open the bubble, send a message, and see it persisted on a thread carrying their humanId; a signed-out user sees a sign-in prompt + "email us" link and cannot create a thread.
+  - Opening the widget from an event/order page records eventId/orderId on the thread.
+  - With the window open, an operator reply appears for the user within one poll interval (~3-5s); with the tab backgrounded, polling pauses and resumes on focus.
+  - A new thread posts a Discord alert with context; simulating a Discord failure still lets the user send successfully.
+  - /admin/support lists threads (awaiting-human first), an operator can reply and resolve, and non-staff cannot access it.
+  - SupportMessage.authorType supports AI_CLERK and SYSTEM with no further migration (verified against the schema).

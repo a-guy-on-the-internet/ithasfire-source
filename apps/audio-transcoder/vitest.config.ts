@@ -6,6 +6,9 @@ const resolveFromPackages = (...segments: string[]) =>
 
 export default defineConfig({
   test: {
+    // Queue for a machine-wide light slot (scripts/dev/gate); watch mode takes none.
+    // Absolute: a relative entry resolves against vitest's root (cwd), not this file.
+    globalSetup: [path.resolve(__dirname, "../../scripts/dev/gate/vitest-global-setup.mjs")],
     globals: true,
     environment: "node",
     include: ["test/**/*.test.ts"],

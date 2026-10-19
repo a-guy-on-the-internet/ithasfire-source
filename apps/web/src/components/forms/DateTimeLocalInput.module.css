@@ -1,0 +1,39 @@
+/* ───────────────────────────────────────────────────────────────────────────
+   DATE / DATETIME FIELD — the `boxed` look of `DateTimeLocalInput`.
+
+   Matches the design system's TextInput (`IthasFireTextInput` in
+   packages/ui/.../forms/TextInput.tsx): 2px border, surface fill, radius 0,
+   16px body text, the strong border on hover and the accent border on focus.
+   Sites that used to render a date through TextInput keep that look on a
+   plain `<input>`, which takes the mouse and key handlers the field needs.
+
+   CONTENT, so strict Swiss: radius 0, no shadow.
+   ─────────────────────────────────────────────────────────────────────────── */
+
+.boxed {
+	box-sizing: border-box;
+	width: 100%;
+	min-height: 36px;
+	padding: 0 12px;
+	border: 2px solid var(--borderColor, #211c16);
+	border-radius: 0;
+	background-color: var(--surface, #fdfaf3);
+	color: var(--color, #211c16);
+	font-family: var(--font-body);
+	font-size: 16px;
+	transition: border-color 150ms ease-out;
+}
+
+.boxed:hover {
+	border-color: var(--borderColorStrong, #000000);
+}
+
+.boxed:focus {
+	outline: none;
+	border-color: var(--accent, #e2481d);
+}
+
+.boxed:disabled {
+	opacity: 0.6;
+	cursor: not-allowed;
+}

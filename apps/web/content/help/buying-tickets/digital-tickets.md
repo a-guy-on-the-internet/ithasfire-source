@@ -9,7 +9,7 @@ faqs:
   - q: "Where do I find my Ithas Fire tickets?"
     a: "On the web, tickets live at /my-tickets. In the mobile app, open the Tickets tab, then tap an order to see its passes. Your confirmation email also includes a direct link, and wallet passes are available from the web order detail page."
   - q: "Do I need phone signal at the door?"
-    a: "No. Once you have opened an order in the mobile app, its passes are saved to your device and will still show if the venue has no signal. The pass is marked Offline copy when it comes from that saved version."
+    a: "No. Once you have opened an order in the mobile app, its passes are saved to your device and will still show if the place has no signal. The pass is marked Offline copy when it comes from that saved version."
   - q: "Do I need to print my ticket?"
     a: "No. A QR code on your phone or in your wallet app works at the door. If you prefer paper, open your order at /my-tickets and click Print tickets — that produces a printable sheet with three tickets to a page, each with its own QR code and a tear-off stub. The printed QR scans exactly the same way."
   - q: "Can I share one device with multiple tickets?"
@@ -32,7 +32,7 @@ Every Ithas Fire ticket is a QR code. Bring it on your phone, in your wallet app
 
 ## At the door
 
-Venue staff scan the QR code.
+Door staff scan the QR code.
 
 In the mobile app, tap a ticket to open its pass. The app turns your screen brightness up on its own while the pass is showing — scanners read reflected light, and a dimmed screen is the most common reason a code takes a few tries. Brightness goes back to normal when you leave the pass.
 
@@ -42,7 +42,7 @@ If your order has several tickets, use the arrows under the code to move between
 Every ticket has its own QR code. You can keep multiple tickets on one device and scan everyone in together, or [transfer](/help/buying-tickets/manage-your-orders) one to each guest so the ticket lives in their own account.
 :::
 
-## No signal at the venue
+## No signal at the door
 
 Basements, packed rooms, and thick walls all eat phone signal, so the app does not rely on having it.
 
@@ -55,7 +55,7 @@ Open your order once before you set off, while you still have signal. That is wh
 Two things to know about the saved copy:
 
 - It shows the ticket's status as of when it was saved, so a ticket scanned by someone else in the meantime may still look unused until you are back online.
-- Saved passes are cleared when you sign out, and are removed a few days after the event.
+- Saved passes are cleared when you sign out, when the app asks you to verify your email, and a few days after the event.
 
 ## If a pass says the ticket has moved
 

@@ -1,0 +1,227 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Deal terms and the settlement sheet (deal-terms-and-settlement stage 1,
+// P4b). docs/specs/2026-09-29/deal-terms-and-settlement.spec.yaml FR-001,
+// FR-004; the 08-07 event-settlement-report §6 data model, adapted.
+//
+// The clause columns live on PayoutTermsLine (finance.prisma) and the
+// remainder holder on PayoutTerms. This file holds what is new: the enums,
+// the costs off the top (PayoutTermsDeduction) and the per-event settlement
+// sheet with what was typed into it.
+//
+// The enums are declared HERE, beside the models that use them, rather than
+// in enums.prisma: this feature's schema then lands as one file, and a commit
+// cannot take a model without the enum it references (the 785283f7 red-main
+// failure). Stored money is integer cents; amounts are bounded by the
+// calculator (`packages/core/src/lib/settlement/deal-terms.ts`).
+//
+// STAGE 1 RECORDS AND CALCULATES. Nothing here moves money: the per-order
+// engine still reads only PERCENT lines on the GROSS basis (the adapter's
+// `listLines` fence), and "Mark settled" freezes a sheet without paying it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How a clause's amount is stated (the calculator's DealClause.amountType).
+enum DealClauseAmountType {
+  FIXED
+  PERCENT
+  FIXED_AND_PERCENT
+}
+
+/// What a clause's percent is OF (NFR-003). GROSS = ticket money (M8): Σ order
+/// basis net of refunds. NET_POOL = the pool after the costs off the top.
+enum DealBasisKind {
+  GROSS
+  NET_POOL
+}
+
+/// How a FIXED_AND_PERCENT clause resolves: SUM ("dollar one") or GREATER_OF
+/// ("versus").
+enum DealClauseResolution {
+  SUM
+  GREATER_OF
+}
+
+/// Costs off the top. DEPOSIT_PAID is deliberately absent (M10): a deposit is
+/// money that already changed hands, recorded as a direct payment on the
+/// sheet, and never changes the split.
+enum DealDeductionKind {
+  RENTAL
+  EXPENSE
+  HOUSE_NUT
+}
+
+/// Money the platform never sees, typed into the sheet (M4).
+enum OffPlatformAmountKind {
+  DOOR_CASH
+  BAR_SHARE
+  OTHER
+}
+
+/// DRAFT until the organiser marks the sheet settled after the show.
+enum SettlementSheetStatus {
+  DRAFT
+  SETTLED
+}
+
+/// One cost off the top, in waterfall order (`sortOrder`). Exactly one of
+/// `amountCents` / `percent` (a percent of the GROSS) — SQL CHECK
+/// "PayoutTermsDeduction_amount_or_percent_check". Whatever is recouped is
+/// credited to `creditedPayeeId`, who fronted it; what the money cannot cover
+/// is "Not recovered", that payee's loss (FR-002).
+model PayoutTermsDeduction {
+  id              String            @id @default(uuid())
+  payoutTermsId   String
+  kind            DealDeductionKind
+  label           String            @db.VarChar(200)
+  amountCents     Int?
+  percent         Int?
+  creditedPayeeId String
+  /// An estimate until an actual is typed into the sheet after the show
+  /// (NFR-002 "Estimated"). A non-estimated cost (an agreed rental) takes no
+  /// actual.
+  estimated       Boolean           @default(false)
+  /// Waterfall position, 0-based and unique per terms.
+  sortOrder       Int
+
+  payoutTerms   PayoutTerms @relation(fields: [payoutTermsId], references: [id], onDelete: Cascade)
+  creditedPayee Payee       @relation("PayoutTermsDeductionCredited", fields: [creditedPayeeId], references: [id], onDelete: Restrict)
+  actuals       SettlementSheetDeductionActual[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([payoutTermsId, sortOrder])
+  @@index([creditedPayeeId])
+}
+
+/// The settlement sheet of one event (FR-004): what was typed in after the
+/// show, and — once the organiser marks it settled — a frozen copy of the
+/// calculator's inputs and output. A SETTLED sheet is read from `snapshot`,
+/// never recomputed, so a later engine change can never rewrite it.
+///
+/// SQL CHECK "SettlementSheet_settled_shape_check": SETTLED ⇔ settledAt,
+/// settledByHumanId, engineVersion and snapshot are all set.
+///
+/// Human ids here and on the child rows are recorded WITHOUT a foreign key
+/// (precedent: Order.compIssuedByHumanId): they are provenance on a money
+/// record, and a deleted account must neither cascade the sheet away nor
+/// block the deletion.
+model SettlementSheet {
+  id               String                @id @default(uuid())
+  eventId          String                @unique
+  status           SettlementSheetStatus @default(DRAFT)
+  settledByHumanId String?
+  settledAt        DateTime?
+  /// DEAL_SETTLEMENT_ENGINE_VERSION that produced `snapshot`.
+  engineVersion    Int?
+  /// { engineVersion, terms, inputs, result, provenance, ledger } as frozen
+  /// at "Mark settled".
+  snapshot         Json?
+  /// Bumped by every write; each write's guarded UPDATE on this row is the
+  /// lock that serializes writes against "Mark settled".
+  revision         Int                   @default(0)
+  /// The last reopen (owner/admin, with a reason), if any.
+  reopenedAt       DateTime?
+  reopenedByHumanId String?
+
+  event            Event                 @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  offPlatform      SettlementSheetOffPlatformAmount[]
+  deductionActuals SettlementSheetDeductionActual[]
+  directPayments   SettlementSheetDirectPayment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// Money the platform never saw (door cash, a bar share). `amountCents` NULL
+/// means "Not entered" — never $0 (M4, NFR-002). It belongs to `ownerPayeeId`,
+/// or to the remainder payee when null (M11), and is already in the hands of
+/// `heldByPayeeId`.
+model SettlementSheetOffPlatformAmount {
+  id               String                @id @default(uuid())
+  sheetId          String
+  kind             OffPlatformAmountKind
+  label            String                @db.VarChar(200)
+  amountCents      Int?
+  heldByPayeeId    String
+  ownerPayeeId     String?
+  enteredByHumanId String
+  enteredAt        DateTime
+
+  sheet   SettlementSheet @relation(fields: [sheetId], references: [id], onDelete: Cascade)
+  heldBy  Payee           @relation("SheetOffPlatformHeldBy", fields: [heldByPayeeId], references: [id], onDelete: Restrict)
+  owner   Payee?          @relation("SheetOffPlatformOwner", fields: [ownerPayeeId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+
+  @@index([sheetId, createdAt])
+  @@index([heldByPayeeId])
+  @@index([ownerPayeeId])
+}
+
+/// The actual amount of an ESTIMATED cost off the top, typed in after the show.
+model SettlementSheetDeductionActual {
+  id               String   @id @default(uuid())
+  sheetId          String
+  deductionId      String
+  amountCents      Int
+  enteredByHumanId String
+  enteredAt        DateTime
+
+  sheet     SettlementSheet      @relation(fields: [sheetId], references: [id], onDelete: Cascade)
+  deduction PayoutTermsDeduction @relation(fields: [deductionId], references: [id], onDelete: Cascade)
+
+  @@unique([sheetId, deductionId])
+  @@index([deductionId])
+}
+
+/// Money that already changed hands between two participants (M10: a deposit
+/// already paid). Moves the two balances, never the split. SQL CHECK: amount
+/// > 0 and two different sides.
+model SettlementSheetDirectPayment {
+  id               String   @id @default(uuid())
+  sheetId          String
+  fromPayeeId      String
+  toPayeeId        String
+  amountCents      Int
+  label            String   @db.VarChar(200)
+  note             String?  @db.VarChar(1000)
+  enteredByHumanId String
+  enteredAt        DateTime
+
+  sheet SettlementSheet @relation(fields: [sheetId], references: [id], onDelete: Cascade)
+  from  Payee           @relation("SheetDirectPaymentFrom", fields: [fromPayeeId], references: [id], onDelete: Restrict)
+  to    Payee           @relation("SheetDirectPaymentTo", fields: [toPayeeId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+
+  @@index([sheetId, createdAt])
+  @@index([fromPayeeId])
+  @@index([toPayeeId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// freeze-the-deal (docs/specs/2026-10-14/freeze-the-deal.spec.yaml FR-005).
+// The freeze itself is two columns on Event (`dealFrozenAt`,
+// `dealFrozenByHumanId`); this is the record of each change made while frozen.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One change to a frozen event's deal: who, when, and the whole deal before
+/// and after, in the normalised shape `deal-freeze.ts` snapshots (the fields
+/// `deal-fingerprint.ts` hashes, per terms row, plus the payout schedule and
+/// the resale clause). Append-only: no update or delete use case; rows go with
+/// their event (CASCADE). A save that changes nothing appends no row.
+model DealChange {
+  id           String   @id @default(uuid())
+  eventId      String
+  /// Null once the human is deleted (SET NULL); the change stays on record.
+  actorHumanId String?
+  createdAt    DateTime @default(now())
+  before       Json
+  after        Json
+
+  event Event  @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  actor Human? @relation("DealChangeActor", fields: [actorHumanId], references: [id], onDelete: SetNull)
+
+  @@index([eventId, createdAt(sort: Desc)])
+  @@index([actorHumanId])
+}

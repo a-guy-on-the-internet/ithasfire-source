@@ -1,0 +1,47 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "jsx": "react-jsx",
+    "baseUrl": ".",
+    "noEmit": true,
+    "paths": {
+      "@th/core/*": ["packages/core/src/*"],
+      "@th/adapters/*": ["packages/adapters/src/*"],
+      "@th/ports": ["packages/ports/src/index.ts"],
+      "@th/ports/*": ["packages/ports/src/*"],
+      "@th/types": ["packages/types/src/index.ts"],
+      "@th/types/*": ["packages/types/src/*"],
+      "@th/errors": ["packages/errors/src/index.ts"],
+      "@th/errors/*": ["packages/errors/src/*"],
+      "@th/trpc/*": ["packages/transport/trpc/src/*"],
+      "@th/ui": ["packages/ui/src/index.ts"],
+      "@th/ui/*": ["packages/ui/src/*"],
+      "@th/schema/*": ["packages/schema/src/*"],
+      "@th/test-utils": ["packages/test-utils/src/index.ts"],
+      "@th/test-utils/*": ["packages/test-utils/src/*"],
+      "@th/locale": ["packages/locale/src/index.ts"],
+      "@th/locale/*": ["packages/locale/src/*"],
+      "@th/services-auth-client": ["packages/service/auth-client/src/index.ts"],
+      "@th/services-auth-client/*": ["packages/service/auth-client/src/*"]
+    },
+    "skipLibCheck": true
+  },
+  "exclude": [
+    "node_modules",
+    "apps/audio-transcoder/test/fixtures/output",
+    "**/__tests__/**",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/*.stories.ts",
+    "**/*.stories.tsx",
+    "scripts/**",
+    "packages/test-utils/**",
+    "**/playwright.config.ts",
+    "**/volunteering/**",
+    "**/volunteering.ts",
+    "apps/**"
+  ]
+}

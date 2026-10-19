@@ -13,9 +13,12 @@
 import { z } from "zod";
 import { defineJob, defineScheduledTask } from "../lib/define-job";
 import { getSchedule } from "../lib/manifest";
+import { reportNotConfiguredOnce } from "../lib/report-not-configured";
 import { runPayoutBatch } from "@th/core/use-cases/settlements/run-batch";
 import { verifyLedgerInvariants } from "@th/core/use-cases/settlements/verify-ledger-invariants";
+import type { CheckPlatformSolvencyOutput } from "@th/core/use-cases/settlements/check-platform-solvency";
 import { notifyPayoutCompleted } from "@th/core/use-cases/settlements/notify-payout-completed";
+import { backfillProcessorFees } from "@th/core/use-cases/settlements/backfill-processor-fees";
 import { notify as notifyUseCase } from "@th/core/use-cases/comms/notify";
 import { logAndReport } from "@th/adapters/infra/discord-alerts";
 import type { DiscordAlertField } from "@th/adapters/infra/discord-alerts";
@@ -51,13 +54,10 @@ export const runBatch = defineScheduledTask({
           sms: ctx.sms ?? undefined,
           push: ctx.push ?? undefined,
           logger: ctx.logger,
+          reportError: ctx.reportError,
         },
         payload,
       );
-    const payoutsUrl = ctx.appBaseUrl
-      ? `${ctx.appBaseUrl.replace(/\/+$/, "")}/sell/payouts`
-      : undefined;
-
     let result: Awaited<ReturnType<typeof runPayoutBatch>>;
     try {
       result = await runPayoutBatch(
@@ -73,10 +73,27 @@ export const runBatch = defineScheduledTask({
           // The `crashed` catch below re-throws and is caught by the boundary
           // (D1) — do NOT capture there too, or issues would be duplicated.
           reportError: Sentry.captureException,
+          // The payouts link is resolved PER PAYEE inside the notifier (an org
+          // lands on its own /admin/<slug>/payouts; a human gets no link).
+          // The first real payout shipped one global `/sell/payouts` URL from
+          // here — the ticket-RESALE seller page — to an organization.
           notifyPayee: (args) =>
             notifyPayoutCompleted(
-              { repos: ctx.repos, notify, logger: ctx.logger },
-              { ...args, payoutsUrl },
+              {
+                repos: ctx.repos,
+                notify,
+                logger: ctx.logger,
+                // Without a Stripe key `ctx.payments` is a stub that THROWS
+                // on every call; handing it over would report a Sentry error
+                // per item for a field that was always going to be null.
+                payments: ctx.paymentsConfigured ? ctx.payments : undefined,
+                clock: ctx.clock,
+                // The notifier's enrichment reads (org, orders, events,
+                // balance, Connect schedule) are swallowed into a degraded
+                // email; each swallow is reported here so it is not silent.
+                reportError: Sentry.captureException,
+              },
+              { ...args, appBaseUrl: ctx.appBaseUrl ?? null },
             ),
         },
         { limit: input.limit },
@@ -133,6 +150,8 @@ export const runBatch = defineScheduledTask({
       itemsSkippedIneligible: result.itemsSkippedIneligible,
       itemsSkippedPayableDropped: result.itemsSkippedPayableDropped,
       itemsSkippedClaimLost: result.itemsSkippedClaimLost,
+      itemsFailedInsufficientPlatformBalance:
+        result.itemsFailedInsufficientPlatformBalance,
       payeesDeferredByLimit: result.payeesDeferredByLimit,
       itemsLedgerHealed: result.itemsLedgerHealed,
       itemsHeldForSuspension: result.itemsHeldForSuspension,
@@ -221,6 +240,20 @@ export const runBatch = defineScheduledTask({
               },
             ]
           : [];
+      // The PLATFORM ran out of available balance mid-batch. Called out
+      // separately from "Failed" because the remedy is entirely ours — top up
+      // or slow our own Stripe payout schedule — and none of these payees did
+      // anything wrong. Their money is untouched and re-plans on the next run.
+      const floatField: DiscordAlertField[] =
+        result.itemsFailedInsufficientPlatformBalance > 0
+          ? [
+              {
+                name: "Platform balance short",
+                value: `${result.itemsFailedInsufficientPlatformBalance} item(s) unfunded — top up; no payee is at fault`,
+                inline: true,
+              },
+            ]
+          : [];
       // Rolling reserve on membership payouts. Same posture as the debt
       // field: only surfaced when the batch actually deferred or returned
       // reserve money — pure-ticketing runs stay clean.
@@ -265,6 +298,7 @@ export const runBatch = defineScheduledTask({
                 value: `${result.itemsTransferred}/${result.payeesConsidered} paid`,
                 inline: true,
               },
+              ...floatField,
               ...skippedField,
               ...deferredField,
               ...healedField,
@@ -288,10 +322,83 @@ export const runBatch = defineScheduledTask({
 // settlements.verify-ledger - Read-only ledger invariant sweep (daily cron,
 // a few hours AFTER the payout batch, + manually triggerable)
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * One Discord field value summarising platform solvency.
+ *
+ * Only called when something is worth saying, so it optimises for "what is
+ * wrong" rather than a full dump. Pure string building and deliberately
+ * total: it runs INSIDE the alert path that reports the very violation it
+ * describes, so throwing here would suppress the alert.
+ *
+ * `null` is NOT a clean bill of health — it means the check never ran (no
+ * processor wired, or it faulted and already reported). Say that, rather than
+ * printing zeros a reader would take for "nothing owed".
+ */
+function describeSolvency(
+  solvency: CheckPlatformSolvencyOutput | null,
+): string {
+  if (!solvency) {
+    return "Not measured — no processor wired, or the check faulted (already reported separately). This is NOT a clean bill of health.";
+  }
+
+  // `null` cents means the read failed. It must never render as "$0.00": the
+  // whole point of the nullable fields is that an unknown balance is not a
+  // zero balance.
+  const money = (cents: number | null) =>
+    cents === null ? "unknown" : `$${(cents / 100).toFixed(2)}`;
+
+  const lines: string[] = [];
+
+  // Degraded reads first — every figure below is suspect when either is set.
+  if (solvency.ledgerUnavailable) {
+    lines.push("⚠ Ledger read FAILED — liability figures are missing, not zero.");
+  }
+  if (solvency.balanceUnavailable) {
+    lines.push("⚠ Stripe balance read FAILED — no solvency verdict drawn.");
+  }
+
+  for (const row of solvency.currencies) {
+    const flags = [
+      row.headroomBelowFloor ? "BELOW FLOOR" : null,
+      row.tonightShortfall ? "TONIGHT SHORT" : null,
+    ].filter((flag): flag is string => flag !== null);
+
+    lines.push(
+      `${row.currency.toUpperCase()}${flags.length > 0 ? ` — ${flags.join(" + ")}` : ""}: ` +
+        `available ${money(row.stripeAvailableCents)} · ` +
+        `liability ${money(row.liabilityCents)} · ` +
+        `headroom ${money(row.headroomCents)} (floor ${money(row.headroomFloorCents)}) · ` +
+        `tonight needs ${money(row.maturedPayableCents)}`,
+    );
+  }
+
+  if (lines.length === 0) {
+    return "Solvency checked; no per-currency detail reported.";
+  }
+
+  // Discord rejects the WHOLE embed when one field value exceeds 1024 chars,
+  // so an account with many currencies must not silence the alert this field
+  // is attached to. Trim by whole lines and say what was dropped.
+  const LIMIT = 1024;
+  const kept: string[] = [];
+  let used = 0;
+  for (const line of lines) {
+    const suffixBudget = 48; // room for the "…and N more" line
+    if (used + line.length + 1 > LIMIT - suffixBudget) break;
+    kept.push(line);
+    used += line.length + 1;
+  }
+  const dropped = lines.length - kept.length;
+  if (dropped > 0) {
+    kept.push(`…and ${dropped} more currency line(s) — see logs.`);
+  }
+  return kept.join("\n");
+}
+
 export const verifyLedger = defineScheduledTask({
   name: "settlements.verify-ledger",
   description:
-    "Read-only ledger reconciliation sweep (spec 2026-08-10 §9). Recomputes the PayeeLedgerBalance rollups from entries, checks per-(order,payee) refund conservation, and flags finalized orders missing their SETTLEMENT_CREDITs. Reports violations (Sentry + Discord); never repairs.",
+    "Read-only ledger reconciliation sweep (spec 2026-08-10 §9). Recomputes the PayeeLedgerBalance rollups from entries, checks per-(order,payee) refund conservation, flags finalized orders missing their SETTLEMENT_CREDITs, and compares the PLATFORM Stripe balance against total liability. Reports violations (Sentry + Discord); never repairs.",
   input: z.object({
     graceMinutes: z.number().int().min(0).max(1440).default(30),
   }),
@@ -308,6 +415,11 @@ export const verifyLedger = defineScheduledTask({
       {
         repos: ctx.repos,
         clock: ctx.clock,
+        // READ-ONLY use of the processor: the solvency leg calls
+        // `getPlatformBalance()` and nothing else. A Stripe failure is
+        // reported and swallowed INSIDE the use case — the three ledger
+        // invariants must survive a Stripe outage.
+        payments: ctx.payments,
         logger: ctx.logger,
         // Grouped per-invariant Sentry reports (one per violated class per
         // run). ctx.reportError is the safeReporter-wrapped
@@ -320,15 +432,54 @@ export const verifyLedger = defineScheduledTask({
     const totalViolations =
       result.rollupDriftCount +
       result.conservationViolationCount +
-      result.completenessGapCount;
+      result.completenessGapCount +
+      result.cancelledEventCashDebitCount +
+      result.cancelledEventOpenDoorCardSaleCount;
+
+    // Solvency is REPORTED, never gating: a breach here means "look now",
+    // not "stop paying". `solvency: null` means NOT MEASURED (no processor
+    // wired, or the check faulted and reported) — never "healthy".
+    const solvency = result.solvency;
+    const solvencyBreaches =
+      solvency?.currencies.filter(
+        (row) => row.headroomBelowFloor || row.tonightShortfall,
+      ) ?? [];
+    const solvencyAlarm =
+      solvencyBreaches.length > 0 ||
+      solvency?.balanceUnavailable === true ||
+      solvency?.ledgerUnavailable === true;
 
     const summary = {
       rollupDriftCount: result.rollupDriftCount,
       conservationViolationCount: result.conservationViolationCount,
       completenessGapCount: result.completenessGapCount,
+      cancelledEventCashDebitCount: result.cancelledEventCashDebitCount,
+      cancelledEventOpenDoorCardSaleCount:
+        result.cancelledEventOpenDoorCardSaleCount,
+      solvency: solvency
+        ? {
+            balanceUnavailable: solvency.balanceUnavailable,
+            ledgerUnavailable: solvency.ledgerUnavailable,
+            currencies: solvency.currencies,
+          }
+        : null,
     };
 
-    if (totalViolations > 0) {
+    // One Discord field summarising every currency, only when there is
+    // something to say — a clean run must not carry a permanent noise line.
+    // Never allowed to fail the job: this is string building, and the send
+    // itself is env-gated inside fireDiscordAlert.
+    const solvencyField: DiscordAlertField[] = solvencyAlarm
+      ? [
+          {
+            name: "Platform solvency",
+            value: describeSolvency(solvency),
+            inline: false,
+          },
+        ]
+      : [];
+
+    if (totalViolations > 0 || solvencyAlarm) {
       const logsUrl = buildCloudLoggingUrl(ctx.runId);
       const fields: DiscordAlertField[] = [
         {
@@ -346,6 +497,20 @@ export const verifyLedger = defineScheduledTask({
           value: String(result.completenessGapCount),
           inline: true,
         },
+        {
+          name: "Cancelled-event cash debits",
+          value: String(result.cancelledEventCashDebitCount),
+          inline: true,
+        },
+        {
+          // Report-only: a paid door card sale on a cancelled event that was
+          // never refunded, or one the door sweep could not void. A person
+          // refunds it; nothing does it automatically.
+          name: "Cancelled-event door card sales",
+          value: String(result.cancelledEventOpenDoorCardSaleCount),
+          inline: true,
+        },
+        ...solvencyField,
         { name: "Run ID", value: ctx.runId, inline: true },
       ];
       if (logsUrl) {
@@ -362,12 +527,20 @@ export const verifyLedger = defineScheduledTask({
         alert: {
           send: fireDiscordAlert,
           payload: {
-            title: "Ledger invariant violation",
+            title:
+              totalViolations > 0
+                ? "Ledger invariant violation"
+                : "Platform solvency warning",
             colour: "error",
             description:
-              "The ledger reconciliation sweep found invariant violations. " +
-              "Read-only job — nothing was repaired. Investigate via Sentry " +
-              "(ledger_invariant_violation) before the next payout batch.",
+              totalViolations > 0
+                ? "The ledger reconciliation sweep found invariant violations. " +
+                  "Read-only job — nothing was repaired. Investigate via Sentry " +
+                  "(ledger_invariant_violation) before the next payout batch."
+                : "The platform Stripe balance no longer comfortably covers what " +
+                  "we owe. Read-only job — nothing was repaired or held. " +
+                  "Investigate via Sentry (platform_solvency_headroom_low / " +
+                  "platform_tonight_shortfall).",
             fields,
           },
         },
@@ -381,6 +554,66 @@ export const verifyLedger = defineScheduledTask({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// settlements.backfill-processor-fees - Read each charge's REAL Stripe fee and
+// stamp it on the order (hourly cron + manually triggerable)
+// ─────────────────────────────────────────────────────────────────────────────
+export const backfillProcessorFeesJob = defineScheduledTask({
+  name: "settlements.backfill-processor-fees",
+  description:
+    "Reads what Stripe actually charged to process each order, from the charge's balance transaction, and stamps Order.processorFeeCents — the only source of the processor-cost input to platform revenue; a rate-card estimate is a different number wearing its name. A failed read leaves the column NULL ('not attributed'), backs the row off for 6h and parks it after 24 failures; Sentry hears about a row on its first failure and when it is parked, never on the retries between. Hourly.",
+  input: z.object({
+    limit: z.number().int().min(1).max(500).default(100),
+  }),
+  schedule: getSchedule("settlements.backfill-processor-fees"),
+  handler: async ({ input, ctx }) => {
+    // `ctx.payments` is NEVER null — without a Stripe key it is a stub that
+    // THROWS on every call (see container.ts). Branching on `paymentsConfigured`
+    // is therefore the only correct guard; branching on `payments` being falsy
+    // would sail straight into the stub and report every order as failed.
+    if (!ctx.paymentsConfigured) {
+      ctx.logger.info("settlements.backfill-processor-fees.skipped", {
+        reason: "payments_not_configured",
+      });
+      // An info line does not reach Sentry (CLAUDE.md), and app.ts answers
+      // 200 for this return: without the report a cleared Stripe key leaves
+      // every order's processor fee unattributed, silently. Once per process.
+      reportNotConfiguredOnce(ctx, {
+        job: "settlements.backfill-processor-fees",
+        reason: "payments_not_configured",
+      });
+      return {
+        considered: 0,
+        stamped: 0,
+        alreadyStamped: 0,
+        failed: 0,
+        parked: 0,
+        stampedCentsByCurrency: [],
+        oldestUnstampedAt: null,
+        skipped: "payments_not_configured" as const,
+      };
+    }
+
+    const result = await backfillProcessorFees(
+      {
+        repos: ctx.repos,
+        payments: ctx.payments,
+        clock: ctx.clock,
+        logger: ctx.logger,
+        reportError: ctx.reportError,
+      },
+      { limit: input.limit },
+    );
+
+    ctx.logger.info("settlements.backfill-processor-fees.completed", result);
+    return result;
+  },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Export all settlement jobs
 // ─────────────────────────────────────────────────────────────────────────────
-export const settlementJobs = [runBatch, verifyLedger];
+export const settlementJobs = [
+  runBatch,
+  verifyLedger,
+  backfillProcessorFeesJob,
+];

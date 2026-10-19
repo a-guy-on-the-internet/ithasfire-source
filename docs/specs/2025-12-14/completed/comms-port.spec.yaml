@@ -1,0 +1,121 @@
+status: complete
+task: Define communication ports and schemas (no code generation beyond TypeScript types/interfaces)
+repo_root: packages/ports/src
+goal: Create stable, implementation-agnostic Port contracts for Mail, SMS, and In-App notifications with shared schemas, error codes, and health checks.
+
+files:
+  - path: packages/ports/src/comms/mailer.ts
+  - path: packages/ports/src/comms/sms.ts
+  - path: packages/ports/src/comms/inapp.ts
+  - path: packages/ports/src/comms/schemas.ts
+  - path: packages/ports/src/index.ts
+
+constraints:
+  - No external SDK imports here. Pure types/interfaces/zod schemas only.
+  - Ports return plain DTOs (no union of vendor types).
+  - Include error classes with `code` string literal unions and optional `details`.
+  - Include `health()` on every port returning a standard HealthStatus.
+  - Provide request/response zod schemas for validation in callers.
+  - Support idempotency keys on all send calls.
+  - Include `metadata` bag for audit/trace context.
+  - Include `tags` string[] for downstream filtering (e.g., “checkout”, “security”).
+  - Respect per-channel rate limit hints in the request (optional).
+  - Support both template-based and raw content variants.
+  - Include batch APIs for bulk sending with partial success reporting.
+
+shared_schemas (in comms/schemas.ts):
+  - HealthStatus: { ok: boolean; vendor?: string; latencyMs?: number; message?: string }
+  - RateLimitHint: { maxPerMinute?: number; burst?: number }
+  - Idempotency:
+      - `idempotencyKey?: string` (caller-supplied)
+  - Localization:
+      - `locale?: string` (BCP-47), `timezone?: string`
+  - Recipient types:
+      - EmailAddress: { to: string; name?: string }
+      - PhoneNumber: { toE164: string }
+      - InAppRecipient: { humanId: string }
+  - TemplateRef: { key: string; version?: string; variables?: Record<string, unknown> }
+  - Attachment: { filename: string; mime: string; bytesBase64: string }
+  - SendResult:
+      - success: boolean
+      - id?: string            # vendor message id
+      - idempotentReplay?: boolean
+      - errorCode?: string
+      - errorMessage?: string
+      - details?: unknown
+  - BatchResult<T>:
+      - results: Array<T>
+      - okCount: number
+      - errorCount: number
+
+error_codes:
+  - "invalid_input"
+  - "unauthorized"
+  - "rate_limited"
+  - "dependency_failed"
+  - "transient"
+  - "not_found"          # e.g., template or channel
+  - "conflict"           # idempotency conflict
+
+MailerPort (mailer.ts):
+  methods:
+    - send:
+        input:
+          - to: EmailAddress | EmailAddress[]
+          - from?: EmailAddress
+          - subject?: string
+          - text?: string
+          - html?: string
+          - template?: TemplateRef
+          - attachments?: Attachment[]
+          - idempotencyKey?: string
+          - metadata?: Record<string, string>
+          - tags?: string[]
+          - rateLimit?: RateLimitHint
+        output: { result: SendResult }
+    - sendBatch:
+        input: Array<send.input>
+        output: BatchResult<SendResult>
+    - health: () => HealthStatus
+
+SMSPort (sms.ts):
+  methods:
+    - send:
+        input:
+          - to: PhoneNumber | PhoneNumber[]
+          - body?: string
+          - template?: TemplateRef
+          - mediaUrls?: string[]
+          - idempotencyKey?: string
+          - metadata?: Record<string, string>
+          - tags?: string[]
+          - rateLimit?: RateLimitHint
+        output: { result: SendResult }
+    - sendBatch: as above
+    - health: () => HealthStatus
+
+InAppPort (inapp.ts):
+  methods:
+    - publish:
+        input:
+          - to: InAppRecipient | InAppRecipient[]   # humanId target(s)
+          - title?: string
+          - body: string
+          - kind: "INFO" | "SUCCESS" | "WARNING" | "ERROR"
+          - action?: { label: string; href?: string; route?: string }
+          - template?: TemplateRef
+          - expiresAt?: Date
+          - idempotencyKey?: string
+          - metadata?: Record<string, string>
+          - tags?: string[]
+        output: { result: SendResult }
+    - publishBatch: as above
+    - health: () => HealthStatus
+
+notes:
+  - Export zod schemas for each input/output for callers to parse/validate.
+  - Export error base class `CommsPortError extends Error { code: <union>; details?: unknown }`.
+  - Re-export everything via `packages/ports/src/index.ts`.
+
+tests (interface-level only):
+  - No runtime tests here—just ensure types compile and schema unions cover all fields.

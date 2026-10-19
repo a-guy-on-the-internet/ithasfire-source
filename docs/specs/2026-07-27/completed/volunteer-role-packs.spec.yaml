@@ -1,0 +1,450 @@
+# volunteer-role-packs.spec.yaml
+#
+# Staff-curated volunteer role packs living in the existing template tables:
+# platform rows (orgId null, isPlatform true) shown read-only to organizers
+# with a "From Ithas Fire" tag, plus start/end-anchored shift timing.
+
+version: "1.0"
+updated: "2026-07-27"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Volunteer role templates start empty. Every org has to invent "Door",
+    "Sound", "Cleanup" from scratch before volunteering is usable, and the
+    only examples that exist are four seeded rows in seed/volunteering.ts.
+    Separately, template shift presets are stored as wall-clock time — a
+    "Load-in 16:00" preset is right for a 19:00 show and schedules load-in
+    two hours AFTER the show starts on a 14:00 matinee. The 2026-04-28 spec
+    that built template shifts stated its goal as "a start offset (relative
+    to event start)"; the implementation landed as time-of-day + day offset,
+    and the gap has been there since.
+  solution: >
+    Platform-curated rows live in the tables that already exist.
+    VolunteerRoleTemplate.orgId becomes nullable and gains isPlatform +
+    packId; a catalogue role is (orgId null, isPlatform true). Their shifts
+    are ordinary VolunteerRoleTemplateShift rows, so the anchor work is done
+    once. One thin new table (VolunteerPack) holds pack metadata — name,
+    blurb, targeting, DRAFT/LIVE — because a blurb has to live somewhere.
+    Organizers see LIVE platform roles inline in their own list, tagged and
+    read-only, usable directly on events; "Customise" forks one into an
+    org-owned copy. Staff curate at /platform/volunteer-packs.
+    Shift timing gains an anchor (event start, event end, or clock time)
+    with a signed offset; WALL_CLOCK is the default and reproduces today's
+    behaviour exactly.
+  users:
+    - Platform staff curating the catalogue (ADMIN, DEVELOPER)
+    - Organizers setting up volunteering for the first time
+    - Organizers applying templates to a specific event
+  surfaces:
+    - web
+    - api
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Schema — VolunteerPack (metadata only): key (stable slug, unique),
+        name, blurb, status (DRAFT | LIVE), targetCategoryIds (String[]),
+        rankFirst, sortOrder, curatedByHumanId (SetNull), timestamps.
+        Mirrors FeaturedItem. It holds no roles of its own; roles point at
+        it.
+    - id: FR-002
+      description: >
+        Schema — VolunteerRoleTemplate: orgId becomes String? (relation
+        optional), plus isPlatform (Boolean, default false) and packId
+        (String?, SetNull). A catalogue row is orgId=null +
+        isPlatform=true + packId set. An org row is unchanged:
+        orgId set, isPlatform=false, packId null.
+    - id: FR-003
+      description: >
+        The existing @@unique([orgId, name]) stops constraining catalogue
+        rows — Postgres treats NULLs as distinct, so it would permit a pack
+        to list the same role twice. Add a raw partial unique index
+        ("packId", "name") WHERE "orgId" IS NULL in the migration,
+        following the established precedent of
+        VolunteerAsk_event_subject_key and VolunteerReward_ask_level_key:
+        SQL-only, invisible to Prisma, documented as expected drift.
+
+        AMENDED 2026-07-28 (was: (name) WHERE "orgId" IS NULL). A
+        catalogue-global name constraint is wrong and makes FR-018
+        unseedable: "Sound" belongs to both the house-show and DIY packs,
+        "Merch" to both DIY and club-night. The real invariant is per pack,
+        not per catalogue. Caught in review before the migration was
+        applied anywhere.
+    - id: FR-004
+      description: >
+        Schema — VolunteerRoleTemplateShift gains anchor
+        (VolunteerShiftAnchor, default WALL_CLOCK), offsetMinutes (Int,
+        default 0), notes (String?). Serves org and platform rows alike;
+        there is no second shift model.
+    - id: FR-005
+      description: >
+        Anchor semantics. EVENT_START and EVENT_END resolve against
+        Event.startsAt / Event.endsAt (both required columns, so both
+        always resolve). WALL_CLOCK ignores offsetMinutes and uses
+        startMinuteOfDay exactly as today. There is no doors anchor —
+        Event has no doorsAt column. startDayOffset applies in all cases.
+    - id: FR-006
+      description: >
+        Resolution moves into the event's own timezone. materializeTemplateShift
+        currently does browser-local arithmetic (apps/web/src/lib/
+        template-shift-offset.ts:159-170); it takes Event.timezone and
+        resolves there. Lands as its own commit, before any anchor work
+        sits on top of it.
+    - id: FR-007
+      description: >
+        BLOCKING SECURITY REQUIREMENT — platform rows are read-only to
+        organizers. Every mutating template use case (updateRoleTemplate,
+        archiveRoleTemplate, upsertRoleTemplateShifts, and any sibling)
+        must reject isPlatform rows BEFORE any membership check, returning
+        the same TEMPLATE_NOT_FOUND it already uses for a foreign template.
+        Today updateRoleTemplate derives its authz from the row itself —
+        requireOrgMembership({ orgId: template.orgId }) at
+        manage-role-templates.ts:109-114 — so a null orgId leaves the
+        "which org owns this" question unanswerable on a row any org can
+        name by id.
+    - id: FR-008
+      description: >
+        The nullable orgId is a typed audit list, not a hope.
+        RequireOrgMembershipInput.orgId is `string` (rbac.ts:74), so
+        widening the column surfaces a compile error at every site that
+        feeds template.orgId into an authz check. Every such error is
+        resolved deliberately — never with a non-null assertion or a
+        `?? ""` — and the resolution is recorded in the PR description.
+    - id: FR-009
+      description: >
+        Org-scoped read paths include LIVE platform rows: listRoleTemplates
+        returns the org's own rows plus catalogue rows, each carrying
+        isPlatform so the UI can tag them. DRAFT packs' roles are excluded
+        from every organizer-facing path.
+    - id: FR-010
+      description: >
+        Applying a platform role to an event works. The guard at
+        add-volunteer-role.ts:66-73 currently rejects anything where
+        template.orgId !== ask.orgId, which a null orgId fails. It widens
+        to "platform row, or a row owned by this ask's org" — and to
+        nothing wider. A template owned by a DIFFERENT org must still
+        yield TEMPLATE_NOT_FOUND without confirming it exists.
+    - id: FR-011
+      description: >
+        "Customise" on a platform row forks it into an org-owned copy
+        (orgId set, isPlatform=false, packId retained as provenance),
+        including its shifts. The org's copy shadows the platform row in
+        that org's list — matched on (packId, name), case-insensitively —
+        so the organizer never sees two rows for the same role.
+
+        AMENDED 2026-07-28 (was: "matched on packId, not on name").
+        packId alone is wrong: forking one role from a six-role pack would
+        hide the other five. Name alone is also wrong: an org's own
+        pre-existing "Door" would hide a catalogue "Door" they never
+        forked. The pair is exactly the identity the FR-003 partial unique
+        index enforces.
+    - id: FR-012
+      description: >
+        Forking is idempotent per (orgId, source template id) via the
+        existing Idempotency store, so a double-clicked "Customise" cannot
+        create two copies.
+    - id: FR-013
+      description: >
+        Organizer UI: platform rows in the templates list carry a small
+        "From Ithas Fire" tag and offer Customise instead of Edit/Archive.
+        A pack picker in the empty state groups them by pack; once
+        templates exist it moves behind a "Start from a pack" action.
+        Ranking is rankFirst then sortOrder.
+
+        AMENDED 2026-07-28 (was: "packs matching the org's category ranked
+        first"). Organization has NO category column — the ranking signal
+        the spec assumed does not exist. targetCategoryIds stays on
+        VolunteerPack and the UI's categoryMatch path stays wired but
+        inert, so it lights up the day an org-category source lands.
+        Ranking by the org's most common Event.categoryId is the obvious
+        candidate and is deliberately deferred rather than guessed at.
+    - id: FR-014
+      description: >
+        Staff catalogue at /platform/volunteer-packs — list packs with
+        status, targeting, role count and fork count; create, edit,
+        reorder, publish. Gated on STAFF_TECH (ADMIN + DEVELOPER),
+        matching the fees and jobs panels rather than the wider STAFF_ALL
+        used by featured.
+    - id: FR-015
+      description: >
+        Every pack and platform-role mutation writes an AuditLog row
+        (entity "volunteer_pack") — the only review trail once catalogue
+        content lives in the database instead of in git.
+    - id: FR-016
+      description: >
+        Staff can preview a pack as an organizer sees it, including while
+        DRAFT. Preview authorizes on STAFF_TECH, never on pack status.
+    - id: FR-017
+      description: >
+        The shift editor gains the anchor control (Starts / By / Lasts)
+        with a resolved preview against two contrasting showtimes.
+        FromTemplatesDialog resolves anchors against the target event's
+        real start and end and shows concrete dates before confirm.
+        The same editor component serves the staff pack editor.
+    - id: FR-018
+      description: >
+        Launch catalogue seeded as five LIVE packs: house show (6 roles),
+        DIY & all-ages space (9), performing arts (9), club night (8),
+        standing crew (9, no shifts). Seeded through the normal seed path
+        so dev, staging and prod start identical; DB-managed from then on.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Zero behaviour change for existing templates. A regression test
+        asserts a WALL_CLOCK shift with offsetMinutes=0 materializes to
+        byte-identical output against the pre-migration implementation.
+    - id: NFR-002
+      description: >
+        No cross-tenant leak. Org A must never see, apply, fork, or mutate
+        a template owned by Org B. The nullable orgId means "not org B's"
+        is no longer the same test as "not null" — every filter states
+        which it means.
+    - id: NFR-003
+      description: >
+        Org-facing template list stays a single query (org rows + LIVE
+        platform rows), no N+1 across shifts.
+    - id: NFR-004
+      description: >
+        Pack blurbs and platform role descriptions are staff-authored free
+        text rendered to organizers — escaped on output, no HTML
+        passthrough.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: list-role-templates (MODIFIED)
+        description: >
+          Returns the org's rows plus LIVE platform rows, each flagged.
+          Applies pack shadowing (FR-011).
+        input: orgId, includeArchived?
+        output: templates[] with isPlatform, packId
+        idempotent: true
+        money: false
+        authz: existing org membership check, unchanged
+
+      - name: update/archive-role-template (MODIFIED)
+        description: >
+          Gains the isPlatform rejection of FR-007 ahead of the membership
+          check.
+        input: unchanged
+        output: unchanged
+        idempotent: false
+        money: false
+        authz: org OWNER | ADMIN, and never on a platform row
+
+      - name: fork-platform-template
+        description: >
+          Copies a platform role + its shifts into an org-owned template.
+          Guarded by the Idempotency store.
+        input: orgId, templateId, actorHumanId, idempotencyKey
+        output: template
+        idempotent: true
+        money: false
+        authz: org OWNER | ADMIN
+
+      - name: list-volunteer-packs
+        description: LIVE packs with their roles, ranked by category match.
+        input: orgId, categoryId?
+        output: packs[] with roles[] and shifts[]
+        idempotent: true
+        money: false
+        authz: any org member who can view volunteer templates
+
+      - name: list-packs-admin / upsert-volunteer-pack /
+              set-volunteer-pack-status / remove-volunteer-pack
+        description: >
+          Staff CRUD over packs and their platform roles. Mirrors
+          upsertFeaturedItem. Each writes AuditLog.
+        input: pack fields, roles[], shifts[], actorHumanId
+        output: pack
+        idempotent: false
+        money: false
+        authz: STAFF_TECH
+
+  ports:
+    new: []
+    existing:
+      - VolunteeringRepo (template reads/writes gain isPlatform + packId;
+        listRoleTemplates gains the platform-row union)
+      - IdempotencyPort
+      - AuditLogRepo
+      - ReporterPort (any catch-and-fallback branch — see CLAUDE.md)
+    notes: >
+      No new repo port. Catalogue rows are template rows, which is the
+      point of the collapse; VolunteerPack metadata CRUD attaches to the
+      same VolunteeringRepo.
+
+  adapters:
+    new: []
+    existing:
+      - packages/adapters/src/db/prisma/volunteering.ts — 11 query sites
+        touch volunteerRoleTemplate / volunteerRoleTemplateShift (lines
+        ~829-960); each is audited for whether it means "this org's rows",
+        "catalogue rows", or "both".
+
+  transport:
+    trpc_procedures:
+      - volunteer.templates.fork (authed, org-scoped)
+      - volunteerPacks.list (authed, org-scoped)
+      - volunteerPacks.admin.list | get | upsert | setStatus | remove (staff)
+    webhooks: []
+
+  ui:
+    pages:
+      - apps/web/src/app/platform/volunteer-packs/page.tsx (catalogue)
+      - apps/web/src/app/platform/volunteer-packs/[key]/page.tsx (editor)
+    components:
+      - PackCatalogueView (staff list, status pills, fork counts)
+      - PackEditorView (roles + shifts + targeting + publish)
+      - PackPickerGrid (organizer empty state)
+      - PlatformTemplateTag ("From Ithas Fire")
+      - ShiftAnchorFields (shared — staff editor and org editor)
+      - VolunteerTemplatesView (modified — tag, Customise, read-only state)
+      - InlineShiftComposer (modified — anchor fields + resolved preview)
+      - FromTemplatesDialog (modified — resolve anchors against the event)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - VolunteerPack
+  new_enums:
+    - VolunteerShiftAnchor (WALL_CLOCK | EVENT_START | EVENT_END)
+    - VolunteerPackStatus (DRAFT | LIVE)
+  modified_models:
+    - VolunteerRoleTemplate (orgId → nullable, + isPlatform, + packId)
+    - VolunteerRoleTemplateShift (+ anchor, + offsetMinutes, + notes)
+  migrations_needed: true
+  migration_notes: >
+    Widening orgId to nullable is not reversible without data loss once
+    catalogue rows exist. anchor defaults to WALL_CLOCK and offsetMinutes
+    to 0, so existing rows keep their exact meaning with no backfill. The
+    partial unique index of FR-003 is raw SQL in the migration. Dev DB
+    needs a real migration, not db push (see project memory on P2022
+    reverts).
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      An organizer edits or archives a platform template, changing the
+      catalogue for every other org on the platform. The current authz
+      derives the tenant from the row (requireOrgMembership({ orgId:
+      template.orgId })), and that row's orgId is now null.
+    severity: HIGH
+    mitigation: >
+      FR-007 rejects isPlatform rows before the membership check, in every
+      mutating use case. Explicit negative tests per use case. This is the
+      single highest-risk consequence of sharing one table and should be
+      the first thing reviewed.
+
+  - risk: >
+      A query meaning "this org's templates" silently starts returning
+      catalogue rows, or vice versa — because `orgId: null` now matches
+      rows that used to be impossible.
+    severity: HIGH
+    mitigation: >
+      Audit all 11 adapter query sites and every listRoleTemplates caller;
+      each states org-only, platform-only, or both. FR-008's compile
+      errors enumerate the authz subset for free. NFR-002 covers it with
+      cross-tenant tests.
+
+  - risk: >
+      Two platform roles named the same, because @@unique([orgId, name])
+      does not constrain NULL orgId in Postgres.
+    severity: MEDIUM
+    mitigation: >
+      FR-003's partial unique index, following the two existing partial
+      indexes in this schema.
+
+  - risk: >
+      Catalogue content ships with no code review — a typo or wrong shift
+      time reaches organizers with no PR and no CI.
+    severity: MEDIUM
+    mitigation: >
+      DRAFT by default, staff preview-as-organizer, AuditLog on publish,
+      and the five launch packs seeded through the normal seed path so a
+      reviewed baseline exists in git.
+
+  - risk: >
+      EventDate.endsAt is nullable (unlike Event.endsAt), so an
+      EVENT_END-anchored shift applied to a recurring occurrence has
+      nothing to resolve against.
+    severity: MEDIUM
+    mitigation: >
+      Disable the row in the apply dialog with a stated reason. Do NOT
+      fall back to the parent Event.endsAt — that invents a shift time
+      from a different date. Decided, not open.
+
+  - risk: >
+      Deleting a pack orphans platform roles, which are now real rows in a
+      table organizers read.
+    severity: MEDIUM
+    mitigation: >
+      Deleting a pack deletes its platform roles (Cascade). Org-owned
+      forks survive — packId is SetNull on them, so a fork outlives the
+      catalogue row it came from.
+
+open_questions:
+  - >
+      Does the organizer-facing catalogue need i18n? Platform role names
+      and pack blurbs are staff-authored database text, so they cannot go
+      through the dual-catalog message system. Assumption: English-only at
+      launch, a real limitation for the es catalog.
+  - >
+      Should "save this event's roles as a template" ship alongside? It is
+      the cheapest way for an org to build a personal catalogue and is
+      deliberately out of scope — worth confirming that ordering.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Scheduled live windows (curatedAt / curatedUntil) — DRAFT + LIVE only.
+  - Org-authored packs shared with other orgs. Catalogue is platform-only.
+  - Pack-level defaults for waivers, comp rewards, application questions,
+    or auto-approve. Roles + shifts only.
+  - "Save this event's roles as a template" — see open_questions.
+  - Any change to VolunteerAsk, groups, broadcasts, or rewards.
+  - Shift occurrences / claims for standing asks — that is
+    specs/2026-07-07/generic-volunteer-shifts-occurrences.spec.yaml. The
+    standing-crew pack ships roles with no shifts to avoid colliding.
+  - A doors-time concept on Event.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - An org OWNER calling update or archive with a platform template id gets
+    TEMPLATE_NOT_FOUND, and the platform row is byte-identical afterwards.
+  - An org member calling update with ANOTHER org's template id still gets
+    TEMPLATE_NOT_FOUND, with no signal that the row exists.
+  - listRoleTemplates for Org A returns Org A's rows plus LIVE platform
+    rows, and zero rows belonging to Org B.
+  - Roles belonging to a DRAFT pack appear in no organizer-facing response;
+    a staff preview of the same pack shows them.
+  - Applying a platform role to an event succeeds; applying another org's
+    template to the same event fails with TEMPLATE_NOT_FOUND.
+  - One pack cannot list two roles both named "Door" (partial unique index),
+    while two DIFFERENT packs both listing a "Door" is allowed and is what
+    FR-018's launch catalogue actually requires.
+  - Customise creates an org-owned copy with its shifts; the platform row
+    disappears from that org's list and is untouched for every other org.
+    A second Customise with the same idempotency key creates nothing more.
+  - Deleting a pack removes its platform roles and leaves every org-owned
+    fork intact.
+  - An existing template shift, untouched, materializes to exactly the same
+    start/end after the migration as before (NFR-001 equivalence test).
+  - A shift anchored EVENT_START −180m resolves to 17:00 for a 20:00 show
+    and 11:00 for a 14:00 matinee, in the event's timezone, not the
+    browser's.
+  - A non-STAFF_TECH staff member (REVIEWER, SUPPORT) gets a forbidden
+    error from every volunteerPacks.admin.* procedure.
+  - An EVENT_END-anchored shift applied to a recurring occurrence with no
+    end time is shown disabled with a reason, and is not written.

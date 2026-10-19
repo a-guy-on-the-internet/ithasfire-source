@@ -25,7 +25,7 @@ import { DEMO_IDS } from "./ids.js";
 // NOTE: the listing body is intentionally kept null and the free text avoids
 // apostrophe contractions to steer clear of a content-filter false positive.
 //
-// RELATED: an older standalone script `apps/api/src/scripts/seed-community-
+// RELATED: an older standalone script `apps/api/src/scripts/qa/seed-community-
 // suggestions.ts` also creates community-suggestion test data, but by driving
 // the real use cases (non-idempotent, re-inserts on every run). THIS module is
 // the idempotent in-seed-run fixture (upsert by deterministic id) wired into
@@ -104,7 +104,8 @@ async function upsertPendingSuggestion(
     id: string;
     eventId: string;
     submitterHumanId: string | null;
-    submitterIp: string | null;
+    /** Keyed IP hash; seeds carry none (the key is server-side). */
+    submitterIpHash: string | null;
     fields: Record<string, unknown>;
     baseVersion: Record<string, unknown>;
     note: string | null;
@@ -113,7 +114,7 @@ async function upsertPendingSuggestion(
   const data = {
     eventId: params.eventId,
     submitterHumanId: params.submitterHumanId,
-    submitterIp: params.submitterIp,
+    submitterIpHash: params.submitterIpHash,
     fields: params.fields as object,
     baseVersion: params.baseVersion as object,
     note: params.note,
@@ -198,7 +199,7 @@ export const seedCommunityEditSuggestions = async (
     id: DEMO_IDS.communitySuggestionAnon,
     eventId: communityEvent.id,
     submitterHumanId: null,
-    submitterIp: "203.0.113.10",
+    submitterIpHash: null,
     fields: { title: "Community Board — Neighborhood Jam (fixed casing)" },
     baseVersion: communityBaseVersion,
     note: "The em dash reads cleaner than the colon on the card.",
@@ -216,7 +217,7 @@ export const seedCommunityEditSuggestions = async (
     id: DEMO_IDS.communitySuggestionSchedule,
     eventId: communityEvent.id,
     submitterHumanId: DEMO_IDS.human2,
-    submitterIp: null,
+    submitterIpHash: null,
     fields: {
       startsAt: proposedStart.toISOString(),
       endsAt: proposedEnd.toISOString(),
@@ -230,7 +231,7 @@ export const seedCommunityEditSuggestions = async (
     id: DEMO_IDS.communitySuggestionAge,
     eventId: communityEvent.id,
     submitterHumanId: DEMO_IDS.human4,
-    submitterIp: null,
+    submitterIpHash: null,
     fields: { ageLimit: 18 },
     baseVersion: communityBaseVersion,
     note: "The bar in the park serves alcohol, so this should be 18 plus.",
@@ -250,7 +251,7 @@ export const seedCommunityEditSuggestions = async (
       id: DEMO_IDS.orgEventSuggestion,
       eventId: orgEvent.id,
       submitterHumanId: DEMO_IDS.human3,
-      submitterIp: null,
+      submitterIpHash: null,
       // FIXED short replacement (well under the 140-char title cap) — must NOT
       // be derived from the resolved event's current title, or a long org
       // title could push the proposed value past 140 and make this suggestion

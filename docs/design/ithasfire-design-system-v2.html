@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ithas Fire — Design System v2</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;900&display=swap" rel="stylesheet">
+<!--
+  CANONICAL DESIGN SYSTEM — browsable reference. Flip the Ember/Stub toggle.
+  Agent-readable contract + v2-name→code-token mapping: ./design-system-v2.md
+  NOTE: Stub is the shipped default theme; code token names differ from the
+  --color-* names used here (see design-system-v2.md §2). Where this doc and the
+  code disagree (e.g. --color-on-accent), the code wins — see §3 Divergences.
+-->
+<style>
+  /* =========================================================
+     00 · TOKENS — the only place raw hex values are allowed.
+     Components below reference SEMANTIC tokens exclusively.
+     ========================================================= */
+
+  /* --- Theme: EMBER (Swiss Signal · dark) --- */
+  body[data-theme="ember"]{
+    --color-bg:#0F1B33;
+    --color-surface:#162240;
+    --color-surface-raised:#1A2847;
+    --color-ink:#FFFFFF;
+    --color-ink-muted:#A0B0CC;
+    --color-border:#5A78A6;
+    --color-border-soft:rgba(90,120,166,.4);
+    --color-accent:#FF5721;
+    --color-accent-hover:#E84B19;
+    --color-on-accent:#FFFFFF;
+    --color-structure:#35589A;          /* secondary action / structural fills */
+    --color-structure-press:#2A4578;
+    --color-support:#F59E0B;            /* amber: free-price, highlights */
+    --color-on-support:#0F1B33;
+    --shadow-card:none;
+    --shadow-pop:0 0 0 2px var(--color-border);
+    --grain:0;
+  }
+  /* --- Theme: STUB (Ticket Stub · light) — SHIPPED DEFAULT --- */
+  body[data-theme="stub"]{
+    --color-bg:#F6F0E4;
+    --color-surface:#FDFAF3;
+    --color-surface-raised:#EFE7D6;
+    --color-ink:#211C16;
+    --color-ink-muted:#5C544A;
+    --color-border:#211C16;
+    --color-border-soft:rgba(33,28,22,.3);
+    --color-accent:#E2481D;
+    --color-accent-hover:#B93312;
+    --color-on-accent:#FFFFFF;
+    --color-structure:#211C16;
+    --color-structure-press:#000000;
+    --color-support:#F59E0B;
+    --color-on-support:#211C16;
+    --shadow-card:4px 4px 0 rgba(33,28,22,.85);
+    --shadow-pop:6px 6px 0 rgba(33,28,22,.9);
+    --grain:.5;
+  }
+
+  :root{
+    /* type */
+    --font-sans:'Montserrat',sans-serif;
+    --font-mono:ui-monospace,"SFMono-Regular",Menlo,Monaco,Consolas,"Liberation Mono",monospace; /* genuine code ONLY — Montserrat is the only brand font */
+    /* spacing — the only spacing values allowed */
+    --sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:24px;--sp-6:32px;--sp-7:48px;--sp-8:72px;
+    /* radius — locked */
+    --radius:0px;
+    /* borders */
+    --bw-structure:2px;   /* section rules, cards, buttons */
+    --bw-hair:1px;        /* inner dividers only */
+    /* layout */
+    --container:1200px;
+    --container-wide:1440px;
+    /* motion */
+    --t-fast:120ms ease-out;
+    --t-base:160ms ease-out;
+  }
+
+  /* ========================================================= */
+  *{margin:0;padding:0;box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    background:var(--color-bg);color:var(--color-ink);
+    font-family:var(--font-sans);font-size:15px;line-height:1.65;
+    -webkit-font-smoothing:antialiased;transition:background .25s,color .25s;
+  }
+  ::selection{background:var(--color-accent);color:var(--color-on-accent)}
+  body::before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;opacity:var(--grain);
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2'/%3E%3CfeColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 .05 0'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E");}
+  .wrap{position:relative;z-index:1;max-width:1080px;margin:0 auto;padding:0 32px}
+  .mono{font-family:var(--font-mono)}
+  .kicker{font-size:11px;font-weight:700;letter-spacing:2.5px;text-transform:uppercase;color:var(--color-accent)}
+  .note{color:var(--color-ink-muted);font-size:13.5px}
+  code{font-family:var(--font-mono);font-size:12px;background:var(--color-surface-raised);border:1px solid var(--color-border-soft);padding:2px 6px;color:var(--color-ink)}
+
+  /* doc chrome */
+  .topbar{position:sticky;top:0;z-index:80;background:var(--color-bg);border-bottom:var(--bw-structure) solid var(--color-border);transition:background .25s}
+  .topbar .in{max-width:1080px;margin:0 auto;padding:0 32px;display:flex;align-items:center;justify-content:space-between;gap:16px;height:60px}
+  .topbar b{font-weight:900;text-transform:uppercase;letter-spacing:-.5px;font-size:16px;display:flex;align-items:center;gap:10px}
+  .flame{width:12px;height:18px;background:var(--color-accent);clip-path:polygon(50% 0,100% 62%,78% 100%,22% 100%,0 62%)}
+  .themetoggle{display:flex;border:var(--bw-structure) solid var(--color-border)}
+  .themetoggle button{font-size:10.5px;letter-spacing:2px;text-transform:uppercase;background:transparent;border:0;color:var(--color-ink-muted);padding:9px 16px;cursor:pointer}
+  .themetoggle button.on{background:var(--color-accent);color:var(--color-on-accent);font-weight:700}
+
+  header.doc{border-bottom:var(--bw-structure) solid var(--color-border);padding:64px 0 52px}
+  header.doc h1{font-weight:900;text-transform:uppercase;letter-spacing:-3px;font-size:clamp(40px,7vw,80px);line-height:.92;margin:14px 0 18px}
+  header.doc h1 span{color:var(--color-accent)}
+  header.doc p{max-width:600px;color:var(--color-ink-muted)}
+
+  section{padding:64px 0;border-bottom:var(--bw-structure) solid var(--color-border-soft)}
+  .sec-head{display:flex;gap:16px;align-items:baseline;margin-bottom:8px}
+  .sec-head .num{font-variant-numeric:tabular-nums;color:var(--color-accent);font-weight:700;letter-spacing:1.5px}
+  .sec-head h2{font-weight:900;text-transform:uppercase;letter-spacing:-1px;font-size:clamp(24px,3.5vw,36px)}
+  .sec-intro{color:var(--color-ink-muted);max-width:660px;margin-bottom:34px}
+  h3.sub{font-weight:900;text-transform:uppercase;letter-spacing:.5px;font-size:15px;margin:44px 0 16px;display:flex;gap:10px;align-items:center}
+  h3.sub::before{content:"";width:18px;height:3px;background:var(--color-accent)}
+
+  /* spec frames */
+  .frame{border:var(--bw-structure) solid var(--color-border-soft);background:var(--color-surface);margin-bottom:18px}
+  .frame .fh{border-bottom:var(--bw-structure) solid var(--color-border-soft);padding:11px 18px;font-size:10.5px;letter-spacing:2px;text-transform:uppercase;color:var(--color-ink-muted);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+  .frame .fb{padding:26px 22px;display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+  .frame .fb.col{flex-direction:column;align-items:flex-start}
+  .split2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  .split3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:18px}
+
+  /* rules table */
+  table.rules{width:100%;border-collapse:collapse;font-size:13.5px}
+  table.rules th{font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--color-accent);text-align:left;padding:12px 14px;border-bottom:var(--bw-structure) solid var(--color-border)}
+  table.rules td{padding:12px 14px;border-bottom:var(--bw-hair) solid var(--color-border-soft);vertical-align:top;color:var(--color-ink-muted)}
+  table.rules td:first-child{color:var(--color-ink);font-weight:600;white-space:nowrap}
+  .yes{color:#4ADE80;font-size:11px;font-weight:600;letter-spacing:1px}
+  .no{color:#F87171;font-size:11px;font-weight:600;letter-spacing:1px}
+  body[data-theme="stub"] .yes{color:#15803D}
+  body[data-theme="stub"] .no{color:#B91C1C}
+
+  /* =========================================================
+     ATOMS
+     ========================================================= */
+
+  /* --- Buttons --- */
+  .btn{
+    display:inline-flex;align-items:center;justify-content:center;gap:var(--sp-2);
+    font-family:var(--font-sans);font-weight:700;text-transform:uppercase;
+    cursor:pointer;border:var(--bw-structure) solid transparent;border-radius:var(--radius);
+    transition:all var(--t-base);text-decoration:none;white-space:nowrap;
+    letter-spacing:1.5px;
+  }
+  .btn svg{flex-shrink:0}
+  /* sizes */
+  .btn--sm{height:36px;padding:0 var(--sp-4);font-size:11px}
+  .btn--md{height:44px;padding:0 var(--sp-5);font-size:12px}
+  .btn--lg{height:54px;padding:0 var(--sp-6);font-size:13px}
+  /* variants */
+  .btn--primary{background:var(--color-accent);border-color:var(--color-accent);color:var(--color-on-accent);box-shadow:var(--shadow-card)}
+  .btn--primary:hover{background:var(--color-accent-hover);border-color:var(--color-accent-hover)}
+  .btn--primary:active{transform:scale(.98)}
+  .btn--secondary{background:transparent;border-color:var(--color-structure);color:var(--color-ink)}
+  .btn--secondary:hover{background:var(--color-structure);color:var(--color-bg)}
+  body[data-theme="ember"] .btn--secondary:hover{color:#fff}
+  .btn--ghost{background:transparent;border-color:transparent;color:var(--color-ink)}
+  .btn--ghost:hover{background:var(--color-surface-raised)}
+  .btn--icononly{padding:0;aspect-ratio:1}
+  .btn:disabled{opacity:.45;cursor:not-allowed;pointer-events:none}
+  .btn:focus-visible{outline:2px solid var(--color-accent);outline-offset:2px}
+
+  /* --- Chip --- */
+  .chip{font-size:11px;letter-spacing:1.5px;text-transform:uppercase;padding:8px 16px;border:var(--bw-structure) solid var(--color-border-soft);color:var(--color-ink-muted);background:transparent;cursor:pointer;transition:all var(--t-base)}
+  .chip:hover{border-color:var(--color-accent);color:var(--color-ink)}
+  .chip.on{border-color:var(--color-accent);background:color-mix(in srgb,var(--color-accent) 12%,transparent);color:var(--color-ink)}
+
+  /* --- Tag / Badge --- */
+  .tag{font-size:9.5px;letter-spacing:2.5px;text-transform:uppercase;font-weight:600;color:var(--color-accent)}
+  .badge{font-size:10px;letter-spacing:2px;text-transform:uppercase;font-weight:700;padding:6px 12px;background:var(--color-accent);color:var(--color-on-accent)}
+  .badge--support{background:var(--color-support);color:var(--color-on-support)}
+  .badge--outline{background:transparent;border:1px solid var(--color-border-soft);color:var(--color-ink-muted)}
+
+  /* --- Input --- */
+  .input{background:var(--color-bg);border:var(--bw-structure) solid var(--color-border-soft);color:var(--color-ink);font-size:13px;padding:12px 16px;outline:none;border-radius:var(--radius);transition:border-color var(--t-base);min-width:0}
+  .input:focus{border-color:var(--color-accent)}
+  .input::placeholder{color:var(--color-ink-muted);opacity:.7}
+  .fieldlabel{display:block;font-size:10px;letter-spacing:2.5px;text-transform:uppercase;color:var(--color-ink-muted);margin-bottom:7px}
+
+  /* --- Claimed bar (promoted to official atom) --- */
+  .claimed{display:flex;align-items:center;gap:var(--sp-3);font-size:9.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--color-ink-muted);width:100%}
+  .claimed .track{flex:1;height:5px;background:var(--color-surface-raised);border:1px solid var(--color-border-soft);position:relative}
+  .claimed .fill{height:100%;background:var(--color-accent);transition:width .4s ease-out}
+  .claimed.hot .fill{background:var(--color-support)}
+  .claimed .pct{min-width:82px}
+
+  /* --- Index number & kbd --- */
+  .idx{font-variant-numeric:tabular-nums;color:var(--color-accent);font-weight:700;letter-spacing:1.6px;font-size:14px}
+  .kbd{font-family:var(--font-mono);font-size:10px;color:var(--color-ink-muted);border:1px solid var(--color-border-soft);padding:3px 7px;letter-spacing:1px;background:var(--color-surface-raised)}
+
+  /* =========================================================
+     MOLECULES
+     ========================================================= */
+  .searchbar{display:flex;border:var(--bw-structure) solid var(--color-border);background:var(--color-surface);width:100%;max-width:560px}
+  .searchbar .input{flex:1;border:0;background:transparent}
+  .searchbar .btn{border:0;border-left:var(--bw-structure) solid var(--color-border);border-radius:0}
+  .metalist{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--color-ink-muted);letter-spacing:.4px}
+  .metalist div{display:flex;gap:10px;align-items:center}
+  .metalist .d{width:7px;height:7px;background:var(--color-accent);flex-shrink:0}
+  .metalist .v{width:7px;height:7px;background:var(--color-structure);flex-shrink:0}
+  body[data-theme="stub"] .metalist .v{background:var(--color-support)}
+  .dateblock{display:flex;flex-direction:column;align-items:center;gap:2px;text-align:center;padding:var(--sp-4) var(--sp-3)}
+  .dateblock .mo{font-size:11px;letter-spacing:2.5px;text-transform:uppercase;color:var(--color-accent);font-weight:700}
+  .dateblock .day{font-weight:900;font-size:36px;line-height:1;letter-spacing:-1px}
+  .dateblock .dow{font-size:10px;letter-spacing:2px;color:var(--color-ink-muted);text-transform:uppercase}
+  .priceblock{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;padding:var(--sp-3) var(--sp-4);background:var(--color-accent);color:var(--color-on-accent);min-width:84px}
+  .priceblock.free{background:var(--color-support);color:var(--color-on-support)}
+  .priceblock .amt{font-variant-numeric:tabular-nums;font-weight:700;font-size:16px}
+  .priceblock .lbl{font-size:8.5px;letter-spacing:2px;text-transform:uppercase;opacity:.85}
+  .sechead-demo{display:flex;align-items:baseline;justify-content:space-between;gap:20px;flex-wrap:wrap;width:100%}
+  .sechead-demo .l{display:flex;gap:14px;align-items:baseline}
+  .sechead-demo h4{font-weight:900;text-transform:uppercase;letter-spacing:-1px;font-size:30px}
+  .sechead-demo .r{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--color-ink-muted)}
+
+  /* =========================================================
+     ORGANISMS (live demos)
+     ========================================================= */
+  .democard{border:var(--bw-structure) solid var(--color-border-soft);background:var(--color-surface);display:flex;flex-direction:column;max-width:340px;width:100%;transition:border-color var(--t-base),transform var(--t-base);box-shadow:var(--shadow-card)}
+  .democard:hover{border-color:var(--color-accent);transform:translateY(-3px)}
+  .democard .art{height:150px;position:relative;border-bottom:var(--bw-structure) solid var(--color-border-soft);background:linear-gradient(135deg,var(--color-structure),var(--color-bg))}
+  body[data-theme="stub"] .democard .art{background:linear-gradient(135deg,var(--color-support),var(--color-accent))}
+  .democard .art .glyph{position:absolute;right:-6px;bottom:-22px;font-weight:900;font-size:110px;letter-spacing:-6px;color:rgba(255,255,255,.12);line-height:1}
+  .democard .art .cattag{position:absolute;top:0;left:0;background:var(--color-bg);border-right:var(--bw-structure) solid var(--color-border-soft);border-bottom:var(--bw-structure) solid var(--color-border-soft);padding:6px 11px}
+  .democard .art .pr{position:absolute;bottom:0;right:0}
+  .democard .body{padding:var(--sp-5);display:flex;flex-direction:column;gap:var(--sp-3)}
+  .democard h4{font-weight:700;text-transform:uppercase;font-size:16px;letter-spacing:.3px;line-height:1.25}
+  .demostub{display:grid;grid-template-columns:100px 1fr auto;border:var(--bw-structure) solid var(--color-border);background:var(--color-surface);box-shadow:var(--shadow-card);max-width:560px;width:100%}
+  .demostub .dcol{border-right:2px dashed var(--color-border);display:flex;align-items:center;justify-content:center;position:relative}
+  .demostub .dcol::before,.demostub .dcol::after{content:"";position:absolute;right:-8px;width:14px;height:14px;background:var(--color-bg);border:2px solid var(--color-border);border-radius:50%}
+  .demostub .dcol::before{top:-9px}.demostub .dcol::after{bottom:-9px}
+  .demostub .main{padding:var(--sp-4) var(--sp-5);display:flex;flex-direction:column;gap:6px;min-width:0}
+  .demostub .main h4{font-weight:900;text-transform:uppercase;font-size:16px;line-height:1.2}
+  .demostub .main .where{font-size:11.5px;color:var(--color-ink-muted)}
+  .demostub .pcol{border-left:var(--bw-structure) solid var(--color-border);display:flex}
+  .demostub .foot{grid-column:1/-1;border-top:var(--bw-hair) solid var(--color-border-soft);padding:8px var(--sp-5)}
+  .demorow{display:grid;grid-template-columns:110px 1fr auto auto;align-items:center;gap:var(--sp-5);border-top:var(--bw-hair) solid var(--color-border-soft);border-bottom:var(--bw-hair) solid var(--color-border-soft);padding:var(--sp-5) var(--sp-2);width:100%;cursor:pointer;transition:background var(--t-base)}
+  .demorow:hover{background:var(--color-surface-raised)}
+  .demorow:hover .nm{color:var(--color-accent);transform:translateX(8px)}
+  .demorow .wh{font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--color-ink-muted)}
+  .demorow .wh b{color:var(--color-ink);display:block;font-size:13px}
+  .demorow .nm{font-weight:900;text-transform:uppercase;letter-spacing:-1px;font-size:24px;transition:color var(--t-base),transform var(--t-base)}
+  .demorow .prc{font-variant-numeric:tabular-nums;font-weight:700;font-size:14px;color:var(--color-accent)}
+
+  /* =========================================================
+     WIREFRAMES
+     ========================================================= */
+  .wf{border:var(--bw-structure) solid var(--color-border);background:var(--color-bg);padding:var(--sp-4);display:flex;flex-direction:column;gap:8px;width:100%}
+  .wf-row{display:flex;gap:8px}
+  .wf-box{border:1.5px dashed var(--color-border-soft);background:var(--color-surface);display:flex;align-items:center;justify-content:center;font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--color-ink-muted);padding:8px;min-height:34px;text-align:center;flex:1}
+  .wf-box.tall{min-height:72px}
+  .wf-box.xtall{min-height:110px}
+  .wf-box.accent{background:color-mix(in srgb,var(--color-accent) 18%,var(--color-surface));border-color:var(--color-accent);color:var(--color-ink)}
+  .wf-box.solid{background:var(--color-surface-raised);border-style:solid}
+  .wf-box.thin{min-height:22px;padding:3px}
+  .wfspec{display:grid;grid-template-columns:300px 1fr;border:var(--bw-structure) solid var(--color-border-soft);margin-bottom:20px;background:var(--color-surface)}
+  .wfspec .info{padding:var(--sp-5);border-right:var(--bw-structure) solid var(--color-border-soft);display:flex;flex-direction:column;gap:10px}
+  .wfspec .info b{font-weight:900;text-transform:uppercase;font-size:16px;letter-spacing:-.3px}
+  .wfspec .info .slot{font-size:9.5px;letter-spacing:2px;text-transform:uppercase;color:var(--color-accent);font-weight:700}
+  .wfspec .info p{font-size:12.5px;color:var(--color-ink-muted);line-height:1.6}
+  .wfspec .info ul{font-size:12px;color:var(--color-ink-muted);padding-left:16px;line-height:1.8}
+  .wfspec .draw{padding:var(--sp-5)}
+
+  footer.doc{padding:40px 0 56px;font-size:11px;color:var(--color-ink-muted);letter-spacing:.5px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
+
+  @media(max-width:880px){
+    .split2,.split3{grid-template-columns:1fr}
+    .wfspec{grid-template-columns:1fr}
+    .wfspec .info{border-right:0;border-bottom:var(--bw-structure) solid var(--color-border-soft)}
+    .demorow{grid-template-columns:80px 1fr;gap:10px}
+    .demorow .prc,.demorow .chip{display:none}
+  }
+</style>
+</head>
+<body data-theme="stub">
+
+<!-- TOPBAR / THEME SWITCH -->
+<div class="topbar">
+  <div class="in">
+    <b><span class="flame"></span>Ithas Fire · Design System</b>
+    <div class="themetoggle" role="group" aria-label="Theme">
+      <button data-t="ember" onclick="setTheme('ember',this)">Ember</button>
+      <button class="on" data-t="stub" onclick="setTheme('stub',this)">Stub</button>
+    </div>
+  </div>
+</div>
+
+<header class="doc">
+  <div class="wrap">
+    <span class="kicker">Design System · v2.0 · Tokens → Atoms → Molecules → Organisms → Sections</span>
+    <h1>The <span>Foundation</span></h1>
+    <p>Every component on this page is built from semantic tokens only — no raw hex outside the token block. Flip the theme toggle above: the entire system reskins between the Ember (dark) and Stub (light) palettes. Choosing a final palette later is a one-variable decision, not a rebuild. <b style="color:var(--color-ink)">Stub is the shipped default.</b></p>
+  </div>
+</header>
+
+<!-- ============ 01 TOKENS ============ -->
+<section id="tokens">
+  <div class="wrap">
+    <div class="sec-head"><span class="num">01.</span><h2>Token Architecture</h2></div>
+    <p class="sec-intro">Three tiers. <b style="color:var(--color-ink)">Primitive</b> tokens hold raw values (hex, px). <b style="color:var(--color-ink)">Semantic</b> tokens map primitives to meaning (<code>--color-accent</code>, <code>--sp-5</code>). <b style="color:var(--color-ink)">Component</b> styles consume semantic tokens only. Themes redefine the semantic layer; components never change. <b style="color:var(--color-ink)">The code uses different token names — see <code>design-system-v2.md</code> for the mapping.</b></p>
+    <table class="rules">
+      <tr><th>Semantic token</th><th>Role</th><th>Ember</th><th>Stub</th></tr>
+      <tr><td>--color-bg</td><td>Page background</td><td class="mono">#0F1B33</td><td class="mono">#F6F0E4</td></tr>
+      <tr><td>--color-surface</td><td>Cards, panels, nav</td><td class="mono">#162240</td><td class="mono">#FDFAF3</td></tr>
+      <tr><td>--color-surface-raised</td><td>Raised chrome, hover fills</td><td class="mono">#1A2847</td><td class="mono">#EFE7D6</td></tr>
+      <tr><td>--color-ink / -muted</td><td>Text primary / secondary</td><td class="mono">#FFF / #A0B0CC</td><td class="mono">#211C16 / #5C544A</td></tr>
+      <tr><td>--color-border / -soft</td><td>2px structure / 1px hairlines</td><td class="mono">#5A78A6 / 40%</td><td class="mono">#211C16 / 30%</td></tr>
+      <tr><td>--color-accent (+hover)</td><td>THE action color. Primary CTA, active states, section numbers</td><td class="mono">#FF5721</td><td class="mono">#E2481D</td></tr>
+      <tr><td>--color-structure</td><td>Secondary buttons, structural fills</td><td class="mono">#35589A</td><td class="mono">#211C16</td></tr>
+      <tr><td>--color-support</td><td>Amber highlight: FREE price, hot claimed bars</td><td class="mono">#F59E0B</td><td class="mono">#F59E0B</td></tr>
+      <tr><td>--shadow-card</td><td>Card elevation</td><td>none (flat)</td><td class="mono">4px 4px 0 ink</td></tr>
+      <tr><td>--radius</td><td>All corners</td><td colspan="2"><span class="no">LOCKED AT 0PX.</span> No exceptions — pills from the old nav are retired.</td></tr>
+    </table>
+    <p class="note" style="margin-top:18px">Budget rule: accent ≤ 5% of any viewport, support ≤ 2%. If a mock feels loud, it's over budget.</p>
+  </div>
+</section>
+
+<!-- ============ 02 LAYOUT: FLEX VS GRID ============ -->
+<section id="layout">
+  <div class="wrap">
+    <div class="sec-head"><span class="num">02.</span><h2>Flex vs Grid — Strict Rules</h2></div>
+    <p class="sec-intro">One question decides it: <b style="color:var(--color-ink)">do columns need to align across rows?</b> Yes → Grid. No → Flex. Everything else follows from that.</p>
+    <table class="rules">
+      <tr><th>Context</th><th>Use</th><th>Pattern</th></tr>
+      <tr><td>Card collections</td><td class="mono">GRID</td><td><code>grid-template-columns:repeat(auto-fill,minmax(272px,1fr))</code> — never media-query column counts for cards; let minmax do it.</td></tr>
+      <tr><td>Multi-column page regions</td><td class="mono">GRID</td><td>Explicit fr ratios, asymmetric on purpose: <code>grid-template-columns:7fr 5fr</code>. Never 50/50 unless content is truly equal.</td></tr>
+      <tr><td>Table-like rows (lineup, stub)</td><td class="mono">GRID</td><td>Fixed first/last tracks, fluid middle: <code>110px 1fr auto auto</code>. Guarantees column alignment across every row.</td></tr>
+      <tr><td>Nav bars, button rows, chips</td><td class="mono">FLEX</td><td><code>display:flex;gap:var(--sp-2)</code>. Content-sized, wraps naturally.</td></tr>
+      <tr><td>Card internals (vertical stack)</td><td class="mono">FLEX</td><td><code>flex-direction:column</code> + <code>margin-top:auto</code> to pin footers. Cards must be equal-height siblings inside the grid.</td></tr>
+      <tr><td>Meta lists, icon+label pairs</td><td class="mono">FLEX</td><td>Row flex, <code>align-items:center</code>, gap only.</td></tr>
+      <tr><td>Spacing between siblings</td><td class="mono">GAP</td><td><span class="no">NEVER margins between siblings.</span> Gap only, always from the spacing scale. Margins exist only for <code>margin:auto</code> pinning.</td></tr>
+      <tr><td>Nesting</td><td class="mono">—</td><td>Grid for the skeleton, flex for the flesh. Never a grid inside a grid to fake a row; never flex-basis percentages to fake columns.</td></tr>
+      <tr><td>Containers</td><td class="mono">—</td><td>Content: 1200px. Full-bleed chrome (footer, CTA bands): 1440px. Side padding: <code>--sp-6</code> desktop, <code>--sp-4</code> mobile.</td></tr>
+      <tr><td>Breakpoints</td><td class="mono">—</td><td>480 / 640 / 900 / 1200. Grids collapse by re-declaring <code>grid-template-columns</code> — never by hiding content.</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 03 BUTTONS ============ -->
+<section id="buttons">
+  <div class="wrap">
+    <div class="sec-head"><span class="num">03.</span><h2>Buttons</h2></div>
+    <p class="sec-intro">Three variants, three sizes, four icon positions. A page gets exactly one primary button per viewport. If two actions compete, one of them is secondary — decide, don't hedge.</p>
+
+    <h3 class="sub">Variants × sizes</h3>
+    <div class="frame">
+      <div class="fh"><span>Primary — accent fill</span><span>1 per viewport max</span></div>
+      <div class="fb">
+        <button class="btn btn--primary btn--sm">Small</button>
+        <button class="btn btn--primary btn--md">Medium</button>
+        <button class="btn btn--primary btn--lg">Large</button>
+        <button class="btn btn--primary btn--md" disabled>Disabled</button>
+      </div>
+    </div>
+    <div class="frame">
+      <div class="fh"><span>Secondary — structure outline</span><span>Fills on hover</span></div>
+      <div class="fb">
+        <button class="btn btn--secondary btn--sm">Small</button>
+        <button class="btn btn--secondary btn--md">Medium</button>
+        <button class="btn btn--secondary btn--lg">Large</button>
+      </div>
+    </div>
+    <div class="frame">
+      <div class="fh"><span>Ghost — chrome &amp; tertiary actions</span><span>Nav, cancel, less-important</span></div>
+      <div class="fb">
+        <button class="btn btn--ghost btn--md">Sign In</button>
+        <button class="btn btn--ghost btn--sm">Cancel</button>
+      </div>
+    </div>
+
+    <h3 class="sub">Icon rules</h3>
+    <div class="frame">
+      <div class="fh"><span>Icon placement — the grammar</span></div>
+      <div class="fb">
+        <button class="btn btn--primary btn--md">Browse Events
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+        </button>
+        <button class="btn btn--secondary btn--md">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z"/><path d="M13 5v2"/><path d="M13 17v2"/><path d="M13 11v2"/></svg>
+          My Tickets
+        </button>
+        <button class="btn btn--secondary btn--md btn--icononly" aria-label="Search" style="width:44px">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.34-4.34"/></svg>
+        </button>
+      </div>
+    </div>
+    <table class="rules">
+      <tr><th>Rule</th><th>Spec</th></tr>
+      <tr><td>Trailing icon</td><td>Reserved for <b style="color:var(--color-ink)">direction and progression only</b> — arrows, external-link, chevron. "This takes you somewhere."</td></tr>
+      <tr><td>Leading icon</td><td>Reserved for <b style="color:var(--color-ink)">objects and context</b> — ticket, calendar, user, search. "This is about a thing."</td></tr>
+      <tr><td>Never both</td><td><span class="no">One icon max per button.</span> An icon on each side reads as decoration, not meaning.</td></tr>
+      <tr><td>Icon size</td><td>sm: 13px · md: 15px · lg: 16px viewBox render. Lucide set only, stroke-width 2 (2.5 for arrows). No mixed icon sets.</td></tr>
+      <tr><td>Color</td><td>Always <code>stroke="currentColor"</code>. Icons never carry their own color.</td></tr>
+      <tr><td>Gap</td><td><code>--sp-2</code> (8px) between icon and label at all sizes.</td></tr>
+      <tr><td>Icon-only</td><td>Square (width = height), <code>aria-label</code> required, minimum 44×44 touch target at md. Only for universally understood glyphs: search, close, menu.</td></tr>
+      <tr><td>Label case</td><td>UPPERCASE, +1.5px tracking, weight 700. 1–3 words. Verbs first: "Get Tickets," never "Tickets Here."</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 04 REMAINING ATOMS ============ -->
+<section id="atoms">
+  <div class="wrap">
+    <div class="sec-head"><span class="num">04.</span><h2>Atoms</h2></div>
+    <p class="sec-intro">The rest of the primitive layer. Each is themable, each has one job.</p>
+    <div class="split2">
+      <div class="frame">
+        <div class="fh"><span>Chip — filter state</span></div>
+        <div class="fb">
+          <button class="chip on">All</button>
+          <button class="chip">Music</button>
+          <button class="chip">Food &amp; Drink</button>
+        </div>
+      </div>
+      <div class="frame">
+        <div class="fh"><span>Badges &amp; tags</span></div>
+        <div class="fb">
+          <span class="badge">$45</span>
+          <span class="badge badge--support">FREE</span>
+          <span class="badge badge--outline">SOLD OUT</span>
+          <span class="tag">Music · Festival</span>
+        </div>
+      </div>
+      <div class="frame">
+        <div class="fh"><span>Input + field label</span></div>
+        <div class="fb col">
+          <div style="width:100%;max-width:320px">
+            <label class="fieldlabel">Email</label>
+            <input class="input" style="width:100%" placeholder="you@example.com">
+          </div>
+        </div>
+      </div>
+      <div class="frame">
+        <div class="fh"><span>Index number · kbd hint</span></div>
+        <div class="fb">
+          <span class="idx">01.</span><span class="idx">02.</span>
+          <span class="kbd">⌘K</span><span class="kbd">ESC</span>
+        </div>
+      </div>
+    </div>
+
+    <h3 class="sub">Claimed bar — official atom</h3>
+    <p class="note" style="margin-bottom:16px;max-width:640px">Promoted from the Ticket Stub exploration into the core system. It's social proof and urgency in 5px. Rules: accent fill below 80%, support (amber) fill at 80%+, label always leads, never shown at 0%, never animated on scroll (only on filter change).</p>
+    <div class="frame">
+      <div class="fh"><span>States</span><span>&lt;80% accent · ≥80% support</span></div>
+      <div class="fb col" style="gap:18px">
+        <div class="claimed"><span class="pct">34% claimed</span><div class="track"><div class="fill" style="width:34%"></div></div></div>
+        <div class="claimed"><span class="pct">67% claimed</span><div class="track"><div class="fill" style="width:67%"></div></div></div>
+        <div class="claimed hot"><span class="pct">88% claimed</span><div class="track"><div class="fill" style="width:88%"></div></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 05 MOLECULES ============ -->
+<section id="molecules">
+  <div class="wrap">
+    <div class="sec-head"><span class="num">05.</span><h2>Molecules</h2></div>
+    <p class="sec-intro">Atoms composed into reusable clusters. These are the units organisms are assembled from — if an organism needs a new cluster, it gets defined here first.</p>
+    <div class="split2">
+      <div class="frame">
+        <div class="fh"><span>Search bar</span><span>input + primary btn, shared border</span></div>
+        <div class="fb">
+          <div class="searchbar">
+            <input class="input" placeholder="SEARCH EVENTS, VENUES, CITIES...">
+            <button class="btn btn--primary btn--md">Go</button>
+          </div>
+        </div>
+      </div>
+      <div class="frame">
+        <div class="fh"><span>Section header</span><span>idx + h2 + meta note</span></div>
+        <div class="fb">
+          <div class="sechead-demo">
+            <div class="l"><span class="idx">02.</span><h4>Popular Events</h4></div>
+            <span class="r">Updated hourly</span>
+          </div>
+        </div>
+      </div>
+      <div class="frame">
+        <div class="fh"><span>Meta list</span><span>accent dot = time · structure dot = place</span></div>
+        <div class="fb">
+          <div class="metalist">
+            <div><span class="d"></span>SAT AUG 15 · 2:00 PM</div>
+            <div><span class="v"></span>RIVERFRONT PARK, NASHVILLE</div>
+          </div>
+        </div>
+      </div>
+      <div class="frame">
+        <div class="fh"><span>Date block · price block</span></div>
+        <div class="fb">
+          <div class="dateblock" style="border:var(--bw-structure) solid var(--color-border-soft)"><span class="mo">Aug</span><span class="day">15</span><span class="dow">Sat</span></div>
+          <div class="priceblock"><span class="amt">$45</span><span class="lbl">From</span></div>
+          <div class="priceblock free"><span class="amt">FREE</span><span class="lbl">RSVP</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 06 ORGANISMS ============ -->
+<section id="organisms">
+  <div class="wrap">
+    <div class="sec-head"><span class="num">06.</span><h2>Organisms — Event Display</h2></div>
+    <p class="sec-intro">Three sanctioned ways to render an event. All three are built from the same molecules (date block, meta list, price block, claimed bar), so they can coexist on one site. Pick by density need, not taste.</p>
+
+    <h3 class="sub">A · Event card — grid contexts</h3>
+    <p class="note" style="margin-bottom:16px">Default for browse/discovery grids. Art panel with corner tag + price, body with title, meta list, pinned footer. Hover: accent border + 3px lift.</p>
+    <div class="frame"><div class="fb">
+      <div class="democard">
+        <div class="art"><span class="cattag tag">Music</span><span class="glyph">H&amp;H</span><span class="pr badge">$45</span></div>
+        <div class="body">
+          <h4>Hearth &amp; Howl Music Festival</h4>
+          <div class="metalist">
+            <div><span class="d"></span>SAT AUG 15 · 2:00 PM</div>
+            <div><span class="v"></span>RIVERFRONT PARK, NASHVILLE</div>
+          </div>
+          <div class="claimed" style="margin-top:4px"><span class="pct">72% claimed</span><div class="track"><div class="fill" style="width:72%"></div></div></div>
+        </div>
+      </div>
+    </div></div>
+
+    <h3 class="sub">B · Ticket stub — list contexts, editorial pages</h3>
+    <p class="note" style="margin-bottom:16px">Higher character, medium density. Perforated tear line with punch holes between date and body. The claimed bar spans the full footer.</p>
+    <div class="frame"><div class="fb">
+      <div class="demostub">
+        <div class="dcol"><div class="dateblock"><span class="mo">Aug</span><span class="day">02</span><span class="dow">Sun</span></div></div>
+        <div class="main">
+          <span class="tag">Food &amp; Drink</span>
+          <h4>Smoke &amp; Ember BBQ Cookoff</h4>
+          <span class="where">Franklin Fairgrounds · 12:00 PM</span>
+        </div>
+        <div class="pcol"><div class="priceblock free"><span class="amt">FREE</span><span class="lbl">RSVP</span></div></div>
+        <div class="foot"><div class="claimed hot"><span class="pct">88% claimed</span><div class="track"><div class="fill" style="width:88%"></div></div></div></div>
+      </div>
+    </div></div>
+
+    <h3 class="sub">C · Lineup row — maximum density, poster pages</h3>
+    <p class="note" style="margin-bottom:16px">From the Night Heat exploration — the structure survives even though that palette didn't. Grid tracks <code>110px 1fr auto auto</code> keep every column aligned. Hover: raised fill, title shifts 8px and takes accent.</p>
+    <div class="frame"><div class="fb col" style="gap:0;padding:0">
+      <div class="demorow">
+        <div class="wh"><b>JUL 24</b>FRI · 10 PM</div>
+        <div class="nm">Midnight Vinyl</div>
+        <span class="chip" style="cursor:default">Music</span>
+        <div class="prc">$12</div>
+      </div>
+      <div class="demorow" style="border-top:0">
+        <div class="wh"><b>JUL 18</b>SAT · 8:30 PM</div>
+        <div class="nm">Neon Run 5K</div>
+        <span class="chip" style="cursor:default">Sports</span>
+        <div class="prc">$30</div>
+      </div>
+    </div></div>
+
+    <table class="rules" style="margin-top:28px">
+      <tr><th>Organism</th><th>Use when</th><th>Never</th></tr>
+      <tr><td>Event card</td><td>Discovery grids, category browse, 6+ events with imagery</td><td>Inside sidebars or anywhere narrower than 272px</td></tr>
+      <tr><td>Ticket stub</td><td>Curated lists ("Popular this week"), 4–10 events, editorial feel</td><td>In auto-fill grids — stubs are list creatures, max 2 columns</td></tr>
+      <tr><td>Lineup row</td><td>Full catalogs, schedule pages, 10+ events, text-first</td><td>With fewer than 5 rows — it needs mass to read as a lineup</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 07 SECTION WIREFRAMES ============ -->
+<section id="sections">
+  <div class="wrap">
+    <div class="sec-head"><span class="num">07.</span><h2>Sections &amp; Hierarchy</h2></div>
+    <p class="sec-intro">The section vocabulary. Every page is assembled from these, in slot order, with index numbers (Montserrat 700, tabular-nums) assigned top to bottom. Slots: <b style="color:var(--color-ink)">S1 Open → S2 Signal → S3 Discover → S4 Browse → S5 Proof → S6 Convert → S7 Close</b>. A page may skip slots but never reorder them.</p>
+
+    <div class="wfspec">
+      <div class="info">
+        <span class="slot">S1 · Open — pick one</span>
+        <b>Split Hero + Rail</b>
+        <p>Display type left, live data rail right. The rail earns its space with real numbers (event count, trending, scans).</p>
+        <ul>
+          <li>Grid <code>1fr 340px</code></li>
+          <li>1 primary + 1 secondary CTA</li>
+          <li>Display: Montserrat 900, one accent line</li>
+        </ul>
+      </div>
+      <div class="draw">
+        <div class="wf">
+          <div class="wf-row">
+            <div style="flex:2.6;display:flex;flex-direction:column;gap:8px">
+              <div class="wf-box thin" style="max-width:180px">KICKER · IDX 01</div>
+              <div class="wf-box xtall">DISPLAY H1 · 2 LINES · LINE 2 = ACCENT</div>
+              <div class="wf-box thin" style="max-width:300px">LEDE ≤460PX</div>
+              <div class="wf-row" style="max-width:340px"><div class="wf-box accent">BTN PRIMARY →</div><div class="wf-box">BTN SECONDARY</div></div>
+            </div>
+            <div style="flex:1;display:flex;flex-direction:column;gap:8px">
+              <div class="wf-box solid tall">STAT BIG</div>
+              <div class="wf-box solid tall">TRENDING LIST ×3</div>
+              <div class="wf-box solid">LIVE COUNTER</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="wfspec">
+      <div class="info">
+        <span class="slot">S1 · Open — alternative</span>
+        <b>Statement Hero + Search Object</b>
+        <p>Display statement left; the search lives inside a themed object (the hero ticket). Search becomes the hero, not a widget.</p>
+        <ul>
+          <li>Grid <code>1.15fr .85fr</code></li>
+          <li>Search object may rotate ≤2°</li>
+          <li>Quick-filter chips ride inside the object</li>
+        </ul>
+      </div>
+      <div class="draw">
+        <div class="wf">
+          <div class="wf-row">
+            <div style="flex:1.3;display:flex;flex-direction:column;gap:8px">
+              <div class="wf-box thin">KICKER</div>
+              <div class="wf-box xtall">DISPLAY H1 · 3 LINES</div>
+              <div class="wf-box accent" style="max-width:230px">BTN PRIMARY →</div>
+            </div>
+            <div style="flex:1;display:flex;flex-direction:column;gap:8px">
+              <div class="wf-box solid thin">OBJECT HEAD · NO. 001984</div>
+              <div class="wf-box tall">SEARCH INPUT + GO</div>
+              <div class="wf-box thin">CHIPS ×6</div>
+              <div class="wf-box solid thin">BARCODE FOOT</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="wfspec">
+      <div class="info">
+        <span class="slot">S2 · Signal — optional, max 1</span>
+        <b>Marquee Strip</b>
+        <p>Full-bleed accent or ink band, bold uppercase, infinite scroll. Content: cities, categories, or upcoming dates — real signal, not decoration.</p>
+        <ul><li>Height ≤ 44px · speed 22–28s</li><li>Never adjacent to another accent band</li></ul>
+      </div>
+      <div class="draw">
+        <div class="wf"><div class="wf-box accent">→ NASHVILLE → MUSIC → THIS WEEKEND → 38 EVENTS → FRANKLIN → ···</div></div>
+      </div>
+    </div>
+
+    <div class="wfspec">
+      <div class="info">
+        <span class="slot">S3 · Discover — required on home</span>
+        <b>Event Collection</b>
+        <p>Section header + filter chips + one event organism (card grid, stub list, or lineup). One organism per section — never mix renderers in a collection.</p>
+        <ul>
+          <li>Cards: auto-fill minmax(272px,1fr)</li>
+          <li>First card may span 2 tracks (feature)</li>
+          <li>Empty state required (dashed box, caps label)</li>
+        </ul>
+      </div>
+      <div class="draw">
+        <div class="wf">
+          <div class="wf-row"><div class="wf-box thin" style="flex:2">IDX 02. + H2 "POPULAR EVENTS"</div><div class="wf-box thin">META NOTE</div></div>
+          <div class="wf-row"><div class="wf-box thin">CHIPS: ALL · MUSIC · FOOD · SPORTS · ARTS · COMMUNITY</div></div>
+          <div class="wf-row"><div class="wf-box xtall" style="flex:2">FEATURE CARD · SPAN 2</div><div class="wf-box xtall">CARD</div></div>
+          <div class="wf-row"><div class="wf-box tall">CARD</div><div class="wf-box tall">CARD</div><div class="wf-box tall">CARD</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="wfspec">
+      <div class="info">
+        <span class="slot">S4 · Browse — optional</span>
+        <b>Category Browse</b>
+        <p>Horizontal category rail feeding a second, smaller collection. Only appears if S3 exists above it; inherits S3's organism choice.</p>
+        <ul><li>Scroll-snap rail on mobile</li><li>Result count with <code>aria-live</code></li></ul>
+      </div>
+      <div class="draw">
+        <div class="wf">
+          <div class="wf-row"><div class="wf-box thin">IDX 03. + H2 "BROWSE BY CATEGORY"</div></div>
+          <div class="wf-row"><div class="wf-box thin">CATEGORY RAIL — SCROLLABLE</div></div>
+          <div class="wf-row"><div class="wf-box tall">CARD</div><div class="wf-box tall">CARD</div><div class="wf-box tall">CARD</div><div class="wf-box tall">CARD</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="wfspec">
+      <div class="info">
+        <span class="slot">S5 · Proof — optional</span>
+        <b>Stats Band</b>
+        <p>3–4 real numbers in Montserrat 700 tabular figures, hairline-divided. Numbers must be true (tickets scanned, organizers, events live). No number, no band.</p>
+        <ul><li>Grid repeat(4,1fr), 1px inner dividers</li></ul>
+      </div>
+      <div class="draw">
+        <div class="wf">
+          <div class="wf-row"><div class="wf-box tall">12,408 SCANNED</div><div class="wf-box tall">412 ORGANIZERS</div><div class="wf-box tall">38 THIS WEEK</div><div class="wf-box tall">2 CITIES</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="wfspec">
+      <div class="info">
+        <span class="slot">S6 · Convert — always second-to-last</span>
+        <b>Host CTA (Create Event)</b>
+        <p>The organizer conversion. Split panel: pitch + numbered steps left, action panel right. This is the one place a large accent fill is allowed.</p>
+        <ul>
+          <li>Grid <code>7fr 5fr</code></li>
+          <li>Steps are index-numbered (01–04, tabular-nums)</li>
+          <li>Right panel: inverse button on accent/ink fill</li>
+        </ul>
+      </div>
+      <div class="draw">
+        <div class="wf">
+          <div class="wf-row">
+            <div style="flex:1.4;display:flex;flex-direction:column;gap:8px">
+              <div class="wf-box thin" style="max-width:160px">KICKER</div>
+              <div class="wf-box tall">H2 "YOUR EVENT, LIVE IN 4 MIN"</div>
+              <div class="wf-box thin">STEP 01 · NAME IT</div>
+              <div class="wf-box thin">STEP 02 · PRICE IT</div>
+              <div class="wf-box thin">STEP 03 · SHARE IT</div>
+            </div>
+            <div style="flex:1;display:flex"><div class="wf-box accent" style="min-height:100%">ACCENT PANEL<br>BTN INVERSE "CREATE EVENT"</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="wfspec" style="margin-bottom:0">
+      <div class="info">
+        <span class="slot">S7 · Close — always last, always numbered</span>
+        <b>Footer</b>
+        <p>Brand block left (2fr), link columns right. Carries the final index number. Base row: copyright, build hash, cookie control.</p>
+        <ul><li>Grid <code>2fr 1fr 1fr 1fr</code></li><li>Column heads: Montserrat 11px/700 caps, accent</li></ul>
+      </div>
+      <div class="draw">
+        <div class="wf">
+          <div class="wf-row">
+            <div class="wf-box tall" style="flex:2">IDX 04. · BRAND · TAGLINE</div>
+            <div class="wf-box tall">PLATFORM</div>
+            <div class="wf-box tall">COMPANY</div>
+            <div class="wf-box tall">ORGANIZERS</div>
+          </div>
+          <div class="wf-row"><div class="wf-box thin">© · BUILD HASH · COOKIES</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 08 PAGE TEMPLATE ============ -->
+<section id="template" style="border-bottom:0">
+  <div class="wrap">
+    <div class="sec-head"><span class="num">08.</span><h2>Page Assembly — Home</h2></div>
+    <p class="sec-intro">The canonical home template. Slots in order, indices assigned after assembly. Rules of composition: exactly one S1, S6 is mandatory on marketing pages, only one accent-dominant band per page (S2 <i>or</i> S6's panel — not both at full strength).</p>
+    <div class="wf" style="max-width:520px">
+      <div class="wf-box thin solid">NAV — BRAND · SEARCH · SIGN IN · CREATE EVENT</div>
+      <div class="wf-box xtall">S1 · OPEN — HERO (SPLIT+RAIL or STATEMENT+SEARCH OBJECT)</div>
+      <div class="wf-box thin accent">S2 · SIGNAL — MARQUEE (OPTIONAL)</div>
+      <div class="wf-box xtall">S3 · DISCOVER — IDX 02 · POPULAR EVENTS + FILTERS</div>
+      <div class="wf-box tall">S4 · BROWSE — IDX 03 · CATEGORY (OPTIONAL)</div>
+      <div class="wf-box thin">S5 · PROOF — STATS BAND (OPTIONAL)</div>
+      <div class="wf-box tall accent">S6 · CONVERT — IDX 04 · HOST CTA</div>
+      <div class="wf-box tall solid">S7 · CLOSE — IDX 05 · FOOTER</div>
+    </div>
+    <p class="note" style="margin-top:22px">Login is chrome, not a slot: it lives in the nav as a ghost button opening the auth modal, and reappears wherever an action requires an account (S6 button when logged out).</p>
+  </div>
+</section>
+
+<footer class="doc wrap">
+  <span>Ithas Fire · Design System v2.0</span>
+  <span>Themes: Ember · Stub (semantic tokens) — Stub is the shipped default</span>
+  <span>© 2026</span>
+</footer>
+
+<script>
+  function setTheme(t,btn){
+    document.body.dataset.theme=t;
+    document.querySelectorAll('.themetoggle button').forEach(b=>b.classList.toggle('on',b===btn));
+  }
+</script>
+</body>
+</html>

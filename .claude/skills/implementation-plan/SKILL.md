@@ -1,6 +1,6 @@
 ---
 name: implementation-plan
-description: "Break a scoped feature into an ordered implementation plan that follows hexagonal architecture layers. Use when a spec exists and you need to plan the build sequence before delegating to specialists. Use when asked to 'plan the implementation', 'break this down into steps', 'what order do we build this', or when the dev orchestrator needs to sequence work across agents."
+description: "Turn a spec into an ordered build plan in memory/session_<feature>.plan.md: steps in hexagonal layer order, each with its agent and model. Use when a spec exists and the build needs sequencing."
 ---
 
 # Implementation Plan
@@ -53,37 +53,34 @@ Break the feature into **ordered steps** following the hexagonal dependency flow
 
 Not every feature needs all layers. Skip layers that don't apply.
 
-**Plan format:**
+**Plan format** (the shape of the existing `memory/session_*.plan.md` files; read one before writing yours):
 
 ```markdown
-# Implementation Plan: <Feature Name>
+---
+name: session-<feature>-plan
+description: "Build plan (<YYYY-MM-DD>) for <feature>; <N> steps, <money path? auth?>, <coder model> + <reviewer model>"
+metadata:
+  type: project
+---
 
-**Spec**: docs/specs/<date>/<name>.spec.yaml
-**Branch**: feat/<kebab-case-name>
-**Layers touched**: core, ports, adapters, transport, ui
+Spec: `docs/specs/<date>/<name>.spec.yaml`. Rulings live in the spec header and in [[<memory file>]].
+
+## Status
+- <YYYY-MM-DD> session <id>: <what landed: step, commit hash, pushed or NOT pushed; what is next>
+
+## Ground rules for every step
+- Model routing (CLAUDE.md "Model Selection"): which steps go to `coder` on opus and why.
+- Files or hunks that belong to peer sessions and must not be staged.
+- Typecheck = `pnpm typecheck` + `pnpm typecheck:<app>` for each app touched.
 
 ## Steps
+1. **<Title>** (<agent>/<model>). <Concrete change, exact files with CREATE | EDIT, tests, verify command.>
+2. ...
+N-1. **Design board** (orchestrator, artifact): the screens and states, built from the real components; owner picks before the UI step.
+N. **Live run**: drive the real app through the feature; 320px; zero console errors.
 
-### Step 1: <Title>
-**Agent**: @coder | @ui | @infra
-**Packages**: packages/db, packages/ports, etc.
-**What**:
-- <Concrete change 1>
-- <Concrete change 2>
-**Files**:
-- `path/to/file.ts` — CREATE | EDIT
-**Tests**:
-- <What to test>
-**Verify**: <Command to run — e.g., `pnpm db:validate`>
-
-### Step 2: <Title>
-...
-
-## Commit Strategy
-- <How to split commits — one per step, or group related steps>
-
-## Risk Checkpoints
-- After Step N: <verify X before continuing>
+## Risk checkpoints
+- After <step>: <what the orchestrator re-runs itself before continuing>
 ```
 
 ### Step 4: Validate the Plan
@@ -92,11 +89,12 @@ Before presenting to the user, verify:
 
 - [ ] Every use case from the spec has a corresponding step
 - [ ] Dependencies flow downward (ports before core, core before transport)
-- [ ] Each step names the specialist agent that should handle it
+- [ ] Each step names the specialist agent and model that should handle it
 - [ ] Each step has a verification command
 - [ ] Money flows have idempotency noted
 - [ ] Auth/RBAC checks are assigned to a step
 - [ ] No step requires knowledge of a later step to complete
+- [ ] A UI feature has a design-board step before its UI step, and every feature ends in a live run
 
 ### Step 5: Present and Confirm
 
@@ -109,17 +107,14 @@ The orchestrator can then delegate each step to the appropriate specialist, runn
 
 ## Plan Artifact
 
-Save the plan to session memory (`/memories/session/<feature-name>.plan.md`) so it survives across chat turns. Plans are ephemeral orchestration artifacts — they go stale as soon as implementation is done, so they don't belong in `docs/specs/` alongside durable specs.
-
-If the orchestrator starts a new chat, it can read the session memory file and pick up where it left off.
+Save the plan to `~/.claude/projects/-Users-somehuman-Projects-TicketHunter/memory/session_<feature>.plan.md` and add its line to `MEMORY.md` under "In flight". Append to `## Status` as each step lands (commit hash, pushed or not); a later session or a handoff picks up from that log.
 
 ## Rules
 
 - **Follow the dependency order.** Schema before ports, ports before core, core before transport, transport before UI. Violating this creates forward references that break builds.
 - **One step = one specialist.** Don't mix backend and UI work in the same step. The orchestrator delegates steps to different agents.
 - **Name exact files.** "Edit the orders router" is not enough. Say `packages/transport/trpc/src/routers/orders.ts — EDIT`.
-- **Include verification.** Every step must have a command that proves it worked: `pnpm db:validate`, `pnpm -C packages/core vitest --run`, `pnpm -w tsc -p tsconfig.base.json --noEmit`, etc.
+- **Include verification.** Every step must have a command that proves it worked: `pnpm db:validate`, `pnpm -C packages/core vitest --run`, `pnpm typecheck` + `pnpm typecheck:<app>`, etc.
 - **Flag risk checkpoints.** If a later step depends on a tricky assumption from an earlier step, mark it as a checkpoint where the orchestrator should pause and verify before continuing.
 - **Keep it scannable.** A plan for a medium feature should fit on one screen. If it's longer, the feature might need to be split into multiple specs.
 - **Reference the spec.** Every plan links back to its spec. Every step should be traceable to a requirement in that spec.
-- **Use context-map per step.** When the orchestrator delegates a step to a specialist, consider invoking the `context-map` skill first to map exact file dependencies and test impact before coding begins.

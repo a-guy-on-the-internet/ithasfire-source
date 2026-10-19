@@ -1,195 +1,81 @@
 ---
 name: error-tracker
-description: "Query Cloud Logging for production errors, group into signatures, and maintain docs/ops/error-log.md as a living backlog of stuff to fix. Invoke daily via the scheduled automation, or manually to refresh the log."
+description: "Refresh docs/ops/error-log.md, the backlog of production error signatures, from Sentry (plus Cloud Logging for crashes Sentry cannot see). Use when asked for production errors, the error log, or what is breaking in prod."
 ---
 
 # Error Tracker
 
-Scrapes the last 24 hours of Cloud Logging for `severity >= ERROR` on Ithas Fire's Cloud Run services, groups errors by signature, and keeps `docs/ops/error-log.md` as a grep-able backlog with stable `ERR-NNNN` IDs.
+Keeps `docs/ops/error-log.md` as a grep-able backlog of production error signatures with stable `ERR-NNNN` IDs. The file is a materialised view: every run re-reads the sources, so a hand-edited count is corrected on the next run.
 
-## When to run
+**Nothing runs this on a schedule.** The log was last written 2026-04-23. Run it by hand; scheduling it needs a token-auth path first (like resource-burn's `scripts/sentry-burn.mjs`), because the Sentry MCP's OAuth token expires in headless runs (resource-burn, "Prerequisites").
 
-- **Daily 06:00 local** — via the scheduled automation (see `CronCreate` setup below)
-- **Manually** — when investigating a recent incident or checking the current state
+## Sources
 
-## Prerequisites
+### 1. Sentry (primary)
 
-- `gcloud` source active and configured with `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT=sad-mans-computer@hearthfire-491918.iam.gserviceaccount.com`. This is already set in the source config — just activate the source.
+Sentry sees what Cloud Logging misses: every `reportError` swallow (the deliberate catch-and-fallback branches, CLAUDE.md "Error Reporting Convention"), `logger.error` through the pino integration, and server tRPC 500s via `logAndReport`.
 
-## How stats are collected (the mechanism)
+- Org `hearth-fire`, region `https://us.sentry.io`. Projects: `hearth-fire-web` (web **and** the API and jobs servers, which share its DSN), `hearth-fire-mobile`, `hearth-fire-scanner`.
+- **Every query carries `environment:production`.** Dev and prod report into the same project; an unfiltered sweep once surfaced 3,442 localhost Redis errors that read as a prod outage.
+- Discovery: `mcp__sentry__search_issues` per project, `query: "environment:production is:unresolved"`, `period: "24h"`, `sort: "freq"`, `limit: 100`.
+- 7-day refresh: the same with `period: "7d"` for every signature already in Open or Ignored; counts come from `mcp__sentry__search_errors` (`count()` grouped by issue) over `7d`.
+- Sentry has already grouped events into issues, so a Sentry signature is its issue short ID (`HEARTH-FIRE-WEB-1A2`). Keep the issue link on the entry.
+- Load the Sentry tools with ToolSearch (`select:mcp__sentry__search_issues,mcp__sentry__search_errors,mcp__sentry__get_sentry_resource`).
 
-**Cloud Logging is the source of truth.** `docs/ops/error-log.md` is a materialised view. Git is the history store. No separate stats database.
+### 2. Cloud Logging (what never reaches the SDK)
 
-Per run, to produce accurate numbers the automation:
+Project `hearthfire-491918`, `gcloud logging read --freshness=24h` (and `7d` for refreshes). Only these classes:
 
-1. **Discovery query** — single `--freshness=24h` query over all Cloud Run services to find every error signature with activity in the last day. New signatures get `ERR-NNNN` IDs.
-2. **Per-signature 7-day refresh** — for every signature tracked in the Open **or** Ignored section, run a targeted `--freshness=7d` query filtered to that signature's service + pattern. That is the `Count (7d)` value. Cheap; most signatures resolve in < 500ms.
-3. **Trend computation** — read yesterday's committed file: `git show HEAD~1:docs/ops/error-log.md`. For each ERR-NNNN that existed in the prior snapshot, compare old `Count (7d)` → new. Thresholds:
-   - `new ≥ 2× old` → **↗** (up)
-   - `new ≤ 0.5× old` → **↘** (down)
-   - else → **→** (steady)
-   - No prior entry → no trend arrow (fresh signature)
-4. **Write and commit** — if any counts or signatures changed, write the file and commit with `chore(ops): error-tracker daily run YYYY-MM-DD`.
+- **Pre-boot crashes**: a container that dies before Node starts (failed secret injection, bad image) never reaches Sentry. `resource.type="cloud_run_revision" severity>=ERROR` with no matching Sentry issue.
+- **Platform 5xx**: `httpRequest.status>=500` from Cloud Run itself (timeouts, OOM kills).
+- **Jobs that "succeeded" with `{success:false}`**: `apps/jobs` answers 200 unless the handler throws, so a failing job can look green. Search `hf-prod-jobs` for `success:false` in `jsonPayload`.
 
-**Why this shape:** re-querying from Cloud Logging every run means the MD file can't silently drift from reality. If someone edits it by hand and lies about a count, the next run corrects it. Git handles versioning and diffs for free. The file is grep-able and PR-referencable; the counts stay honest.
+Signature for a Cloud Logging entry: service + first line of the message (or the URL path), with UUIDs → `<uuid>`, numbers over 4 digits → `<N>`, query strings stripped.
 
-## Queries to run
+## Run
 
-All queries use project `hearthfire-491918` and default to `--freshness=24h` unless re-seeding.
+1. Read the current `docs/ops/error-log.md` and note every entry's `Triage` and `Count (7d)`.
+2. Query both sources as above.
+3. Apply the update rules below and rewrite the file. Trend compares against the counts you noted in step 1: `new ≥ 2× old` → ↗, `new ≤ 0.5× old` → ↘, else →; no prior entry → no arrow.
+4. Report to the user: new signatures, escalations, regressions of `fixed` entries, and anything on a money path (Stripe webhooks, settlement, payouts), which is zero-tolerance. Leave the commit to the user or the orchestrator (temp-index, explicit path).
 
-### 1. Cloud Run 5xx by service
+Done when every Open and Ignored entry has a fresh `Count (7d)` from this run and every production Sentry issue from the last 24h is either an entry or listed in the report as skipped noise with a reason.
 
-```
-resource.type="cloud_run_revision"
-severity>=ERROR
-```
-
-Fields we need per entry: `resource.labels.service_name`, `httpRequest.status`, `httpRequest.requestUrl`, `jsonPayload.message`, `textPayload`, `timestamp`.
-
-### 2. Unhandled exceptions (focus on `api`, `jobs`)
-
-```
-resource.type="cloud_run_revision"
-(resource.labels.service_name="hf-prod-api" OR resource.labels.service_name="hf-prod-jobs")
-severity>=ERROR
-(textPayload=~"Error:" OR jsonPayload.error=~".+")
-```
-
-### 3. Stripe webhook failures
-
-```
-resource.type="cloud_run_revision"
-(textPayload=~"stripe" OR jsonPayload.message=~"stripe")
-severity>=ERROR
-```
-
-## Signature grouping
-
-Two errors are the "same signature" if they share:
-
-1. **Service** (`hf-prod-web`, `hf-prod-api`, `hf-prod-jobs`, `hf-prod-tileserver`, etc.)
-2. **Either** the first line of the error message (trimmed of dynamic values like UUIDs, IDs, timestamps) **or** the request URL pattern (path only, no query string)
-
-Normalise dynamic values before comparing:
-
-- UUIDs → `<uuid>`
-- Numbers longer than 4 digits → `<N>`
-- `?...` query strings → stripped
-- Stack-trace paths with `?cache-buster` suffixes → stripped
-
-## Output: `docs/ops/error-log.md`
+## File format
 
 ```markdown
 # Production error log
 
-Last updated: <ISO timestamp> by error-tracker automation.
+Last updated: <ISO timestamp> by error-tracker (manual run).
 
-## Open — <count> signatures, <total_occurrences> occurrences in last 7 days
+## Open — <count> signatures, <total> occurrences in last 7 days
 
 ### [ERR-NNNN] <one-line summary>
-- **Service:** `<service_name>`
+- **Source:** Sentry `<SHORT-ID>` <issue link> | Cloud Logging `<service>`
 - **First seen:** YYYY-MM-DD · **Last seen:** YYYY-MM-DD
-- **Count (7d):** <n> · **Trend:** ↗ (up 2x) | → (steady) | ↘ (down)
-- **Signature:** `<stack top or URL pattern>`
-- **Example log:** [Cloud Logging link with time range]
+- **Count (7d):** <n> · **Trend:** ↗ | → | ↘
+- **Signature:** `<issue title or normalised message / URL pattern>`
 - **Triage:** open | investigating | waiting_on_<thing>
-- **Notes:** <free text, optional>
+- **Notes:** <optional>
 
-...
+## Ignored
 
-## Recently fixed — rolling 14 days
+## Recently fixed — dropped after 30 days
 
 ### [ERR-NNNN] <summary> — last seen YYYY-MM-DD
-- Service: `<service>`
-- Resolved by: <PR link or commit, optional>
+- Resolved by: <commit or PR, optional>
 ```
 
-### Triage states
+## Update rules
 
-The `Triage:` field is **human-owned**. The automation reads it to decide how to place an entry; it never writes to it. Allowed values:
+`Triage` and `Notes` are human-owned; the run reads them and never rewrites them.
 
-| State | Meaning | Automation behaviour |
-|---|---|---|
-| `open` | New or unresolved. Default for new signatures. | Shown in Open section, sorted by `Count (7d)`. |
-| `investigating` | Someone is actively on it. | Shown in Open section. |
-| `waiting_on_<thing>` | Blocked (e.g. `waiting_on_stripe`, `waiting_on_infra`). | Shown in Open section, visually grouped. |
-| `ignored` | Decided this is noise — crawler traffic, third-party flake, accepted trade-off. | Moved to **Ignored** section. Counts still update so you can tell if it escalates, but it doesn't clutter Open. |
-| `fixed` | Human marked it fixed before the 14-day silence window. | Moved to **Recently fixed** on the next run regardless of whether it's still firing (trust the human). |
+- **New signature**: next `ERR-NNNN` (monotonic, never reused), into Open with `Triage: open`.
+- **`open` / `investigating` / `waiting_on_*`**: refresh Last seen, Count, Trend; stays in Open, sorted by Count descending.
+- **`ignored`**: refresh counts in the Ignored section (sorted by Last seen). A Count ≥ 3× the previous run's adds an `⚠ Escalation:` line.
+- **`fixed`**: move to Recently fixed with `Resolved by:` and the date. Firing again in any later run → back to Open with `⚠ Regression:`, which asks the owner to reset Triage; until they do, the entry stays in Open.
+- **Silent 14 days** (any state): move to Recently fixed with an auto-resolution note; drop after 30 days.
 
-### Rules for updating
+Worth tracking: user-facing 5xx, unhandled exceptions, `reportError` swallows, Stripe webhook failures, settlement/payout errors. Noise: expected 429s, crawler timeouts (filter by user agent).
 
-- **New signature** — assign next `ERR-NNNN` (monotonic, never reused). Add to Open with `Triage: open`.
-- **Known signature, Triage in {`open`, `investigating`, `waiting_on_*`}** — update `Last seen`, `Count (7d)`, `Trend`. Keep in Open. Don't touch `Triage` or `Notes`.
-- **Known signature, Triage = `ignored`** — update `Last seen`, `Count (7d)`, `Trend`. Keep in **Ignored** section. If `Count (7d)` jumps ≥ 3× over the previous run's count, add a `⚠ Escalation:` line below the entry — the human can decide whether to re-open. Don't auto-re-open; that overrides human judgment.
-- **Known signature, Triage = `fixed`** — move to **Recently fixed** on the next run. Add a `Resolved: YYYY-MM-DD` line. If the signature keeps appearing in logs for 3 consecutive runs after being marked fixed, add a `⚠ Regression?` line — likely the fix didn't actually ship.
-- **Silent > 14 days (regardless of triage state)** — move from Open (or Ignored) to Recently fixed with an auto-resolution note. Keep for 30 days, then drop.
-- **Ordering** — Open section sorted by `Count (7d)` descending. Ignored section sorted by `Last seen` descending (recent noise first).
-
-## What's a worthwhile signature to track
-
-- ✅ **5xx on user-facing routes** (`hf-prod-web`, `hf-prod-api`) — affects real users
-- ✅ **Unhandled exceptions** — stack traces matter, they're bugs
-- ✅ **Stripe webhook failures** — payment correctness; any failure is load-bearing
-- ✅ **Settlement / payout errors** — money path; zero-tolerance
-- ⚠️ **`hf-dev-*` errors** — include but lower priority. Dev-only bugs are still signal but don't block launches.
-- ❌ **Rate limit 429s** — expected, noise
-- ❌ **Client-IP-address timeout 504s from obvious crawlers** — filter out well-known bot user-agents
-
-## Example output (first run, 2026-04-24)
-
-```markdown
-# Production error log
-
-## Open — 4 signatures, 47 occurrences in last 7 days
-
-### [ERR-0001] hf-prod-web homepage timing out
-- **Service:** `hf-prod-web`
-- **First seen:** 2026-04-21 · **Last seen:** 2026-04-23
-- **Count (7d):** 23 · **Trend:** ↗
-- **Signature:** `GET ithasfire.com/ → 504`
-- **Triage:** open
-
-### [ERR-0002] search.full-reindex job 500s
-- **Service:** `hf-prod-jobs`
-- **First seen:** 2026-04-22 · **Last seen:** 2026-04-23
-- **Count (7d):** 8 · **Trend:** →
-- **Signature:** `POST /jobs/search.full-reindex → 500`
-- **Triage:** open
-
-### [ERR-0003] Stripe webhook module resolution (dev)
-- **Service:** `hf-dev-api`
-- **First seen:** 2026-04-22 · **Last seen:** 2026-04-23
-- **Count (7d):** 12 · **Trend:** →
-- **Signature:** `ERR_MODULE_NOT_FOUND: @th/core/src/use-cases/orders/reconcile-stripe-full-refund`
-- **Triage:** open
-
-### [ERR-0004] Tileserver blanket 502s
-- **Service:** `hf-prod-tileserver` / `hf-dev-tileserver`
-- **First seen:** 2026-04-22 · **Last seen:** 2026-04-23
-- **Count (7d):** 4 · **Trend:** →
-- **Signature:** `502 on all static asset paths`
-- **Triage:** open
-```
-
-## Referencing errors in PRs
-
-Commit/PR titles reference the ID:
-
-```
-fix: ERR-0002 — index settlement_order_id to unblock search.full-reindex job
-```
-
-Two ways to close the loop:
-
-1. **Passive** — let the signature go silent. The automation moves it to Recently fixed after 14 days of no hits.
-2. **Active** — edit the entry in `docs/ops/error-log.md`, change `Triage: open` to `Triage: fixed`, commit. The next automation run moves it to Recently fixed immediately and will flag a regression if it keeps firing.
-
-## Dismissing noise
-
-For errors that are real-looking but not worth fixing (third-party 500s from a crawler, rate-limited clients, intentional test failures):
-
-1. Edit the entry, change `Triage: open` to `Triage: ignored`.
-2. Add a short **Reason:** line explaining why it's ignored — for the future reader who finds it and wonders.
-3. Commit.
-
-The entry moves to the Ignored section on the next run. Counts keep updating silently, so if the signature escalates 3× or more the automation surfaces an `⚠ Escalation:` flag and the human can reconsider.
+Commit and PR titles cite the ID (`fix: ERR-0002 — …`). To close an entry by hand, set `Triage: fixed`; to dismiss noise, set `Triage: ignored` and add a **Reason:** line.

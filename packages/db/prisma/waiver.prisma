@@ -1,0 +1,157 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Waiver — Event-level waiver templates, clause library, and acceptance records.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reusable waiver text managed by an org, a solo human, or provided as a
+/// platform default. Exactly one of `orgId` / `humanId` is set, or both are
+/// null for platform-provided templates.
+/// The `version` field increments whenever `body` changes, ensuring acceptance
+/// records always reference the exact text the buyer agreed to.
+model WaiverTemplate {
+  id        String   @id @default(uuid())
+  orgId     String?  // Null when human-owned or platform-provided
+  humanId   String?  // Null when org-owned or platform-provided
+  name      String   // e.g. "House Show Waiver", "General Admission"
+  body      String   @db.Text // The full waiver text (markdown or plain text)
+  version   Int      @default(1) // Increment on edit so acceptance records reference the exact version
+  isDefault Boolean  @default(false) // Owner-level default waiver (or platform default)
+
+  /// Audience discriminator: attendee-facing (event/checkout) vs
+  /// volunteer-facing (ask signup) templates. A raw partial unique index
+  /// (migration 20260804120000_waiver_template_kind) guarantees at most ONE
+  /// platform template (orgId + humanId null) with isDefault=true per kind —
+  /// pickers resolve "the standard volunteer waiver" by kind, not by id.
+  /// AUTHORITATIVE FOR PLATFORM ROWS ONLY: createWaiverTemplate exposes no
+  /// kind input, so org/human-authored templates all default ATTENDEE even
+  /// when written for volunteer asks. Never filter owner-template pickers by
+  /// kind without first threading kind through create — it would silently
+  /// hide every org-authored volunteer waiver.
+  kind      WaiverTemplateKind @default(ATTENDEE)
+
+  /// How this template was created.
+  source              WaiverTemplateSource @default(FREEFORM)
+  /// JSON array of { clauseId, clauseVersion } for ASSEMBLED waivers.
+  assembledFromClauses Json?
+  /// US state code (e.g. "TN") — drives jurisdiction-specific clause gating.
+  jurisdictionState    String?  @db.VarChar(2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  org                        Organization?               @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  human                      Human?                      @relation("HumanWaiverTemplates", fields: [humanId], references: [id], onDelete: Cascade)
+  events                     Event[]
+  /// Standing volunteer asks gated on this template (Restrict FK from the ask).
+  asks                       VolunteerAsk[]
+  waiverAcceptances          WaiverAcceptance[]
+  volunteerWaiverAcceptances VolunteerWaiverAcceptance[]
+
+  @@index([orgId])
+  @@index([humanId])
+}
+
+/// Immutable record proving a buyer accepted a specific waiver version at
+/// checkout. Created inside the finalization transaction after payment succeeds.
+model WaiverAcceptance {
+  id                String         @id @default(uuid())
+  orderId           String
+  humanId           String
+  waiverTemplateId  String
+  waiverVersion     Int            // Snapshot of template.version at time of acceptance
+  waiverBodyHash    String         // SHA-256 of the waiver body at acceptance time
+  acceptedAt        DateTime       @default(now())
+  ipAddress         String?        // Optional: IP at time of acceptance for legal record
+  userAgent         String?        // Browser user-agent string for legal record
+
+  order             Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  human             Human          @relation(fields: [humanId], references: [id], onDelete: Cascade)
+  waiverTemplate    WaiverTemplate @relation(fields: [waiverTemplateId], references: [id], onDelete: Restrict)
+
+  @@unique([orderId, waiverTemplateId]) // One acceptance per waiver per order
+  @@index([humanId])
+  @@index([waiverTemplateId])
+}
+
+/// Immutable record proving a volunteer accepted a specific waiver version at
+/// signup time. Keyed to the Human profile (not just the signup) so a
+/// returning volunteer's acceptance for the same template+version carries to
+/// their next event ("already on file"). Created inside the signup
+/// transaction. Kept separate from `WaiverAcceptance` (order-keyed) per the
+/// 2026-06-10 AcceptanceRecord decision context.
+model VolunteerWaiverAcceptance {
+  id               String   @id @default(uuid())
+  /// The profile the acceptance belongs to. NULL for a CONTACT-ONLY signup
+  /// (an anonymous signup naming an email that already has an account): the
+  /// acceptance is proven for that signup, but is never attributed to the
+  /// account, so it can never count as "already on file" for anyone.
+  humanId          String?
+  signupId         String   @unique // The signup that prompted it
+  waiverTemplateId String
+  waiverVersion    Int      // Snapshot of template.version at time of acceptance
+  waiverBodyHash   String   // SHA-256 of the waiver body at acceptance time
+  acceptedAt       DateTime @default(now())
+  ipAddress        String?  // Optional: IP at time of acceptance for legal record
+  userAgent        String?  // Browser user-agent string for legal record
+
+  human            Human?          @relation(fields: [humanId], references: [id], onDelete: Cascade)
+  signup           VolunteerSignup @relation(fields: [signupId], references: [id], onDelete: Cascade)
+  waiverTemplate   WaiverTemplate  @relation(fields: [waiverTemplateId], references: [id], onDelete: Restrict)
+
+  @@index([humanId, waiverTemplateId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Waiver Clause Library — Platform-maintained risk paragraphs that assemble
+// into event-specific waivers. Three-layer architecture:
+//   Layer 1 (STRUCTURAL): Always included, never toggleable (definitions,
+//           release, assumption of risk, gross-negligence carve-out, severability)
+//   Layer 2 (RISK_SPECIFIC): Toggleable by organizer, auto-selected based on
+//           event properties (private property, amplified sound, alcohol, etc.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A single clause in the waiver library. Platform-maintained.
+model WaiverClause {
+  id             String               @id @default(uuid())
+  slug           String               @unique
+  title          String
+  body           String               @db.Text
+  category       WaiverClauseCategory
+  layer          WaiverClauseLayer
+  isRequired     Boolean              @default(false)
+  /// When true, this clause is auto-selected for new waivers (organizer can toggle off if not required).
+  isDefault      Boolean              @default(false)
+  sortOrder      Int                  @default(0)
+  version        Int                  @default(1)
+  active         Boolean              @default(true)
+
+  /// US state codes where this clause is void and should be stripped (e.g. ["LA", "VA"]).
+  voidInStates     String[]           @default([])
+  /// US state codes where this clause must be injected even if organizer didn't select it.
+  requiredInStates String[]           @default([])
+
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  autoSelectRules WaiverClauseAutoRule[]
+
+  @@index([category, active, sortOrder])
+  @@index([layer, active])
+}
+
+/// Rule that auto-selects a clause based on event properties.
+/// Example: slug=private-residential auto-selects when locationMode eq OBSCURED.
+model WaiverClauseAutoRule {
+  id        String   @id @default(uuid())
+  clauseId  String
+  /// Event field to check (e.g. "locationMode", "visibility", "pricingMode").
+  field     String
+  /// Comparison operator: "eq", "in", "exists".
+  operator  String
+  /// Value to compare against (e.g. "OBSCURED", "PRIVATE").
+  value     String
+  createdAt DateTime @default(now())
+
+  clause    WaiverClause @relation(fields: [clauseId], references: [id], onDelete: Cascade)
+
+  @@index([clauseId])
+}

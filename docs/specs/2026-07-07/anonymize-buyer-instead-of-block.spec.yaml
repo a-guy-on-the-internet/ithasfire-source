@@ -1,0 +1,295 @@
+# anonymize-buyer-instead-of-block.spec.yaml
+#
+# Tier1, scoped tiny: give a human with financial history (orders, tickets,
+# scans, transfers, disputes, resale) an eventual path off the platform
+# instead of the current hard block, WITHOUT deleting or mutating any
+# accounting/audit record. Does not redesign account deletion — narrowly
+# extends the existing shared deletion transaction with one new branch.
+
+version: "1.0"
+updated: "2026-07-07"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Today `executeHumanDeletionTx` (packages/core/src/use-cases/platform/_shared/
+    delete-human-shared.ts) hard-blocks deletion with
+    CANNOT_DELETE_ACCOUNT_WITH_ORDER_HISTORY for ANY human with an order,
+    ticket, scan, transfer, dispute, or resale row (see
+    docs/account-deletion.md, "Guards" table). This is correct today — those
+    rows are ON DELETE RESTRICT and are retained for accounting/audit — but it
+    leaves such users with NO deletion path at all, ever. This is flagged as
+    an explicit open follow-up in docs/account-deletion.md (lines 24-26, 121).
+  solution: >
+    When the order-history guard trips, instead of throwing, take an
+    "anonymize" branch: scrub PII on the Human row in place (never delete it —
+    it must keep existing so the RESTRICT FKs on Order/Ticket/TicketScan/
+    TicketTransfer/PendingTicketTransfer/Claim/ResaleListing/ResaleListingHold
+    stay satisfied) and fully delete the human's AuthUser row (and its
+    Better-Auth cascade: AuthAccount, AuthSession, Passkey, AuthTwoFactor) so
+    the account can no longer authenticate. Everything currently done for a
+    full delete (support-content scrub, EntityPage teardown + R2 enqueue,
+    storage-quota row delete, audit log) still runs. Money-adjacent rows
+    (Order amounts/tax/billing snapshot, Ticket, TicketScan, TicketTransfer,
+    Claim, ResaleListing, PromoRedemption, VolunteerRewardGrant, settlement/
+    payout records) are untouched — they keep pointing at the same
+    (now-anonymized) humanId, satisfying accounting/tax retention without any
+    schema change to those tables.
+  users:
+    - a self-serve user with any order/ticket history who wants to delete
+      their account (currently fully blocked)
+    - platform admin performing a staff-initiated hard delete on such a user
+  surfaces:
+    - web   # Account Settings → Danger Zone, same entry point as today
+    - api   # humans.deleteMyAccount / platform.adminDeleteHuman, same procedures
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        `executeHumanDeletionTx` gains a second outcome. Today:
+        `hasDeletionBlockingHistory(humanId) == true` → throw
+        CANNOT_DELETE_ACCOUNT_WITH_ORDER_HISTORY. New: on that same condition,
+        proceed down an "anonymize" path instead of throwing (see FR-002-FR-004).
+        The sole-org-owner guard (CANNOT_DELETE_SOLE_ORG_OWNER) is UNCHANGED
+        and still blocks unconditionally in both the delete and anonymize
+        paths — it is orthogonal to order history.
+    - id: FR-002
+      description: >
+        Anonymize scrubs PII in place on the Human row (no delete):
+        `name` → a tombstone value (e.g. "Deleted user"), `phone` → null,
+        `billingAddressLine1/2/City/State/PostalCode/Country` → null. Roles
+        are cleared (`roles = []`) — an anonymized identity should not retain
+        elevated access. A new `Human.anonymizedAt DateTime?` column is set to
+        the transaction time; this is the durable marker distinguishing an
+        anonymized row from a normal one (see `data.modified_models` — this is
+        the one schema change this spec needs).
+    - id: FR-003
+      description: >
+        Anonymize deletes the human's `AuthUser` row outright (cascade removes
+        AuthAccount/AuthSession/Passkey/AuthTwoFactor) — identical
+        externally-visible effect to today's full delete: the account can
+        never sign in again, all sessions die immediately. `AuthUser` has no
+        inbound FK from any financial table (Order/Ticket/etc. reference
+        `Human` directly), so this is safe with no retention impact.
+    - id: FR-004
+      description: >
+        Everything else in today's deletion tx runs unchanged in the
+        anonymize path: `scrubHumanSupportContent`, `EntityPage` teardown +
+        owned-media R2 enqueue (`PendingObjectDeletion`), the
+        `ResourceUsage` (STORAGE_BYTES_HUMAN) row delete, and the audit log —
+        written with a distinct action name (`self.anonymizeAccount` /
+        `admin.anonymizeHuman`) so the audit trail can tell a real delete from
+        an anonymize apart from a real delete at a glance.
+    - id: FR-005
+      description: >
+        Financial/accounting rows are NEVER touched by anonymize: Order (all
+        amount/fee/tax/billing-snapshot/Stripe-reference columns),
+        OrderItem, Ticket, TicketScan, TicketTransfer, PendingTicketTransfer,
+        Claim, ResaleListing, ResaleListingHold, PromoRedemption,
+        VolunteerRewardGrant, and any settlement/payout ledger rows keyed off
+        this human. They keep their existing `*HumanId` values pointing at the
+        now-anonymized row — this is intentional and is how accounting
+        retention is satisfied without duplicating any financial data.
+        Order.billingAddressLine1/2/City/State/PostalCode/Country and
+        Human.billing* are DIFFERENT columns (the Order fields are a
+        checkout-time snapshot already); scrubbing Human's copy does not
+        touch the Order snapshot.
+    - id: FR-006
+      description: >
+        UI-facing behavior: a user with order history can now complete
+        self-serve deletion via the SAME `deleteMyAccount` entry point and
+        preconditions (confirmation phrase, password step-up, rate limit) —
+        no new UI surface, no new confirmation copy branch is required beyond
+        updating the Danger Zone explanation text to no longer claim deletion
+        is blocked by order history.
+  non_functional:
+    - id: NFR-001
+      description: >
+        Idempotent / safe to retry: if `anonymizedAt` is already set, re-running
+        deleteMyAccount on the same humanId should short-circuit as a no-op
+        success (AuthUser is already gone; there's nothing left to scrub) rather
+        than erroring — mirrors "delete an already-deleted account" being a
+        harmless no-op elsewhere in the codebase.
+    - id: NFR-002
+      description: >
+        No behavior change for humans WITHOUT order history — they continue
+        through the existing hard-delete path unchanged. This spec only adds a
+        branch reached when `hasDeletionBlockingHistory == true`.
+    - id: NFR-003
+      description: >
+        Audit log entries referencing the anonymized human (both the new
+        anonymize entry and any PRE-EXISTING entries with this humanId as
+        actor/subject) are left as-is — see open_questions for whether that
+        needs a special read-time redaction/display rule.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: delete-human-shared (executeHumanDeletionTx)  # MODIFY existing
+        description: >
+          packages/core/src/use-cases/platform/_shared/delete-human-shared.ts.
+          Replace the unconditional `throw fail("CANNOT_DELETE_ACCOUNT_WITH_ORDER_HISTORY")`
+          with a branch: if blocked by history, call a new internal
+          `anonymizeHumanInTx` helper (same file or a sibling
+          `anonymize-human-shared.ts`) instead of the full delete branch;
+          both branches share the audit/support-scrub/entity-page/storage-quota
+          steps via one helper to avoid drift (mirrors why this file exists at
+          all — one sequence, two call sites).
+        input: humanId, actorHumanId, actorKind, deletedEmail, deletedName (unchanged signature)
+        output: void (unchanged) — or a discriminated result if callers need to
+          tell the UI which branch fired (see open_questions)
+        idempotent: true
+        money: false
+      - name: delete-my-account / admin-delete-human  # UNCHANGED call sites
+        description: >
+          No signature change. Both already call `executeHumanDeletionTx`
+          inside their own guard/rate-limit/step-up logic and only need to stop
+          treating CANNOT_DELETE_ACCOUNT_WITH_ORDER_HISTORY as a hard failure
+          in whatever copy/telemetry they surface (the error code itself no
+          longer throws from inside the shared tx for this case).
+
+  ports:
+    existing:
+      - HumansRepo   # hasDeletionBlockingHistory (reused as the branch condition, unchanged), new: anonymize-in-place update method
+      - AuditPort
+      - SupportThreadsRepo   # scrubHumanSupportContent, reused unchanged
+      - EntityPagesRepo      # getByOwner/deleteByOwner, reused unchanged
+      - PendingObjectDeletionsRepo  # enqueueMany, reused unchanged
+      - ResourceQuotasRepo   # deleteUsage, reused unchanged
+
+  adapters:
+    existing:
+      - packages/adapters/src/db/prisma/humans.ts   # add an `anonymizeHuman(humanId)` method (PII field nulling + AuthUser delete) alongside the existing `deleteHuman`/`hasDeletionBlockingHistory`
+
+  transport:
+    trpc_procedures: []   # no new procedures; humans.deleteMyAccount / platform.adminDeleteHuman are reused as-is
+
+  ui:
+    pages: []
+    components:
+      - Account Settings Danger Zone copy update (web) — stop stating deletion is blocked by order history; word the confirmation as "your account will be anonymized; your orders/tickets are retained for accounting" when the anonymize branch will fire (requires the use case to signal which branch will run, or a cheap pre-check read)
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  modified_models:
+    - Human   # add anonymizedAt DateTime? (nullable, default null) — the only schema change this spec needs
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      An anonymized-but-retained Human row could be mistaken for a live user
+      by code that doesn't check anonymizedAt (e.g. notification fan-out,
+      search/attribution, admin human list).
+    severity: MEDIUM
+    mitigation: >
+      Scope of this spec is the deletion-tx mechanics only; a follow-up sweep
+      (out of scope here) should audit read paths that surface Human rows and
+      add an anonymizedAt filter/guard where user-facing. Flagging, not solving.
+  - risk: >
+      Clearing `roles = []` on anonymize could silently strip an org OWNER's
+      staff/admin role without the sole-owner guard catching a case where the
+      human still administers orgs in a non-owner capacity (e.g. ORG_ADMIN
+      member, not owner).
+    severity: LOW
+    mitigation: >
+      The sole-owner guard already blocks the sole-OWNER case unconditionally
+      (FR-001, unchanged). Non-owner org memberships are OrgMember rows
+      (Cascade), not roles, and are unaffected either way — flagged for
+      review, not expected to be a real gap.
+  - risk: >
+      This spec's PII scrub list (name/phone/billing*) may not be
+      exhaustive — Human also carries chargebackTerms*/scannerTermsAck*
+      timestamps and trust-tier fields that are not obviously PII but are not
+      explicitly reviewed here.
+    severity: LOW
+    mitigation: >
+      Out of scope to re-derive from scratch; FR-002's field list should be
+      reviewed against a full column-by-column pass of auth.prisma's Human
+      model before implementation, not assumed complete from this spec alone.
+
+open_questions:
+  - >
+    How is anonymize triggered — same `deleteMyAccount` mutation transparently
+    taking a different internal branch (this spec's assumption), or a
+    separate user-facing lifecycle/state the user explicitly opts into
+    (e.g. a distinct "anonymize my account" action with its own consent
+    copy)? Not decided here — flagging for product decision.
+  - >
+    Is there a data-retention MINIMUM before anonymization is allowed at all
+    (e.g. tax/accounting rules requiring N years of retained, non-anonymized
+    identity before scrubbing PII, independent of the order rows themselves
+    surviving)? This spec assumes anonymization is allowed immediately on
+    request; that assumption needs sign-off, not silent adoption.
+  - >
+    Do pre-existing AuditLog entries that reference this humanId (as actor or
+    subject, e.g. past `self.deleteAccount`-adjacent actions, admin actions
+    taken BY this human when they had staff roles, or `deletedEmail`/
+    `deletedName` payloads on OTHER humans' delete audit rows) need special
+    handling — redaction, a display-time "deleted/anonymized user" fallback,
+    or are they left exactly as-is (this spec's default assumption, consistent
+    with audit logs being immutable historical record)?
+  - >
+    Relationship to the three FK-less/PII rows already flagged as unhandled by
+    deletion in docs/account-deletion.md (`PlaceOwnership`,
+    `PlaceVerificationRequest.claimantHumanId`, `PlaceClaimEmailChallenge`
+    email) — those are NOT order-history related and are not solved by this
+    spec. They are a parallel PII-on-teardown gap (claim-venue flow, not
+    checkout) that anonymize inherits unchanged: an anonymized human who once
+    claimed a venue still leaves those bare-scalar/PII rows dangling exactly
+    as a fully-deleted human would today. Cross-referenced, not re-solved
+    here — see docs/account-deletion.md and
+    docs/specs/2026-07-05/completed/claim-venue-flow.spec.yaml.
+  - >
+    Should `anonymizedAt` gate re-signup with the same email? AuthUser.email
+    is deleted (cascade), so the email becomes available for a fresh signup
+    immediately — is that the desired behavior, or should the tombstoned
+    email be held/blocked for some period? Not decided here.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Solving the claim-venue FK-less/PII rows (PlaceOwnership,
+    PlaceVerificationRequest.claimantHumanId, PlaceClaimEmailChallenge) — see
+    open_questions; cross-referenced only.
+  - A full read-path sweep for anonymizedAt-awareness (admin human list,
+    search, attribution/stats, notification fan-out).
+  - A dedicated "SAR / data export" mechanism — separate spec, see
+    docs/specs/2026-07-07/subject-access-request-export.spec.yaml.
+  - Any change to the sole-org-owner guard.
+  - Re-deriving the exhaustive PII field list on Human/AuthUser from scratch
+    (see risks).
+  - Redacting or rewriting historical AuditLog rows.
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A human with at least one Order/Ticket/TicketScan/TicketTransfer/
+    PendingTicketTransfer/Claim/ResaleListing/ResaleListingHold row can
+    complete `deleteMyAccount` (or be processed via `adminDeleteHuman`)
+    without hitting CANNOT_DELETE_ACCOUNT_WITH_ORDER_HISTORY.
+  - After anonymize, the Human row still exists with `anonymizedAt` set,
+    `name` tombstoned, `phone`/billing* fields null, and `roles = []`.
+  - After anonymize, the human's AuthUser row (and AuthAccount/AuthSession/
+    Passkey/AuthTwoFactor) no longer exist; the account cannot sign in.
+  - Every Order/Ticket/TicketScan/TicketTransfer/Claim/ResaleListing/
+    PromoRedemption/VolunteerRewardGrant row previously tied to this human is
+    byte-for-byte unchanged (amounts, tax snapshot, billing snapshot,
+    timestamps, Stripe references) and still resolves via the same humanId.
+  - Support message bodies authored by this human are tombstoned and the
+    human's EntityPage (+ owned avatar/banner R2 objects) is torn down,
+    exactly as in today's full-delete path.
+  - An audit log entry (`self.anonymizeAccount` / `admin.anonymizeHuman`)
+    exists, written inside the same transaction, before the identity scrub.
+  - A sole OWNER of any org is still blocked (CANNOT_DELETE_SOLE_ORG_OWNER)
+    regardless of order history.
+  - Re-running deleteMyAccount on an already-anonymized human is a safe no-op
+    (see NFR-001).

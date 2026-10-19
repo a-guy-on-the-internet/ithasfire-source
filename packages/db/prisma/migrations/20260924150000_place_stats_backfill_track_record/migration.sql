@@ -1,0 +1,16 @@
+-- Venue track record (FR-008 / FR-009): make every EXISTING PlaceStats row
+-- stale so its six new track-record columns (20260924120000, defaults 0/NULL)
+-- get computed.
+--
+-- The stale query's "no row yet" arm only reaches places WITHOUT a row. A row
+-- stamped before the columns existed — every row from the review-driven era,
+-- and every row `setPublicSnapshot` minted with `lastCalculatedAt`'s
+-- `now()` default — whose shows all ended before that stamp hits no
+-- activity arm, and would read `showsHosted = 0` forever. Resetting the
+-- stamp to the epoch puts every row into the sweep arm (f), oldest first, and
+-- the job drains them at ~batchSize × 96 runs/day.
+--
+-- Its own file: it must not share one with the CONCURRENTLY index builds,
+-- which run outside a transaction. Idempotent and harmless to re-run (a
+-- fresh recompute is always correct). No columns change.
+UPDATE "PlaceStats" SET "lastCalculatedAt" = '1970-01-01 00:00:00';

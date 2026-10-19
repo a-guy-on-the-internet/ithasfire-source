@@ -1,0 +1,144 @@
+# place-layout-view.component.yaml
+meta:
+  goal: Build a high-performance, cross-platform PlaceLayoutView component wrapping canvas/Skia renderers with shared interaction logic.
+  files:
+    web:
+      component: apps/web/src/app/events/[slug]/_components/place-layout-view.tsx
+      renderer: packages/ui/src/ui/place-layout/renderers/canvas-renderer.ts
+    native:
+      component: apps/mobile/src/features/place-layout/place-layout-view.tsx
+      renderer: packages/ui/src/ui/place-layout/renderers/skia-renderer.ts
+  exports:
+    - PlaceLayoutView (web + native wrappers)
+    - createLayoutIndex (shared helper)
+    - useLayoutSelection (shared hook)
+  types:
+    - Point: { x: number; y: number }
+    - SectionGeometry: { polygons: Array<Point[]> }
+  tech:
+    - React 18 / Next.js (web)
+    - React Native / Expo (mobile & scanner)
+    - Tamagui for surrounding UI chrome
+    - Canvas (OffscreenCanvas when available) on web
+    - react-native-skia on native
+    - rbush or flatbush for spatial indexing
+props:
+  required:
+    - glyphs: Array<PlaceLayoutGlyph> # includes { x, y, radius?, width?, height?, rotation?, facingAngle? }
+    - sections: Array<{ id: string; name: string; colorToken: string; transform: Transform; geometry?: SectionGeometry; stageAnchor?: { facingAngle?: number; point?: Point } }>
+    - statusPalette: Record<SeatStatus, { fill: string; stroke: string }>
+    - viewport: { center: { x: number; y: number }; zoom: number } # controlled state
+    - onViewportChange(next: { center: { x: number; y: number }; zoom: number }): void
+    - selection: Set<string> # controlled selected seat IDs
+    - onSelectionChange(next: Set<string>, diff: { added: string[]; removed: string[] }): void
+    - availability: Record<string, SeatStatus> # authoritative status map (seatId -> status)
+    - holdExpirations?: Record<string, string> # ISO string per seatId
+    - stage: { polygon: Point[]; center: Point; lookAt?: Point }
+  optional:
+    - interactionMode?: "single" | "multi" | "pan-only" (default multi)
+    - maxSelectable?: number
+    - disabled?: boolean
+    - permittedStatuses?: SeatStatus[] # default ["AVAILABLE"]; prevents selection of sold/blocked
+    - overlayRenderer?: (ctx: CanvasRenderingContext2D | SkCanvas, helpers: OverlayHelpers) => void
+    - tooltipRenderer?: (seat: PlaceLayoutGlyph, status: SeatStatus) => React.ReactNode
+    - legend?: React.ReactNode # fallback to default legend if not provided
+    - testIdBase?: string (default "place-layout")
+    - locale?: string # for formatted aria labels
+    - onSeatHover?(seatId: string | null): void
+    - onHoldExpired?(seatId: string): void
+layout:
+  structure:
+    - Container (Tamagui Stack) controlling height/width, background, loading states.
+    - Layered canvas:
+      - Base drawing surface (Canvas/Skia) sized to container.
+      - Optional overlay canvas for interactive highlights (hover/select).
+    - Legend + controls slot (bottom or side) using Tamagui components.
+    - Accessibility grid overlay (hidden visually) for keyboard navigation on web.
+  sizing:
+    - Container responsive to parent; enforce min-height 320px, ideal 480px+.
+    - DPI scaling based on devicePixelRatio; use OffscreenCanvas for rasterization when available.
+interactions:
+  selection:
+    - Click/tap toggles seat if status in `permittedStatuses` and not exceeding `maxSelectable`.
+    - Shift/drag box select on web; multi-touch lasso on native (phase 2 optional).
+    - Provide `onSelectionChange` diff for analytics + checkout integration.
+  viewport:
+    - Wheel/trackpad zoom with limits from API metadata (minZoom/maxZoom).
+    - Two-finger pinch zoom on touch devices, double-tap to zoom in/out.
+    - Panning via click-drag / touch drag with momentum.
+  hover:
+    - Web: show tooltipRenderer content near cursor; call `onSeatHover`.
+    - Native: long-press shows tooltip popover.
+  holds:
+    - Render hold countdown badge on selected seats with `holdExpirations` data.
+    - Fire `onHoldExpired` when countdown hits zero (debounced to avoid duplicate events); also visually mark seat as expired (pulse + revert to AVAILABLE).
+  accessibility:
+    - Keyboard navigation using arrow keys across logical grid; Enter/Space toggles selection.
+    - Screen readers receive seat info (section, row, seat, price tier, status, hold expiry).
+  disabled_state:
+    - When `disabled`, lock interactions, reduce opacity, and show overlay text ("Place layout selection disabled").
+states:
+  - loading: until glyphs loaded; show skeleton gradient and legend placeholder.
+  - empty: no seats (GA event) → render fallback copy.
+  - default: full interactivity.
+  - selection_full: when `maxSelectable` reached → show toast/inline message.
+  - error: render fallback while preserving previously cached glyphs.
+a11y:
+  - Canvas region labelled `aria-label="Place layout"` with description linking to instructions.
+  - Provide off-screen instructions for keyboard usage.
+  - Each seat accessible via virtualized focusable `button` with `aria-pressed` reflecting selection.
+  - Respect prefers-reduced-motion (disable zoom animations, highlight pulses).
+rendering:
+  pipeline:
+    - Normalize glyph coordinates to fit viewport; maintain transform matrix.
+    - Derive draw size per seat: use width/height when provided; otherwise render circle using radius (default 1.5 units) and orient icon with `facingAngle` toward stage center.
+    - Batch draw by status/tier to minimize context state changes.
+    - Use WebGL instancing (phase 2) if seat count > 8k for web; fallback to Canvas 2D otherwise.
+    - On native, use Skia Picture recording for static geometry and dynamic layer for status/selection overlays.
+  performance:
+    - Use requestAnimationFrame + dirty rectangle tracking. Only redraw sections whose seats changed status/selection.
+    - Maintain RBush index for hit testing; rebuild only when glyph count changes.
+    - Offload expensive computations (index build, glyph normalization) to Web Worker/JSI where available.
+test_hooks:
+  data_testids:
+    - container: `${testIdBase}-container`
+    - canvas: `${testIdBase}-canvas`
+    - legend: `${testIdBase}-legend`
+    - seat_button: `${testIdBase}-seat-${seatId}` (virtual a11y overlay)
+    - zoom_in: `${testIdBase}-zoom-in`
+    - zoom_out: `${testIdBase}-zoom-out`
+    - reset_view: `${testIdBase}-reset`
+  storybook_controls:
+    - seatCount (100, 1k, 10k)
+    - statusDistribution (available/held/sold)
+    - showHoldCountdown (boolean)
+    - interactionMode (enum)
+quality:
+  - Strict TypeScript types shared across web/native.
+  - Memoize expensive computations with `useMemo`/`useLayoutEffect`.
+  - Provide fallback for browsers without OffscreenCanvas.
+  - 60 FPS target on modern laptops; 45 FPS floor on iPad Air / Pixel 6.
+dependencies:
+  - `rbush` (web) or `flatbush` for indexing.
+  - `react-native-gesture-handler` + `react-native-reanimated` for panning/zooming.
+  - Shared place layout utils package under `packages/ui/src/ui/place-layout/utils`.
+tests:
+  - Unit tests for selection reducer (packages/ui/src/ui/place-layout/__tests__/selection.test.ts).
+  - Geometry utilities tests verifying facing angle fallback to stage center when absent.
+  - Integration test using jsdom + canvas mock to ensure event handling works (limit to critical flows).
+  - E2E storybook-based visual diff for 100 vs 10k seats (Chromatic/Expo snapshot).
+  - Performance harness (scripts/perf/place-layout-benchmark.ts) to measure frame/render times.
+stories:
+  - SmallVenue: 150 seats, default palette.
+  - Arena: 12k seats, zoom controls, hold countdowns.
+  - Accessibility: accessible seats highlighted, keyboard nav instructions.
+  - Disabled: disabled state overlay.
+  - ErrorFallback: shows retry UI when glyph load fails.
+non_goals:
+  - Server-side rendering of place layout canvas (client-only).
+  - Persisting selection state; parent owns it (e.g., React Query store).
+  - Handling GA (standing room) flows; fallback UI handles text-based selection.
+implementation_notes:
+  - Wrap component in `React.memo` with deep compare on glyph version + availability checksum.
+  - Provide `PlaceLayoutProvider` context to share index + viewport between nested controls.
+  - Export hook `usePlaceLayoutHover` for analytics.

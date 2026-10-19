@@ -1,0 +1,312 @@
+# booking-review-data-weave.spec.yaml
+#
+# Weave three mature-but-disconnected subsystems together: PerformerBookingDefaults
+# (private pitch prefill), PlaceStats (crowd-sourced venue review aggregates), and
+# the entity-page block system. Four workstreams: org-side booking defaults editor,
+# venue_stats block on place pages, booking↔review loop closure, and an explicit
+# defaults→block import.
+#
+# Related specs:
+#   - specs/2026-07-13/completed/booking-request-embed-button.spec.yaml (embed prefill for
+#     signed-in performers rides the same getBookingDefaults — WS1 makes that work
+#     for org/band senders too)
+#   - specs/2026-07-07/completed/entity-page-templates.spec.yaml (template/seeding machinery
+#     WS2 plugs into)
+#   - specs/2026-07-07/completed/musician-epk-content.spec.yaml (server-derived trusted-block
+#     pattern WS2 copies; booking_info on HUMAN pages that WS4 imports into)
+#   - specs/2026-07-13/completed/place-review-anonymization.spec.yaml (SUPERSEDES the flat
+#     n>=3 gate in FR-005/FR-008: all public review aggregates flow through its
+#     policy module — per-slice thresholds, coarsening, snapshot cadence)
+#   - specs/2026-07-13/deal-terms-transparency-map.spec.yaml (its post-settlement
+#     one-tap contribution prompt targets the same performer moment as WS3's
+#     post-gig review prompt — coordinate into one flow before building either)
+#   - specs/2026-07-14/completed/attendee-reviews.spec.yaml (generalizes WS3's
+#     PostGigPrompt to a PostEventPrompt with an audience enum PERFORMER |
+#     ATTENDEE, @@unique([eventId, humanId, audience]); whichever ships first
+#     builds the shared outbox — do not build two prompt pipelines)
+
+version: "1.0"
+updated: "2026-07-13"
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    Three subsystems hold overlapping data with no connective tissue. Org/band
+    performers get an empty booking-form prefill because the only
+    BookingDefaultsEditor hardcodes ownerType "human". The entire place-review
+    pipeline (PlaceReview → PlaceStats) has zero public per-venue display — no
+    consumer of getPlacePublicStats or placeReviews.list on /p/[slug]. And the
+    review loop never captures verified platform gigs: PlaceReview.eventId and
+    source=PLATFORM exist unused.
+  solution: >
+    Mount the existing defaults editor in org admin (WS1). Add a server-derived
+    venue_stats block on PLACE pages fed by PlaceStats aggregates, mirroring the
+    trusted-dataSource stats/shows pattern (WS2). Prompt performers to review
+    after a platform-booked gig completes, and surface payout/would-play-again
+    aggregates inside the Request to Play form (WS3). Give the block editor an
+    explicit one-shot "import from booking defaults" for booking_info/rider on
+    performer pages — defaults stay the private source of truth; blocks stay
+    owner-curated public copy; no background sync (WS4).
+  users:
+    - Org/band performers (WS1 unblocks their prefill entirely)
+    - Solo performers deciding where to pitch (WS2/WS3 stats surfaces)
+    - Venue owners (WS2 block on their page; existing respond-to-review tooling)
+  surfaces:
+    - web
+    - jobs (review-prompt dispatch)
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    # WS1 — org-side booking defaults
+    - id: FR-001
+      description: >
+        Refactor BookingDefaultsEditor to accept { ownerType, ownerId } props
+        instead of hardcoding ownerType "human"
+        (apps/web/src/app/account/settings/_components/BookingDefaultsEditor.tsx:117).
+        No behavior change for the account-settings mount.
+    - id: FR-002
+      description: >
+        Mount a "Performer" section in org admin settings (admin/[slug]/settings)
+        containing the org performer-mode toggle (performers.setMode already
+        accepts org owners) and the BookingDefaultsEditor with
+        ownerType "organization". Server authz is already enforced by the use
+        cases (org EDIT roles); UI visibility follows the same roles.
+    - id: FR-003
+      description: >
+        RequestToPlayForm prefill for org senders works end-to-end: saved org
+        defaults seed untouched fields exactly as human defaults do today
+        (no form changes expected — verify and add a regression test).
+
+    # WS2 — venue_stats block on PLACE pages
+    - id: FR-004
+      description: >
+        New PLACE-only block kind "venue_stats" in block-config.ts. Data schema
+        strips all keys except heading (anti-spoofing, same as the HUMAN stats
+        block); content is rebuilt server-side in get-public-page.ts from
+        PlaceStats with a trusted dataSource marker.
+    - id: FR-005
+      description: >
+        venue_stats renders aggregates only: review count, payout median +
+        range by payment method, would-play-again %, sound/backline/parking/
+        booker scores, promotion behavior. All values, thresholds, and
+        omissions come from the place-review-anonymization policy module
+        (per-slice k-thresholds, bucketing, weekly snapshot) — the block
+        renders nothing when the policy returns no snapshot.
+    - id: FR-006
+      description: >
+        venue_stats is seeded into the PLACE "venue" template (additive,
+        idempotent, via the entity-page-templates lazy seeding path). The venue
+        owner can toggle the block's visibility like any block — but the same
+        aggregates remain visible in the Request to Play form (FR-008), which
+        the owner does not control.
+    - id: FR-007
+      description: >
+        Crowd-sourced data is visually distinct from owner-curated blocks:
+        the block is labeled as reported by performers ("Reported by N
+        performers"), never merged into amenities/house_rules/booking_info.
+
+    # WS3 — booking↔review loop
+    - id: FR-008
+      description: >
+        RequestToPlayForm shows a compact stats line for the target place
+        (median payout, would-play-again %, review count) via
+        placeReviews.getPublicStats, which serves the anonymization policy's
+        snapshot (payout appears only past its own threshold; the line
+        degrades to "N performers have reviewed this venue"). Neutral,
+        factual framing per calm-honest-ux.
+    - id: FR-009
+      description: >
+        When a platform-booked gig completes (BookingRequest ACCEPTED → its
+        Agreement's event date has passed), enqueue one POST-GIG prompt per
+        performer human on the gig into an outbox row, dispatched by a job as
+        in-app + email (existing notify pipeline; per-channel derived
+        idempotency keys). The review ask leads: deep-link to /review-a-place
+        prefilled with placeId and eventId. The prompt flow is the single
+        post-gig surface — deal-terms-transparency-map FR-003 appends its
+        one-tap deal-contribution step here when a finalized settlement
+        exists; never a second standalone notification for the same gig.
+    - id: FR-010
+      description: >
+        Post-gig prompt enqueue is idempotent per (eventId, humanId) via a
+        unique index. Prompts are sent once, no reminders. Review submissions
+        from the prompt carry source=PLATFORM, eventId, and humanId; public
+        display remains aggregates-only regardless of source.
+
+    # WS4 — defaults ↔ page-block relationship
+    - id: FR-011
+      description: >
+        The block editor for booking_info and rider on performer pages (HUMAN,
+        and ORG once org pages seed those kinds) offers a one-shot "Import from
+        my booking defaults" action that maps contactPhone → contactPhone,
+        linkEpk → bookingUrl, techNeeds → rider requirements. It shows the
+        mapped values for confirmation before saving — defaults contain private
+        data (phone) and importing publishes it.
+    - id: FR-012
+      description: >
+        No background sync in either direction. PerformerBookingDefaults is the
+        canonical private pitch store; page blocks are owner-curated public
+        copy. Document this in the block editor help text.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        venue_stats computation adds no per-request aggregation: read the
+        precomputed PlaceStats row only (recalculate-place-stats.ts already
+        maintains it).
+    - id: NFR-002
+      description: >
+        Review prompts respect the anonymity promise: the prompt email never
+        implies the venue will see who reviewed; platform-sourced reviews are
+        still stripped of identifying fields on all public/list reads.
+    - id: NFR-003
+      description: >
+        Any swallow-and-fallback branch in the prompt job or stats injection
+        declares reportError (ReporterPort) per the Sentry convention.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: enqueue-post-gig-prompts
+        description: >
+          Sweep completed platform gigs (accepted BookingRequest → Agreement →
+          event end < now) and insert PostGigPrompt rows for each performer
+          human, skipping existing (eventId, humanId) pairs.
+        input: "now (clock)"
+        output: "enqueued count"
+        idempotent: true
+        money: false
+      - name: dispatch-post-gig-prompts
+        description: >
+          Drain pending PostGigPrompt rows through the notify pipeline
+          (in-app + email, derived per-channel idempotency keys), mark sent.
+        input: "batch size"
+        output: "dispatched/failed counts"
+        idempotent: true
+        money: false
+      - name: get-public-page (modified)
+        description: >
+          Inject server-derived venue_stats block data from PlaceStats for
+          PLACE pages (n>=3 gate), trusted dataSource marker.
+        input: slug
+        output: page with rebuilt venue_stats block
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - booking-requests repo (query accepted+completed)
+      - place-reviews repo / place-stats (getPublicStats)
+      - notify (in-app + email)
+      - reporter (swallow branches)
+
+  adapters:
+    new:
+      - PlaceReviewPrompt repo (prisma)
+    existing:
+      - place-stats reads; entity-page get-public-page
+
+  transport:
+    trpc_procedures:
+      - "none new — performers.updateBookingDefaults, performers.setMode,
+         placeReviews.getPublicStats, entityPages.managePageBlocks all exist"
+    webhooks: []
+
+  ui:
+    pages:
+      - "admin/[slug]/settings — new Performer section (WS1)"
+    components:
+      - "BookingDefaultsEditor.tsx — parameterize ownerType (WS1)"
+      - "blocks/VenueStatsBlock.tsx — new renderer (WS2)"
+      - "RequestToPlayForm.tsx — stats line (WS3)"
+      - "block editor booking_info/rider — import action + confirm (WS4)"
+
+  jobs:
+    - "review-prompts sweep + dispatch (pattern: booking-requests expiry job,
+       rsvp-notice outbox dispatch)"
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - "PostGigPrompt (id, eventId, humanId, placeId, status, sentAt,
+       createdAt; @@unique([eventId, humanId])) — generalized so the
+       deal-transparency contribution step rides the same row"
+  modified_models: []
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Small-n review aggregates deanonymize reviewers ("the one band that
+      played there last month").
+    severity: HIGH
+    mitigation: >
+      Every public aggregate surface (block, booking form) reads through the
+      place-review-anonymization policy module (per-slice k-thresholds,
+      bucketing, delayed snapshots), enforced in core, not the UI.
+  - risk: >
+      Venues object to crowd-sourced stats on "their" page.
+    severity: MEDIUM
+    mitigation: >
+      Owner can hide the block on their page; stats persist on performer-facing
+      surfaces. Venue response tooling already exists (respond-to-place-review).
+      Neutral framing, aggregates only, no individual review text.
+  - risk: >
+      Defaults import publishes private data (contactPhone) unintentionally.
+    severity: MEDIUM
+    mitigation: >
+      Import is explicit + shows mapped values before save (FR-011); never
+      auto-synced (FR-012).
+  - risk: >
+      Review prompts fire for cancelled/rescheduled gigs.
+    severity: LOW
+    mitigation: >
+      Sweep checks event status (exclude CANCELLED) and uses event end time;
+      reschedules simply shift eligibility.
+
+open_questions:
+  - >
+    RESOLVED: org performer mode is toggled in org admin settings
+    (OrgSettingsView.tsx "Performer mode" section, PerformerModeToggle with
+    owner {type:"org"}). WS1 mounts the editor below that existing toggle.
+  - >
+    Should venue_stats hide-block behavior be per-venue sticky analytics we
+    track (owner hid it) for trust signals later? Deferred — not needed to ship.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Displaying individual review text/comments on public venue pages
+  - Writing review-derived facts into Place columns or owner blocks
+    (capacity, amenities, house_rules stay owner-curated)
+  - Review prompts for non-platform gigs (no eventId — nothing to verify)
+  - Embed-widget prefill (covered by booking-request-embed-button spec)
+  - Live sync between PerformerBookingDefaults and page blocks
+  - Reminder/follow-up emails for unanswered review prompts
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - An org EDIT-role member can save org booking defaults in admin/[slug]
+    settings, and a subsequent Request to Play as that org prefills from them.
+  - A PLACE page with >=3 visible reviews renders venue_stats aggregates with
+    "Reported by N performers" framing; with <3 reviews the block renders
+    nothing; a page owner cannot inject fake stats via managePageBlocks.
+  - The Request to Play form shows median payout / would-play-again for a
+    place with >=3 reviews and nothing otherwise.
+  - After an accepted booking request's event date passes, each performer
+    human receives exactly one in-app + email prompt (re-running the sweep
+    and dispatch jobs sends nothing new) deep-linking to a prefilled
+    /review-a-place; the resulting review row has source=PLATFORM and eventId.
+  - "Import from my booking defaults" in the booking_info block editor shows
+    the mapped values, and saving publishes them to the page; declining
+    changes nothing.
+  - Regression tests cover org-sender prefill, the n>=3 gate, and prompt
+    idempotency.

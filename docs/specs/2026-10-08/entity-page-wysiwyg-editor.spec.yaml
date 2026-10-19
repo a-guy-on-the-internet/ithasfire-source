@@ -1,0 +1,502 @@
+# entity-page-wysiwyg-editor.spec.yaml
+#
+# Replace the entity page editor with one where the page is the editor: edit in
+# place, autosaved draft, Publish. Venues first, then orgs, then people.
+#
+# STATUS: CONFIRMED by owner 2026-10-08 ("Looks good"). Rulings R1–R19. Supersedes
+# docs/specs/2026-04-28/entity-page-editor-dynamic-fields.spec.yaml (R8).
+# Design board: https://claude.ai/artifact/CJv9tCnM9VB3Hv2VqfnR3R (v6).
+
+version: "1.0"
+updated: "2026-10-08"
+
+# ── Rulings (owner, 2026-10-08) ──────────────────────────────────────────────
+# Questions are as asked in the grilling round; answers are the owner's words.
+#
+# R1  Q1 "What gets edited directly on the page" → "a and c".
+#     (a) Everything visible is edited in place: name, bio, block headings and
+#     About text typed where they render; avatar/banner/photos clicked to
+#     replace or crop; list blocks (links, FAQ, team) get in-block add rows and
+#     remove buttons. A side panel holds only what is not visible content
+#     (slug, visibility, theme, block settings such as which events show).
+#     (c) Any field that stays in a panel updates the page live as you type.
+# R2  Q2 "Draft or live" → "a". Draft + Publish: every edit autosaves to a
+#     draft only editors see; visitors see nothing until Publish; the draft can
+#     be discarded. One migration (draft snapshot on EntityPage); public read
+#     unchanged. One undo history across text, images, theme and blocks; the
+#     per-block Save buttons and the three save behaviours go away.
+# R3  Q3 "Moving blocks on the standard layout" → "a". Keep the standard
+#     layout's fixed zones (upcoming shows lead). Reorder within a zone; a new
+#     block lands in its zone; the editor marks where a block can go.
+#     Deciding principle: The room is the point.
+# R4  Q4 "Formatting in About and Mission text" → "a". Bold, italic, links,
+#     bullet lists via Tiptap (already used by the event editor) and the
+#     existing announcement sanitiser; stored as sanitised HTML; existing plain
+#     text converted to paragraphs.
+# R5  Q5 "Editing at phone width" → "a". Phone / Tablet / Desktop switch that
+#     works while editing. Public page CSS moves from viewport media queries to
+#     container queries so the canvas lays out as a phone inside the page.
+# R6  Q6 "Which pages, and the venue name" → "This will progressively go
+#     throuhg all those entities. Start with venues. We have a standard venue
+#     template that if can be formatted in a way to match the wysiwyg editor
+#     that'd be ideal". Rollout order: venues first, then the other owner
+#     types. The venue standard template (PlaceEntityLayout) is itself the
+#     editing canvas. Web only. (Venue-name sub-question closed by R9.)
+# R7  Q7 "Rollout" → "a". Replace the old editor outright (per owner type as
+#     each one moves), no parallel gated editor. Freeform layouts stay gated.
+# R8  Q8 "The April dynamic-fields spec" → "a". Fold
+#     docs/specs/2026-04-28/entity-page-editor-dynamic-fields.spec.yaml in as
+#     the side panel's field model; mark the April spec superseded.
+#
+# Round 2 (owner, 2026-10-08), venue-specific:
+# R9  Q9 "Venue facts on the canvas (name, capacity, phone, website,
+#     address)" → "a". Edited in place, carried in the draft as a patch;
+#     Publish writes them to Place together with the page. If the same field
+#     changed in Settings since the draft started, Publish shows both values
+#     and asks which to keep.
+# R10 Q10 "Venue Settings after this ships" → "a". Settings' "Public page"
+#     section (bio, images, theme, slug, visibility) is removed and replaced
+#     by a link to the editor. Identity and Location stay in Settings and keep
+#     saving straight to live.
+# R11 Q11 "Bio and About" → "a". Bio becomes a short line under the name
+#     (~280 chars). About holds the long text. The hide-About-if-it-repeats-
+#     the-bio rule (about-block-dedupe.ts) is removed. Existing bios over the
+#     limit move into About when converted.
+# R12 Q12 "Automatic sections in the editor" → "a". Upcoming events, track
+#     record and review stats render exactly what a visitor sees, with a small
+#     "filled in from your shows" label; when a visitor would not see the
+#     section, a muted note says why (e.g. "Appears once 3 reviews are in",
+#     "Turned off in Reviews settings"). Only the heading is editable.
+#     Placeholder cards are removed. Principle: Trust comes from traces.
+# R13 Q13 "Who can Publish" → "a". Everyone who can edit the page today can
+#     Publish (canManagePlace: org OWNER/ADMIN/EDITOR or verified human
+#     owner). No approval step. Principle: Nobody gets silence.
+# R14 Q14 "Two people editing at once" → "a". One shared draft per page,
+#     field-level merge, most recent edit to a field wins, toolbar shows who
+#     edited last and when.
+# R15 Q15 "A shareable preview link for a draft" → "leave it". Out of scope.
+#
+# Design pick (owner, 2026-10-08, on the board above):
+# R16 "I think A with b's hover is a nice combo where you can close out B's
+#     hover." Direction A (side panel; bottom sheet on phone) combined with
+#     B's floating controls on the selected section: the section toolbar
+#     (drag, move up/down, more) and the section settings card anchored to
+#     the section, which the editor closes with its X. Reading recorded
+#     here (Claude, unconfirmed): the docked side panel keeps page-level
+#     settings (slug, visibility, theme) and fields too large for the card
+#     (Location, which events show); closing the card leaves the section
+#     selected with its toolbar; on phone the card opens as A's bottom sheet.
+# R17 Q "Is that reading of R16 right (card = main place a section is edited,
+#     panel = page settings + large fields)?" → "yep." Reading confirmed.
+# R18 Q "Upcoming events heading stays fixed ("Always leads the page")?" →
+#     "I think it's fine for now." Fixed for this phase; revisit later.
+# R19 Owner note on confirming: "I do think at some point we will want to
+#     enable a lot more creativity, but this is the step in the right
+#     direction". Build this spec's structure so later phases can loosen the
+#     zones and add layout/styling freedom without replacing the editor
+#     again (draft, selection, toolbar, card and panel are reused).
+#     Follow-up (owner, same day): "The goal is geo cities/tumblr creativity
+#     when applied" — the long-term target is GeoCities/Tumblr-level
+#     self-expression; this phase is the foundation for it.
+#
+# Earlier rulings that still bind:
+#   - A venue has ONE name, Place.name (owner 2026-09-22;
+#     memory project_venue_one_name_ruling.md).
+#   - Place authz = 3 tiers (memory project_venue_consent_toggles_accept_any_org_role.md).
+
+# ── Findings that motivate this spec (2026-10-08, [REASONED] from code + screenshots) ──
+# - Name, bio, avatar, banner, theme edited in a "Page settings" form above the
+#   page; block text in a form under each block. Nothing edited in place.
+# - Theme / name / bio drafts never reach the canvas until Save + refetch
+#   (PageEditorView.tsx:1103 claims otherwise).
+# - Three save behaviours: blocks immediately live, profile/theme on "Save
+#   changes", images on upload.
+# - Standard layout forces "edit-only": no add / reorder / delete for anyone.
+# - Empty blocks show dashed placeholders visitors never see; an About block
+#   equal to the bio is silently dropped publicly.
+# - Phone preview iframes the SAVED page; edit canvas is desktop-only.
+# - Human "View page" link 404s while humanProfilesPublic is off; hero Follow /
+#   Share are clickable inside the editor; hard-coded English in EditableBlock.
+# - The Upcoming events heading is a fixed i18n string, not a block field.
+# - resident_artists is palette:true but renders a stub.
+# - The canonical public venue URL is /places/<slug>; /p/<slug> also serves it.
+# - upsertPlace gates on ORG_EDIT_ROLES (OWNER/ADMIN/EDITOR), the same org
+#   roles canManagePlace allows, so Publish can write Place facts without
+#   widening anyone's access. [VERIFIED: grep packages/core/src/lib/rbac.ts,
+#   upsert-place.ts:1023-1029]
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The editor shows the page but edits it through forms beside it. Changes
+    reach the canvas only after a save and refetch, three things save three
+    different ways, and on the standard venue layout nobody can add or reorder
+    sections. Editors cannot see what visitors will see, including at phone
+    width.
+  solution: >
+    The venue's public layout becomes the editing surface. Text is typed where
+    it renders; sections are selected on the page and get a floating toolbar
+    and settings card; a docked side panel holds page-level settings. Every
+    edit autosaves to one shared draft per page, and Publish writes page and
+    venue facts live in one transaction.
+  users:
+    - venue editors (org OWNER / ADMIN / EDITOR, verified human owner of a place)
+    - later phases: org page editors, then people editing their own page
+  surfaces:
+    - web
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+# Phase 1 is venues (R6). FR-020+ are the pieces later owner types reuse.
+
+requirements:
+  functional:
+    # Editing on the canvas
+    - id: FR-001
+      description: >
+        The venue editor renders PlaceEntityLayout with the draft applied, the
+        same component the public page renders. No separate "Page settings"
+        form above the page.
+    - id: FR-002
+      description: >
+        Venue name, short bio, block headings, About text, list rows (links,
+        FAQ, house rules, amenities, tech specs) are edited in place, in the
+        font and position they render in. Empty fields show muted placeholder
+        text in place. (R1a)
+    - id: FR-003
+      description: >
+        About (and Mission on later owner types) uses Tiptap with bold,
+        italic, link, bulleted and numbered lists only. Saved HTML passes
+        through the same allowlist as sanitizeAnnouncementHtml on the server
+        before it reaches the draft; the public page renders only sanitised
+        HTML. (R4)
+    - id: FR-004
+      description: >
+        Avatar, banner and photos are replaced or cropped by clicking them on
+        the canvas (existing ImageCropDialog and upload flow); the new image
+        goes into the draft, not live.
+    - id: FR-005
+      description: >
+        Hero action buttons (Follow, Share, Play here, ticket links) and event
+        links are inert in the editor and say so on hover ("Inert while
+        editing").
+    # Selection, toolbar, card, panel (R16)
+    - id: FR-006
+      description: >
+        Clicking a section selects it: an outline and a name tag on the
+        section, B's floating toolbar (drag grip, move up, move down, more)
+        and B's settings card anchored beside it. The card's X closes it and
+        keeps the section selected. Escape closes the card, then clears the
+        selection.
+    - id: FR-007
+      description: >
+        A docked side panel (340px at desktop) shows page settings when
+        nothing is selected (slug, visibility, theme, follows) and the
+        section's large fields when a section needs them (Location: address,
+        address privacy, circle size, area name; Upcoming events: which events
+        show). Panel fields update the canvas as the editor types. (R1c)
+    - id: FR-008
+      description: >
+        At Phone width the side panel and the settings card open as one
+        bottom sheet; the floating toolbar stays on the section.
+    # Structure
+    - id: FR-009
+      description: >
+        Sections reorder only within their zone: Upcoming events leads; About
+        then Photos are fixed first; Booking info is fixed last; every other
+        main-column kind moves freely between Photos and Booking. Drag folds
+        sections to their headings and shows a drop line; Move up/down in the
+        toolbar does the same by keyboard. Locked sections show why. (R3)
+    - id: FR-010
+      description: >
+        "Add section" appears as an insertion line between movable sections
+        and opens a palette grouped as Moves freely / Fixed spot / Elsewhere
+        on the page / Not on this layout. Kinds already on the page show
+        "On page". resident_artists is removed from the palette.
+    - id: FR-011
+      description: >
+        A new, empty section is in the draft but marked "Not on your page
+        until it has content"; Publish does not create an empty block.
+    - id: FR-012
+      description: >
+        Automatic sections (Upcoming events, What's happened here, What
+        performers report, What attendees say) render what a visitor would
+        see. When a visitor would see nothing, the section renders dimmed
+        with a reason: fewer than MIN_HEADLINE_REVIEWS reviews, turned off in
+        Reviews & feedback, no upcoming shows. Their block headings are
+        editable; Upcoming events' heading is not (see open_questions). No
+        placeholder cards. (R12)
+    # Device widths
+    - id: FR-013
+      description: >
+        A Phone / Tablet / Desktop switch sets the canvas container to 390 /
+        768 / full width while editing stays live. The public page CSS lays
+        out from container queries on its root, so the canvas at 390px
+        matches the public page on a 390px viewport. (R5)
+    # Draft, Publish, people
+    - id: FR-014
+      description: >
+        Every edit autosaves to the page's one shared draft within 1s of the
+        last keystroke. The toolbar shows "Saved to draft", the number of
+        unpublished changes, and who edited last and when. (R2, R14)
+    - id: FR-015
+      description: >
+        Two editors on the same draft: each change is a field-level patch;
+        the most recent write to a field wins; another editor's changes
+        appear on the canvas within 15s and on window focus. (R14)
+    - id: FR-016
+      description: >
+        Publish applies page fields, theme, blocks (create, update, delete,
+        reorder) and the venue-facts patch in one transaction, then clears
+        the draft. Anyone who passes canManagePlace can Publish. (R13)
+    - id: FR-017
+      description: >
+        If a venue fact in the patch changed on Place since the draft first
+        touched that field, Publish stops before writing anything and shows
+        each conflicting field with both values; the editor picks one per
+        field and publishes again. (R9)
+    - id: FR-018
+      description: >
+        "Discard draft" restores the canvas to the live page after a confirm.
+        Uploaded images the discarded draft referenced are cleaned up.
+    - id: FR-019
+      description: >
+        One undo/redo history covers text, images, theme, structure and
+        panel fields for the session (Cmd/Ctrl+Z, Shift+Cmd/Ctrl+Z, toolbar
+        buttons).
+    # Venue Settings and data changes
+    - id: FR-020
+      description: >
+        Venue Settings drops its "Public page" section (bio, images, theme,
+        slug, visibility) for a link to the editor. Identity and Location
+        stay in Settings and keep saving live. (R10)
+    - id: FR-021
+      description: >
+        Bio is capped at 280 characters. A one-time data migration moves any
+        longer venue bio into the About block (creating it when absent) and
+        trims the bio to its first sentence that fits. about-block-dedupe.ts
+        and its call sites are removed. (R11)
+    - id: FR-022
+      description: >
+        Existing plain-text About / Mission data is converted to paragraph
+        HTML on first read by the editor and on Publish; the public renderer
+        accepts both until every page has been published once.
+    # Old editor
+    - id: FR-023
+      description: >
+        For venue pages, PageFieldsEditor, page-settings-save.tsx, the inline
+        per-block Save in EditableBlock and the venue path of PageEditorView
+        are deleted. Org and human pages keep the old editor until their phase
+        (R7). The old editor's "View page" link is hidden while the page's
+        public route would 404 (humanProfilesPublic off), and venue links go
+        to /places/<slug>.
+    - id: FR-024
+      description: >
+        Field definitions for the panel and card follow the April spec's
+        model: each field declares its kind, label key and a visibility
+        predicate over current block data, so the card shows only fields
+        that apply. (R8)
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Typing in place shows no visible lag: a keystroke paints within one
+        frame on a 2020 MacBook Air; autosave never blocks input.
+    - id: NFR-002
+      description: >
+        The public venue page renders identically before and after the
+        container-query change at 320, 390, 768, 1024 and 1440px (screenshot
+        comparison), with no new horizontal overflow at 320px.
+    - id: NFR-003
+      description: >
+        No hydration mismatch on the editor route or the public route; zero
+        new console errors at any of the three device widths.
+    - id: NFR-004
+      description: >
+        Keyboard and screen reader: every section is reachable by Tab; the
+        toolbar has role=toolbar; moves announce their result ("Amenities:
+        moved between Capacity and House rules"); accessible names on the
+        page stay unique (no two "Save" or "Remove" buttons with the same
+        name).
+    - id: NFR-005
+      description: >
+        Every user-facing string goes through the locale catalogs; no
+        hard-coded English in the editor components.
+    - id: NFR-006
+      description: >
+        Any catch-and-fallback in the new use cases declares reportError and
+        reports through it (CLAUDE.md error convention).
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: getPageDraft
+        description: >
+          Returns the live page with the draft applied, the per-field
+          last-editor map, the change count, and the live values of every
+          venue fact the patch touches. Creates nothing.
+        input: pageId, actorHumanId
+        output: page view model, draft meta, placeFacts
+        idempotent: true
+        money: false
+      - name: savePageDraft
+        description: >
+          Applies a list of field-level patch ops ({path, value}) to the
+          shared draft, last write wins per path, and records the editor and
+          time per path. Rich-text values are sanitised here. Block ops cover
+          add, remove, move within zone and field edits; zone rules from
+          block-sections.ts are enforced here, not only in the UI.
+        input: pageId, ops[], clientRevision, actorHumanId
+        output: draft revision, merged fields changed by others since clientRevision
+        idempotent: true (same op batch id applied once)
+        money: false
+      - name: publishPageDraft
+        description: >
+          In one transaction: checks venue-fact conflicts against the base
+          values stored in the draft, applies resolutions, writes EntityPage,
+          PageTheme, PageBlock changes and the Place patch (through the same
+          validation upsertPlace uses), clears the draft. Returns CONFLICT
+          with both values per field instead of writing when unresolved.
+        input: pageId, draftRevision, resolutions?, actorHumanId
+        output: published page | { conflicts[] }
+        idempotent: true (draftRevision; a second call on a cleared draft is a no-op)
+        money: false
+      - name: discardPageDraft
+        description: Deletes the draft and queues cleanup of images only it referenced.
+        input: pageId, actorHumanId
+        output: void
+        idempotent: true
+        money: false
+    authz: >
+      All four use the existing per-owner-type check in update-page.ts
+      (canManagePlace for PLACE pages, requireOrgRole for ORG, self for
+      HUMAN). Publish adds no role beyond it (R13).
+
+  ports:
+    new:
+      - EntityPagesRepo draft primitives (getDraft, lockDraftForUpdate, writeDraft, clearDraft) in packages/ports/src/repos/entity-pages.ts; merge logic lives in core. The draft row is cleared, never deleted, by Publish and Discard (see the PageDraft comment in packages/db/prisma/entity-page.prisma).
+    existing:
+      - AuthZPort.canManagePlace (packages/ports/src/authz.ts)
+      - PlacesRepo (Place patch on Publish)
+      - FileStoragePort (draft image cleanup)
+      - ReporterPort (swallow sites)
+
+  adapters:
+    new: []
+    existing:
+      - packages/adapters/src/db/prisma/entity-pages.ts (draft table, publish transaction)
+
+  transport:
+    trpc_procedures:
+      - entityPages.getDraft (authed)
+      - entityPages.saveDraft (authed)
+      - entityPages.publishDraft (authed)
+      - entityPages.discardDraft (authed)
+      - "Kept: getBySlug, getMyPage, isSlugAvailable, requestImageUpload, finalizeImageUpload. updatePage / updatePageTheme / managePageBlocks stay for org and human pages until their phase, then go."
+    webhooks: []
+
+  ui:
+    pages:
+      - the existing venue page-editor route renders the new editor (no new route)
+    components:
+      - PageCanvasEditor (owns draft state, undo history, selection)
+      - InlineText / InlineRichText (Tiptap) bound to draft paths
+      - SectionToolbar and SectionCard (B's floating controls, R16)
+      - EditorSidePanel (A; bottom sheet at Phone)
+      - SectionPalette, DropLine, ZoneLock
+      - AutomaticSectionNote (R12 reasons)
+      - PublishBar, ConflictPicker, DeviceSwitch
+      - PlaceEntityLayout and its sections take an optional editing context instead of a fork
+    css: >
+      place-entity.module.css: the ~14 layout @media queries become
+      @container queries on the page root (container-type: inline-size).
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models:
+    - name: PageDraft
+      fields: >
+        pageId (unique, FK EntityPage, cascade), data Json (page, theme and
+        block overlay), placePatch Json, placeBase Json (Place values when
+        each patched field was first edited), fieldEditors Json
+        (path → {humanId, at}), revision Int, updatedAt, updatedByHumanId
+      note: >
+        One row per page (R14). Public reads never touch it, so the public
+        page path is unchanged (R2).
+  modified_models: []
+  data_migrations:
+    - long venue bios → About block (FR-021)
+  migrations_needed: true
+
+# ── Risks ────────────────────────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Moving the public CSS to container queries changes the live venue page
+      for every visitor, not only editors.
+    severity: HIGH
+    mitigation: >
+      Land it as its own step before the editor, with screenshot comparison at
+      five widths (NFR-002) and a 320px overflow check by clientWidth vs
+      scrollWidth.
+  - risk: >
+      Tiptap contentEditable inside a server-rendered layout causes hydration
+      mismatches (React 19 does not console.error them).
+    severity: MEDIUM
+    mitigation: >
+      Mount editors client-only inside the canvas; assert a React fiber and
+      no mismatch in the e2e run, not only console silence.
+  - risk: >
+      Publish spans EntityPage, PageTheme, PageBlock and Place; a partial
+      write leaves the page and the venue disagreeing.
+    severity: MEDIUM
+    mitigation: One Prisma transaction; conflicts are checked inside it.
+  - risk: >
+      Pinned blocks (track_record) and the PageBlock partial unique index can
+      reject a draft's block ops at Publish.
+    severity: LOW
+    mitigation: >
+      savePageDraft applies the same pinned / zone rules, so the draft can
+      never hold an op Publish would reject; map P2002 to BLOCK_PINNED.
+  - risk: >
+      Rich-text HTML stored in block data is rendered publicly.
+    severity: HIGH
+    mitigation: >
+      Sanitise on write in core (FR-003) and render only sanitised HTML;
+      security-reviewer pass on the renderer.
+
+# ── Open questions ───────────────────────────────────────────────────────────
+
+open_questions: []   # both resolved 2026-10-08 as R17 and R18
+
+# ── Out of scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Shareable draft preview links (R15)
+  - Org and human pages (later phases of this spec, R6)
+  - Freeform layouts (stay gated, R7)
+  - Mobile and scanner apps (R6: web only)
+  - Real-time cursors or presence beyond "last edited by" (R14)
+  - Editing the Upcoming events list itself (it comes from shows)
+  - More layout and styling freedom (owner R19: wanted later; this phase must not block it)
+
+# ── Acceptance criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - A venue editor types a new name in the hero, a new short bio and bold text in About; the canvas shows each as typed; a visitor sees none of it until Publish, then sees all of it.
+  - Reloading the editor mid-edit shows the draft, with "Saved to draft" and the change count.
+  - On the standard venue layout an editor adds an FAQ, types one question and answer, moves it between Amenities and Tech specs, and publishes; the public page shows it there.
+  - About cannot be moved below Photos, and Booking cannot be moved above any other section, by drag or by keyboard.
+  - An empty new section is not created on Publish.
+  - With 2 attendee reviews, "What attendees say" renders dimmed in the editor with the reason, and is absent on the public page.
+  - The Phone switch lays the canvas out exactly as the public page at a 390px viewport (screenshot match).
+  - Editor B changes the phone number while editor A has the page open; A sees it within 15s; A's own edits to other fields are kept.
+  - The venue's capacity changes in Settings after the draft edited it; Publish shows both values, and the chosen one is what Place and the page show.
+  - Discard draft returns the canvas to the live page, and images uploaded only for the draft are deleted.
+  - Venue Settings no longer has a Public page section; its link opens the editor.
+  - No venue bio over 280 characters remains after the migration, and no text is lost (it is in About).
+  - Saving `<script>` or `onerror=` in About stores and renders none of it.
+  - The editor and the public venue page have zero new console errors and no horizontal overflow at 320px.

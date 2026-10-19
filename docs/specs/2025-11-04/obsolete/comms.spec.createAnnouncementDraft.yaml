@@ -1,0 +1,69 @@
+title: use-case | comms.create-announcement-draft
+owner: comms
+file: packages/core/src/use-cases/comms/create-announcement-draft.ts
+goal: >
+  Create a draft Announcement owned by an org or human, with scoped audience,
+  initial channels (email/in-app/SMS), and content seed (subject/body/templateId/props).
+  No delivery yet; status=DRAFT.
+
+ports:
+  - Repos (announcements, orgs, humans, authz)
+  - Logger
+  - Idempotency
+  - Clock
+  - Metrics (optional)
+
+invariants:
+  - Actor must be OWNER|ADMIN|EDITOR of the org (if org-owned) or the same human for human-owned.
+  - status must start as DRAFT.
+  - Content must pass minimal validation (subject <= 140, body len <= 100k, template exists if provided).
+  - Audience must be one of: {ALL_FOLLOWERS, TICKET_HOLDERS, CUSTOM_SEGMENT(id)}.
+  - No external sends here.
+
+input_schema:
+  actorHumanId: uuid
+  owner:
+    kind: enum[ORG,HUMAN]
+    id: uuid
+  audience:
+    kind: enum[ALL_FOLLOWERS, TICKET_HOLDERS, CUSTOM_SEGMENT]
+    segmentId?: uuid
+  channels: array[enum[EMAIL, SMS,IN_APP]]
+  content:
+    subject?: string
+    body?: string
+    templateId?: string
+    templateProps?: record
+  clientKey: string(min:8) # idempotency key
+
+output_schema:
+  announcementId: uuid
+  status: enum[DRAFT,SCHEDULED,SENT,CANCELED,FAILED] = DRAFT
+  version: int
+
+side_effects:
+  - DB: insert Announcement(DRAFT) with owner/audience/content/channels.
+  - Audit: comms.announcement.created
+  - Metrics: increment "comms.announcement.created"
+
+idempotency:
+  key: comms:createDraft:${owner.kind}:${owner.id}:${clientKey}
+  ttl_sec: 60
+  behavior: replay prior {announcementId,status,version} if identical payload; conflict on mismatch.
+
+errors:
+  - invalid_input(422): bad zod; missing subject+template; unknown audience; invalid channels
+  - forbidden(403): actor lacks rights
+  - not_found(404): owner or segment missing
+  - conflict(409): idempotency payload mismatch
+  - dependency_failed(424): repos failure
+  - transient(503): idem lock contention
+
+notes:
+  - Validate template existence via ui-email registry (ported as a string enum check stub for now).
+  - Canonicalize subject/body whitespace; store normalized.
+  - Store content as { subject, body, templateId, templateProps } blob.
+  - Return minimal DTO, not full row.
+tests:
+  - happy path org-owned; human-owned
+  - invalid audience; forbidden actor; idempotency replay; payload mismatch

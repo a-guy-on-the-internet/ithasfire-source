@@ -46,45 +46,22 @@ type SellTabScreenProps = {
   sessionContext: ScannerSessionContext | null;
 };
 
-type SellableItem = {
-  ticketTypeId: string;
-  name: string;
-  unitPriceCents: number;
-  capacityRemaining: number;
-  /**
-   * Per-tier sale window (time-based-ticket-pricing FR-010). Optional so an
-   * older API build (or a cached response) still renders — absent means "no
-   * window", which is what every existing tier is.
-   */
-  sellability?: {
-    available: boolean;
-    reason: string;
-    opensAt?: string | Date | null;
-    closedAt?: string | Date | null;
-  };
-};
-
-type ListSellableItemsResult = {
-  eventId: string;
-  currency: string;
-  /** IANA zone of the EVENT — window instants render on the venue's clock. */
-  timezone?: string;
-  ticketTypes: SellableItem[];
-};
-
 export function SellTabScreen({ eventId, sessionContext }: SellTabScreenProps) {
   const styles = useThemedSheet(makeSheet);
   const sellable = trpc.pos.listSellableItems.useQuery({ eventId });
 
-  // Stable per-press idempotency key — combines actor's session + monotonic
-  // wall-clock. The server enforces uniqueness; this just gives the SDK
-  // a fresh value per Charge press.
+  // One idempotency key per SALE (the Sell screen holds it across retries; see
+  // sale-attempt.ts). The server scopes it to the operator
+  // (`pos:{actorHumanId}:{clientKey}`), so two operators at one door can't
+  // collide; the random tail separates two sales by the same operator.
   const newClientKey = useCallback(() => {
     return `pos-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   }, []);
 
+  // No `as` here: the shape comes from the router. A cast is how a renamed
+  // `sellability` field once reached the web till as `undefined` on every tier.
   const ticketTypes: SellScreenProps["ticketTypes"] = useMemo(() => {
-    const data = sellable.data as ListSellableItemsResult | undefined;
+    const data = sellable.data;
     if (!data) return [];
     return data.ticketTypes.map((t) => ({
       id: t.ticketTypeId,
@@ -98,6 +75,7 @@ export function SellTabScreen({ eventId, sessionContext }: SellTabScreenProps) {
       saleState: describeSaleState(t.sellability, data.timezone),
     }));
   }, [sellable.data]);
+  const currency = sellable.data?.currency ?? "usd";
 
   // POS attestation entry gate (spec 2026-05-14/pos-attestation): an
   // operator without a current-version scanner-terms ack sees the blocking
@@ -121,7 +99,10 @@ export function SellTabScreen({ eventId, sessionContext }: SellTabScreenProps) {
     );
   }
 
-  if (sellable.isError) {
+  // Only when there is nothing to show. A failed BACKGROUND refetch (every
+  // sale invalidates this list) keeps its data and must not replace the
+  // screen: that would wipe the done screen's "Change $X" mid-handover.
+  if (sellable.isError && !sellable.data) {
     return (
       <ScreenSurface>
         <Panel>
@@ -141,6 +122,7 @@ export function SellTabScreen({ eventId, sessionContext }: SellTabScreenProps) {
     return (
       <TapToPayCapableShell
         eventId={eventId}
+        currency={currency}
         ticketTypes={ticketTypes}
         newClientKey={newClientKey}
       />
@@ -151,6 +133,7 @@ export function SellTabScreen({ eventId, sessionContext }: SellTabScreenProps) {
     <View style={styles.root}>
       <SellScreen
         eventId={eventId}
+        currency={currency}
         ticketTypes={ticketTypes}
         newClientKey={newClientKey}
       />
@@ -166,10 +149,12 @@ export function SellTabScreen({ eventId, sessionContext }: SellTabScreenProps) {
  */
 function TapToPayCapableShell({
   eventId,
+  currency,
   ticketTypes,
   newClientKey,
 }: {
   eventId: string;
+  currency: string;
   ticketTypes: SellScreenProps["ticketTypes"];
   newClientKey: SellScreenProps["newClientKey"];
 }) {
@@ -221,6 +206,7 @@ function TapToPayCapableShell({
       <StripeTerminalProvider tokenProvider={tokenProvider} logLevel="verbose">
         <SellScreen
           eventId={eventId}
+          currency={currency}
           ticketTypes={ticketTypes}
           newClientKey={newClientKey}
           tapToPayLocationId={locationId ?? undefined}

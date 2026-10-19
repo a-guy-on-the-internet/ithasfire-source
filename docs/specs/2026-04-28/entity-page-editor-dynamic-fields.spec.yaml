@@ -1,0 +1,101 @@
+# Owner note 2026-10-08: "We need a clean version of this"
+# SUPERSEDED 2026-10-08 by docs/specs/2026-10-08/entity-page-wysiwyg-editor.spec.yaml
+# (owner ruling R8 there: this field model becomes the editor side panel's, FR-024).
+# entity-page-editor-dynamic-fields.spec.yaml
+# Let block field schemas adapt to current block data without coupling to a specific editor library.
+
+version: "1.0"
+updated: "2026-04-28"
+
+summary:
+  problem: >
+    Some entity-page blocks need fields that depend on current settings, such as events mode,
+    selected source, media provider, or owner context. Static field lists force awkward disabled
+    controls or block-specific editor code.
+  solution: >
+    Extend the shared block config so fields can be either static arrays or resolver functions that
+    receive current block data and owner context, inspired by Puck's dynamic fields pattern.
+  users:
+    - Page editors on web
+    - Future mobile block editors
+  surfaces:
+    - web
+    - mobile
+    - core
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Block config supports dynamic field resolvers that return serializable field descriptors.
+    - id: FR-002
+      description: >
+        Field resolvers can read current block data, ownerType, ownerId, and optional read-only flags.
+    - id: FR-003
+      description: >
+        Web field rendering updates when controlling values change without losing unsaved edits.
+    - id: FR-004
+      description: >
+        First adoption covers at least one block with genuinely conditional fields.
+  non_functional:
+    - id: NFR-001
+      description: >
+        Dynamic field resolution remains deterministic and side-effect-free.
+    - id: NFR-002
+      description: >
+        External data lookups stay outside core; field resolvers can describe a source key but not fetch.
+
+architecture:
+  core:
+    use_cases:
+      - name: entity-page-dynamic-field-config
+        description: >
+          Pure helpers for resolving block field schemas from current data and owner context.
+        input: block kind, block data, owner context
+        output: field descriptors
+        idempotent: false
+        money: false
+  ports:
+    new: []
+    existing: []
+  adapters:
+    new: []
+    existing: []
+  transport:
+    trpc_procedures: []
+    webhooks: []
+  ui:
+    pages:
+      - apps/web/src/components/entity-pages/PageEditorView.tsx
+    components:
+      - apps/web/src/components/entity-pages/BlockSettingsPanel.tsx
+
+data:
+  new_models: []
+  modified_models: []
+  migrations_needed: false
+
+risks:
+  - risk: >
+      Overly powerful resolvers could recreate app logic inside config.
+    severity: MEDIUM
+    mitigation: >
+      Keep resolvers pure and only allow them to return field descriptor data.
+  - risk: >
+      Dynamic fields may hide data that still exists in a block payload.
+    severity: LOW
+    mitigation: >
+      Preserve unknown data unless field-level cleanup is explicitly requested.
+
+open_questions:
+  - Which block should be the first dynamic-field adopter: upcoming_events, video, tracks, or managed_places?
+
+out_of_scope:
+  - Nested slots and multi-column layouts.
+  - Async external data fetching inside core config.
+  - Installing Puck.
+
+acceptance_criteria:
+  - Core tests prove static and dynamic field configs resolve predictably.
+  - Web editor rerenders conditional fields as controlling values change.
+  - No UI package imports leak into core.

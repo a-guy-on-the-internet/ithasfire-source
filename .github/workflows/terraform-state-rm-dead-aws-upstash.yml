@@ -1,0 +1,163 @@
+# One-off state surgery: drop the retired AWS (SES/SNS/IAM) and out-of-band
+# Upstash resources from a workspace's Terraform state.
+#
+# WHY THIS EXISTS
+# Dev carried `enable_aws = true` / `enable_upstash = true` long after mail
+# moved to Resend and Upstash Redis became an out-of-band, free-tier database
+# shared with prod (prod already runs both flags false). The state therefore
+# still tracks:
+#   - aws_iam_user hf-dev-api, hf-dev-ses-smtp
+#   - aws_sesv2_email_identity / aws_sesv2_configuration_set
+#   - aws_sns_topic hf-dev-notifications
+#   - upstash_redis_database.primary  (points at a DELETED database)
+# whose credentials are now invalid, so every plan/apply dies in REFRESH with
+# `InvalidClientTokenId` / Upstash 401 before it can act on the flag flip.
+#
+# `state rm` is metadata-only: it does NOT delete the real resource, and it is
+# reversible with `terraform import`. The orphaned AWS SES/SNS/IAM objects are
+# retired and can be cleaned up in the AWS console at leisure; the live Upstash
+# database is deliberately left alone (the app reads it via the REDIS_URL
+# passthrough, exactly as prod does).
+#
+# Dry-run by default: `mode: list` prints what WOULD be removed and changes
+# nothing. `mode: remove` additionally requires typing the workspace name into
+# `confirm`, so a stray dispatch can't mutate state.
+name: Terraform state rm — dead AWS/Upstash (manual, one-off)
+
+on:
+  workflow_dispatch:
+    inputs:
+      workspace:
+        description: "Terraform workspace to operate on"
+        type: choice
+        required: true
+        options:
+          - dev
+          - prod
+      mode:
+        description: "list = dry run (default, safe). remove = actually run `terraform state rm`."
+        type: choice
+        required: true
+        default: list
+        options:
+          - list
+          - remove
+      confirm:
+        description: "For mode=remove ONLY: type the workspace name exactly (dev / prod) to confirm."
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  # Shared group with deploy-{env} / terraform-apply so state surgery can never
+  # race a deploy on the GCS state lock.
+  group: hf-${{ inputs.workspace }}
+  cancel-in-progress: false
+
+jobs:
+  state_rm:
+    name: state rm (${{ inputs.workspace }}, ${{ inputs.mode }})
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.workspace }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.6
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify gcloud is on PATH
+        run: gcloud version
+
+      - name: Guard — confirm matches workspace when removing
+        if: ${{ inputs.mode == 'remove' }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.confirm }}" != "${{ inputs.workspace }}" ]]; then
+            echo "::error::mode=remove requires the confirm input to equal the workspace name (got '${{ inputs.confirm }}', expected '${{ inputs.workspace }}')."
+            exit 1
+          fi
+          echo "Confirmation accepted for workspace '${{ inputs.workspace }}'."
+
+      # -backend=false would hide the real state; we need the GCS backend.
+      - name: Terraform init (cached)
+        run: bash infra/terraform/scripts/tf-init-cached.sh infra/terraform -input=false
+
+      - name: Select workspace
+        run: terraform -chdir=infra/terraform workspace select ${{ inputs.workspace }}
+
+      # `state list` does not refresh, so it works even though the AWS/Upstash
+      # credentials that break `plan` are invalid — that is the whole point.
+      - name: Compute matching addresses
+        id: match
+        run: |
+          set -euo pipefail
+          terraform -chdir=infra/terraform state list > /tmp/state-all.txt
+          echo "Total addresses in ${{ inputs.workspace }} state: $(wc -l < /tmp/state-all.txt)"
+
+          # Anchored to resource TYPES so a name that merely contains "aws"
+          # (e.g. a google_* resource with aws in its label) is never matched.
+          # `[.` after the type covers both `type.name` and `type["key"]`.
+          grep -E '(^|\.)(aws_[a-z0-9_]+|upstash_redis_database)[.[]' /tmp/state-all.txt \
+            > /tmp/state-match.txt || true
+
+          COUNT=$(wc -l < /tmp/state-match.txt | tr -d ' ')
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Terraform state rm — ${{ inputs.workspace }} (${{ inputs.mode }})"
+            echo ""
+            echo "Matched **${COUNT}** address(es):"
+            echo ""
+            echo '```'
+            cat /tmp/state-match.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "───── matched addresses ─────"
+          cat /tmp/state-match.txt || true
+          echo "─────────────────────────────"
+
+      - name: Dry run — nothing removed
+        if: ${{ inputs.mode == 'list' }}
+        run: |
+          echo "mode=list: no state was modified."
+          echo "Re-dispatch with mode=remove and confirm=${{ inputs.workspace }} to apply."
+
+      - name: Remove matched addresses from state
+        if: ${{ inputs.mode == 'remove' }}
+        run: |
+          set -euo pipefail
+          if [[ ! -s /tmp/state-match.txt ]]; then
+            echo "No matching addresses — nothing to remove."
+            exit 0
+          fi
+          # One address per invocation: a single `state rm a b c` aborts the
+          # whole batch if any one address is already gone, which would leave
+          # the run red with the work half done and no record of which failed.
+          while IFS= read -r addr; do
+            [[ -z "$addr" ]] && continue
+            echo "→ terraform state rm '${addr}'"
+            terraform -chdir=infra/terraform state rm "${addr}"
+          done < /tmp/state-match.txt
+
+          echo ""
+          echo "Remaining aws_/upstash_ addresses (expect none):"
+          terraform -chdir=infra/terraform state list \
+            | grep -E '(^|\.)(aws_[a-z0-9_]+|upstash_redis_database)[.[]' || echo "  (none)"

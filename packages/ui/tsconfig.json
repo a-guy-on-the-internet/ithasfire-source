@@ -1,0 +1,25 @@
+{
+  "extends": "@th/tsconfig/react-library.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "jsx": "react-jsx",
+    "types": ["react", "vitest/globals", "@testing-library/jest-dom"],
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "lib": ["DOM", "DOM.Iterable", "ES2022"],
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "@th/ui": ["./src/index.ts"],
+      "@th/ui/*": ["./src/*"],
+      "@th/schema": ["../schema/src/index.ts"],
+      "@th/schema/*": ["../schema/src/*"],
+      "@th/types": ["../types/src/index.ts"],
+      "@th/types/*": ["../types/src/*"],
+      "@th/locale": ["../locale/src/index.ts"],
+      "@th/locale/*": ["../locale/src/*"]
+    }
+  },
+  "include": ["src", "test", ".storybook"],
+  "exclude": ["node_modules", "dist"]
+}

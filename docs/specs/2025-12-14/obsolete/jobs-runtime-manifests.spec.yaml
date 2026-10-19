@@ -1,0 +1,96 @@
+# Spec: Jobs Runtime Manifests & Dependency Injection
+meta:
+  owner: platform-eng
+  status: draft
+  reviewers:
+    - sre
+    - devex
+summary: |
+  Define the infrastructure manifests, deployment topology, and dependency-injection bindings
+  required to run batch (KEDA) jobs and BullMQ workers described in the jobs catalog.
+scope:
+  included:
+    - Kubernetes/KEDA manifest structure (Helm/Kustomize expectations).
+  - Container image build + release flow for `apps/jobs`.
+    - Secrets/config plumbing via `@th/config` and env overlays.
+    - DI container wiring per runtime (batch vs worker).
+  excluded:
+    - Individual job logic (covered in existing job specs).
+    - Cloudflare Workers migration (captured separately).
+requirements:
+  manifests:
+    batch:
+      toolchain: KEDA ScaledJob + CronJob templates (Helm chart).
+      files:
+        - infra/argo/apps/jobs-batch.yaml (namespaced per env).
+        - infra/k8s/templates/jobs-scaledjob.yaml (parameterized for job name).
+      runtime_env:
+        image: ghcr.io/ithasfire/jobs:<git-sha>
+        serviceAccount: jobs-runner
+        configMaps:
+          - jobs-config (shared env)
+        secrets:
+          - jobs-secrets (Cloudflare R2, Stripe, Redis creds)
+        volumes:
+          - emptyDir scratch for large exports (optional)
+      annotations:
+        - keda.sh/queue-selector where applicable for event triggers.
+    workers:
+      toolchain: Kubernetes Deployment + HPA (cpu + custom metrics).
+      files:
+        - infra/k8s/templates/jobs-worker-deployment.yaml
+        - infra/k8s/templates/jobs-worker-service.yaml (metrics scraping)
+      runtime_env:
+        image: ghcr.io/ithasfire/jobs:<git-sha>
+        replicas:
+          min: 1
+          max: 10
+        env:
+          - BULLMQ_QUEUE=notifications:transactional (example)
+          - REDIS_URL from secret
+        probes:
+          liveness: /healthz
+          readiness: /ready (exposed via Express or Fastify in worker bundle)
+ci_cd:
+  build:
+  - turbo run build --filter=apps/jobs
+    - docker buildx bake jobs
+  publish:
+    - tag ghcr.io/ithasfire/jobs:<git-sha>
+    - update Helm values with new tag via Argo CD pipeline
+  release_gates:
+  - staging deploy + smoke job (`pnpm -C apps/jobs run smoke`)
+    - feature flag `feature.sitemaps` check before prod rollout
+bootstrap:
+  di_container:
+  file: apps/jobs/src/lib/container.ts
+    bindings:
+      batch:
+        - bind JobLockPort -> RedisLockAdapter
+        - bind StoragePort -> S3FileStorageAdapter
+      worker:
+        - bind JobQueuePort -> BullMQAdapter
+        - bind NotificationPort -> ResendEmailAdapter
+      shared:
+        - ConfigPort -> ConfigAdapter (@th/config)
+        - Logger -> Pino structured logger
+    testing:
+      - Provide `createTestContainer()` returning stub adapters for unit tests
+observability:
+  metrics:
+    - ServiceMonitor per namespace scraping /metrics from jobs pods
+    - KEDA ScaledObject exposes queue depth metrics for Prometheus
+  logging:
+    - stdout JSON shipped via existing Fluent Bit stack
+    - Correlate job runs with `job.name`, `job.run_id`
+rollout_plan:
+  1. Create Helm templates + values for batch + worker runtimes.
+  2. Wire Argo CD applications pointing to new manifests (dev → stage → prod).
+  3. Build DI container + health endpoints in apps/jobs.
+  4. Deploy dry-run jobs (feature flags off) to validate plumbing.
+  5. Enable per-job specs following dependency chain.
+acceptance_criteria:
+  - All batch/worker jobs deployable via Argo CD using shared templates.
+  - DI container satisfies port bindings for sitemap generator and queue workers.
+  - Observability endpoints registered, metrics visible in Prometheus.
+  - Secrets/config resolved from `env/envs/<env>` overlays with no hard-coded values.

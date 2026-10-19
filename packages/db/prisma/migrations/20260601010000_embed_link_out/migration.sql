@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "Embed" ADD COLUMN "linkOut" BOOLEAN NOT NULL DEFAULT false;

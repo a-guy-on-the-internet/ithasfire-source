@@ -2,6 +2,18 @@
   "extends": "../../packages/config/tsconfig/base.json",
   "compilerOptions": {
     "noEmit": false,
+    // Incremental so a re-run that follows no source change is near-instant.
+    // The build info lives in node_modules/.cache (already gitignored) instead
+    // of beside the tsconfig, so it never shows up as untracked.
+    //
+    // GOTCHA: `tsc --incremental` never stats its own outputs, so deleting
+    // `dist/` while this build info survives makes `pnpm build` exit 0 having
+    // emitted NOTHING. If you cleaned dist by hand, delete the file below too.
+    // Harmless in the deploy path — this Dockerfile discards dist and the
+    // runtime is `node --import tsx src/index.ts` — but it will cost you
+    // twenty minutes at a terminal.
+    "incremental": true,
+    "tsBuildInfoFile": "../../node_modules/.cache/tsc-daemon/apps-audio-transcoder.tsbuildinfo",
     "outDir": "dist",
     "baseUrl": ".",
     "skipLibCheck": true,

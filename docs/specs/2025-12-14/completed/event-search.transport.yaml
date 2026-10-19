@@ -1,0 +1,133 @@
+# Spec: Event Search Transport (tRPC + Fastify)
+meta:
+  owner: transport-trpc
+  status: complete
+  reviewers:
+    - core
+    - web
+    - mobile
+  last_updated: 2025-11-25
+summary: |
+  Define the transport contracts that expose event search capabilities (autocomplete + full search + related events)
+  to Next.js, mobile, and scanner surfaces via tRPC. Ensures consistent validation, caching, and error mapping.
+objectives:
+  - Provide low-latency autocomplete endpoint (<150 ms p95) backed by SearchQueryPort.autocomplete.
+  - Provide richer search endpoint with pagination, facets, and trace IDs for debugging.
+  - Guarantee results include routing metadata (slug, eventId) and contextual helper copy for UI.
+  - Enforce auth + org scoping consistently before hitting the search port.
+
+procedures:
+  namespace: `events`
+  endpoints:
+    - `events.autocomplete` (publicProcedure)
+    - `events.search` (publicProcedure, but supports optional auth for org-scope)
+    - `events.related` (publicProcedure)
+    - `events.searchPrompts` (publicProcedure)
+
+schemas:
+  autocomplete_input (zod):
+    - query: string().trim().min(2).max(120)
+    - limit: number().int().min(1).max(10).default(6)
+    - orgId: string().uuid().optional()
+    - filters: optional object with `regionCodes`, `tags`, `dateRange` (mirrors QueryFilters subset)
+  autocomplete_output:
+    - suggestions: array of {
+        eventId: string
+        slug: string | null
+        title: string
+        subtitle: string | null
+        helper: string | null
+        matchReason: string | null
+        confidence: number
+      }
+    - latencyMs: number
+    - prompts?: array of helper prompt objects (id, title, subtitle)
+
+  search_input:
+    - query: string().trim().min(2).max(240)
+    - limit: number().int().min(1).max(50).default(20)
+    - cursor: string().optional() # base64 offset
+    - filters: QueryFilters + `orgScope?: "viewer" | "org"`
+    - includeFacets: boolean().default(true)
+    - includeAvailability: boolean().default(true)
+  search_output:
+    - results: array of {
+        eventId: string
+        slug: string | null
+        title: string
+        snippet: string | null
+        badges: string[]
+        location: { city?: string; regionCode?: string; venueName?: string }
+        startsAt: string | null
+        matchReasons: string[]
+        score: number
+        confidence: number
+        ticketAvailability?: {
+          status: "AVAILABLE" | "LOW" | "SOLD_OUT" | "UNKNOWN"
+          remaining?: number
+          lastUpdatedAt?: string | null
+        }
+      }
+  search_prompts_input:
+    - orgId: string().uuid().optional()
+    - ownerHumanId: string().uuid().optional()
+    - regionCode: string().optional()
+    - limit: number().int().min(1).max(8).default(4)
+  search_prompts_output:
+    - prompts: array of { id: string; title: string; subtitle?: string; helper?: string }
+
+    - facets: { city?: Facet[]; tag?: Facet[]; dateBucket?: Facet[] }
+    - nextCursor?: string
+    - latencyMs: number
+
+  related_input:
+    - eventId: string().uuid()
+    - limit: number().int().min(1).max(12).default(6)
+  related_output:
+    - results: array of simplified cards (subset of search result fields)
+
+caching:
+  - Autocomplete responses cached in-memory per query for 60 seconds when query length >= 3 and no orgId (shared suggestions).
+  - Search results not cached globally (user-specific filters), but we emit `Cache-Control: no-store` since responses user-scoped.
+  - Prompts served from `SearchPromptPort` (Redis-backed adapter) and cached per (orgId|ownerHumanId, region) tuple for 5 minutes; merged by transport when suggestions <3.
+
+authz:
+  - Public queries allowed but limited to `status = PUBLISHED` results.
+  - If request is authed (Better Auth session), attach `orgId` or `ownerHumanId` from session and allow `status = HIDDEN` results belonging to that owner.
+  - For multi-org users, require explicit `orgId` query param or default to active org from session claim.
+
+error_mapping:
+  - `invalid_input` → TRPC `BAD_REQUEST`
+  - `forbidden` → `FORBIDDEN`
+  - `dependency_failed`/`transient` → `INTERNAL_SERVER_ERROR` with `retryable: true`
+  - Unknown errors bubble through `toTrpcError` helper per transport standards.
+
+observability:
+  - Inject `traceparent` from Fastify request into SearchQueryPort context.
+  - Emit `events.search.autocomplete_latency` + `events.search.query_latency` histograms.
+  - Log query hash, filters, result count, latency, promptsUsed flag.
+  - Redact raw query in info logs when it contains email/phone (detected via regex) -> log hash only.
+
+rate_limits:
+  - Autocomplete: 30 req / 10 sec / IP (burst), enforced via Fastify plugin.
+  - Search: 15 req / 10 sec / IP without auth; 60 req / min / org or human owner when authed.
+  - Regionalization handled at the reverse proxy/CDN edge; transport-level counters remain regional but we rely on proxy to aggregate for global protection.
+
+rollout_plan:
+  phase_0:
+    - keep endpoints behind flag `search.transport.enabled=false`; return placeholder suggestions.
+  phase_1:
+    - enable autocomplete for internal orgs; monitor metrics.
+  phase_2:
+    - enable full search + facets once index coverage >95%.
+  phase_3:
+    - add pagination + related endpoint for public preview.
+
+client_contracts:
+  - Web navbar + hero search call autocomplete with `orgId` when user logged in, otherwise anonymous.
+  - `/events/search?search=foo` page hits `events.search` via server action to prefetch SSR data.
+  - Mobile + scanner surfaces reuse same endpoints through transport clients.
+
+open_questions:
+  - prompts_endpoint: ✅ Resolved — handled via dedicated `events.searchPrompts` procedure backed by `SearchPromptPort`.
+  - rate_limit_regionalization: ✅ Documented — global coordination handled at reverse proxy/CDN; transport counters remain per-region for observability only.

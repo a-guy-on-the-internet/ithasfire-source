@@ -1,0 +1,11 @@
+-- How the search map may DRAW a document's lat/lng: a pin only when true.
+-- Written from the already-redacted search document (events:
+-- projectPublicEventLocation; places: redactPlaceLocation), so it carries no
+-- more than lat/lng already did.
+--
+-- NOT NULL DEFAULT false is metadata-only on Postgres 11+ (no table rewrite).
+-- The default is the fail-closed value: every existing row reads "not exact"
+-- with no radius, so it is left off the map (never drawn as a pin) until the
+-- next reindex writes the real value — the nightly `search.full-reindex`, or
+-- `pnpm -F api reindex:search`.
+ALTER TABLE "SearchDocument" ADD COLUMN "location_is_exact" BOOLEAN NOT NULL DEFAULT false;

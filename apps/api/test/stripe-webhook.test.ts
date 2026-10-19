@@ -26,6 +26,49 @@ const openDisputeMock = vi.fn(async () => ({
 const refreshDisputeMock = vi.fn(async () => ({ ok: true }));
 const recordFundsWithdrawnMock = vi.fn(async () => ({ ok: true }));
 const closeDisputeMock = vi.fn(async () => ({ ok: true }));
+const recordEarlyFraudWarningMock = vi.fn(async () => ({
+  ok: true as const,
+  earlyFraudWarningId: "efw_1",
+  stripeEfwId: "issfr_123",
+  orderId: "22222222-2222-4222-8222-222222222222",
+  ownerOrgId: "org_1",
+  ownerHumanId: null,
+  actionable: true,
+  created: true,
+  alerted: true,
+}));
+const resolveEarlyFraudWarningMock = vi.fn(async () => ({
+  ok: true as const,
+  resolved: true,
+  earlyFraudWarningId: "efw_1",
+  resolution: "DISPUTED",
+  skippedReason: null,
+}));
+// `charge.refunded` reconciles through the real use case, which needs a full
+// repo surface; the EFW auto-resolution tests only need the case to reach
+// its tail, so the reconcile is stubbed at module level.
+const reconcileStripeFullRefundMock = vi.fn(async () => ({
+  ok: true as const,
+  paymentIntentId: "pi_123",
+  orderId: "22222222-2222-4222-8222-222222222222",
+  outcome: "reconciled_primary",
+}));
+
+vi.mock("@th/core/use-cases/orders/reconcile-stripe-full-refund", () => ({
+  reconcileStripeFullRefund: (deps: unknown, input: unknown) =>
+    reconcileStripeFullRefundMock(deps, input),
+}));
+
+// The failed-payment harness points this at its per-test call log so the
+// send's position relative to the tx commit can be asserted.
+let bankEmailCallLog: string[] | null = null;
+const sendBankPaymentFailedEmailMock = vi.fn(async () => {
+  bankEmailCallLog?.push("sendBankPaymentFailedEmail");
+});
+vi.mock("@th/core/use-cases/orders/send-bank-payment-failed-email", () => ({
+  sendBankPaymentFailedEmail: (deps: unknown, input: unknown) =>
+    sendBankPaymentFailedEmailMock(deps, input),
+}));
 
 vi.mock("@th/core/use-cases/orders/finalize-from-payment-intent", () => ({
   finalizePaymentIntent: (deps: unknown, input: unknown) =>
@@ -97,6 +140,28 @@ vi.mock("@th/core/use-cases/disputes", () => ({
     recordFundsWithdrawnMock(deps, input),
   closeDispute: (deps: unknown, input: unknown) =>
     closeDisputeMock(deps, input),
+  recordEarlyFraudWarning: (deps: unknown, input: unknown) =>
+    recordEarlyFraudWarningMock(deps, input),
+  resolveEarlyFraudWarning: (deps: unknown, input: unknown) =>
+    resolveEarlyFraudWarningMock(deps, input),
+}));
+
+const assembleDisputeEvidenceMock = vi.fn(async () => ({
+  ok: true as const,
+  disputeId: "dispute_1",
+  skipped: null,
+  evidence: { assembledVersion: 1 },
+}));
+const syncDisputeEvidenceDetailsMock = vi.fn(async () => ({
+  ok: true as const,
+  updated: true,
+}));
+
+vi.mock("@th/core/use-cases/disputes/evidence", () => ({
+  assembleDisputeEvidence: (deps: unknown, input: unknown) =>
+    assembleDisputeEvidenceMock(deps, input),
+  syncDisputeEvidenceDetails: (deps: unknown, input: unknown) =>
+    syncDisputeEvidenceDetailsMock(deps, input),
 }));
 
 /**
@@ -128,6 +193,26 @@ describe("stripe webhook route", () => {
     refreshDisputeMock.mockClear();
     recordFundsWithdrawnMock.mockClear();
     closeDisputeMock.mockClear();
+    assembleDisputeEvidenceMock.mockClear();
+    assembleDisputeEvidenceMock.mockImplementation(async () => ({
+      ok: true as const,
+      disputeId: "dispute_1",
+      skipped: null,
+      evidence: { assembledVersion: 1 },
+    }));
+    syncDisputeEvidenceDetailsMock.mockClear();
+    syncDisputeEvidenceDetailsMock.mockImplementation(async () => ({
+      ok: true as const,
+      updated: true,
+    }));
+    openDisputeMock.mockImplementation(async () => ({
+      ok: true,
+      disputeId: "dispute_1",
+      stripeDisputeId: "dp_123",
+      orderId: "22222222-2222-4222-8222-222222222222",
+      status: "OPEN",
+      triageReason: null,
+    }));
     recordMembershipInvoicePaidMock.mockClear();
     recordMembershipPaymentFailedMock.mockClear();
     syncMembershipFromStripeMock.mockClear();
@@ -1272,8 +1357,47 @@ async function postStripeEvent(
   });
 }
 
+/**
+ * Minimal ioredis surface used by `WebhookDlq`, so a test can assert that a
+ * failed event reached the DLQ (mirrors stripe-webhook-dlq-coverage.test.ts).
+ */
+function makeFakeRedis() {
+  const pushed: Array<Record<string, string>> = [];
+  const multi = () => {
+    const chain = {
+      hset: (_key: string, value: Record<string, string>) => {
+        pushed.push(value);
+        return chain;
+      },
+      expire: () => chain,
+      zadd: () => chain,
+      zrem: () => chain,
+      del: () => chain,
+      exec: async () => [],
+    };
+    return chain;
+  };
+  const redis = {
+    multi,
+    zcard: async () => pushed.length,
+    zrange: async () => [],
+    zrevrange: async () => [],
+    hgetall: async () => ({}),
+  };
+  return { redis, pushed };
+}
+
 async function makeWebhookApp(
-  options: { mailer?: unknown; orders?: Record<string, unknown> } = {},
+  options: {
+    mailer?: unknown;
+    orders?: Record<string, unknown>;
+    payments?: Record<string, unknown>;
+    reportError?: unknown;
+    /** Extra repo slices (e.g. `audit`, `disputes`) merged into `trpc.repos`. */
+    repos?: Record<string, unknown>;
+    /** A fake redis so the outer catch can push to the DLQ. */
+    redis?: unknown;
+  } = {},
 ) {
   const { default: rawBody } = await import("../src/plugins/raw-body");
   const { default: stripeWebhook } =
@@ -1286,6 +1410,7 @@ async function makeWebhookApp(
     // unconditionally would route payment_intent.succeeded into the REAL
     // (unmocked) sendTicketIssuedEmail.
     ...(options.mailer ? { mailer: options.mailer } : {}),
+    ...(options.redis ? { redis: options.redis } : {}),
     trpc: {
       repos: {
         // The membership webhook cases pre-check whether we track the
@@ -1302,7 +1427,10 @@ async function makeWebhookApp(
           getById: vi.fn(async () => null),
           ...(options.orders ?? {}),
         },
+        ...(options.repos ?? {}),
       },
+      ...(options.payments ? { payments: options.payments } : {}),
+      ...(options.reportError ? { reportError: options.reportError } : {}),
       idempotency: {},
       clock: { now: () => new Date("2026-05-15T12:00:00.000Z") },
       // Truthy stubs so the customer.updated handler's not-configured guard
@@ -1325,3 +1453,1415 @@ async function makeWebhookApp(
 
   return app;
 }
+
+// ── Dispute evidence side effects (assemble + evidence_details mirror) ─────
+describe("stripe webhook dispute evidence side effects", () => {
+  // This describe is a sibling of the main one, so its beforeEach does not
+  // apply here — reset the dispute mocks ourselves or calls leak across tests.
+  beforeEach(() => {
+    openDisputeMock.mockClear();
+    refreshDisputeMock.mockClear();
+    closeDisputeMock.mockClear();
+    finalizeMock.mockClear();
+    assembleDisputeEvidenceMock.mockClear();
+    assembleDisputeEvidenceMock.mockImplementation(async () => ({
+      ok: true as const,
+      disputeId: "dispute_1",
+      skipped: null,
+      evidence: { assembledVersion: 1 },
+    }));
+    syncDisputeEvidenceDetailsMock.mockClear();
+    syncDisputeEvidenceDetailsMock.mockImplementation(async () => ({
+      ok: true as const,
+      updated: true,
+    }));
+    openDisputeMock.mockImplementation(async () => ({
+      ok: true,
+      disputeId: "dispute_1",
+      stripeDisputeId: "dp_123",
+      orderId: "22222222-2222-4222-8222-222222222222",
+      status: "OPEN",
+      triageReason: null,
+    }));
+  });
+
+  const stripe = () =>
+    new Stripe("stripe-mock", { apiVersion: "2025-08-27.basil" as any });
+
+  function disputeEvent(
+    type: string,
+    overrides: Record<string, unknown> = {},
+  ) {
+    return {
+      id: `evt_${type.replace(/\./g, "_")}`,
+      type,
+      created: 1_779_000_000,
+      data: {
+        object: {
+          id: "dp_123",
+          amount: 5000,
+          currency: "usd",
+          reason: "fraudulent",
+          status: "needs_response",
+          charge: { id: "ch_123", payment_intent: { id: "pi_123", metadata: {} } },
+          evidence_details: {
+            due_by: 1_779_604_800,
+            has_evidence: false,
+            past_due: false,
+            submission_count: 0,
+          },
+          ...overrides,
+        },
+      },
+    };
+  }
+
+  async function post(app: any, payloadObj: unknown) {
+    const payload = JSON.stringify(payloadObj);
+    const signature = stripe().webhooks.generateTestHeaderString({
+      payload,
+      secret: "whsec_test_local",
+    });
+    return app.inject({
+      method: "POST",
+      url: "/webhooks/stripe",
+      headers: {
+        "stripe-signature": signature,
+        "content-type": "application/json",
+      },
+      payload,
+    });
+  }
+
+  it("assembles evidence for a linked, formal dispute and mirrors evidence_details on created", async () => {
+    const app = await makeWebhookApp();
+    const res = await post(app, disputeEvent("charge.dispute.created"));
+
+    expect(res.statusCode).toBe(200);
+    expect(openDisputeMock).toHaveBeenCalledTimes(1);
+    expect(assembleDisputeEvidenceMock).toHaveBeenCalledTimes(1);
+    expect(assembleDisputeEvidenceMock.mock.calls[0]?.[1]).toEqual({
+      disputeId: "dispute_1",
+    });
+    // The webhook shares the desk's per-dispute mutex.
+    expect(assembleDisputeEvidenceMock.mock.calls[0]?.[0]).toMatchObject({
+      idempotency: expect.anything(),
+    });
+    expect(syncDisputeEvidenceDetailsMock).toHaveBeenCalledTimes(1);
+    expect(syncDisputeEvidenceDetailsMock.mock.calls[0]?.[1]).toEqual({
+      stripeDisputeId: "dp_123",
+      evidenceDetails: {
+        dueBy: new Date(1_779_604_800 * 1000),
+        hasEvidence: false,
+        pastDue: false,
+        submissionCount: 0,
+      },
+    });
+    await app.close();
+  });
+
+  it("does not assemble for a NEEDS_TRIAGE (unlinked) dispute", async () => {
+    openDisputeMock.mockImplementationOnce(async () => ({
+      ok: true,
+      disputeId: "dispute_1",
+      stripeDisputeId: "dp_123",
+      orderId: null,
+      status: "NEEDS_TRIAGE",
+      triageReason: "order_not_found",
+    }));
+    const app = await makeWebhookApp();
+    const res = await post(app, disputeEvent("charge.dispute.created"));
+    expect(res.statusCode).toBe(200);
+    expect(assembleDisputeEvidenceMock).not.toHaveBeenCalled();
+    // The mirror still syncs — the row exists even in triage.
+    expect(syncDisputeEvidenceDetailsMock).toHaveBeenCalledTimes(1);
+    await app.close();
+  });
+
+  it("does not assemble for a warning-only (inquiry) dispute", async () => {
+    openDisputeMock.mockImplementationOnce(async () => ({
+      ok: true,
+      disputeId: "dispute_1",
+      stripeDisputeId: "dp_123",
+      orderId: "22222222-2222-4222-8222-222222222222",
+      status: "WARNING_OPEN",
+      triageReason: null,
+    }));
+    const app = await makeWebhookApp();
+    const res = await post(
+      app,
+      disputeEvent("charge.dispute.created", { status: "warning_needs_response" }),
+    );
+    expect(res.statusCode).toBe(200);
+    expect(assembleDisputeEvidenceMock).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("keeps the webhook green and reports when assembly throws", async () => {
+    assembleDisputeEvidenceMock.mockImplementationOnce(async () => {
+      throw new Error("assembly exploded");
+    });
+    const reportError = vi.fn();
+    const app = await makeWebhookApp({ reportError });
+    // The route logs through the pino child of `app.deps.logger` (the harness
+    // returns the same mock), never `app.log` (a no-op under `logger: false`)
+    // — the live run's first assembly failure was invisible in the log file
+    // for exactly that reason.
+    const routeLogError = (app as any).deps.logger.error as ReturnType<typeof vi.fn>;
+    routeLogError.mockClear();
+
+    const res = await post(app, disputeEvent("charge.dispute.created"));
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ received: true });
+    expect(openDisputeMock).toHaveBeenCalledTimes(1);
+    expect(reportError).toHaveBeenCalledWith(
+      expect.any(Error),
+      expect.objectContaining({
+        tags: expect.objectContaining({ step: "assemble_dispute_evidence" }),
+      }),
+    );
+    expect(routeLogError).toHaveBeenCalledWith(
+      "stripe_webhook_dispute_evidence_assemble_failed",
+      expect.objectContaining({ disputeId: "dispute_1" }),
+    );
+    await app.close();
+  });
+
+  it("a failing evidence_details sync is logged through the route logger and reported, event still applied", async () => {
+    syncDisputeEvidenceDetailsMock.mockImplementationOnce(async () => {
+      throw new Error("mirror exploded");
+    });
+    const reportError = vi.fn();
+    const app = await makeWebhookApp({ reportError });
+    const routeLogError = (app as any).deps.logger.error as ReturnType<typeof vi.fn>;
+    routeLogError.mockClear();
+
+    const res = await post(app, disputeEvent("charge.dispute.updated", { status: "under_review" }));
+
+    expect(res.statusCode).toBe(200);
+    expect(refreshDisputeMock).toHaveBeenCalledTimes(1);
+    expect(routeLogError).toHaveBeenCalledWith(
+      "stripe_webhook_dispute_evidence_details_sync_failed",
+      expect.objectContaining({ stripeDisputeId: "dp_123" }),
+    );
+    expect(reportError).toHaveBeenCalledWith(
+      expect.any(Error),
+      expect.objectContaining({
+        tags: expect.objectContaining({ step: "sync_dispute_evidence_details" }),
+      }),
+    );
+    await app.close();
+  });
+
+  it("mirrors evidence_details on updated and closed, and omits dueBy when Stripe nulls it", async () => {
+    const app = await makeWebhookApp();
+    await post(app, disputeEvent("charge.dispute.updated", {
+      status: "under_review",
+      evidence_details: {
+        due_by: null,
+        has_evidence: true,
+        past_due: false,
+        submission_count: 1,
+      },
+    }));
+    await post(app, disputeEvent("charge.dispute.closed", { status: "won" }));
+
+    expect(refreshDisputeMock).toHaveBeenCalledTimes(1);
+    expect(closeDisputeMock).toHaveBeenCalledTimes(1);
+    expect(assembleDisputeEvidenceMock).not.toHaveBeenCalled();
+    expect(syncDisputeEvidenceDetailsMock).toHaveBeenCalledTimes(2);
+    expect(syncDisputeEvidenceDetailsMock.mock.calls[0]?.[1]).toEqual({
+      stripeDisputeId: "dp_123",
+      evidenceDetails: { hasEvidence: true, pastDue: false, submissionCount: 1 },
+    });
+    await app.close();
+  });
+
+  it("captures card AVS/CVC checks on payment_intent.succeeded and never fails the event when the write throws", async () => {
+    const setPaymentMethodType = vi.fn(async () => undefined);
+    const setPaymentCardChecks = vi.fn(async () => {
+      throw new Error("db hiccup");
+    });
+    const reportError = vi.fn();
+    const app = await makeWebhookApp({
+      reportError,
+      orders: { setPaymentMethodType, setPaymentCardChecks },
+      payments: {
+        getPaymentMethodType: vi.fn(async () => ({
+          methodType: "card",
+          cardChecks: {
+            addressLine1Check: "pass",
+            addressPostalCodeCheck: "fail",
+            cvcCheck: "pass",
+          },
+        })),
+      },
+    });
+
+    const res = await post(app, {
+      id: "evt_pi_checks",
+      type: "payment_intent.succeeded",
+      data: {
+        object: {
+          id: "pi_checks",
+          status: "succeeded",
+          amount_received: 1000,
+          currency: "usd",
+          metadata: { orderId: "22222222-2222-4222-8222-222222222222" },
+        },
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(finalizeMock).toHaveBeenCalledTimes(1);
+    expect(setPaymentMethodType).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      "card",
+    );
+    expect(setPaymentCardChecks).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      { addressLine1Check: "pass", addressPostalCodeCheck: "fail", cvcCheck: "pass" },
+    );
+    expect(reportError).toHaveBeenCalledWith(
+      expect.any(Error),
+      expect.objectContaining({
+        tags: expect.objectContaining({ step: "set_payment_card_checks" }),
+      }),
+    );
+    await app.close();
+  });
+});
+
+// ── Radar early fraud warnings + funds_reinstated ──────────────────────────
+describe("stripe webhook early fraud warnings", () => {
+  beforeEach(() => {
+    openDisputeMock.mockClear();
+    assembleDisputeEvidenceMock.mockClear();
+    syncDisputeEvidenceDetailsMock.mockClear();
+    recordEarlyFraudWarningMock.mockClear();
+    recordEarlyFraudWarningMock.mockImplementation(async () => ({
+      ok: true as const,
+      earlyFraudWarningId: "efw_1",
+      stripeEfwId: "issfr_123",
+      orderId: "22222222-2222-4222-8222-222222222222",
+      ownerOrgId: "org_1",
+      ownerHumanId: null,
+      actionable: true,
+      created: true,
+      alerted: true,
+    }));
+    resolveEarlyFraudWarningMock.mockClear();
+    resolveEarlyFraudWarningMock.mockImplementation(async () => ({
+      ok: true as const,
+      resolved: true,
+      earlyFraudWarningId: "efw_1",
+      resolution: "DISPUTED",
+      skippedReason: null,
+    }));
+    reconcileStripeFullRefundMock.mockClear();
+    openDisputeMock.mockImplementation(async () => ({
+      ok: true,
+      disputeId: "dispute_1",
+      stripeDisputeId: "dp_123",
+      orderId: "22222222-2222-4222-8222-222222222222",
+      status: "OPEN",
+      triageReason: null,
+    }));
+  });
+
+  const stripe = () =>
+    new Stripe("stripe-mock", { apiVersion: "2025-08-27.basil" as any });
+
+  async function post(app: any, payloadObj: unknown) {
+    const payload = JSON.stringify(payloadObj);
+    const signature = stripe().webhooks.generateTestHeaderString({
+      payload,
+      secret: "whsec_test_local",
+    });
+    return app.inject({
+      method: "POST",
+      url: "/webhooks/stripe",
+      headers: {
+        "stripe-signature": signature,
+        "content-type": "application/json",
+      },
+      payload,
+    });
+  }
+
+  const efwEvent = (
+    type: "radar.early_fraud_warning.created" | "radar.early_fraud_warning.updated",
+    overrides: Record<string, unknown> = {},
+  ) => ({
+    id: `evt_${type.replace(/\./g, "_")}`,
+    type,
+    created: 1_779_000_000,
+    data: {
+      object: {
+        id: "issfr_123",
+        object: "radar.early_fraud_warning",
+        actionable: true,
+        charge: "ch_123",
+        payment_intent: "pi_123",
+        fraud_type: "made_with_stolen_card",
+        created: 1_778_999_000,
+        livemode: false,
+        ...overrides,
+      },
+    },
+  });
+
+  const chargeRefundedEvent = (
+    refunded: boolean,
+    amountRefunded = refunded ? 5129 : 4933,
+    id = `evt_charge_refunded_${refunded ? "full" : "partial"}`,
+  ) => ({
+    id,
+    type: "charge.refunded",
+    created: 1_779_000_000,
+    data: {
+      object: {
+        id: "ch_123",
+        object: "charge",
+        refunded,
+        payment_intent: "pi_123",
+        amount_refunded: amountRefunded,
+        refunds: { data: [{ id: "re_123" }] },
+      },
+    },
+  });
+
+  /**
+   * Drives the REAL `resolveEarlyFraudWarning` through the webhook against
+   * in-memory repos, so the "is the platform refund full?" decision is
+   * exercised end to end rather than asserted on a mock's arguments.
+   */
+  async function makeRefundApp(orderStatus: "REFUNDED" | "PART_REFUNDED") {
+    const actual = await vi.importActual<
+      typeof import("@th/core/use-cases/disputes")
+    >("@th/core/use-cases/disputes");
+    resolveEarlyFraudWarningMock.mockImplementation((deps: any, input: any) =>
+      actual.resolveEarlyFraudWarning(deps, input),
+    );
+    const warning = {
+      id: "efw_1",
+      stripeEfwId: "issfr_123",
+      stripeChargeId: "ch_123",
+      paymentIntentId: "pi_123",
+      orderId: "22222222-2222-4222-8222-222222222222",
+      ownerOrgId: "org_1",
+      ownerHumanId: null,
+      fraudType: "made_with_stolen_card",
+      actionable: true,
+      stripeCreatedAt: new Date("2026-09-01T10:00:00.000Z"),
+      resolvedAt: null,
+      resolution: null,
+      createdAt: new Date("2026-09-01T10:00:00.000Z"),
+      updatedAt: new Date("2026-09-01T10:00:00.000Z"),
+    };
+    const markResolved = vi.fn(async (input: any) => ({
+      ...warning,
+      resolvedAt: input.resolvedAt,
+      resolution: input.resolution,
+    }));
+    const auditLog = vi.fn(async () => undefined);
+    const repos: Record<string, unknown> = {
+      earlyFraudWarnings: {
+        findActiveByStripeChargeId: vi.fn(async () => warning),
+        markResolved,
+      },
+      audit: { log: auditLog },
+    };
+    repos.tx = async (fn: (tx: unknown) => Promise<unknown>) =>
+      fn((app as any).deps.trpc.repos);
+    const app = await makeWebhookApp({
+      repos,
+      orders: {
+        getById: vi.fn(async () => ({ id: warning.orderId, status: orderStatus })),
+        findByPaymentIntent: vi.fn(async () => ({ id: warning.orderId, status: orderStatus })),
+      },
+    });
+    return { app, markResolved, auditLog };
+  }
+
+  it("dispatches radar.early_fraud_warning.created to intake with the parsed shape", async () => {
+    const app = await makeWebhookApp();
+
+    const res = await post(app, efwEvent("radar.early_fraud_warning.created"));
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ received: true });
+    expect(recordEarlyFraudWarningMock).toHaveBeenCalledTimes(1);
+    expect(recordEarlyFraudWarningMock.mock.calls[0]?.[1]).toEqual({
+      stripeEventId: "evt_radar_early_fraud_warning_created",
+      stripeEventType: "radar.early_fraud_warning.created",
+      stripeEfwId: "issfr_123",
+      stripeChargeId: "ch_123",
+      paymentIntentId: "pi_123",
+      metadataOrderId: null,
+      metadataEventId: null,
+      fraudType: "made_with_stolen_card",
+      actionable: true,
+      stripeCreatedAt: new Date(1_778_999_000 * 1000),
+    });
+    // The use case gets the full trpc deps (repos, clock, discordAlert...).
+    expect(recordEarlyFraudWarningMock.mock.calls[0]?.[0]).toMatchObject({
+      repos: expect.anything(),
+      clock: expect.anything(),
+    });
+    await app.close();
+  });
+
+  it("accepts expanded charge / payment_intent objects and lifts metadata.orderId", async () => {
+    const app = await makeWebhookApp();
+
+    const res = await post(
+      app,
+      efwEvent("radar.early_fraud_warning.updated", {
+        actionable: false,
+        charge: { id: "ch_123", metadata: {} },
+        payment_intent: {
+          id: "pi_123",
+          metadata: {
+            orderId: "22222222-2222-4222-8222-222222222222",
+            eventId: "33333333-3333-4333-8333-333333333333",
+          },
+        },
+      }),
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(recordEarlyFraudWarningMock.mock.calls[0]?.[1]).toMatchObject({
+      stripeEventType: "radar.early_fraud_warning.updated",
+      stripeChargeId: "ch_123",
+      paymentIntentId: "pi_123",
+      metadataOrderId: "22222222-2222-4222-8222-222222222222",
+      metadataEventId: "33333333-3333-4333-8333-333333333333",
+      actionable: false,
+    });
+    await app.close();
+  });
+
+  it("a malformed EFW payload is NOT applied: the parse guard throws and the event lands in the DLQ (still 200)", async () => {
+    const { redis, pushed } = makeFakeRedis();
+    const app = await makeWebhookApp({ redis });
+
+    const res = await post(
+      app,
+      efwEvent("radar.early_fraud_warning.created", { charge: 42 }),
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(recordEarlyFraudWarningMock).not.toHaveBeenCalled();
+    expect(pushed).toHaveLength(1);
+    expect(pushed[0]).toMatchObject({
+      stripeEventId: "evt_radar_early_fraud_warning_created",
+      eventType: "radar.early_fraud_warning.created",
+    });
+    expect(pushed[0]?.error).toContain("[radar.early_fraud_warning.created:parse]");
+    await app.close();
+  });
+
+  it("a DLQ write that Redis aborts is reported (step dlq_store), not silently treated as stored", async () => {
+    const { redis } = makeFakeRedis();
+    const brokenRedis = {
+      ...redis,
+      multi: () => {
+        const chain = redis.multi();
+        chain.exec = async () => null as never;
+        return chain;
+      },
+    };
+    const reportError = vi.fn();
+    const app = await makeWebhookApp({ redis: brokenRedis, reportError });
+
+    const res = await post(
+      app,
+      efwEvent("radar.early_fraud_warning.created", { charge: 42 }),
+    );
+
+    // Same response as a stored DLQ write: only the report is new.
+    expect(res.statusCode).toBe(200);
+    expect(reportError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: expect.stringMatching(/^redis webhook dlq push aborted \(keyHash=[0-9a-f]{12}\)$/),
+      }),
+      expect.objectContaining({
+        tags: { webhook: "stripe", step: "dlq_store" },
+      }),
+    );
+    await app.close();
+  });
+
+  it("a failing intake write DLQs the EFW event for replay rather than dropping the warning", async () => {
+    recordEarlyFraudWarningMock.mockImplementationOnce(async () => {
+      throw new Error("efw_write_failed");
+    });
+    const { redis, pushed } = makeFakeRedis();
+    const app = await makeWebhookApp({ redis });
+
+    const res = await post(app, efwEvent("radar.early_fraud_warning.created"));
+
+    expect(res.statusCode).toBe(200);
+    expect(pushed).toHaveLength(1);
+    expect(pushed[0]?.error).toContain("efw_write_failed");
+    await app.close();
+  });
+
+  it("charge.dispute.created closes the charge's active warning as DISPUTED after the lifecycle write", async () => {
+    const app = await makeWebhookApp();
+
+    const res = await post(app, {
+      id: "evt_dp_created",
+      type: "charge.dispute.created",
+      created: 1_779_000_000,
+      data: {
+        object: {
+          id: "dp_123",
+          amount: 5000,
+          currency: "usd",
+          reason: "fraudulent",
+          status: "needs_response",
+          charge: "ch_123",
+          payment_intent: "pi_123",
+        },
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(openDisputeMock).toHaveBeenCalledTimes(1);
+    expect(resolveEarlyFraudWarningMock).toHaveBeenCalledTimes(1);
+    expect(resolveEarlyFraudWarningMock.mock.calls[0]?.[1]).toEqual({
+      stripeChargeId: "ch_123",
+      resolution: "DISPUTED",
+      stripeEventId: "evt_dp_created",
+      stripeEventType: "charge.dispute.created",
+      sourceId: "dp_123",
+    });
+    await app.close();
+  });
+
+  it("a failing auto-resolution never fails the dispute event: swallowed, logged, reported", async () => {
+    resolveEarlyFraudWarningMock.mockImplementationOnce(async () => {
+      throw new Error("efw table on fire");
+    });
+    const reportError = vi.fn();
+    const app = await makeWebhookApp({ reportError });
+    // The route logs through `app.deps.logger.child(...)` (which the harness
+    // returns as the same mock), NOT `app.log` — Fastify boots with
+    // `logger: false`, so `app.log` is a no-op that Sentry never sees.
+    const routeLogError = (app as any).deps.logger.error as ReturnType<typeof vi.fn>;
+    routeLogError.mockClear();
+
+    const res = await post(app, {
+      id: "evt_dp_created_efw_fail",
+      type: "charge.dispute.created",
+      created: 1_779_000_000,
+      data: {
+        object: {
+          id: "dp_123",
+          amount: 5000,
+          currency: "usd",
+          reason: "fraudulent",
+          status: "needs_response",
+          charge: "ch_123",
+        },
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ received: true });
+    expect(openDisputeMock).toHaveBeenCalledTimes(1);
+    expect(reportError).toHaveBeenCalledWith(
+      expect.any(Error),
+      expect.objectContaining({
+        tags: expect.objectContaining({ step: "resolve_early_fraud_warning" }),
+      }),
+    );
+    expect(routeLogError).toHaveBeenCalledWith(
+      "stripe_webhook_early_fraud_warning_resolve_failed",
+      expect.objectContaining({ stripeChargeId: "ch_123", resolution: "DISPUTED" }),
+    );
+    // No DLQ-path error log: the event was applied.
+    expect(routeLogError).not.toHaveBeenCalledWith(
+      "stripe_webhook_unhandled_error_dlq",
+      expect.anything(),
+    );
+    await app.close();
+  });
+
+  it("charge.refunded hands the refund facts to the resolver whenever money went back; nothing for amount_refunded 0", async () => {
+    const app = await makeWebhookApp();
+
+    const full = await post(app, chargeRefundedEvent(true));
+    expect(full.statusCode).toBe(200);
+    expect(reconcileStripeFullRefundMock).toHaveBeenCalledTimes(1);
+    expect(resolveEarlyFraudWarningMock).toHaveBeenCalledTimes(1);
+    expect(resolveEarlyFraudWarningMock.mock.calls[0]?.[1]).toEqual({
+      stripeChargeId: "ch_123",
+      resolution: "REFUNDED",
+      stripeEventId: "evt_charge_refunded_full",
+      stripeEventType: "charge.refunded",
+      sourceId: "re_123",
+      refund: { stripeFullyRefunded: true, amountRefundedCents: 5129 },
+    });
+
+    const partial = await post(app, chargeRefundedEvent(false));
+    expect(partial.statusCode).toBe(200);
+    expect(resolveEarlyFraudWarningMock).toHaveBeenCalledTimes(2);
+    expect(resolveEarlyFraudWarningMock.mock.calls[1]?.[1]).toMatchObject({
+      refund: { stripeFullyRefunded: false, amountRefundedCents: 4933 },
+    });
+
+    const nothing = await post(app, chargeRefundedEvent(false, 0, "evt_charge_refunded_zero"));
+    expect(nothing.statusCode).toBe(200);
+    expect(resolveEarlyFraudWarningMock).toHaveBeenCalledTimes(2);
+    await app.close();
+  });
+
+  it("a platform refund (Stripe: refunded=false, fee withheld) with the local order REFUNDED resolves the warning", async () => {
+    // Observed live: $51.29 charge, platform refunded $49.33 (processing fee
+    // withheld by design) → Stripe sends refunded:false, amount_refunded:4933.
+    const { app, markResolved, auditLog } = await makeRefundApp("REFUNDED");
+
+    const res = await post(app, chargeRefundedEvent(false, 4933));
+
+    expect(res.statusCode).toBe(200);
+    expect(markResolved).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "efw_1", resolution: "REFUNDED" }),
+    );
+    expect(auditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "early_fraud_warning.resolved",
+        data: expect.objectContaining({
+          resolution: "REFUNDED",
+          refund: { stripeFullyRefunded: false, amountRefundedCents: 4933 },
+        }),
+      }),
+    );
+    await app.close();
+  });
+
+  it("a platform PARTIAL refund (local order PART_REFUNDED) leaves the warning open", async () => {
+    const { app, markResolved, auditLog } = await makeRefundApp("PART_REFUNDED");
+
+    const res = await post(app, chargeRefundedEvent(false, 1000));
+
+    expect(res.statusCode).toBe(200);
+    expect(resolveEarlyFraudWarningMock).toHaveBeenCalledTimes(1);
+    expect(markResolved).not.toHaveBeenCalled();
+    expect(auditLog).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("a replay refused by a still-held idempotency claim explains the marker instead of a bare code", async () => {
+    openDisputeMock.mockImplementationOnce(async () => {
+      throw { code: "IDEMPOTENCY_LOCK_IN_PROGRESS", message: "IDEMPOTENCY_LOCK_IN_PROGRESS" };
+    });
+    const app = await makeWebhookApp();
+    const replay = (app as any).deps.trpc.replayStripeEvent as (
+      raw: string,
+    ) => Promise<{ ok: boolean; error?: string }>;
+
+    const result = await replay(
+      JSON.stringify({
+        id: "evt_replay_locked",
+        type: "charge.dispute.created",
+        created: 1_779_000_000,
+        data: {
+          object: {
+            id: "dp_123",
+            amount: 5000,
+            currency: "usd",
+            reason: "fraudulent",
+            status: "needs_response",
+            charge: "ch_123",
+          },
+        },
+      }),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("IDEMPOTENCY_LOCK_IN_PROGRESS");
+    // Leads with the common case (an attempt in flight, 300 s claims) and
+    // names the deterministic-rejection marker only as the tail.
+    expect(result.error).toContain("in flight");
+    expect(result.error).toContain("300 s");
+    expect(result.error).toContain("15-minute marker");
+    expect(result.error).toContain("reproduce that rejection");
+    await app.close();
+  });
+
+  it("charge.dispute.funds_reinstated writes an audit row and a warn log, and touches no lifecycle use case", async () => {
+    const auditLog = vi.fn(async () => undefined);
+    const findByStripeDisputeId = vi.fn(async () => ({
+      id: "dispute_local_1",
+      orderId: "22222222-2222-4222-8222-222222222222",
+    }));
+    const app = await makeWebhookApp({
+      repos: { audit: { log: auditLog }, disputes: { findByStripeDisputeId } },
+    });
+    const routeLogWarn = (app as any).deps.logger.warn as ReturnType<typeof vi.fn>;
+    routeLogWarn.mockClear();
+
+    const res = await post(app, {
+      id: "evt_funds_reinstated",
+      type: "charge.dispute.funds_reinstated",
+      created: 1_779_000_000,
+      data: {
+        object: {
+          id: "dp_123",
+          amount: 5000,
+          currency: "usd",
+          reason: "fraudulent",
+          status: "won",
+          charge: "ch_123",
+          payment_intent: "pi_123",
+        },
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ received: true });
+    expect(findByStripeDisputeId).toHaveBeenCalledWith("dp_123");
+    expect(auditLog).toHaveBeenCalledTimes(1);
+    expect(auditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity: "dispute",
+        entityId: "dispute_local_1",
+        action: "dispute.funds_reinstated",
+        at: new Date(1_779_000_000 * 1000),
+        data: expect.objectContaining({
+          stripeEventId: "evt_funds_reinstated",
+          stripeDisputeId: "dp_123",
+          stripeChargeId: "ch_123",
+          orderId: "22222222-2222-4222-8222-222222222222",
+          amountCents: 5000,
+          stripeStatus: "won",
+        }),
+      }),
+    );
+    expect(routeLogWarn).toHaveBeenCalledWith(
+      "stripe_webhook_dispute_funds_reinstated",
+      expect.objectContaining({ stripeDisputeId: "dp_123", disputeId: "dispute_local_1" }),
+    );
+    // Informational only: no ledger-bearing lifecycle call.
+    expect(openDisputeMock).not.toHaveBeenCalled();
+    expect(refreshDisputeMock).not.toHaveBeenCalled();
+    expect(recordFundsWithdrawnMock).not.toHaveBeenCalled();
+    expect(closeDisputeMock).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("charge.dispute.funds_reinstated with a failing audit write reaches the DLQ, not a silent 200", async () => {
+    const { redis, pushed } = makeFakeRedis();
+    const app = await makeWebhookApp({
+      redis,
+      repos: {
+        audit: {
+          log: vi.fn(async () => {
+            throw new Error("audit down");
+          }),
+        },
+        disputes: { findByStripeDisputeId: vi.fn(async () => null) },
+      },
+    });
+    const res = await post(app, {
+      id: "evt_funds_reinstated_fail",
+      type: "charge.dispute.funds_reinstated",
+      created: 1_779_000_000,
+      data: {
+        object: {
+          id: "dp_123",
+          amount: 5000,
+          currency: "usd",
+          status: "won",
+          charge: "ch_123",
+        },
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(pushed).toHaveLength(1);
+    expect(pushed[0]?.error).toContain("[charge.dispute.funds_reinstated:audit]");
+    expect(pushed[0]?.error).toContain("audit down");
+    await app.close();
+  });
+});
+
+// ── payment_intent.payment_failed: cancel + release EVERY hold ─────────────
+describe("stripe webhook payment_intent.payment_failed", () => {
+  const ORDER_ID = "44444444-4444-4444-8444-444444444444";
+  const PI_ID = "pi_failed_1";
+
+  const failedEvent = (overrides: Record<string, unknown> = {}) => ({
+    id: "evt_pi_failed",
+    type: "payment_intent.payment_failed",
+    created: 1_779_000_000,
+    data: {
+      object: {
+        id: PI_ID,
+        object: "payment_intent",
+        status: "requires_payment_method",
+        metadata: { orderId: ORDER_ID },
+        last_payment_error: { message: "Your card was declined." },
+        ...overrides,
+      },
+    },
+  });
+
+  /**
+   * One repo surface shared by the root `repos` and the `tx` handle, with a
+   * call log so the ORDER of Stripe-vs-DB writes can be asserted: the PI has
+   * to be proven dead BEFORE the order is cancelled, or a still-confirmable
+   * PI finalises into a CANCELLED order (charge, no ticket).
+   */
+  function makeFailedPaymentApp(opts: {
+    status: "PENDING" | "PROCESSING" | "CANCELLED" | "SUCCEEDED";
+    /** What `cancelPaymentIntent` answers. Default: cancelled cleanly. */
+    cancelResult?: { canceled: boolean };
+    /** What `retrievePaymentIntent` reports when the cancel was a no-op. */
+    retrievedStatus?: string;
+    /** Whether the CAS cancel of the order wins. Default true. */
+    casWins?: boolean;
+    /** Make `cancelPaymentIntent` reject (Stripe unreachable). */
+    cancelRejects?: boolean;
+    /** The PI the order row is linked to. Default: the event's PI. */
+    linkedPaymentIntentId?: string;
+    /** A RESALE order holding this listing until `holdExpiresAt`. */
+    resale?: { listingId: string; holdExpiresAt: string };
+    /** `credits.releaseForOrder` throws inside the tx. */
+    releaseCreditsRejects?: boolean;
+    /** Wire a mailer (the bank-payment-failed email needs one). Default true. */
+    withMailer?: boolean;
+  }) {
+    sendBankPaymentFailedEmailMock.mockClear();
+    const calls: string[] = [];
+    bankEmailCallLog = calls;
+    const orders = {
+      getById: vi.fn(async () => ({
+        id: ORDER_ID,
+        status: opts.status,
+        stripePaymentIntentId: opts.linkedPaymentIntentId ?? PI_ID,
+        source: opts.resale ? "RESALE" : "PRIMARY",
+        buyerHumanId: "buyer-1",
+        items: opts.resale
+          ? [
+              {
+                id: "item-1",
+                resaleListingId: opts.resale.listingId,
+                meta: {
+                  holdExpiresAt: opts.resale.holdExpiresAt,
+                  resaleListingId: opts.resale.listingId,
+                },
+              },
+            ]
+          : [],
+      })),
+      findByPaymentIntent: vi.fn(async () => ({
+        id: ORDER_ID,
+        status: opts.status,
+      })),
+      cancelPendingOrder: vi.fn(async () => {
+        calls.push("cancelPendingOrder");
+        return opts.casWins ?? true;
+      }),
+      cancelProcessingOrder: vi.fn(async () => {
+        calls.push("cancelProcessingOrder");
+        return opts.casWins ?? true;
+      }),
+    };
+    const promos = {
+      releaseHoldsForOrder: vi.fn(async () => {
+        calls.push("promos.releaseHoldsForOrder");
+      }),
+    };
+    const feeWaivers = {
+      release: vi.fn(async () => {
+        calls.push("feeWaivers.release");
+        return { releasedTickets: 0 };
+      }),
+    };
+    const credits = {
+      releaseForOrder: vi.fn(async () => {
+        calls.push("credits.releaseForOrder");
+        if (opts.releaseCreditsRejects) throw new Error("credits_release_failed");
+        return { releasedCents: 0, creditIds: [] };
+      }),
+    };
+    const resaleListings = {
+      releaseHold: vi.fn(async () => {
+        calls.push("resaleListings.releaseHold");
+        return { released: true, listingStatus: "ACTIVE" };
+      }),
+    };
+    const txRepos = { orders, promos, feeWaivers, credits, resaleListings };
+    const tx = vi.fn(async (fn: (t: unknown) => Promise<unknown>) => {
+      const out = await fn(txRepos);
+      // Only reached when `fn` resolved: a throw inside never "commits".
+      calls.push("tx:committed");
+      return out;
+    });
+    const payments = {
+      cancelPaymentIntent: vi.fn(async () => {
+        calls.push("cancelPaymentIntent");
+        if (opts.cancelRejects) throw new Error("stripe_unreachable");
+        return opts.cancelResult ?? { canceled: true };
+      }),
+      retrievePaymentIntent: vi.fn(async () => {
+        calls.push("retrievePaymentIntent");
+        return {
+          id: PI_ID,
+          status: opts.retrievedStatus ?? "canceled",
+          amountReceived: 0,
+          currency: "usd",
+          metadata: { orderId: ORDER_ID },
+        };
+      }),
+    };
+    const reportError = vi.fn();
+    const { redis, pushed } = makeFakeRedis();
+    return {
+      calls,
+      orders,
+      promos,
+      feeWaivers,
+      credits,
+      resaleListings,
+      tx,
+      payments,
+      reportError,
+      pushed,
+      app: makeWebhookApp({
+        orders,
+        repos: { promos, feeWaivers, credits, tx },
+        payments,
+        reportError,
+        redis,
+        ...((opts.withMailer ?? true) ? { mailer: { send: vi.fn() } } : {}),
+      }),
+    };
+  }
+
+  // ── Buyer email on a failed BANK payment (owner, 2026-10-14) ───────────
+  it.each([false, true])(
+    "(m1) PROCESSING cancelled here emails the buyer once (resale=%s)",
+    async (isResale) => {
+      const t = makeFailedPaymentApp({
+        status: "PROCESSING",
+        ...(isResale
+          ? {
+              resale: {
+                listingId: "listing-1",
+                holdExpiresAt: "2026-10-04T12:15:00.000Z",
+              },
+            }
+          : {}),
+      });
+      const app = await t.app;
+
+      const res = await postStripeEvent(app, failedEvent());
+      expect(res.statusCode).toBe(200);
+      expect(t.pushed).toHaveLength(0);
+
+      expect(sendBankPaymentFailedEmailMock).toHaveBeenCalledTimes(1);
+      const [deps, input] = sendBankPaymentFailedEmailMock.mock
+        .calls[0] as unknown as [Record<string, unknown>, Record<string, unknown>];
+      expect(input).toEqual({
+        orderId: ORDER_ID,
+        publicAppUrl: expect.any(String),
+      });
+      expect(deps.mailer).toBeDefined();
+      expect(deps.reportError).toBe(t.reportError);
+      // Sent only after the cancel committed.
+      expect(t.calls).toContain("cancelProcessingOrder");
+      expect(t.calls).toContain("tx:committed");
+      expect(t.calls.indexOf("sendBankPaymentFailedEmail")).toBeGreaterThan(
+        t.calls.indexOf("tx:committed"),
+      );
+
+      await app.close();
+    },
+    45_000,
+  );
+
+  it("(m1b) a throw inside the cancel tx sends no email and DLQs the event once", async () => {
+    const t = makeFailedPaymentApp({
+      status: "PROCESSING",
+      releaseCreditsRejects: true,
+    });
+    const app = await t.app;
+
+    const res = await postStripeEvent(app, failedEvent());
+    expect(res.statusCode).toBe(200);
+    expect(t.credits.releaseForOrder).toHaveBeenCalled();
+    expect(t.calls).not.toContain("tx:committed");
+    expect(sendBankPaymentFailedEmailMock).not.toHaveBeenCalled();
+    expect(t.pushed).toHaveLength(1);
+    expect(t.pushed[0]).toMatchObject({
+      eventType: "payment_intent.payment_failed",
+    });
+    expect(t.pushed[0]?.error).toContain("credits_release_failed");
+
+    await app.close();
+  }, 45_000);
+
+  it("(m2) a PENDING failure (a decline the buyer saw) sends no email", async () => {
+    const t = makeFailedPaymentApp({ status: "PENDING" });
+    const app = await t.app;
+
+    const res = await postStripeEvent(app, failedEvent());
+    expect(res.statusCode).toBe(200);
+    expect(t.orders.cancelPendingOrder).toHaveBeenCalled();
+    expect(sendBankPaymentFailedEmailMock).not.toHaveBeenCalled();
+
+    await app.close();
+  }, 45_000);
+
+  it("(m3) PROCESSING whose cancel CAS lost (a redelivery, or it finalised) sends no email", async () => {
+    const t = makeFailedPaymentApp({ status: "PROCESSING", casWins: false });
+    const app = await t.app;
+
+    const res = await postStripeEvent(app, failedEvent());
+    expect(res.statusCode).toBe(200);
+    expect(t.orders.cancelProcessingOrder).toHaveBeenCalled();
+    expect(sendBankPaymentFailedEmailMock).not.toHaveBeenCalled();
+
+    await app.close();
+  }, 45_000);
+
+  it("(m4) an already-CANCELLED order (redelivered event) sends no email", async () => {
+    const t = makeFailedPaymentApp({ status: "CANCELLED" });
+    const app = await t.app;
+
+    const res = await postStripeEvent(app, failedEvent());
+    expect(res.statusCode).toBe(200);
+    expect(sendBankPaymentFailedEmailMock).not.toHaveBeenCalled();
+
+    await app.close();
+  }, 45_000);
+
+  it("(m5) PROCESSING cancelled with no mailer: logs at error level, still 200, no DLQ", async () => {
+    const t = makeFailedPaymentApp({ status: "PROCESSING", withMailer: false });
+    const app = await t.app;
+    const error = vi.spyOn(app.log, "error");
+
+    const res = await postStripeEvent(app, failedEvent());
+    expect(res.statusCode).toBe(200);
+    expect(t.pushed).toHaveLength(0);
+    expect(t.orders.cancelProcessingOrder).toHaveBeenCalled();
+    expect(sendBankPaymentFailedEmailMock).not.toHaveBeenCalled();
+    expect(error).toHaveBeenCalledWith(
+      expect.objectContaining({ orderId: ORDER_ID }),
+      "stripe_webhook_bank_payment_failed_email_no_mailer",
+    );
+
+    await app.close();
+  }, 45_000);
+
+  it.each(["PENDING", "PROCESSING"] as const)(
+    "(G1) a %s RESALE order cancelled here gives its listing hold back, fenced, after the cancel, in the same tx",
+    async (status) => {
+      const holdExpiresAt = "2026-10-04T12:15:00.000Z";
+      const t = makeFailedPaymentApp({
+        status,
+        resale: { listingId: "listing-1", holdExpiresAt },
+      });
+      const app = await t.app;
+
+      const res = await postStripeEvent(app, failedEvent());
+      expect(res.statusCode).toBe(200);
+
+      expect(t.resaleListings.releaseHold).toHaveBeenCalledWith(
+        "listing-1",
+        { buyerHumanId: "buyer-1", heldUntil: new Date(holdExpiresAt) },
+        { now: expect.any(Date) },
+      );
+      expect(t.tx).toHaveBeenCalledTimes(1);
+      const cancelCall =
+        status === "PENDING" ? "cancelPendingOrder" : "cancelProcessingOrder";
+      expect(t.calls.indexOf(cancelCall)).toBeLessThan(
+        t.calls.indexOf("resaleListings.releaseHold"),
+      );
+
+      await app.close();
+    },
+    45_000,
+  );
+
+  it("(G1) a RESALE order whose cancel CAS loses keeps its listing hold", async () => {
+    const t = makeFailedPaymentApp({
+      status: "PENDING",
+      casWins: false,
+      resale: { listingId: "listing-1", holdExpiresAt: "2026-10-04T12:15:00.000Z" },
+    });
+    const app = await t.app;
+
+    const res = await postStripeEvent(app, failedEvent());
+    expect(res.statusCode).toBe(200);
+    expect(t.orders.cancelPendingOrder).toHaveBeenCalled();
+    expect(t.resaleListings.releaseHold).not.toHaveBeenCalled();
+
+    await app.close();
+  }, 45_000);
+
+  it("(a) PENDING + PI still confirmable: settles the PI FIRST, then cancels and releases promo, fee-waiver and credit holds in one tx", async () => {
+    const t = makeFailedPaymentApp({ status: "PENDING" });
+    const app = await t.app;
+
+    const res = await postStripeEvent(app, failedEvent());
+    expect(res.statusCode).toBe(200);
+    expect(t.pushed).toHaveLength(0);
+
+    expect(t.orders.cancelPendingOrder).toHaveBeenCalledWith(ORDER_ID, {
+      expectedPaymentIntentId: PI_ID,
+    });
+    expect(t.orders.cancelProcessingOrder).not.toHaveBeenCalled();
+    expect(t.promos.releaseHoldsForOrder).toHaveBeenCalledWith(ORDER_ID);
+    expect(t.feeWaivers.release).toHaveBeenCalledWith(ORDER_ID);
+    expect(t.credits.releaseForOrder).toHaveBeenCalledTimes(1);
+    expect(t.credits.releaseForOrder.mock.calls[0]![0]).toBe(ORDER_ID);
+    // The DB writes ran inside a transaction, not on the root repos.
+    expect(t.tx).toHaveBeenCalledTimes(1);
+
+    // Order of operations is the load-bearing part.
+    expect(t.calls.indexOf("cancelPaymentIntent")).toBeGreaterThanOrEqual(0);
+    expect(t.calls.indexOf("cancelPaymentIntent")).toBeLessThan(
+      t.calls.indexOf("cancelPendingOrder"),
+    );
+    expect(t.calls.indexOf("cancelPendingOrder")).toBeLessThan(
+      t.calls.indexOf("promos.releaseHoldsForOrder"),
+    );
+    expect(t.reportError).not.toHaveBeenCalled();
+
+    await app.close();
+  }, 45_000);
+
+  it("(b) PENDING but the PI actually SUCCEEDED: refuses — order untouched, nothing released, refusal reported", async () => {
+    const t = makeFailedPaymentApp({
+      status: "PENDING",
+      cancelResult: { canceled: false },
+      retrievedStatus: "succeeded",
+    });
+    const app = await t.app;
+
+    const res = await postStripeEvent(app, failedEvent());
+    expect(res.statusCode).toBe(200);
+    // A refusal is not a handler failure: finalize owns a succeeded PI.
+    expect(t.pushed).toHaveLength(0);
+
+    expect(t.payments.cancelPaymentIntent).toHaveBeenCalledTimes(1);
+    expect(t.payments.retrievePaymentIntent).toHaveBeenCalledTimes(1);
+    expect(t.orders.cancelPendingOrder).not.toHaveBeenCalled();
+    expect(t.orders.cancelProcessingOrder).not.toHaveBeenCalled();
+    expect(t.promos.releaseHoldsForOrder).not.toHaveBeenCalled();
+    expect(t.feeWaivers.release).not.toHaveBeenCalled();
+    expect(t.credits.releaseForOrder).not.toHaveBeenCalled();
+
+    // Reported ONCE, by the helper, tagged with this caller.
+    expect(t.reportError).toHaveBeenCalledTimes(1);
+    const [err, ctx] = t.reportError.mock.calls[0] as [Error, any];
+    expect(err.message).toBe("carried_over_cart_pi_terminal_not_canceled:succeeded");
+    expect(ctx.tags.caller).toBe("stripe-webhook:payment_failed");
+
+    await app.close();
+  }, 45_000);
+
+  it("(c) PROCESSING (ACH return): cancels via the processing CAS and releases the same three holds, in a tx", async () => {
+    const t = makeFailedPaymentApp({ status: "PROCESSING" });
+    const app = await t.app;
+
+    const res = await postStripeEvent(app, failedEvent());
+    expect(res.statusCode).toBe(200);
+    expect(t.pushed).toHaveLength(0);
+
+    expect(t.orders.cancelProcessingOrder).toHaveBeenCalledWith(ORDER_ID);
+    expect(t.orders.cancelPendingOrder).not.toHaveBeenCalled();
+    expect(t.promos.releaseHoldsForOrder).toHaveBeenCalledWith(ORDER_ID);
+    expect(t.feeWaivers.release).toHaveBeenCalledWith(ORDER_ID);
+    expect(t.credits.releaseForOrder.mock.calls[0]![0]).toBe(ORDER_ID);
+    expect(t.tx).toHaveBeenCalledTimes(1);
+    // An ACH return puts the PI back in `requires_payment_method`, where it
+    // is STILL confirmable with another bank account — so it is settled
+    // before the order is cancelled, exactly like the PENDING path.
+    expect(t.calls.indexOf("cancelPaymentIntent")).toBeGreaterThanOrEqual(0);
+    expect(t.calls.indexOf("cancelPaymentIntent")).toBeLessThan(
+      t.calls.indexOf("cancelProcessingOrder"),
+    );
+    expect(t.calls.indexOf("cancelProcessingOrder")).toBeLessThan(
+      t.calls.indexOf("promos.releaseHoldsForOrder"),
+    );
+    expect(t.reportError).not.toHaveBeenCalled();
+
+    await app.close();
+  }, 45_000);
+
+  it("(c2) PROCESSING but the PI actually SUCCEEDED: refuses — nothing cancelled, nothing released, one report, no DLQ", async () => {
+    const t = makeFailedPaymentApp({
+      status: "PROCESSING",
+      cancelResult: { canceled: false },
+      retrievedStatus: "succeeded",
+    });
+    const app = await t.app;
+
+    const res = await postStripeEvent(app, failedEvent());
+    expect(res.statusCode).toBe(200);
+    // Finalize owns a succeeded PI; a stale failed event is not a failure.
+    expect(t.pushed).toHaveLength(0);
+
+    expect(t.orders.cancelProcessingOrder).not.toHaveBeenCalled();
+    expect(t.orders.cancelPendingOrder).not.toHaveBeenCalled();
+    expect(t.promos.releaseHoldsForOrder).not.toHaveBeenCalled();
+    expect(t.feeWaivers.release).not.toHaveBeenCalled();
+    expect(t.credits.releaseForOrder).not.toHaveBeenCalled();
+    expect(t.tx).not.toHaveBeenCalled();
+    expect(t.reportError).toHaveBeenCalledTimes(1);
+    const [, ctx] = t.reportError.mock.calls[0] as [Error, any];
+    expect(ctx.tags.caller).toBe("stripe-webhook:payment_failed");
+
+    await app.close();
+  }, 45_000);
+
+  it("(c4) PROCESSING and the PI is itself `processing` (buyer mid-retry): refuses — nothing cancelled, no DLQ, one report", async () => {
+    const t = makeFailedPaymentApp({
+      status: "PROCESSING",
+      cancelResult: { canceled: false },
+      retrievedStatus: "processing",
+    });
+    const app = await t.app;
+
+    const res = await postStripeEvent(app, failedEvent());
+    expect(res.statusCode).toBe(200);
+    // Not ours to act on: Stripe will send another payment_failed or a
+    // succeeded, and either one settles it. Not a failure, so no DLQ.
+    expect(t.pushed).toHaveLength(0);
+
+    expect(t.orders.cancelProcessingOrder).not.toHaveBeenCalled();
+    expect(t.orders.cancelPendingOrder).not.toHaveBeenCalled();
+    expect(t.promos.releaseHoldsForOrder).not.toHaveBeenCalled();
+    expect(t.feeWaivers.release).not.toHaveBeenCalled();
+    expect(t.credits.releaseForOrder).not.toHaveBeenCalled();
+    expect(t.tx).not.toHaveBeenCalled();
+    expect(t.reportError).toHaveBeenCalledTimes(1);
+    const [err, ctx] = t.reportError.mock.calls[0] as [Error, any];
+    expect(err.message).toBe(
+      "carried_over_cart_pi_terminal_not_canceled:processing",
+    );
+    expect(ctx.tags.caller).toBe("stripe-webhook:payment_failed");
+
+    await app.close();
+  }, 45_000);
+
+  it("(c3) PROCESSING and Stripe is unreachable: NOT cancelled, and the event lands in the DLQ — no reaper ever revisits a PROCESSING order", async () => {
+    const t = makeFailedPaymentApp({ status: "PROCESSING", cancelRejects: true });
+    const app = await t.app;
+
+    const res = await postStripeEvent(app, failedEvent());
+    // Still 200 to Stripe (the sink owns retries via the DLQ), but preserved.
+    expect(res.statusCode).toBe(200);
+    expect(t.pushed).toHaveLength(1);
+    // The sink prefixes the DLQ row with `[stage]`. Pin the SPECIFIC stage:
+    // the handler's inner catch must rethrow a WebhookStageError untouched,
+    // not re-wrap it under the generic `:apply` stage.
+    expect(t.pushed[0]!.error).toContain(
+      "[payment_intent.payment_failed:settle_pi]",
+    );
+    expect(t.pushed[0]!.error).not.toContain(
+      "[payment_intent.payment_failed:apply]",
+    );
+
+    expect(t.orders.cancelProcessingOrder).not.toHaveBeenCalled();
+    expect(t.orders.cancelPendingOrder).not.toHaveBeenCalled();
+    expect(t.promos.releaseHoldsForOrder).not.toHaveBeenCalled();
+    expect(t.tx).not.toHaveBeenCalled();
+
+    await app.close();
+  }, 45_000);
+
+  it("(d) already CANCELLED: a no-op — no Stripe call, no cancel, no release", async () => {
+    const t = makeFailedPaymentApp({ status: "CANCELLED" });
+    const app = await t.app;
+
+    const res = await postStripeEvent(app, failedEvent());
+    expect(res.statusCode).toBe(200);
+    expect(t.pushed).toHaveLength(0);
+
+    expect(t.calls).toEqual([]);
+    expect(t.tx).not.toHaveBeenCalled();
+    expect(t.reportError).not.toHaveBeenCalled();
+
+    await app.close();
+  }, 45_000);
+
+  it("(e) PENDING but the CAS loses (finalised between settle and cancel): releases nothing", async () => {
+    const t = makeFailedPaymentApp({ status: "PENDING", casWins: false });
+    const app = await t.app;
+    const info = vi.spyOn(app.log, "info");
+
+    const res = await postStripeEvent(app, failedEvent());
+    expect(res.statusCode).toBe(200);
+    expect(t.pushed).toHaveLength(0);
+
+    expect(t.orders.cancelPendingOrder).toHaveBeenCalledTimes(1);
+    expect(t.promos.releaseHoldsForOrder).not.toHaveBeenCalled();
+    expect(t.feeWaivers.release).not.toHaveBeenCalled();
+    expect(t.credits.releaseForOrder).not.toHaveBeenCalled();
+    // The lost CAS is visible in the logs, not silent.
+    expect(info).toHaveBeenCalledWith(
+      expect.objectContaining({ orderId: ORDER_ID, from: "PENDING" }),
+      "stripe_webhook_payment_failed_cancel_cas_lost",
+    );
+
+    await app.close();
+  }, 45_000);
+
+  it("(f) PENDING and Stripe is unreachable: leaves the order to the cart reaper — 200, no DLQ, no cancel, one report", async () => {
+    const t = makeFailedPaymentApp({ status: "PENDING", cancelRejects: true });
+    const app = await t.app;
+
+    const res = await postStripeEvent(app, failedEvent());
+    expect(res.statusCode).toBe(200);
+    // A PENDING order with its hold intact is exactly what the expired-cart
+    // reaper reads, so nothing is lost by answering 200 here.
+    expect(t.pushed).toHaveLength(0);
+
+    expect(t.tx).not.toHaveBeenCalled();
+    expect(t.orders.cancelPendingOrder).not.toHaveBeenCalled();
+    expect(t.promos.releaseHoldsForOrder).not.toHaveBeenCalled();
+    expect(t.reportError).toHaveBeenCalledTimes(1);
+    const [err, ctx] = t.reportError.mock.calls[0] as [Error, any];
+    expect(err.message).toBe("stripe_unreachable");
+    expect(ctx.tags.caller).toBe("stripe-webhook:payment_failed");
+
+    await app.close();
+  }, 45_000);
+
+  it("(g) the order is linked to a DIFFERENT PI than the event's: logs the anomaly and settles the LINKED one", async () => {
+    const t = makeFailedPaymentApp({
+      status: "PENDING",
+      linkedPaymentIntentId: "pi_linked_other",
+    });
+    const app = await t.app;
+
+    const res = await postStripeEvent(app, failedEvent());
+    expect(res.statusCode).toBe(200);
+
+    expect(t.payments.cancelPaymentIntent).toHaveBeenCalledWith({
+      paymentIntentId: "pi_linked_other",
+    });
+    expect(t.orders.cancelPendingOrder).toHaveBeenCalledWith(ORDER_ID, {
+      expectedPaymentIntentId: "pi_linked_other",
+    });
+    expect((app as any).deps.logger.error).toHaveBeenCalledWith(
+      "stripe_webhook_payment_failed_pi_mismatch",
+      expect.objectContaining({
+        orderId: ORDER_ID,
+        linkedPaymentIntentId: "pi_linked_other",
+        eventPaymentIntentId: PI_ID,
+      }),
+    );
+
+    await app.close();
+  }, 45_000);
+});

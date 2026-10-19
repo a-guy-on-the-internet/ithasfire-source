@@ -1,0 +1,204 @@
+# yaml-language-server: $schema=../../../schema.yaml
+kind: flow
+title: Unified Checkout Flow
+status: draft
+area: ui/consumer
+created: 2026-03-11
+
+# ─────────────────────────────────────────────────────────────────────
+# Problem
+# ─────────────────────────────────────────────────────────────────────
+problem: |
+  The web-app checkout (apps/web/src/app/events/checkout/) and the embed
+  checkout (apps/web/src/app/embed/[embedId]/page.tsx) implement the same
+  buyer journey with completely different code.
+
+  Embed:  2,518 lines in one file. Screen-based state machine
+          (grid → eventDetail → seatPicker → checkout → confirmation) with
+          CSS slide/fade transitions (th-embed-slide-forward/back). Light
+          theme. Dedicated EmbedStepper, EmbedPaymentForm, EmbedMobileCTABar,
+          ConfirmationScreen. Guest-only (no auth).
+
+  Web:    ~3,300 lines across 7 files. Phase-based state machine in
+          useCheckoutState (selecting → holding → held → creating → paying →
+          confirming → confirmed). slideDown reveal animation. Dark theme.
+          Auth-gated. Uses CheckoutContactForm, StripePaymentCard,
+          OrderSummary, MobileCTABar, CheckoutSteps, CheckoutInfoBar.
+
+  Consequences:
+    - Every behavioral change (fee transparency, countdown timer, seat
+      picker UX, payment method ordering, redirect-return handling) has to
+      be applied in two places.
+    - The embed's nicer sliding transitions and 4-step stepper don't exist
+      on the website; the website's proper hold-timer, auth pre-fill,
+      billing address, and tax estimation don't exist in the embed.
+    - Bug surface area is doubled.
+
+# ─────────────────────────────────────────────────────────────────────
+# Goal
+# ─────────────────────────────────────────────────────────────────────
+goal: |
+  Extract a single, shared checkout flow component that both the web-app
+  route and the embed route can mount. Behavioral differences (auth vs
+  guest, dark vs light, route-based vs screen-based navigation) are
+  expressed through a props/context API, not code duplication.
+
+  The end result should give the web-app the same smooth sliding
+  transitions the embed already has, while the embed gains the web-app's
+  hold-timer, billing, tax, and fee-breakdown capabilities.
+
+# ─────────────────────────────────────────────────────────────────────
+# Design principles
+# ─────────────────────────────────────────────────────────────────────
+principles:
+  - name: One state machine
+    detail: |
+      Merge the two state machines into a single useCheckoutFlow hook that
+      covers: tickets → hold → info → payment → confirmed.  The hold step
+      is optional (embed can skip it or auto-hold on "Continue").
+  - name: Theme-agnostic
+    detail: |
+      All shared components accept color/style tokens through props or
+      CSS custom properties so the same markup works in the dark web-app
+      shell and the light embed iframe.
+  - name: Auth-optional
+    detail: |
+      The flow accepts an `authMode` prop: "required" (web), "guest"
+      (embed), or "optional" (future). Guest mode shows name+email inputs
+      instead of the sign-in gate + profile pre-fill.
+  - name: Progressive disclosure
+    detail: |
+      Steps slide in with the same forward/back animations the embed
+      uses. The 4-step stepper (Tickets → Details → Payment → Confirmed)
+      replaces the web-app's 2-step bar.
+  - name: Additive migration
+    detail: |
+      Build new components alongside existing ones. Swap one surface at a
+      time (web first, embed second). Never break the live embed.
+
+# ─────────────────────────────────────────────────────────────────────
+# Shared component inventory
+# ─────────────────────────────────────────────────────────────────────
+shared_components:
+  - name: useCheckoutFlow
+    location: apps/web/src/app/events/checkout/_components/useCheckoutFlow.ts
+    responsibility: |
+      Single state machine covering the full journey. Exposes current
+      step, transition helpers (next/back), cart state, hold timer,
+      order creation, Stripe payment, and confirmation.
+    props:
+      - authMode: '"required" | "guest"'
+      - eventId: string
+      - ticketTypes: TicketTypeSummary[]
+      - placeLayout: PlaceLayout | null
+      - embedId?: string  # present only in embed context
+
+  - name: CheckoutStepper
+    location: apps/web/src/app/events/checkout/_components/CheckoutStepper.tsx
+    responsibility: |
+      Replaces both EmbedStepper and CheckoutSteps. 4-step visual
+      indicator. Accepts step definitions + active/completed state.
+      Theme tokens via CSS vars.
+
+  - name: CheckoutSlideContainer
+    location: apps/web/src/app/events/checkout/_components/CheckoutSlideContainer.tsx
+    responsibility: |
+      Wraps step content with forward/back CSS slide animations.
+      Same cubic-bezier curve and timing the embed uses today.
+
+  - name: OrderSummaryCard
+    location: apps/web/src/app/events/checkout/_components/OrderSummaryCard.tsx
+    responsibility: |
+      Unified order summary replacing both the web OrderSummary and the
+      embed's inline summary cards. Shows line items, fees, tax, countdown.
+      Theme-aware.
+
+  - name: PaymentStep
+    location: apps/web/src/app/events/checkout/_components/PaymentStep.tsx
+    responsibility: |
+      Unified StripePaymentCard + EmbedPaymentForm. Handles Elements
+      mount, PaymentElement, ExpressCheckoutElement, submit, redirect
+      return, error display.
+
+  - name: ContactStep
+    location: apps/web/src/app/events/checkout/_components/ContactStep.tsx
+    responsibility: |
+      Renders either the auth-gated CheckoutContactForm (web) or the
+      guest name+email fields (embed) based on authMode.
+
+# ─────────────────────────────────────────────────────────────────────
+# Migration plan
+# ─────────────────────────────────────────────────────────────────────
+migration:
+  - phase: 1 — Extract shared hook
+    tasks:
+      - Build useCheckoutFlow alongside useCheckoutState
+      - Port state machine logic, merging the best of both
+      - Add unit tests for all state transitions
+  - phase: 2 — Shared presentation components
+    tasks:
+      - Build CheckoutStepper, CheckoutSlideContainer, OrderSummaryCard
+      - Add CSS slide animation keyframes to globals.css (reuse embed's)
+      - Theme tokens via CSS custom properties
+  - phase: 3 — Web-app adoption
+    tasks:
+      - Replace Checkout.tsx internals with useCheckoutFlow + shared components
+      - Verify all existing E2E tests pass (fullstack-auth-sync, checkout pricing)
+      - Add sliding transitions to web-app checkout
+  - phase: 4 — Embed adoption
+    tasks:
+      - Replace embed's CheckoutScreen internals with shared components
+      - Keep embed page.tsx as the screen router but delegate to shared flow
+      - Verify embed Turnstile + guest flow still works
+  - phase: 5 — Cleanup
+    tasks:
+      - Remove old useCheckoutState, old embed-only components
+      - Remove duplicated CSS (embed gets shared keyframes)
+      - Update docs/screens.md
+
+# ─────────────────────────────────────────────────────────────────────
+# What the web-app gains from this
+# ─────────────────────────────────────────────────────────────────────
+web_improvements:
+  - 4-step stepper (Tickets → Details → Payment → Confirmed) instead of 2-step
+  - Smooth forward/back slide transitions between steps
+  - Staggered fade-in for ticket type list items
+  - Confirmation screen with pop animation (matching embed)
+  - Express checkout (Apple Pay / Google Pay) button above card form
+
+# ─────────────────────────────────────────────────────────────────────
+# What the embed gains from this
+# ─────────────────────────────────────────────────────────────────────
+embed_improvements:
+  - Hold timer with countdown badge
+  - Billing address collection + tax estimation
+  - Detailed fee breakdown (platform + processor + tax) in sidebar
+  - Processing method rates transparency
+  - Seat label display in order summary
+
+# ─────────────────────────────────────────────────────────────────────
+# Risks and mitigations
+# ─────────────────────────────────────────────────────────────────────
+risks:
+  - risk: Embed is live on third-party sites — breaking it is catastrophic
+    mitigation: |
+      Build shared components alongside existing code. Swap embed last.
+      Feature-flag the new embed checkout behind an embed config option
+      so rollout is gradual.
+  - risk: Theme mismatch — web is dark, embed is light
+    mitigation: |
+      Use CSS custom properties (--checkout-bg, --checkout-fg, etc.)
+      set at the mount boundary. No hardcoded colors in shared code.
+  - risk: Auth differences add complexity to the shared hook
+    mitigation: |
+      authMode prop gates auth-specific branches. Guest mode skips
+      hold-phase auth check and uses inline name/email instead of
+      profile pre-fill.
+
+# ─────────────────────────────────────────────────────────────────────
+# Out of scope (for now)
+# ─────────────────────────────────────────────────────────────────────
+out_of_scope:
+  - Mobile app checkout (Expo) — different platform, different constraints
+  - Org event grid in embed — stays embed-only
+  - Embed layout/routing (screen-based) — stays embed-specific

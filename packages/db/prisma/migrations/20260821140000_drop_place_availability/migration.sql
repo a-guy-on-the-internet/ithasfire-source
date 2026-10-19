@@ -1,0 +1,42 @@
+-- Drop the Place-level `PlaceAvailability` model (venue hierarchy FR-007).
+--
+-- Superseded by the calendar-scoped `CalendarAvailability` model
+-- (packages/db/prisma/venue.prisma) per
+-- docs/specs/2026-08-18/venue-hierarchy-and-holds.spec.yaml. A
+-- `CalendarAvailability` row with `calendarId` NULL is place-wide — it applies
+-- to every calendar of the place — which is the EXACT semantics the old
+-- Place-level rows carried, so the replacement is one-for-one and not an
+-- approximation.
+--
+-- Dead before it was dropped, in this order:
+--   * 2026-08-20 — the write path went: the editor use cases, the tRPC
+--     create/update/delete/list/listForOwner procedures, the port and adapter
+--     writers, and the PlaceHoursEditor / PlaceBlackoutEditor UI.
+--   * later     — the LAST READER went: `getPlaceBookingAvailability` (the
+--     public booking date picker) was re-pointed at `CalendarAvailability`.
+--   * this change — the model, the `Place.availability` back-relation, the
+--     `PlaceAvailabilityRepo` port, its Prisma adapter and its DTOs.
+-- At the time of writing nothing in the repo reads or writes this table except
+-- the backfill named below, which reads it over raw SQL.
+--
+-- ⚠ SEQUENCING — RUN THE BACKFILL FIRST ⚠
+-- `apps/api/src/scripts/backfill-venue-defaults.ts` (phase 2) copies legacy
+-- rows into `CalendarAvailability` with `calendarId: null`. In ANY environment
+-- that still holds legacy rows it MUST run BEFORE this migration, or those
+-- venues' hours are destroyed here — and destroyed SILENTLY from the user's
+-- side, because a venue with no availability rules does not error: the picker
+-- renders every date as closed. Verify with
+--   SELECT count(*) FROM "PlaceAvailability";
+-- and, if non-zero, run
+--   DATABASE_URL=... pnpm -F api backfill:venue-defaults
+-- (a --dry-run pass first) before deploying this. Once this migration has run,
+-- the backfill's phase 2 detects the missing table and no-ops cleanly, so the
+-- deploy step stays green forever after.
+--
+-- No data is preserved by this migration itself. The DROP cascades nothing
+-- else: `PlaceAvailability` is a leaf — it holds one FK OUT to "Place" and
+-- nothing references it. Indexes and the FK constraint are dropped implicitly
+-- with the table.
+
+-- DropTable
+DROP TABLE "PlaceAvailability";

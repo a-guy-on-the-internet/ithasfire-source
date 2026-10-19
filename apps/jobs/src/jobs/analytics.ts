@@ -56,10 +56,10 @@ export const eventDailyStats = defineScheduledTask({
         error: error instanceof Error ? error.message : String(error),
       });
 
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
+      // THROW, never return `{ success: false }`: app.ts answers 200 for any
+      // returned value, so only a throw makes the run fail and show. No
+      // `ctx.reportError` here: the run route's catch reports what it catches.
+      throw error;
     }
   },
 });
@@ -106,10 +106,9 @@ export const resalePriceSnapshots = defineScheduledTask({
         error: error instanceof Error ? error.message : String(error),
       });
 
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
+      // THROW, never return `{ success: false }`: same reason as
+      // `analytics.event-daily-stats` above.
+      throw error;
     }
   },
 });

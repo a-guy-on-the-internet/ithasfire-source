@@ -1,0 +1,20 @@
+# Minimal settings for `infra/envs/dev`.
+#
+# Copy to `infra/envs/dev/dev.tfvars` (gitignored or keep local-only) and fill in.
+# Terraform providers/secret vars should come from `infra/.env.local` via env vars
+# (see `infra/.env.local.template` + optional `infra/env.local`).
+
+project_id = "YOUR_GCP_PROJECT_ID"
+region     = "us-central1"
+domain     = "example.com"
+
+# Enable Cloud Run services by setting image refs.
+# Use immutable digests for stability.
+api_image  = "us-central1-docker.pkg.dev/YOUR_GCP_PROJECT_ID/services/api@sha256:REPLACE_ME"
+web_image  = "us-central1-docker.pkg.dev/YOUR_GCP_PROJECT_ID/services/web@sha256:REPLACE_ME"
+jobs_image = "us-central1-docker.pkg.dev/YOUR_GCP_PROJECT_ID/services/jobs@sha256:REPLACE_ME"
+
+# Optional: manage DNS in Cloudflare (requires TF_VAR_cloudflare_* in infra/.env.local)
+# enable_cloudflare_dns = true
+# cloudflare_zone_id    = "..."
+# cloudflare_account_id = "..."

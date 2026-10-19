@@ -1,0 +1,264 @@
+# attendee-prompt-delivery-hygiene.spec.yaml
+#
+# Make the attendee post-event review prompt (attendee-reviews FR-006/FR-008)
+# humane at scale: weekly EMAIL digest instead of one email per show, a
+# working unsubscribe (compliance + kindness), and auto-suppression after 3
+# ignored digests. In-app stays per-show and immediate — only the EMAIL
+# channel gets the hygiene treatment.
+#
+# Related:
+#   - specs/2026-07-14/completed/attendee-reviews.spec.yaml (FR-006 prompt this refines;
+#     FR-008 calm-honest solicitation this extends)
+#   - the shared post-event prompt outbox lives at
+#     packages/core/src/use-cases/post-event-prompts/ (dispatch + enqueue)
+#   - REUSE targets (from a comms infra audit):
+#       announcements HMAC unsubscribe + List-Unsubscribe header + /unsubscribe
+#         route: unsubscribe-from-audience.ts, send-announcement.ts:562-620,
+#         apps/web/src/app/unsubscribe/
+#       NotificationDigestSubscription / NotificationDigestLog tables +
+#         NotificationDigestsRepo + NotificationDigestType.ATTENDEE_FEEDBACK
+#       ui-email EmailFooter (renders an unsubscribeUrl) + Shell
+
+version: "1.0"
+updated: "2026-07-20"
+status: shipped  # 2026-10-08 docs consolidation; was: draft
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+summary:
+  problem: >
+    The attendee review prompt emails one message per attended show. A frequent
+    attendee (many shows/month) gets one email per show — individually polite,
+    collectively a drip. The email also has NO unsubscribe link (a CAN-SPAM gap
+    for a marketing-category email) and no fatigue backoff, so a chronic
+    non-reviewer keeps getting asked forever.
+  solution: >
+    Split channels. IN-APP stays per-show and immediate (cheap, non-intrusive).
+    EMAIL moves to a WEEKLY DIGEST: one email listing all of a person's
+    un-reviewed, still-in-window shows with per-show links. Every digest email
+    carries a one-click unsubscribe (HMAC link + List-Unsubscribe header) that
+    mutes ONLY review-prompt email — not all marketing. After 3 consecutive
+    digests sent with no review, the email auto-suppresses (in-app persists);
+    any review re-engages it.
+  users:
+    - Attendees with scanned tickets (fewer, better-timed emails; easy opt-out)
+    - (No organizer-facing change)
+  surfaces:
+    - jobs (weekly digest cron; per-show email removed from immediate dispatch)
+    - web (unsubscribe route gains a review-prompts kind)
+    - email
+
+# ── Requirements ─────────────────────────────────────────────────────────────
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        Channel split. The attendee branch of dispatch-post-event-prompts
+        sends the review prompt IN-APP ONLY (drop the email channel there).
+        The EMAIL is delivered exclusively by the new weekly digest (FR-002).
+        Performer prompts are unaffected (they stay in-app + email, single
+        gig, not digested).
+    - id: FR-002
+      description: >
+        Weekly digest sender (new use case + weekly job): for each human with
+        >=1 un-reviewed, in-window attended show (event ended, within
+        ATTENDEE_REVIEW_WINDOW_DAYS, scanned ticket, no AttendeeReview yet),
+        send ONE email listing those shows (title, venue, date, per-show
+        review link). One show that week = a one-item digest. Idempotent per
+        (human, week) via NotificationDigestLog; a re-run sends nothing new.
+    - id: FR-003
+      description: >
+        Control record = NotificationDigestSubscription(digestType
+        ATTENDEE_FEEDBACK), keyed per human. Add two columns:
+        consecutiveIgnored (Int, default 0) and lastDigestSentAt (DateTime?).
+        subscribed=false is the HARD opt-out (user chose); consecutiveIgnored
+        is the SOFT auto-suppression counter. Default (no row) = subscribed.
+    - id: FR-004
+      description: >
+        3-strike auto-suppression. Per human, per weekly run with pending
+        shows: (a) if any AttendeeReview was submitted since lastDigestSentAt,
+        reset consecutiveIgnored=0 (re-engaged); (b) if subscribed=false OR
+        consecutiveIgnored >= 3, DO NOT send the email (in-app already
+        delivered per-show); (c) else send the digest, set lastDigestSentAt,
+        increment consecutiveIgnored. Net effect: at most 3 unanswered digests,
+        then silence until they review something.
+    - id: FR-005
+      description: >
+        Unsubscribe link in EVERY digest email: an HMAC-signed URL
+        (reuse the announcements token helper shape — sha256 over
+        "reviewprompts:<humanId>:<email>", no expiry, constant-time verify)
+        to /unsubscribe?kind=review-prompts&humanId=..&email=..&token=..,
+        PLUS List-Unsubscribe + List-Unsubscribe-Post: One-Click headers
+        (thread a headers field through the mailer — notify's email channel
+        doesn't today; the digest may send via the mailer port directly like
+        send-announcement rather than generic notify). A visible footer link
+        (reuse ui-email EmailFooter / the plain-text footer pattern).
+    - id: FR-006
+      description: >
+        Unsubscribe use case + web wiring: verify the HMAC, set the human's
+        ATTENDEE_FEEDBACK subscription subscribed=false, unsubscribedAt=now,
+        reason="user_unsubscribed". Add a review-prompts case to the existing
+        /unsubscribe route + a tRPC procedure (mirror announcements.unsubscribe).
+        One-click, no login. Re-subscribe is possible via notification settings
+        (a toggle; may be a follow-up if settings UI is out of scope).
+    - id: FR-007
+      description: >
+        Copy stays calm-honest (FR-008 of attendee-reviews): the digest states
+        it's weekly, that scores publish only in aggregate and comments go to
+        the organizer unattributed, and that they can unsubscribe. No
+        reminders language beyond the weekly cadence; no incentives; no
+        negative-review interception.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Suppression + reset logic is pure/unit-tested: pin the counter across
+        a 4-week ignored sequence (send,send,send,skip) and the reset-on-review
+        path; assert in-app is never suppressed.
+    - id: NFR-002
+      description: >
+        HMAC secret via env (reuse the announcements unsubscribe secret or a
+        dedicated one — match the existing pattern); tokens verified
+        constant-time; the unsubscribe route is unauthenticated by design but
+        only ever flips the one review-prompt subscription (no other prefs).
+    - id: NFR-003
+      description: >
+        Digest send failures per-human isolate + reportError (ReporterPort);
+        NotificationDigestLog write is the idempotency guard so a mid-batch
+        crash doesn't double-send on retry.
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+architecture:
+  core:
+    use_cases:
+      - name: send-attendee-review-digests
+        description: >
+          Weekly: gather each eligible human's un-reviewed in-window shows,
+          apply subscription + 3-strike + reset logic (FR-004), send one
+          digest email (FR-002/005), log to NotificationDigestLog.
+        input: "now (clock), batch size"
+        output: "sent / suppressed / skipped counts"
+        idempotent: true
+        money: false
+      - name: unsubscribe-review-prompts
+        description: >
+          HMAC-verify → set ATTENDEE_FEEDBACK subscription subscribed=false.
+        input: humanId, email, token
+        output: ok
+        idempotent: true
+        money: false
+      - name: dispatch-post-event-prompts (modified)
+        description: >
+          Attendee branch: in-app only (email removed; digest owns it).
+        idempotent: true
+        money: false
+
+  ports:
+    new: []
+    existing:
+      - notification-digests repo (subscription + log) — extend with the counter
+      - mailer (List-Unsubscribe headers — already supports arbitrary headers)
+      - notify (in-app path), reporter, clock
+
+  adapters:
+    new: []
+    existing:
+      - prisma notification-digests (new columns + reads for the sweep)
+
+  transport:
+    trpc_procedures:
+      - "attendeeReviews.unsubscribePrompts (public, token-gated) OR extend the
+         announcements unsubscribe router with a review-prompts kind"
+    webhooks: []
+
+  ui:
+    pages:
+      - "apps/web/src/app/unsubscribe — add the review-prompts kind branch"
+    components:
+      - "digest email (ui-email template OR plain-text with footer) — reuse
+         EmailFooter's unsubscribeUrl"
+
+  jobs:
+    - "attendee-review-digests.send (weekly cron; pattern:
+       post-event-prompts jobs). Per-show attendee EMAIL send removed from
+       the daily dispatch (in-app stays)."
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+
+data:
+  new_models: []
+  modified_models:
+    - "NotificationDigestSubscription: + consecutiveIgnored Int @default(0),
+       + lastDigestSentAt DateTime?"
+  migrations_needed: true
+
+# ── Risks & Open Questions ───────────────────────────────────────────────────
+
+risks:
+  - risk: >
+      Delaying email to a weekly batch means a show reviewed via the in-app
+      card still appears in that week's digest if the digest is computed
+      before the review — a redundant nudge.
+    severity: LOW
+    mitigation: >
+      The digest recomputes un-reviewed shows at send time (FR-002), so an
+      already-reviewed show drops out. Only an in-flight same-minute race
+      could slip through; harmless.
+  - risk: >
+      Unsubscribe token in a URL is guessable if the secret leaks / is weak.
+    severity: MEDIUM
+    mitigation: >
+      Reuse the vetted announcements HMAC (sha256 + secret + constant-time);
+      the token only ever mutes review-prompt email for that one human — no
+      other pref, no data read. Same blast radius the announcements
+      unsubscribe already accepts.
+  - risk: >
+      "3 strikes" across weekly digests = ~3 weeks; a very sparse attendee
+      might get suppressed before really engaging.
+    severity: LOW
+    mitigation: >
+      Any single review resets to 0; suppression is soft (email only, in-app
+      persists) and self-heals. Tune the threshold constant if data warrants.
+
+open_questions:
+  - >
+    HMAC secret: reuse the announcements unsubscribe secret, or mint a
+    dedicated REVIEW_PROMPT_UNSUBSCRIBE_SECRET? Leaning reuse to avoid a new
+    env var + rotation surface — decide at implementation.
+  - >
+    Re-subscribe UI: does the notification-settings surface already expose
+    per-digest-type toggles, or is re-enabling a follow-up? (Unsubscribe works
+    regardless; re-subscribe just needs a toggle.)
+  - >
+    Digest email: plain-text (matches today's prompt) or a real ui-email HTML
+    template (nicer, reuses EmailFooter)? HTML is the better long-term answer;
+    plain-text ships faster.
+
+# ── Out of Scope ─────────────────────────────────────────────────────────────
+
+out_of_scope:
+  - Performer prompt delivery (single gig, stays in-app + email, not digested)
+  - The ORGANIZER_WEEKLY digest stub (separate feature)
+  - Push channel for review prompts (marketing push is off by default)
+  - A full notification-preference-token adapter (reuse announcements HMAC)
+  - Changing what/when in-app prompts fire
+
+# ── Acceptance Criteria ──────────────────────────────────────────────────────
+
+acceptance_criteria:
+  - An attendee with 3 un-reviewed shows in a week receives ONE digest email
+    listing all three, not three emails; in-app still shows three cards.
+  - Re-running the weekly job the same week sends no second email
+    (NotificationDigestLog idempotency).
+  - After 3 consecutive digests with no review submitted, the 4th weekly run
+    sends no email to that human; submitting any review resets the counter and
+    the next run emails again. In-app is never suppressed.
+  - Every digest email contains a working one-click unsubscribe (footer link +
+    List-Unsubscribe header); clicking it sets subscribed=false and the next
+    weekly run sends that human no email, with no login required.
+  - A review submitted from an in-app card removes that show from the next
+    digest.
+  - Suppression/reset unit tests pin the 4-week sequence and the in-app-never-
+    suppressed invariant.

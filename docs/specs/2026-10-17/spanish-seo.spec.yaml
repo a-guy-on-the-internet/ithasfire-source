@@ -1,0 +1,287 @@
+# spanish-seo.spec.yaml
+#
+# Draft, scoping. Spanish pages get their own /es/ URLs, translated paths and slugs, and hreflang,
+# so Spanish speakers can find category and city pages in search.
+
+version: "1.0"
+updated: "2026-10-17"
+
+# ── Rulings (owner, 2026-10-17; full text in memory session_spanish_seo.plan.md) ──
+# Round 1 answer: "3. Why not go all the way with it? It shows more care and thought. I agree with
+#   the rest of your answers."
+# R1  Pages: home, category, city×category, about, contact get Spanish twins. Not help (49 English-only
+#     articles), legal pages, /humans, app pages.
+# R2  /es/ prefix; English URLs unchanged.
+# R3  Translated paths and slugs ("go all the way"). Overrules R15 of category-translations
+#     ("shared English slug now").
+# R4  Indexable /es/ only for pages we translate in full (R1 list). Event, place and org pages keep their
+#     English URL only: organiser text is never machine-translated, and Google calls chrome-only
+#     translation a poor experience. An "event held in Spanish" field is a later project.
+# R5  Unprefixed indexable pages are English from the first byte. A visitor who chose Spanish is moved to
+#     the /es/ twin after load; a visitor whose browser is Spanish but who never chose sees the English
+#     page with a "Ver en español" link (superseded by R23). No redirect on a guessed language.
+# R6  Landing on /es/ saves Spanish as the preference only when nothing is saved.
+# R7  Internal links on /es/ pages stay in /es/ where a twin exists, else go to the English URL.
+#     Share and copy-link hand out the URL being viewed.
+# R8  /es/ pages: Spanish title, description, OG and JSON-LD (inLanguage es); self-canonical; reciprocal
+#     hreflang en, es, x-default=en; sitemap xhtml:link alternates.
+# R9  A category with no Spanish name has no /es/ alternate: noindex, out of hreflang and the sitemap.
+#     The page still renders (English name).
+# R10 (superseded by R25) /es/ paths in the AASA file; the mobile deep-link router strips the locale prefix. Embeds untouched.
+# R11 Success check: Search Console /es/ indexing and Spanish queries 4 weeks after the prod deploy.
+#     No new analytics.
+# R12 Prefixed locales = SUPPORTED_LOCALES minus DEFAULT_LOCALE; no /en/ URLs ever exist.
+# Round 2 answer: "I think astra has some good ideas on what is simpler. KISS my guy. I agree with your takes"
+# R13 Path words: /es, /es/eventos/categoria/<slug>, /es/eventos/categoria/<slug>/<city>, /es/acerca-de,
+#     /es/contacto. Slugs are ASCII (deriveCategorySlug already strips accents: Música → musica).
+# R14 A slug never moves on rename. Staff can deliberately change a category's URL (either language)
+#     with a separate control; the old slug is kept and 308s to the current one.
+# R15 Slugs live in a CategorySlug table, unique on (locale, slug) in the database.
+#     A slug string names one category across locales (orchestrator ruling, 2026-10-17, KISS);
+#     enforced in the use cases under lockNaming(), not by the DB. A category's own en and es slug may match.
+# R16 A URL resolves in its own language first; only on a miss does it 308 to the other language's page,
+#     and only when that match is unambiguous. English words under /es/ 308 to the Spanish path.
+# R17 City segments stay as stored (nashville-tn); no Spanish city names.
+# R18 (placement superseded by R24) /platform category form shows the /es/ URL beside the Spanish name, the change-URL control and the
+#     old URLs that still redirect.
+# R19 Deleting a category frees its slugs, current and old.
+# R20 Clearing a Spanish name keeps the Spanish slug reserved for that category; the page follows R9.
+# R21 Thin /es/ route files reuse the English pages' loaders and components; no middleware rewrite.
+#     Correction (Astra, checked by Claude, 2026-10-17): the root layout cannot see the pathname, so the
+#     middleware's existing x-th-route-context header (apps/web/src/lib/route-context.ts) gains the URL
+#     locale. That extends a header middleware already sets; it is not a rewrite. Round 2 said
+#     "middleware untouched"; that was wrong.
+# KISS (owner): when an implementation choice is open, take the simpler one.
+# R22 Q22, owner 2026-10-17: "A small client step is fine" — event, place and org pages stay English from
+#     the first byte; for a reader who chose Spanish, a small client step switches the translatable chrome
+#     to Spanish after hydration. Organiser text stays as written. No /es/ twins for these pages.
+# R23 Owner 2026-10-18: no on-page "Ver en español" offer: "Seeing it in espanol still just needs to be
+#     under that language selector and not on the page. It's weird. As it doesn't scale to other
+#     languages." The language picker (FR-004) is the only switch. Replaces R5's link sentence.
+# R24 Owner 2026-10-18: "For the SEO urls and categorizations it needs to become a drop box container list
+#     for each language defaulting on english. Seeing all of it on the same component is overwhelming."
+#     Replaces R18's "beside the Spanish name" placement (FR-012).
+# R25 Owner 2026-10-18, on mobile: "I'm doubting on mobile that path will matter much." The apps do not
+#     claim /es/* (FR-013). /es/ stays the SEO key on the web.
+# Earlier rulings that still bind: category-translations.spec.yaml (R13 nameTranslations JSON, R17 machine
+# translation only on staff forms); sitemap changes live in apps/jobs/src/jobs/sitemaps.ts (owner 10-13).
+
+summary:
+  problem: >
+    The site has no language in its URLs. The server picks the language from the th-locale cookie or
+    Accept-Language, so Googlebot only sees English and one URL can serve either language (which Google
+    advises against). Spanish searches for "micrófono abierto Nashville" have nothing to find, and
+    Cloudflare caches whichever language reaches a page first.
+  solution: >
+    Five page families get Spanish twins at translated /es/ paths with Spanish metadata, reciprocal
+    hreflang and sitemap alternates. Unprefixed pages become English-only from the first byte. Category
+    slugs move to a table that holds both languages and old slugs that 308.
+  users:
+    - Spanish-speaking visitor arriving from search
+    - Visitor who chose Spanish in the language picker
+    - Platform staff managing categories
+  surfaces:
+    - web
+    - jobs (sitemap)
+    - mobile (none: R25)
+
+requirements:
+  functional:
+    - id: FR-001
+      description: >
+        These routes exist and render Spanish from the URL alone (no cookie, no header): /es,
+        /es/eventos/categoria/[slug], /es/eventos/categoria/[slug]/[city], /es/acerca-de, /es/contacto.
+        Each is a thin route file that reuses the English page's loader and component with locale "es".
+    - id: FR-002
+      description: >
+        Every unprefixed page in the R1 list renders English HTML, metadata and <html lang="en">
+        regardless of th-locale and Accept-Language. The root layout reads the URL locale from the
+        route-context header that middleware sets (route-context.ts), with the existing spoof-stripping
+        kept and its tests extended.
+    - id: FR-003
+      description: >
+        On an unprefixed R1 page, a visitor with an explicit Spanish choice (th-locale) is moved to the
+        /es/ twin with router.replace after load, when the twin exists and is indexable. A visitor
+        without a choice sees the English page and switches with the language picker (R23: no
+        on-page offer).
+    - id: FR-015
+      description: >
+        On pages with no Spanish twin (event, place, org), a client step applies the saved explicit
+        language to the translatable chrome after hydration (R22). Server HTML stays English.
+    - id: FR-004
+      description: >
+        Picking a language in the existing language picker on an R1 page navigates to that language's
+        twin. Landing on /es/ saves es only when no preference is stored (R6).
+    - id: FR-005
+      description: >
+        /es/ pages carry Spanish title, description, OG text and JSON-LD with inLanguage "es", category
+        names from nameTranslations, a self-canonical, and hreflang links for en, es and x-default (en)
+        as fully qualified URLs. English twins carry the same reciprocal set.
+    - id: FR-006
+      description: >
+        Internal links rendered on /es/ pages point to /es/ twins where one exists, else to the English
+        URL (event, place and org pages). One helper builds every public path for a locale.
+    - id: FR-007
+      description: >
+        Category slugs: a CategorySlug row per (category, locale, slug) with isCurrent; unique on
+        (locale, slug). The migration backfills one current en row per category from Category.slug. es
+        rows come from ensureCategorySlugs (derived with deriveCategorySlug; on collision it appends -2,
+        -3), run by setCategoryTranslations and by a backfill script; the same use case repairs a missing
+        en row. A slug string names one category across locales: a slug another category holds in any
+        locale, current or old, is taken (checked under lockNaming(), not by the DB index).
+    - id: FR-008
+      description: >
+        Adding a Spanish name to a category with no es slug creates its current es slug. Renaming
+        (either language) never changes a slug. Clearing a Spanish name keeps the es slug (R20).
+    - id: FR-009
+      description: >
+        New use case changeCategorySlug(categoryId, locale, newSlug): staff only, validates with
+        categorySlugIssue, checks uniqueness inside categories.lockNaming(), marks the old row not
+        current (kept for 308), writes an audit row, calls markForSearchReindex for the category's
+        events when the en slug changes.
+    - id: FR-010
+      description: >
+        Resolution: look up (locale, slug). A current row renders. An old row 308s to the current slug
+        in the same locale. A miss in this locale that matches exactly one category in the other locale
+        308s to that page. English path words under /es/ 308 to the Spanish path. Anything else 404s.
+        A category with no current es slug (never had a Spanish name) has its /es/ page at its current
+        English slug, so that URL renders under /es/ and an old English slug under /es/ 308s to it.
+    - id: FR-011
+      description: >
+        Sitemap job declares xmlns:xhtml and emits, for each R1 URL with an indexable Spanish twin, both
+        <url> entries with the full alternate set (en, es, x-default) including itself. Categories with no
+        es name (R9) and gated-only or empty categories (existing rules) get no es entry.
+    - id: FR-012
+      description: >
+        /platform category tiles, the add form and the request approval show per-language fields behind
+        one language dropdown, default English (R24). The chosen language shows its name, its URL, a
+        "Change URL" control and the old URLs that redirect. A language with no name shows the URL that
+        renders today, muted, with no Change URL. An untouched machine suggestion is saved only after its
+        field has been on screen for the current English name; a notice outside the dropdown names each
+        language holding one. Not built: names, suggestions and request payloads store en + es only
+        (CategoryNameTranslations, CATEGORY_TRANSLATION_LOCALES, useSuggestedName, REQUEST_LANGUAGE_KEYS);
+        the dropdown adds a language once the data model does.
+    - id: FR-013
+      description: >
+        Not built (R25): the apps do not claim /es/*. apps/mobile has no URL router and no screen for any
+        /es/ page, so /es/ links open in the browser. Existing iOS AASA patterns already leave /es/* to
+        Safari; no change.
+    - id: FR-014
+      description: >
+        next.config.ts cache headers cover each /es/ route with the same Cache-Control as its English twin
+        (home 300 s; category and city×category s-maxage 120 like the /events wildcard, the city page
+        also keeping revalidate 3600). Cloudflare's rule already caches every non-excluded path and
+        respects origin headers, so no Terraform change.
+
+  non_functional:
+    - id: NFR-001
+      description: >
+        Proven on a production standalone build (next build + node server.js, middleware is load-bearing
+        there): English and Spanish twins return different HTML, metadata and <html lang> from a cold and a
+        warm cache; client navigation keeps the language; anonymous /admin and /platform still 307.
+    - id: NFR-002
+      description: >
+        No machine translation of organiser text anywhere (R4, category-translations R17).
+    - id: NFR-003
+      description: >
+        Every /es/ page passes the existing e2e console-error fixture and has no horizontal overflow at
+        320 px.
+
+architecture:
+  core:
+    use_cases:
+      - name: resolveCategorySlug
+        description: Locale-first lookup implementing FR-010; returns render, redirect or not-found.
+        input: locale, slug
+        output: "{ kind: render, categoryId } | { kind: redirect, locale, slug } | { kind: notFound }"
+        idempotent: true
+        money: false
+      - name: changeCategorySlug
+        description: FR-009. Staff only (platform category permission, same as renameCategory).
+        input: categoryId, locale, newSlug
+        output: current slug, old slugs
+        idempotent: true
+        money: false
+      - name: setCategoryTranslations (existing)
+        description: Also creates the es slug the first time an es name is set (FR-008).
+        idempotent: true
+        money: false
+      - name: listCategorySitemapEntries (existing)
+        description: Returns es slug and whether the es twin is indexable.
+        idempotent: true
+        money: false
+  ports:
+    new: []
+    existing: ["categories repo (slug methods added)", "tx.audit.log (as rename-category.ts)", ReporterPort]
+  adapters:
+    new: []
+    existing: [Prisma categories repo]
+  transport:
+    trpc_procedures:
+      - categories.resolveSlug (public)
+      - platform.categories.changeSlug (staff)
+    webhooks: []
+  ui:
+    pages:
+      - app/es/page.tsx
+      - app/es/eventos/categoria/[slug]/page.tsx
+      - app/es/eventos/categoria/[slug]/[city]/page.tsx
+      - app/es/acerca-de/page.tsx
+      - app/es/contacto/page.tsx
+    components:
+      - public-path helper (locale → path) used by links, canonical, hreflang and sitemap
+      - language picker navigates between twins on R1 pages
+      - /platform category form URL rows + Change URL control
+
+data:
+  new_models:
+    - "CategorySlug { id, categoryId (FK Category, onDelete Cascade → R19), locale, slug, isCurrent,
+      createdAt; @@unique([locale, slug]) }. One current row per (categoryId, locale) is enforced in the
+      use cases under lockNaming(), not a partial index (KISS; Prisma cannot model one)."
+  modified_models:
+    - "Category.slug stays during this build as a read copy of the current en slug (search docs and
+      existing callers key on it); changeCategorySlug updates both in one transaction."
+  migrations_needed: true
+
+lifecycle:
+  CategorySlug:
+    create: built (category create, first es name, changeCategorySlug)
+    read: built (resolveCategorySlug, /platform list of old URLs)
+    update: built (changeCategorySlug flips isCurrent)
+    remove: "built by cascade only: deleting a category frees its slugs (R19). Old slugs of a live
+      category are never removed one by one, so shared links keep working."
+
+risks:
+  - risk: English-from-first-byte (FR-002) changes what a Spanish reader sees on event, place and org pages, which have no twin.
+    severity: MEDIUM
+    mitigation: R22 client step after hydration; brief English flash accepted.
+  - risk: The cookie/Accept-Language server pick in layout.tsx is shared with every app page; narrowing it to non-R1 routes must not flip app pages.
+    severity: MEDIUM
+    mitigation: Route list lives in one place next to the public-path helper; unit-tested both ways.
+  - risk: Two copies of the en slug (Category.slug and CategorySlug) drift.
+    severity: MEDIUM
+    mitigation: Only changeCategorySlug writes either, in one transaction; a test asserts they match after every write path.
+  - risk: Changing an English category slug moves search data (event search tags hold the en slug); a partly failed reindex drain leaves old tags queryable.
+    severity: MEDIUM
+    mitigation: changeCategorySlug marks every event of the category for reindex in its transaction; resolution 308s old slugs, so a stale tag only affects search filtering until the drain catches up. Test the mark.
+  - risk: (closed by R25) Mobile router change ships only with a new app build. No app change is built; /es/ links open the web page.
+    severity: LOW
+    mitigation: none needed.
+
+open_questions: []
+
+out_of_scope:
+  - Spanish twins for event, place, org, /humans, help and legal pages (R1, R4).
+  - An "event held in Spanish" field (R4, later project).
+  - Spanish city names (R17). Locales beyond es (R12 makes them cheap later).
+  - Android consumer app links (assetlinks.json associates only com.ithasfire.scan; follow-up).
+  - New analytics (R11).
+
+acceptance_criteria:
+  - curl https://<host>/es/eventos/categoria/open-mics/nashville-tn returns Spanish HTML, <html lang="es">, a Spanish <title>, a self-canonical and hreflang en/es/x-default; the English twin returns the reciprocal set.
+  - curl of /events/category/music with th-locale=es and Accept-Language es returns English HTML.
+  - /es/eventos/categoria/music 308s to /es/eventos/categoria/musica; /es/events/category/music 308s to the Spanish path; an old es slug after Change URL 308s to the new one.
+  - A category with no es name: its /es/ page renders, is noindex, and is absent from hreflang and the sitemap.
+  - The nightly sitemap validates with xmlns:xhtml and lists each indexable pair with both alternates.
+  - A visitor who chose Spanish, opening /events/category/music, lands on /es/eventos/categoria/musica.
+  - NFR-001 standalone-build check passes; NFR-003 at 320 px with zero console errors.

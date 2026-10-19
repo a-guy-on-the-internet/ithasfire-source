@@ -540,6 +540,7 @@ describe("covered vs uncovered paths", () => {
     "/sign-in/email-otp",
     "/email-otp/verify-email",
     "/email-otp/send-verification-otp",
+    "/email-otp/change-email",
     "/phone-number/verify",
     "/phone-number/send-otp",
     "/two-factor/verify-totp",
@@ -547,6 +548,12 @@ describe("covered vs uncovered paths", () => {
     "/two-factor/verify-backup-code",
     "/magic-link/verify",
     "/passkey/verify-authentication",
+    "/sign-in/magic-link",
+    "/request-password-reset",
+    "/email-otp/request-password-reset",
+    "/forget-password/email-otp",
+    "/phone-number/request-password-reset",
+    "/change-email",
   ])("consumes a token for %s", async (path) => {
     const consume = vi.fn(async () => allow());
     const { limiter } = makeLimiter(consume);
@@ -658,6 +665,22 @@ describe("account identifier extraction", () => {
       "+16155550100",
     ],
     ["/phone-number/send-otp", { phoneNumber: "+16155550100" }, "+16155550100"],
+    // 2026-09-29 (F8): the other senders, keyed on the RECIPIENT.
+    ["/sign-in/magic-link", { email: " A@B.com " }, "a@b.com"],
+    ["/request-password-reset", { email: "A@B.com" }, "a@b.com"],
+    ["/email-otp/request-password-reset", { email: "A@B.com" }, "a@b.com"],
+    ["/forget-password/email-otp", { email: "A@B.com" }, "a@b.com"],
+    [
+      "/phone-number/request-password-reset",
+      { phoneNumber: "+1 (615) 555-0100" },
+      "+16155550100",
+    ],
+    ["/change-email", { newEmail: "Victim@X.com" }, "victim@x.com"],
+    [
+      "/email-otp/change-email",
+      { newEmail: " Victim@X.com ", otp: "123456" },
+      "victim@x.com",
+    ],
   ])("normalizes %s's identifier", (path, body, expected) => {
     expect(extractAccountIdentifier(path, body)).toBe(expected);
   });
@@ -932,6 +955,12 @@ describe("cap sizing", () => {
     const SEND_PATHS = [
       "/email-otp/send-verification-otp",
       "/phone-number/send-otp",
+      "/sign-in/magic-link",
+      "/request-password-reset",
+      "/email-otp/request-password-reset",
+      "/forget-password/email-otp",
+      "/phone-number/request-password-reset",
+      "/change-email",
     ] as const;
 
     it.each(SEND_PATHS)("%s uses the SEND multiplier", (path) => {

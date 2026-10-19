@@ -1,0 +1,22 @@
+{
+  "extends": "../config/tsconfig/base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "types": ["vitest", "node"],
+    "jsx": "react-jsx",
+    "baseUrl": ".",
+    "paths": {
+      "@th/core/*": ["../core/src/*"],
+      "@th/ports": ["../ports/src/index.ts"],
+      "@th/ports/*": ["../ports/src/*"],
+      "@th/types": ["../types/src/index.ts"],
+      "@th/types/*": ["../types/src/*"],
+      "@th/test-utils": ["../test-utils/src/index.ts"],
+      "@th/test-utils/*": ["../test-utils/src/*"],
+      "@th/ui-email": ["../ui-email/src/index.ts"],
+      "@th/ui-email/*": ["../ui-email/src/*"]
+    }
+  },
+  "include": ["src", "test", "types"],
+  "exclude": ["node_modules", "dist"]
+}
