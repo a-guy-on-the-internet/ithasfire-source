@@ -36,16 +36,16 @@ jobs:
     environment: prod
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.9.6
 
@@ -114,10 +114,10 @@ jobs:
     environment: prod
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
@@ -126,11 +126,11 @@ jobs:
         id: setup_gcloud
         # Retried below — see the note at the first occurrence in deploy-dev.yml.
         continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Setup gcloud (retry)
         if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Verify gcloud is on PATH
         run: gcloud version
@@ -142,10 +142,10 @@ jobs:
           echo "DATABASE_URL=${url}" >> "$GITHUB_ENV"
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -165,7 +165,7 @@ jobs:
     environment: prod
     steps:
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
@@ -174,11 +174,11 @@ jobs:
         id: setup_gcloud
         # Retried below — see the note at the first occurrence in deploy-dev.yml.
         continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Setup gcloud (retry)
         if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Verify gcloud is on PATH
         run: gcloud version
@@ -212,7 +212,7 @@ jobs:
     environment: prod
     steps:
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
@@ -221,11 +221,11 @@ jobs:
         id: setup_gcloud
         # Retried below — see the note at the first occurrence in deploy-dev.yml.
         continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Setup gcloud (retry)
         if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Verify gcloud is on PATH
         run: gcloud version
@@ -311,13 +311,13 @@ jobs:
     environment: prod
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -328,7 +328,7 @@ jobs:
         run: pnpm prisma:gen
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
@@ -337,11 +337,11 @@ jobs:
         id: setup_gcloud
         # Retried below — see the note at the first occurrence in deploy-dev.yml.
         continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Setup gcloud (retry)
         if: steps.setup_gcloud.outcome == 'failure'
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Verify gcloud is on PATH
         run: gcloud version
