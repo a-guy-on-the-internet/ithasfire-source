@@ -56,8 +56,8 @@ jobs:
       # token in the `scope` step. Never 'true' on a push.
       skip_migrate: ${{ steps.scope.outputs.skip_migrate }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           filters: |
@@ -296,12 +296,12 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           lfs: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -351,15 +351,15 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           lfs: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -404,13 +404,13 @@ jobs:
       TZ: UTC
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # setup-node FIRST: corepack ships with Node, and a self-hosted Linux box
       # has no system Node at all, so the old order died on
       # `corepack: command not found`. Harmless reorder on hosted runners.
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
 
@@ -550,7 +550,7 @@ jobs:
           fi
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # NOTE: needs git-lfs on the runner — see the step above. This job is
           # the only LFS consumer that runs on `hf-linux`; both build_web jobs
@@ -588,7 +588,7 @@ jobs:
       # setup-node FIRST — see the note in `typecheck`. corepack comes from
       # Node, and a self-hosted Linux box has no system Node.
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
 
@@ -778,24 +778,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           lfs: false
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Verify gcloud is on PATH
         run: gcloud version
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Configure docker auth for Artifact Registry
         run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
@@ -832,7 +832,7 @@ jobs:
       # drops `type=gha` silently and the build runs uncached; the build step
       # warns when they are missing.
       - name: Expose GitHub Actions cache credentials
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             for (const k of ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RESULTS_URL']) {
@@ -906,7 +906,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # MUST be true: the Dockerfile copies apps/web/public into the image
           # and the OG renderer reads the four LFS-tracked TTFs from
@@ -916,19 +916,19 @@ jobs:
           lfs: true
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Verify gcloud is on PATH
         run: gcloud version
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Configure docker auth for Artifact Registry
         run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
@@ -955,7 +955,7 @@ jobs:
       # drops `type=gha` silently and the build runs uncached; the build step
       # warns when they are missing.
       - name: Expose GitHub Actions cache credentials
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             for (const k of ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RESULTS_URL']) {
@@ -1054,24 +1054,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           lfs: false
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Verify gcloud is on PATH
         run: gcloud version
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Configure docker auth for Artifact Registry
         run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
@@ -1108,7 +1108,7 @@ jobs:
       # drops `type=gha` silently and the build runs uncached; the build step
       # warns when they are missing.
       - name: Expose GitHub Actions cache credentials
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             for (const k of ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RESULTS_URL']) {
@@ -1170,24 +1170,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           lfs: false
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Verify gcloud is on PATH
         run: gcloud version
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Configure docker auth for Artifact Registry
         run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
@@ -1197,7 +1197,7 @@ jobs:
       # drops `type=gha` silently and the build runs uncached; the build step
       # warns when they are missing.
       - name: Expose GitHub Actions cache credentials
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             for (const k of ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RESULTS_URL']) {
@@ -1239,24 +1239,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           lfs: false
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Verify gcloud is on PATH
         run: gcloud version
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Configure docker auth for Artifact Registry
         run: gcloud auth configure-docker ${{ vars.GCP_ARTIFACT_REGISTRY_REGION }}-docker.pkg.dev --quiet
@@ -1293,7 +1293,7 @@ jobs:
       # drops `type=gha` silently and the build runs uncached; the build step
       # warns when they are missing.
       - name: Expose GitHub Actions cache credentials
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             for (const k of ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RESULTS_URL']) {
@@ -1372,21 +1372,21 @@ jobs:
     environment: dev
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.9.6
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Verify gcloud is on PATH
         run: gcloud version
@@ -1538,16 +1538,16 @@ jobs:
     environment: dev
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Verify gcloud is on PATH
         run: gcloud version
@@ -1563,10 +1563,10 @@ jobs:
           echo "DATABASE_URL=${url}" >> "$GITHUB_ENV"
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -1731,13 +1731,13 @@ jobs:
     environment: dev
     steps:
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Verify gcloud is on PATH
         run: gcloud version
@@ -1812,13 +1812,13 @@ jobs:
     environment: dev
     steps:
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Verify gcloud is on PATH
         run: gcloud version
@@ -2011,13 +2011,13 @@ jobs:
     environment: dev
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -2029,13 +2029,13 @@ jobs:
         run: pnpm prisma:gen
 
       - name: Auth to Google Cloud (OIDC)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Verify gcloud is on PATH
         run: gcloud version

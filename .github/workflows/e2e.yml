@@ -218,7 +218,7 @@ jobs:
       # ignored leftovers from other jobs in this shared workspace: .env*,
       # .tmp/ (api pid + e2e DB lock), .next/, playwright/.auth/.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           lfs: true
 
@@ -231,7 +231,7 @@ jobs:
       # Node (runner-smoke.yml). corepack ships with Node, so setup-node comes
       # first. Neither step touches a database.
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
 
@@ -369,7 +369,7 @@ jobs:
         run: echo "version=$(pnpm exec playwright --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
       - name: Cache Playwright browsers
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ steps.pw.outputs.version }}
@@ -456,7 +456,7 @@ jobs:
       # exactly the hang whose logs are most needed.
       - name: Upload Playwright report, traces and stack logs
         if: failure() || cancelled()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-${{ github.run_id }}-${{ github.run_attempt }}
           retention-days: 7
